@@ -1,0 +1,145 @@
+name: Reusable Node CI
+
+# Generic Node quality gate: lint, typecheck, test, build. Runs each script
+# with --if-present so callers only need the scripts they actually have.
+# Defaults to GitHub-hosted ubuntu-latest; private repos may pass a
+# manifest-routed self-hosted label via the runner input. PUBLIC repos must
+# never pass a self-hosted label. Callers pin @vN or a SHA — never @main.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version"
+        required: false
+        type: string
+        default: "22"
+      package-manager:
+        description: "Package manager: pnpm or npm"
+        required: false
+        type: string
+        default: "pnpm"
+      runner:
+        description: "Runner label. Default ubuntu-latest; public repos must never pass a self-hosted label."
+        required: false
+        type: string
+        default: "ubuntu-latest"
+      run-lint:
+        description: "Run the lint script"
+        required: false
+        type: boolean
+        default: true
+      run-typecheck:
+        description: "Run the typecheck script"
+        required: false
+        type: boolean
+        default: true
+      run-tests:
+        description: "Run the test script"
+        required: false
+        type: boolean
+        default: true
+      run-build:
+        description: "Run the build script"
+        required: false
+        type: boolean
+        default: true
+      working-directory:
+        description: "Directory containing package.json"
+        required: false
+        type: string
+        default: "."
+    secrets:
+      NARDUK_PLATFORM_GH_PACKAGES_READ:
+        required: false
+
+env:
+  NUXT_TELEMETRY_DISABLED: 1
+
+jobs:
+  ci:
+    name: Node CI
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      - name: Configure package registry auth
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: |
+          # Skip cleanly when the caller declined to pass a package-registry
+          # token so public/forked callers can still run.
+          if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
+            echo "skipping package-registry auth: no NARDUK_PLATFORM_GH_PACKAGES_READ token passed"
+            exit 0
+          fi
+          if [ -f ./scripts/package-registry-auth.mjs ]; then
+            node ./scripts/package-registry-auth.mjs
+          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
+            node ./tools/configure-package-registry-auth.mjs
+          else
+            echo "skipping package-registry auth: no auth bootstrap script present"
+          fi
+
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci
+
+      - name: Lint
+        if: inputs.run-lint
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm run --if-present lint
+          else
+            npm run --if-present lint
+          fi
+
+      - name: Typecheck
+        if: inputs.run-typecheck
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm run --if-present typecheck
+          else
+            npm run --if-present typecheck
+          fi
+
+      - name: Test
+        if: inputs.run-tests
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm run --if-present test
+          else
+            npm run --if-present test
+          fi
+
+      - name: Build
+        if: inputs.run-build
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm run --if-present build
+          else
+            npm run --if-present build
+          fi
