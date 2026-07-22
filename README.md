@@ -2,6 +2,18 @@
 
 Shared reusable GitHub Actions workflows for the narduk-enterprises estate (CI-5).
 
+> **This repository is public on purpose.** GitHub only serves reusable
+> workflows across owners when the host repo is public (short of GitHub
+> Enterprise, which the estate rejected). Public visibility lets every owner —
+> `narduk-enterprises`, incubator, clients, and personal `loganrenz/*` repos —
+> call these workflows directly. The workflows hold no secrets (all
+> `workflow_call` secrets are optional and skip cleanly).
+>
+> **Callers must pin `@v1` or a full commit SHA — never `@main` — and must
+> never pass a self-hosted runner label.** A fork PR on a public caller can run
+> attacker-controlled code, so estate self-hosted runners are off-limits here;
+> reusable jobs default to GitHub-hosted `ubuntu-latest`.
+
 Fix CI in one place, not 100. Application repos call these workflows via
 `workflow_call` instead of blob-copying YAML. This repo replaces the broken
 pattern where ~20 repos carried copies of `weekly-drift-check.yml` pointing at
