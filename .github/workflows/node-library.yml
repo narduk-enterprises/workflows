@@ -1,0 +1,248 @@
+name: Reusable Node Library CI
+
+# CI gate for the `library` / `cli` project-lifecycle surfaces (narduk-charts,
+# narduk-skills, narduk-eslint-config, narduk-libs). Generalizes
+# reusable-node-ci.yml's lint/typecheck/test/build --if-present pattern plus
+# narduk-libs' package-gates matrix + verify aggregator
+# (narduk-enterprises/narduk-libs .github/workflows/ci.yml) into one reusable
+# workflow. reusable-node-ci.yml has zero live callers today (GitHub code
+# search, 2026-07-24) so nothing breaks by adding this alongside it — see
+# README "Relationship to reusable-node-ci.yml" for which file to pick.
+# Publish/release stays a separate per-repo workflow; credentials and
+# versioning strategy (Changesets vs manual bump) differ enough across
+# publishers that this file intentionally does not cover it.
+#
+# THE "Required" CONVENTION (this is the point of this repo): this workflow's
+# last job is named exactly `Required`, `needs:` every other job, runs with
+# `if: always()`, and fails unless each needed job succeeded or was
+# intentionally skipped (an opted-out input, never a silent pass). Callers
+# name their calling job id `ci`, so GitHub composes the identical required
+# check context `ci / Required` on every adopting repo regardless of how many
+# package-matrix lanes run underneath. See README for the full explanation.
+#
+# RUNNER ROUTING: `runner` is a caller-controlled, JSON-encoded string input —
+# a plain string ("ubuntu-latest"), a JSON array, or a JSON object matching
+# Config/github-runner-fleet.json's `runsOn` shape — decoded with fromJSON()
+# at each job's `runs-on:`. This repo is PUBLIC: public callers must NEVER
+# pass a self-hosted label here (a fork PR would execute attacker-controlled
+# code on estate infrastructure). Only private, manifest-routed callers may
+# pass a self-hosted runs-on value, resolved via
+# `python3 scripts/github_runner_fleet.py route` in agent-infrastructure.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version"
+        required: false
+        type: string
+        default: "22"
+      package-manager:
+        description: "Package manager: pnpm or npm"
+        required: false
+        type: string
+        default: "pnpm"
+      runner:
+        description: >-
+          JSON-encoded runner for every job in this workflow: a plain string
+          ("ubuntu-latest"), a JSON array
+          (["self-hosted","Linux","X64","proxmox","linux-ci"]), or a JSON
+          object ({"group":"linux-ci","labels":[...]}) matching the
+          runner-fleet manifest's `runsOn` shape. Decoded with fromJSON(), so
+          the value must be valid JSON — a bare string needs its own quotes.
+          Defaults to GitHub-hosted ubuntu-latest. PUBLIC CALLERS MUST NEVER
+          PASS A SELF-HOSTED LABEL: this repo is public and a fork PR would
+          run attacker-controlled code on estate self-hosted infrastructure.
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      run-lint:
+        description: "Run the lint script"
+        required: false
+        type: boolean
+        default: true
+      run-typecheck:
+        description: "Run the typecheck script"
+        required: false
+        type: boolean
+        default: true
+      run-tests:
+        description: "Run the test script"
+        required: false
+        type: boolean
+        default: true
+      run-build:
+        description: "Run the build script"
+        required: false
+        type: boolean
+        default: true
+      working-directory:
+        description: "Directory containing the root package.json / lockfile"
+        required: false
+        type: string
+        default: "."
+      package-matrix:
+        description: >-
+          JSON array of {label, filter} lanes, one per workspace package —
+          generalizes narduk-libs' package-gates matrix input. `filter` is
+          passed to `pnpm --filter` / `npm --workspace`; leave it "" to run
+          scripts at the repo root instead of a specific package. Default is
+          a single whole-repo lane, so non-monorepo callers (narduk-charts,
+          narduk-skills, narduk-eslint-config) can ignore this input entirely.
+        required: false
+        type: string
+        default: '[{"label":"default","filter":""}]'
+    secrets:
+      NARDUK_PLATFORM_GH_PACKAGES_READ:
+        required: false
+
+env:
+  NUXT_TELEMETRY_DISABLED: 1
+
+jobs:
+  package:
+    name: package / ${{ matrix.label }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.package-matrix) }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      - name: Configure package registry auth
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: |
+          # Skip cleanly when the caller declined to pass a package-registry
+          # token so public/forked callers can still run.
+          if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
+            echo "skipping package-registry auth: no NARDUK_PLATFORM_GH_PACKAGES_READ token passed"
+            exit 0
+          fi
+          if [ -f ./scripts/package-registry-auth.mjs ]; then
+            node ./scripts/package-registry-auth.mjs
+          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
+            node ./tools/configure-package-registry-auth.mjs
+          else
+            echo "skipping package-registry auth: no auth bootstrap script present"
+          fi
+
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci
+
+      - name: Lint
+        if: inputs.run-lint
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            if [ -n "${{ matrix.filter }}" ]; then
+              pnpm --filter "${{ matrix.filter }}" run --if-present lint
+            else
+              pnpm run --if-present lint
+            fi
+          else
+            if [ -n "${{ matrix.filter }}" ]; then
+              npm run lint --workspace "${{ matrix.filter }}" --if-present
+            else
+              npm run --if-present lint
+            fi
+          fi
+
+      - name: Typecheck
+        if: inputs.run-typecheck
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            if [ -n "${{ matrix.filter }}" ]; then
+              pnpm --filter "${{ matrix.filter }}" run --if-present typecheck
+            else
+              pnpm run --if-present typecheck
+            fi
+          else
+            if [ -n "${{ matrix.filter }}" ]; then
+              npm run typecheck --workspace "${{ matrix.filter }}" --if-present
+            else
+              npm run --if-present typecheck
+            fi
+          fi
+
+      - name: Test
+        if: inputs.run-tests
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            if [ -n "${{ matrix.filter }}" ]; then
+              pnpm --filter "${{ matrix.filter }}" run --if-present test
+            else
+              pnpm run --if-present test
+            fi
+          else
+            if [ -n "${{ matrix.filter }}" ]; then
+              npm run test --workspace "${{ matrix.filter }}" --if-present
+            else
+              npm run --if-present test
+            fi
+          fi
+
+      - name: Build
+        if: inputs.run-build
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            if [ -n "${{ matrix.filter }}" ]; then
+              pnpm --filter "${{ matrix.filter }}" run --if-present build
+            else
+              pnpm run --if-present build
+            fi
+          else
+            if [ -n "${{ matrix.filter }}" ]; then
+              npm run build --workspace "${{ matrix.filter }}" --if-present
+            else
+              npm run --if-present build
+            fi
+          fi
+
+  required:
+    name: Required
+    if: always()
+    needs: package
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require every package lane to succeed
+        env:
+          PACKAGE_RESULT: ${{ needs.package.result }}
+        run: |
+          case "$PACKAGE_RESULT" in
+            success) exit 0 ;;
+            *) echo "::error::package job reported '$PACKAGE_RESULT'"; exit 1 ;;
+          esac
