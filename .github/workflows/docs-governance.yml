@@ -1,0 +1,136 @@
+name: Reusable Docs Governance Check
+
+# Thin generalization of company-hq's handbook-spine-check.yml /
+# untangle-project-sync.yml shape: checkout, optionally provision a Python
+# and/or Node runtime, then run one repo-provided check command. Deliberately
+# thin — path filtering (docs/**, the check script itself, this workflow
+# file) and any script-specific setup beyond a bare interpreter (e.g. `pip
+# install pyyaml`) stay in the CALLER's own trigger `paths:` block or inside
+# the `command` input; this workflow does not know the caller's repo layout.
+#
+# THE "Required" CONVENTION (this is the point of this repo): this workflow's
+# last job is named exactly `Required`, `needs:` every other job, runs with
+# `if: always()`, and fails unless the check job succeeded. Callers name
+# their calling job id `ci`, so GitHub composes the identical required check
+# context `ci / Required` on every adopting repo, the same string produced by
+# nuxt-cloudflare.yml and node-library.yml. See README for the full
+# explanation.
+#
+# RUNNER ROUTING: `runner` is a caller-controlled, JSON-encoded string input —
+# a plain string ("ubuntu-latest"), a JSON array, or a JSON object matching
+# Config/github-runner-fleet.json's `runsOn` shape — decoded with fromJSON()
+# at each job's `runs-on:`. This repo is PUBLIC: public callers must NEVER
+# pass a self-hosted label here (a fork PR would execute attacker-controlled
+# code on estate infrastructure). Only private, manifest-routed callers may
+# pass a self-hosted runs-on value, resolved via
+# `python3 scripts/github_runner_fleet.py route` in agent-infrastructure.
+
+on:
+  workflow_call:
+    inputs:
+      command:
+        description: >-
+          Shell command that runs the repo-provided governance check script,
+          e.g. `python3 scripts/check-handbook-spine.py`. May be multi-line
+          to install its own light dependencies first (company-hq's
+          untangle-project-sync installs PyYAML this way). Runs with bash at
+          `working-directory`.
+        required: true
+        type: string
+      runner:
+        description: >-
+          JSON-encoded runner for the jobs in this workflow: a plain string
+          ("ubuntu-latest"), a JSON array, or a JSON object
+          ({"group":"linux-ci","labels":[...]}) matching the runner-fleet
+          manifest's `runsOn` shape. Decoded with fromJSON(), so the value
+          must be valid JSON — a bare string needs its own quotes. Defaults
+          to GitHub-hosted ubuntu-latest. PUBLIC CALLERS MUST NEVER PASS A
+          SELF-HOSTED LABEL: this repo is public and a fork PR would run
+          attacker-controlled code on estate self-hosted infrastructure.
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      working-directory:
+        description: "Directory to run `command` from"
+        required: false
+        type: string
+        default: "."
+      fetch-depth:
+        description: >-
+          actions/checkout fetch-depth. company-hq's handbook-spine-check and
+          untangle-project-sync both use a shallow 1; raise it for a check
+          that needs history (e.g. a diff-based drift check).
+        required: false
+        type: number
+        default: 1
+      python-version:
+        description: "Python version to provision before running `command`. Empty skips Python setup."
+        required: false
+        type: string
+        default: "3.13"
+      node-version:
+        description: "Node.js version to provision before running `command`. Empty skips Node/pnpm setup."
+        required: false
+        type: string
+        default: ""
+      package-manager:
+        description: "Package manager for Node setup when node-version is set: pnpm or npm"
+        required: false
+        type: string
+        default: "pnpm"
+    secrets:
+      NARDUK_PLATFORM_GH_PACKAGES_READ:
+        required: false
+
+jobs:
+  check:
+    name: check
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: inputs.python-version != ''
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.node-version != '' && inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: inputs.node-version != ''
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+
+      - name: Run governance check
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: ${{ inputs.command }}
+
+  required:
+    name: Required
+    if: always()
+    needs: check
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require the governance check to succeed
+        env:
+          CHECK_RESULT: ${{ needs.check.result }}
+        run: |
+          case "$CHECK_RESULT" in
+            success) exit 0 ;;
+            *) echo "::error::check job reported '$CHECK_RESULT'"; exit 1 ;;
+          esac

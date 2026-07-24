@@ -1,0 +1,381 @@
+name: Reusable Nuxt + Cloudflare CI
+
+# CI gate for the `nuxt-web` / `cloudflare-worker` project-lifecycle surfaces.
+# pnpm/npm install -> typecheck (worker + Nuxt split, matching hydrogen's
+# .github/workflows/ci-deploy.yml `ci` job) -> build -> optional Playwright
+# e2e (opt-in, default false) -> optional `wrangler deploy --dry-run` gate
+# (opt-in, default false). CI ONLY: deploying with real Cloudflare secrets on
+# push-to-main is a deliberately separate `nuxt-cloudflare-deploy.yml`
+# sibling (matching hydrogen's existing two-job ci/deploy split) that is NOT
+# built in this pass — see the workflows repo README for what's deferred.
+#
+# THE "Required" CONVENTION (this is the point of this repo): this workflow's
+# last job is named exactly `Required`, `needs:` every other job, runs with
+# `if: always()`, and fails unless each needed job succeeded or was
+# intentionally skipped (an opted-out input, never a silent pass). Callers
+# name their calling job id `ci`, so GitHub composes the identical required
+# check context `ci / Required` on every adopting repo regardless of whether
+# e2e or the deploy dry-run gate ran. See README for the full explanation.
+#
+# RUNNER ROUTING: `runner` is a caller-controlled, JSON-encoded string input —
+# a plain string ("ubuntu-latest"), a JSON array, or a JSON object matching
+# Config/github-runner-fleet.json's `runsOn` shape — decoded with fromJSON()
+# at each job's `runs-on:`. This repo is PUBLIC: public callers must NEVER
+# pass a self-hosted label here (a fork PR would execute attacker-controlled
+# code on estate infrastructure). Only private, manifest-routed callers may
+# pass a self-hosted runs-on value, resolved via
+# `python3 scripts/github_runner_fleet.py route` in agent-infrastructure.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: "Node.js version"
+        required: false
+        type: string
+        default: "22"
+      package-manager:
+        description: "Package manager: pnpm or npm (hydrogen currently runs npm)"
+        required: false
+        type: string
+        default: "pnpm"
+      runner:
+        description: >-
+          JSON-encoded runner for every job in this workflow: a plain string
+          ("ubuntu-latest"), a JSON array
+          (["self-hosted","Linux","X64","proxmox","linux-ci"]), or a JSON
+          object ({"group":"linux-ci","labels":[...]}) matching the
+          runner-fleet manifest's `runsOn` shape. Decoded with fromJSON(), so
+          the value must be valid JSON — a bare string needs its own quotes.
+          Defaults to GitHub-hosted ubuntu-latest. PUBLIC CALLERS MUST NEVER
+          PASS A SELF-HOSTED LABEL: this repo is public and a fork PR would
+          run attacker-controlled code on estate self-hosted infrastructure.
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      working-directory:
+        description: "Directory containing the root package.json / lockfile"
+        required: false
+        type: string
+        default: "."
+      typecheck-worker-script:
+        description: >-
+          package.json script for the Worker/server typecheck lane (hydrogen:
+          `typecheck`). Run with --if-present, so callers with no worker
+          split can leave this at the default and it simply no-ops.
+        required: false
+        type: string
+        default: "typecheck"
+      typecheck-web-script:
+        description: >-
+          package.json script for the Nuxt web typecheck lane (hydrogen:
+          `web:typecheck`). Run with --if-present, so a caller with a single
+          combined typecheck script can leave this unset without failing.
+        required: false
+        type: string
+        default: "web:typecheck"
+      build-script:
+        description: "package.json build script, run with --if-present"
+        required: false
+        type: string
+        default: "build"
+      run-e2e:
+        description: "Run the optional Playwright e2e suite (opt-in)"
+        required: false
+        type: boolean
+        default: false
+      e2e-script:
+        description: "package.json script for the e2e suite, run with --if-present"
+        required: false
+        type: string
+        default: "test:e2e"
+      e2e-browsers:
+        description: "Space-separated `playwright install --with-deps` browser list"
+        required: false
+        type: string
+        default: "chromium"
+      wrangler-dry-run:
+        description: "Run an opt-in `wrangler deploy --dry-run` validation gate"
+        required: false
+        type: boolean
+        default: false
+      wrangler-working-directory:
+        description: "Directory to run `wrangler deploy --dry-run` from; empty defaults to working-directory"
+        required: false
+        type: string
+        default: ""
+      wrangler-env:
+        description: "Optional wrangler --env passed to the dry-run gate"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      NARDUK_PLATFORM_GH_PACKAGES_READ:
+        required: false
+
+env:
+  NUXT_TELEMETRY_DISABLED: 1
+
+jobs:
+  build:
+    name: Build
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      - name: Configure package registry auth
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: |
+          # Skip cleanly when the caller declined to pass a package-registry
+          # token so public/forked callers can still run.
+          if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
+            echo "skipping package-registry auth: no NARDUK_PLATFORM_GH_PACKAGES_READ token passed"
+            exit 0
+          fi
+          if [ -f ./scripts/package-registry-auth.mjs ]; then
+            node ./scripts/package-registry-auth.mjs
+          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
+            node ./tools/configure-package-registry-auth.mjs
+          else
+            echo "skipping package-registry auth: no auth bootstrap script present"
+          fi
+
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci
+
+      - name: Typecheck Worker
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm run --if-present ${{ inputs.typecheck-worker-script }}
+          else
+            npm run --if-present ${{ inputs.typecheck-worker-script }}
+          fi
+
+      - name: Typecheck Nuxt
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm run --if-present ${{ inputs.typecheck-web-script }}
+          else
+            npm run --if-present ${{ inputs.typecheck-web-script }}
+          fi
+
+      - name: Build
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm run --if-present ${{ inputs.build-script }}
+          else
+            npm run --if-present ${{ inputs.build-script }}
+          fi
+
+  e2e:
+    name: E2E
+    if: inputs.run-e2e
+    needs: build
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      - name: Configure package registry auth
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: |
+          if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
+            echo "skipping package-registry auth: no NARDUK_PLATFORM_GH_PACKAGES_READ token passed"
+            exit 0
+          fi
+          if [ -f ./scripts/package-registry-auth.mjs ]; then
+            node ./scripts/package-registry-auth.mjs
+          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
+            node ./tools/configure-package-registry-auth.mjs
+          else
+            echo "skipping package-registry auth: no auth bootstrap script present"
+          fi
+
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm exec playwright install --with-deps ${{ inputs.e2e-browsers }}
+          else
+            npx playwright install --with-deps ${{ inputs.e2e-browsers }}
+          fi
+
+      - name: Run e2e suite
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm run --if-present ${{ inputs.e2e-script }}
+          else
+            npm run --if-present ${{ inputs.e2e-script }}
+          fi
+
+      - name: Upload Playwright evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-evidence
+          path: |
+            ${{ inputs.working-directory }}/playwright-report
+            ${{ inputs.working-directory }}/test-results
+          if-no-files-found: ignore
+          retention-days: 7
+
+  deploy-dry-run:
+    name: Deploy dry run
+    if: inputs.wrangler-dry-run
+    needs: build
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      - name: Configure package registry auth
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: |
+          if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
+            echo "skipping package-registry auth: no NARDUK_PLATFORM_GH_PACKAGES_READ token passed"
+            exit 0
+          fi
+          if [ -f ./scripts/package-registry-auth.mjs ]; then
+            node ./scripts/package-registry-auth.mjs
+          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
+            node ./tools/configure-package-registry-auth.mjs
+          else
+            echo "skipping package-registry auth: no auth bootstrap script present"
+          fi
+
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci
+
+      - name: Validate Worker bundle (dry run)
+        working-directory: ${{ inputs.wrangler-working-directory != '' && inputs.wrangler-working-directory || inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          ARGS=(deploy --dry-run)
+          if [ -n "${{ inputs.wrangler-env }}" ]; then
+            ARGS+=(--env "${{ inputs.wrangler-env }}")
+          fi
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm exec wrangler "${ARGS[@]}"
+          else
+            npx wrangler "${ARGS[@]}"
+          fi
+
+  required:
+    name: Required
+    if: always()
+    needs: [build, e2e, deploy-dry-run]
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require build to succeed and opt-in gates to succeed-or-skip
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+          DEPLOY_DRY_RUN_RESULT: ${{ needs.deploy-dry-run.result }}
+        run: |
+          status=0
+          # build has no `if:` — it must always report success.
+          require_success() {
+            if [ "$2" != "success" ]; then
+              echo "::error::$1 job reported '$2' (must succeed)"
+              status=1
+            fi
+          }
+          # e2e / deploy-dry-run are opt-in — "skipped" means the caller left
+          # the gate off, which is fine; only an actual failure blocks Required.
+          allow_skip() {
+            case "$2" in
+              success | skipped) ;;
+              *)
+                echo "::error::$1 job reported '$2' (must succeed or be skipped)"
+                status=1
+                ;;
+            esac
+          }
+          require_success build "$BUILD_RESULT"
+          allow_skip e2e "$E2E_RESULT"
+          allow_skip deploy-dry-run "$DEPLOY_DRY_RUN_RESULT"
+          exit "$status"
