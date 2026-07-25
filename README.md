@@ -65,7 +65,7 @@ a missing eighth file: five repos had already hand-rolled the same sharded
 | `python-data.yml` | CI gate for Python / data-pipeline repos: `uv` (lockfile check + sync) or pip/venv, pytest, opt-in pinned `ruff check`, plus an `extra-checks` hook so a repo-specific gate that needs the installed environment does not have to stay behind as a duplicate-install job |
 | `docs-governance.yml` | Thin generic gate for docs/handbook-shaped repos: checkout, optionally provision Python/Node, run one repo-provided check command. Generalizes company-hq's `handbook-spine-check.yml` / `untangle-project-sync.yml` shape |
 | `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: lint/typecheck/test/build, each `--if-present`, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern. See [relationship to `reusable-node-ci.yml`](#relationship-between-node-libraryyml-and-reusable-node-ciyml) below |
-| `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), build, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
+| `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: lint, typecheck, test, build (pnpm or npm). Zero live callers as of 2026-07-24 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
 | `reusable-weekly-drift-check.yml` | Weekly template-drift + quality check for fleet apps: typecheck, unit tests, and `narduk-fleet check-drift` |
 
@@ -372,6 +372,34 @@ workflow's job — that stays a separate `nuxt-cloudflare-deploy.yml` sibling
 (deferred, not built in this pass), matching hydrogen's existing two-job
 `ci` / `deploy` split rather than folding deploy secrets into the CI gate.
 
+#### The unit-test lane and `extra-scripts`
+
+```yaml
+    with:
+      run-tests: true       # opt-in — see below for why the default is false
+      test-script: test     # vitest, jest, whatever the repo already runs
+      extra-scripts: check:vendor
+```
+
+Until `run-tests` existed this workflow had **no unit-test expression at all**,
+while `node-library.yml` had one. A Nuxt app with a vitest suite therefore
+could not adopt its own class's callable without dropping its unit tests — the
+same defect the browser-shard gap was, and the same consequence: the repo keeps
+hand-rolling. `earthdata-viewer` (company-hq#278) is the adopter that surfaced
+it; its `unit` job ran `npm test` and had nowhere to go.
+
+**`run-tests` defaults to `false` on purpose**, even though the script runs
+`--if-present`. `test` is a near-universal `package.json` script, so a default
+of `true` would hand every existing adopter a brand-new gate the instant the
+moving `v1` tag advanced — and a suite that was never in a repo's CI turning
+its default branch red is not a backward-compatible change, whatever the input
+is labelled. Existing callers opt in when they mean to.
+
+`extra-scripts` mirrors `node-library.yml`'s input of the same name and runs
+after `build-script` in the same lane, so a gate needing build output doesn't
+pay for a second install. earthdata-viewer's vendored-package pin check is the
+first case.
+
 #### Browser shards and the isolated pool
 
 `run-e2e: true` on its own runs the suite as one job on the **same** runner as
@@ -557,6 +585,14 @@ executed here.
   breaking change here specifically because the composed context comes from
   the caller's job id and this workflow's `Required` job** — neither of which
   moved. `v1` moved again rather than a `v2` being cut.
+- `nuxt-cloudflare.yml`'s `run-tests` / `test-script` / `extra-scripts` are
+  within-major on the same rule — three optional inputs, no new job, one
+  conditional step each. **`run-tests` defaults to `false` precisely so that
+  it is within-major**: `test` is a near-universal package script, so
+  defaulting it on would have made a moving `v1` tag introduce a gate to
+  callers who never asked for one, which is a breaking change dressed as an
+  additive input. Getting the *default* wrong is how an "additive" change
+  breaks people.
 
 ## Maintainer conventions
 
