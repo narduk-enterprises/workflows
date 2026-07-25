@@ -127,6 +127,12 @@ jobs:
       - name: extra-env behaviour tests
         run: python3 scripts/test_extra_env.py
 
+      # Same discipline: the gate scripts are extracted from node-library.yml
+      # and executed against real package.json fixtures, so a silent
+      # `--if-present` regression cannot land.
+      - name: script-gate behaviour tests
+        run: python3 scripts/test_script_gates.py
+
       # Cheap belt-and-braces: actionlint parses YAML itself, but a file it
       # cannot classify as a workflow is skipped rather than failed, so an
       # unparseable stray .yml would slip past both checks above.

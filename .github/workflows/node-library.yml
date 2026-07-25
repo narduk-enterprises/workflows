@@ -99,6 +99,28 @@ on:
         required: false
         type: boolean
         default: true
+      require-scripts:
+        description: >-
+          Fail a gate whose npm script does not exist, instead of passing
+          silently. `run-tests: true` is a caller ASSERTING that tests exist,
+          but every gate here runs with `--if-present`, so a missing script
+          matches nothing, exits 0, and reports a GREEN lane that ran no tests
+          at all. narduk-libs found this the hard way — its packages define
+          `test:unit`, not `test`.
+
+          DEFAULT IS `false`, and that is measured rather than timid. Turned on
+          today it reddens 3 of the 4 adopters at once: narduk-charts and
+          narduk-mapkit define no `lint` script while `run-lint` defaults true,
+          and x-event-recap sets `run-tests: true` with no `test` script. Those
+          are real silent losses that should be fixed — but reddening them on a
+          tag move nobody is watching is how a shared workflow loses adopters.
+
+          Until a repo flips this, a missing script is reported as a
+          `::warning::` and in the job summary, naming the script and the
+          package, so the loss is visible on every run instead of invisible.
+        required: false
+        type: boolean
+        default: false
       working-directory:
         description: "Directory containing the root package.json / lockfile"
         required: false
@@ -318,74 +340,194 @@ jobs:
 
       - name: Lint
         if: inputs.run-lint
+        env:
+          SCRIPT: lint
+          FILTER: ${{ matrix.filter }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
           set -euo pipefail
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            if [ -n "${{ matrix.filter }}" ]; then
-              pnpm --filter "${{ matrix.filter }}" run --if-present lint
-            else
-              pnpm run --if-present lint
-            fi
+          # `--if-present` turns a missing script into a silent success, so ask
+          # whether it exists FIRST — otherwise "ran nothing" is indistinguishable
+          # from "passed". Both probes below are verified against real package
+          # shapes (root, npm workspace, pnpm filter; present and absent).
+          if [ -n "$FILTER" ] && [ "$PM" = "pnpm" ]; then
+            present=$(pnpm --filter "$FILTER" exec node -e \
+              'const s=require("./package.json").scripts||{};process.stdout.write(s[process.argv[1]]?"yes":"no")' \
+              "$SCRIPT" 2>/dev/null || echo no)
           else
-            if [ -n "${{ matrix.filter }}" ]; then
-              npm run lint --workspace "${{ matrix.filter }}" --if-present
+            if [ -n "$FILTER" ]; then
+              raw=$(npm pkg get "scripts.$SCRIPT" --workspace "$FILTER" 2>/dev/null || echo '{}')
             else
-              npm run --if-present lint
+              raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
             fi
+            # `npm pkg get` yields `{}` for a missing root script and
+            # `{"pkg": {}}` for a missing workspace one — so test the VALUE's
+            # type, never the presence of a quote (the package name has quotes).
+            present=$(printf '%s' "$raw" | node -e \
+              'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          fi
+
+          if [ "$present" != "yes" ]; then
+            where=${FILTER:-the root package}
+            msg="Lint is enabled but no \"$SCRIPT\" script exists in $where — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure."
+            exit 0
+          fi
+
+          if [ "$PM" = "pnpm" ]; then
+            if [ -n "$FILTER" ]; then pnpm --filter "$FILTER" run "$SCRIPT"; else pnpm run "$SCRIPT"; fi
+          else
+            if [ -n "$FILTER" ]; then npm run "$SCRIPT" --workspace "$FILTER"; else npm run "$SCRIPT"; fi
           fi
 
       - name: Typecheck
         if: inputs.run-typecheck
+        env:
+          SCRIPT: typecheck
+          FILTER: ${{ matrix.filter }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
           set -euo pipefail
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            if [ -n "${{ matrix.filter }}" ]; then
-              pnpm --filter "${{ matrix.filter }}" run --if-present typecheck
-            else
-              pnpm run --if-present typecheck
-            fi
+          # `--if-present` turns a missing script into a silent success, so ask
+          # whether it exists FIRST — otherwise "ran nothing" is indistinguishable
+          # from "passed". Both probes below are verified against real package
+          # shapes (root, npm workspace, pnpm filter; present and absent).
+          if [ -n "$FILTER" ] && [ "$PM" = "pnpm" ]; then
+            present=$(pnpm --filter "$FILTER" exec node -e \
+              'const s=require("./package.json").scripts||{};process.stdout.write(s[process.argv[1]]?"yes":"no")' \
+              "$SCRIPT" 2>/dev/null || echo no)
           else
-            if [ -n "${{ matrix.filter }}" ]; then
-              npm run typecheck --workspace "${{ matrix.filter }}" --if-present
+            if [ -n "$FILTER" ]; then
+              raw=$(npm pkg get "scripts.$SCRIPT" --workspace "$FILTER" 2>/dev/null || echo '{}')
             else
-              npm run --if-present typecheck
+              raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
             fi
+            # `npm pkg get` yields `{}` for a missing root script and
+            # `{"pkg": {}}` for a missing workspace one — so test the VALUE's
+            # type, never the presence of a quote (the package name has quotes).
+            present=$(printf '%s' "$raw" | node -e \
+              'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          fi
+
+          if [ "$present" != "yes" ]; then
+            where=${FILTER:-the root package}
+            msg="Typecheck is enabled but no \"$SCRIPT\" script exists in $where — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure."
+            exit 0
+          fi
+
+          if [ "$PM" = "pnpm" ]; then
+            if [ -n "$FILTER" ]; then pnpm --filter "$FILTER" run "$SCRIPT"; else pnpm run "$SCRIPT"; fi
+          else
+            if [ -n "$FILTER" ]; then npm run "$SCRIPT" --workspace "$FILTER"; else npm run "$SCRIPT"; fi
           fi
 
       - name: Test
         if: inputs.run-tests
+        env:
+          SCRIPT: test
+          FILTER: ${{ matrix.filter }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
           set -euo pipefail
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            if [ -n "${{ matrix.filter }}" ]; then
-              pnpm --filter "${{ matrix.filter }}" run --if-present test
-            else
-              pnpm run --if-present test
-            fi
+          # `--if-present` turns a missing script into a silent success, so ask
+          # whether it exists FIRST — otherwise "ran nothing" is indistinguishable
+          # from "passed". Both probes below are verified against real package
+          # shapes (root, npm workspace, pnpm filter; present and absent).
+          if [ -n "$FILTER" ] && [ "$PM" = "pnpm" ]; then
+            present=$(pnpm --filter "$FILTER" exec node -e \
+              'const s=require("./package.json").scripts||{};process.stdout.write(s[process.argv[1]]?"yes":"no")' \
+              "$SCRIPT" 2>/dev/null || echo no)
           else
-            if [ -n "${{ matrix.filter }}" ]; then
-              npm run test --workspace "${{ matrix.filter }}" --if-present
+            if [ -n "$FILTER" ]; then
+              raw=$(npm pkg get "scripts.$SCRIPT" --workspace "$FILTER" 2>/dev/null || echo '{}')
             else
-              npm run --if-present test
+              raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
             fi
+            # `npm pkg get` yields `{}` for a missing root script and
+            # `{"pkg": {}}` for a missing workspace one — so test the VALUE's
+            # type, never the presence of a quote (the package name has quotes).
+            present=$(printf '%s' "$raw" | node -e \
+              'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          fi
+
+          if [ "$present" != "yes" ]; then
+            where=${FILTER:-the root package}
+            msg="Test is enabled but no \"$SCRIPT\" script exists in $where — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure."
+            exit 0
+          fi
+
+          if [ "$PM" = "pnpm" ]; then
+            if [ -n "$FILTER" ]; then pnpm --filter "$FILTER" run "$SCRIPT"; else pnpm run "$SCRIPT"; fi
+          else
+            if [ -n "$FILTER" ]; then npm run "$SCRIPT" --workspace "$FILTER"; else npm run "$SCRIPT"; fi
           fi
 
       - name: Build
         if: inputs.run-build
+        env:
+          SCRIPT: build
+          FILTER: ${{ matrix.filter }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
           set -euo pipefail
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            if [ -n "${{ matrix.filter }}" ]; then
-              pnpm --filter "${{ matrix.filter }}" run --if-present build
-            else
-              pnpm run --if-present build
-            fi
+          # `--if-present` turns a missing script into a silent success, so ask
+          # whether it exists FIRST — otherwise "ran nothing" is indistinguishable
+          # from "passed". Both probes below are verified against real package
+          # shapes (root, npm workspace, pnpm filter; present and absent).
+          if [ -n "$FILTER" ] && [ "$PM" = "pnpm" ]; then
+            present=$(pnpm --filter "$FILTER" exec node -e \
+              'const s=require("./package.json").scripts||{};process.stdout.write(s[process.argv[1]]?"yes":"no")' \
+              "$SCRIPT" 2>/dev/null || echo no)
           else
-            if [ -n "${{ matrix.filter }}" ]; then
-              npm run build --workspace "${{ matrix.filter }}" --if-present
+            if [ -n "$FILTER" ]; then
+              raw=$(npm pkg get "scripts.$SCRIPT" --workspace "$FILTER" 2>/dev/null || echo '{}')
             else
-              npm run --if-present build
+              raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
             fi
+            # `npm pkg get` yields `{}` for a missing root script and
+            # `{"pkg": {}}` for a missing workspace one — so test the VALUE's
+            # type, never the presence of a quote (the package name has quotes).
+            present=$(printf '%s' "$raw" | node -e \
+              'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          fi
+
+          if [ "$present" != "yes" ]; then
+            where=${FILTER:-the root package}
+            msg="Build is enabled but no \"$SCRIPT\" script exists in $where — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure."
+            exit 0
+          fi
+
+          if [ "$PM" = "pnpm" ]; then
+            if [ -n "$FILTER" ]; then pnpm --filter "$FILTER" run "$SCRIPT"; else pnpm run "$SCRIPT"; fi
+          else
+            if [ -n "$FILTER" ]; then npm run "$SCRIPT" --workspace "$FILTER"; else npm run "$SCRIPT"; fi
           fi
 
       - name: Extra scripts
