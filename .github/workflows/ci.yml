@@ -73,7 +73,7 @@ jobs:
     # Resolving the gap properly is one of two things, neither of which belongs
     # to a workflow file: a manifest entry (fleet, D-FLEET-1) or a fourth
     # exception (a dated DECISIONS.md entry + an edit to CI-RUNNER-POLICY.md).
-    # Filed as narduk-enterprises/workflows#10. Until one lands, the gate runs
+    # Filed as narduk-enterprises/workflows#11. Until one lands, the gate runs
     # hosted, holding zero secrets beyond `github.token` and reading only this
     # repository's own workflow YAML.
     # ---------------------------------------------------------------------
