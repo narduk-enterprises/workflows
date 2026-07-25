@@ -19,11 +19,16 @@ name: Reusable Docs Governance Check
 # RUNNER ROUTING: `runner` is a caller-controlled, JSON-encoded string input —
 # a plain string ("ubuntu-latest"), a JSON array, or a JSON object matching
 # Config/github-runner-fleet.json's `runsOn` shape — decoded with fromJSON()
-# at each job's `runs-on:`. This repo is PUBLIC: public callers must NEVER
-# pass a self-hosted label here (a fork PR would execute attacker-controlled
-# code on estate infrastructure). Only private, manifest-routed callers may
-# pass a self-hosted runs-on value, resolved via
-# `python3 scripts/github_runner_fleet.py route` in agent-infrastructure.
+# at each job's `runs-on:`. A caller that is PUBLIC — or that may become
+# public — must NEVER pass a self-hosted label here, because a fork PR would
+# then execute attacker-controlled code on estate infrastructure. Only
+# private, manifest-routed callers may pass a self-hosted runs-on value,
+# resolved via `python3 scripts/github_runner_fleet.py route` in
+# agent-infrastructure. The rule rests on the CALLER, not on this repo: this
+# repo is private with organization-scoped Actions access (D-VIS-1, 2026-07-24
+# — an earlier header here claimed it was public, which reversed CI-5 and was
+# never true after D-VIS-1; workflows#2). `runner` is a free-form
+# caller-supplied value and this workflow cannot police it.
 
 on:
   workflow_call:
@@ -44,9 +49,11 @@ on:
           ({"group":"linux-ci","labels":[...]}) matching the runner-fleet
           manifest's `runsOn` shape. Decoded with fromJSON(), so the value
           must be valid JSON — a bare string needs its own quotes. Defaults
-          to GitHub-hosted ubuntu-latest. PUBLIC CALLERS MUST NEVER PASS A
-          SELF-HOSTED LABEL: this repo is public and a fork PR would run
-          attacker-controlled code on estate self-hosted infrastructure.
+          to GitHub-hosted ubuntu-latest. A PUBLIC (or possibly-future-public)
+          CALLER MUST NEVER PASS A SELF-HOSTED LABEL: a fork PR would run
+          attacker-controlled code on estate self-hosted infrastructure. The
+          constraint is the caller's visibility, not this repo's (private,
+          org-scoped Actions access — D-VIS-1, workflows#2).
         required: false
         type: string
         default: '"ubuntu-latest"'
