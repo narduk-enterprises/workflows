@@ -639,6 +639,11 @@ jobs:
             fi
           fi
 
+      # STEP-level `always()` is deliberate and stays: capturing evidence is
+      # the whole point of this step, and a step-level upload costs seconds, not
+      # a runner slot. Do not "fix" it to `!cancelled()` by analogy with the
+      # job-level change above — a job killed by `timeout-minutes` needs this to
+      # run, and that is precisely the case where the evidence matters most.
       - name: Upload Playwright evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -656,11 +661,25 @@ jobs:
   # Sharded runs produce N partial blob reports and no readable result. This
   # job is what turns them back into one HTML report — the merge step
   # status-apps, operator-portal and earthdata-viewer each hand-rolled.
-  # `if: always()` so a failing shard still produces the report that explains
-  # WHY it failed; `Required` still fails on the shard, not on this job.
+  #
+  # `!cancelled()` rather than `always()`, and the difference matters. The
+  # intent is "still produce the report that explains WHY a shard failed", and
+  # `!cancelled()` keeps exactly that — it is true on failure. What it drops is
+  # the case `always()` also covered and nobody wanted: a run the user
+  # CANCELLED, where this job would still claim a `linux-ci` slot to merge blob
+  # reports from shards that were killed mid-suite. That is the job-level
+  # `if: always()` waste pattern found on nvault (a diagnostic browser job held
+  # a scarce pool slot after `Verify` had already failed, producing a result
+  # that could not gate anything) — job-level `always()` is easy to miss because
+  # gates that check for it usually look at steps.
+  #
+  # Safe for `ci / Required`: on a cancelled run this job reports `skipped`, and
+  # `Required` (which must keep `always()`, or a cancelled run would leave the
+  # required check permanently "Expected" — the company-hq#146 deadlock) already
+  # treats `skipped` as acceptable for this job.
   e2e-report:
     name: E2E report
-    if: always() && inputs.run-e2e && inputs.e2e-shards > 1
+    if: '!cancelled() && inputs.run-e2e && inputs.e2e-shards > 1'
     needs: e2e
     # Merging is pure Node work with no browser — keep it off the scarce
     # isolated browser pool.
@@ -769,6 +788,11 @@ jobs:
             npx playwright merge-reports --reporter html all-blob-reports/blob-report
           fi
 
+      # STEP-level `always()` is deliberate and stays: capturing evidence is
+      # the whole point of this step, and a step-level upload costs seconds, not
+      # a runner slot. Do not "fix" it to `!cancelled()` by analogy with the
+      # job-level change above — a job killed by `timeout-minutes` needs this to
+      # run, and that is precisely the case where the evidence matters most.
       - name: Upload merged report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
