@@ -23,6 +23,19 @@ name: Reusable Nuxt + Cloudflare CI
 # correct shape the easy one. Every one of them is additive with a default
 # that reproduces the previous single-lane behaviour exactly.
 #
+# THE UNIT-TEST LANE (added for company-hq#278, earthdata-viewer). Until
+# `run-tests` existed this workflow had NO unit-test expression at all, while
+# node-library.yml had one — so a Nuxt app with a vitest suite literally could
+# not adopt its own class's callable without dropping its unit tests on the
+# floor. That is the same defect the browser-shard gap was: the callable being
+# unable to say something real, so the repo keeps hand-rolling. `extra-scripts`
+# lands with it for the same reason, mirroring node-library.yml's input of the
+# same name, and covers the repo-specific gate that needs the built output.
+# `run-tests` defaults to FALSE on purpose: `test` is a near-universal
+# package.json script, so defaulting it on would give every existing adopter a
+# new gate the moment `v1` moved, and a never-before-run suite turning a
+# default branch red is not backward-compatible however the input is labelled.
+#
 # ROUTE ADDITIONS ARE NOT THIS FILE'S TO GRANT. `e2e-runner` accepts whatever
 # the caller passes; being able to NAME the isolated pool is not the same as
 # being APPROVED for it. A repo absent from the runner-fleet manifest's
@@ -108,6 +121,41 @@ on:
         required: false
         type: string
         default: "build"
+      run-tests:
+        description: >-
+          Run the unit-test script in the build lane, before `build-script`.
+          OPT-IN, and default `false` deliberately even though the script runs
+          with --if-present: `test` is a near-universal package.json script,
+          so a default of `true` would hand every existing adopter a brand-new
+          gate the moment the `v1` major tag moved — a suite that was never in
+          their CI turning their default branch red is not a backward-compatible
+          change, whatever the semver of the input says.
+
+          This lane exists because until it did, this workflow had NO unit-test
+          expression at all while `node-library.yml` had one, so a Nuxt app with
+          a vitest suite could not adopt its own class's callable without
+          silently dropping its unit tests. earthdata-viewer (company-hq#278) is
+          the adopter that surfaced it.
+        required: false
+        type: boolean
+        default: false
+      test-script:
+        description: "package.json script for the unit-test lane, run with --if-present"
+        required: false
+        type: string
+        default: "test"
+      extra-scripts:
+        description: >-
+          Space-separated package scripts run after `build-script`, each with
+          --if-present, in the same lane so they see the build output. Mirrors
+          `node-library.yml`'s input of the same name, and for the same reason:
+          it is the difference between retiring a whole local job and retiring
+          half of one. A repo-specific gate that would otherwise need a second
+          job with a second full install goes here instead — earthdata-viewer's
+          vendored-package pin check is the first case.
+        required: false
+        type: string
+        default: ""
       run-e2e:
         description: "Run the optional Playwright e2e suite (opt-in)"
         required: false
@@ -274,6 +322,15 @@ jobs:
             npm run --if-present ${{ inputs.typecheck-web-script }}
           fi
 
+      - name: Unit tests
+        if: inputs.run-tests
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm run --if-present ${{ inputs.test-script }}
+          else
+            npm run --if-present ${{ inputs.test-script }}
+          fi
+
       - name: Build
         run: |
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
@@ -281,6 +338,23 @@ jobs:
           else
             npm run --if-present ${{ inputs.build-script }}
           fi
+
+      # After build, in the same lane, so a gate that needs build output does
+      # not pay for a second install. Same contract as node-library.yml's
+      # extra-scripts.
+      - name: Extra scripts
+        if: inputs.extra-scripts != ''
+        run: |
+          set -euo pipefail
+          for script in ${{ inputs.extra-scripts }}; do
+            echo "::group::$script"
+            if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+              pnpm run --if-present "$script"
+            else
+              npm run --if-present "$script"
+            fi
+            echo "::endgroup::"
+          done
 
   # The shard list cannot be built in an expression — there is no range() in
   # the workflow expression language — so it is computed here and consumed by
