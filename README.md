@@ -784,35 +784,65 @@ executed here.
 
 Every job has had a finite `timeout-minutes` since the day it was written — the
 guard is not new. What was missing was a *basis*. Measured 2026-07-25 from the
-jobs endpoint (execution time only, queue excluded; skipped and cancelled jobs
-excluded from the statistics) across the 15 live `@v1` adopters:
+**jobs** endpoint, counting **only jobs the callable actually composed** (a
+`ci / …` or `drift-check / …` name), execution time only with queue excluded,
+never extrapolated from a run count.
 
-| Callable | Job | Timeout | p50 | p95 | max | n | ×p95 |
-|---|---|---|---|---|---|---|---|
-| `apple.yml` | `lint` | 15 (`lint-timeout-minutes`) | 8s | 12s | 12s | 4 | 75× |
-| `apple.yml` | `xcode` | 45 (`xcode-timeout-minutes`) | 74s | 229s | 231s | 6 | 11.8× |
-| `docs-governance.yml` | `check` | 15 | 10s | 14s | 14s | 14 | 64× |
-| `node-library.yml` | `package` | 30 | 78s | 287s | 298s | 21 | **6.3×** |
-| `nuxt-cloudflare.yml` | `Build` | 30 | 67s | 145s | 151s | 33 | 12.4× |
-| `nuxt-cloudflare.yml` | `E2E` | 30 | 75s | 89s | 90s | 9 | 20× |
-| `nuxt-cloudflare.yml` | `E2E report` | 15 | 37s | 41s | 42s | 5 | 22× |
-| `nuxt-cloudflare.yml` | `E2E plan` | 5 | 5s | 6s | 6s | 3 | 50× |
-| `nuxt-cloudflare.yml` | `Deploy dry run` | 15 | 18s | 20s | 20s | 6 | 45× |
-| `python-data.yml` | `test` | 30 (`test-timeout-minutes`) | 82s | 444s | 722s | 10 | **4.1×** |
-| `python-data.yml` | `lint` | 10 | — | — | — | 0 | opt-in; skipped in every sampled run |
-| *(all)* | `Required` | 5 | 4–5s | 5–6s | 6s | 64 | 50× |
-| `reusable-node-ci.yml` | `ci` | 20 | — | — | — | 0 | no adopters |
-| `reusable-weekly-drift-check.yml` | all three | 15/15/10 | — | — | — | 0 | no adopters |
+That filter is the whole measurement, not a detail. A first pass that matched on
+the bare job name mixed each adopter's *pre-adoption* local job into the same
+bucket and reported `python-data / test` at p95 444s / max 722s. Split
+correctly, the callable's `ci / test` is p95 90s / max 91s and the 722s belongs
+to the local `test` job narduk-data ran before it adopted — a 5× error, in the
+direction that would have made a fine timeout look nearly breached.
 
-**Nothing needed changing.** The target band is 4–6× observed p95; the two jobs
-with enough data to matter — `node-library / package` (6.3×) and
-`python-data / test` (4.1×) — both land in it, and everything else is a short
-job where the floor is set by "long enough that a slow runner is not a false
-red", not by p95. `apple / xcode` at 11.8× is the loosest, and deliberately so:
-it holds the estate's **single** Mac slot, but n=6 across three small Swift
-repos is far too thin a basis for tightening a real iOS archive down to ~20
-minutes. It is a caller-tunable input; an adopter that knows its build should
-set it.
+| Callable | Job | Timeout | p50 | p95 | max | n | repos | ×p95 |
+|---|---|---|---|---|---|---|---|---|
+| `apple.yml` | `xcode` | 45 (`xcode-timeout-minutes`) | 116s | 228s | 231s | 8 | 4 | 11.8× |
+| `apple.yml` | `lint` | 15 (`lint-timeout-minutes`) | 8s | 12s | 12s | 4 | 2 | 75.9× |
+| `docs-governance.yml` | `check` | 15 | 10s | 18s | 22s | **39** | 1 | 49.7× |
+| `node-library.yml` | `package / <label>` | 30 | 78s | 289s | 298s | 17 | 4 | **6.2×** |
+| `nuxt-cloudflare.yml` | `Build` | 30 | 72s | 131s | 145s | 16 | 4 | 13.8× |
+| `nuxt-cloudflare.yml` | `Deploy dry run` | 15 | 18s | 20s | 20s | 4 | 1 | 45.7× |
+| `python-data.yml` | `test` | 30 (`test-timeout-minutes`) | 75s | 90s | 91s | 5 | 1 | 20.0× |
+| `reusable-weekly-drift-check.yml` | `Typecheck` | 15 | 69s | 69s | 69s | 1 | 1 | 13.0× |
+| `reusable-weekly-drift-check.yml` | `Unit Tests` | 15 | 50s | 50s | 50s | 1 | 1 | 18.0× |
+| `reusable-weekly-drift-check.yml` | `Template Drift Check` | 10 | 45s | 45s | 45s | 1 | 1 | 13.3× |
+| *(all five)* | `Required` | 5 | 4–5s | 5–7s | 7s | 83 | 11 | 43–65× |
+
+**Jobs with no data at all** — their timeouts are declared, finite, and
+unmeasured. Do not read the numbers above onto them:
+
+| Callable | Job | Timeout | Why nothing ran |
+|---|---|---|---|
+| `nuxt-cloudflare.yml` | `E2E`, `E2E plan`, `E2E report` | 30 / 5 / 15 | **never executed on any adopter.** hydrogen and software-delivery set `run-e2e: false`; marketing-web and vtraceroute leave it at the default. 35 skipped instances, 0 runs |
+| `python-data.yml` | `lint` | 10 | narduk-data leaves `run-ruff` false — skipped in every run |
+| `reusable-node-ci.yml` | `ci` | 20 | **zero adopters, estate-wide.** Nothing has ever run it |
+
+**Nothing was changed as a result.** Every measured timeout sits between 6.2×
+and 76× its observed p95, so none is close to producing a false red. The one job
+near the 4–6× target band is `node-library / package` (6.2×), which is correct
+as-is. The rest are looser than a band would suggest, deliberately:
+
+- **The sample is tiny and 24 hours old.** Composed jobs first appear
+  2026-07-24T21:54Z and most adopters landed the next day. Only
+  `docs-governance / check` (n=39) is a distribution; below n≈10 a percentile is
+  one observation wearing a hat.
+- **For a short job the floor is not p95.** It is "long enough that a cold cache
+  or a slow guest is not a false red", which is minutes regardless of a 12s p95.
+- **`apple / xcode` at 11.8× is the loosest that matters**, because it holds the
+  estate's single Mac slot. It stays: n=8 across four small Swift repos is far
+  too thin to justify tightening a real iOS archive toward ~20 minutes, and it
+  is already a caller-tunable input. An adopter that knows its build should set
+  it.
+
+The regression guard is rule R2 in `scripts/lint_callables.py`, which makes it
+impossible to add a job without a finite timeout — including via an input whose
+numeric default was removed.
+
+**`timeout-minutes` measures execution, never queue — and here that gap is
+enormous.** `docs-governance / check` executes in 10s and has waited **1973s
+(33 min)** for a `linux-ci` runner; its `Required` job has waited 1044s. Anyone
+sizing a timeout from a run's wall-clock duration would set it wildly wrong.
 
 When adding a job, size its timeout from the same place — the jobs endpoint,
 per job, never extrapolated from a run count.
