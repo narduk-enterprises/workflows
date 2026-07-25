@@ -129,6 +129,62 @@ caller conforms, the org ruleset can require `ci / Required` without a
 per-repo verification pass, because the string is enforced by convention, not
 discovered by inspection.
 
+## Dependency caching: restore on every ref, write only on the default branch
+
+Every Node workflow here (`node-library.yml`, `nuxt-cloudflare.yml`,
+`docs-governance.yml`, `reusable-node-ci.yml`) used to hand `cache:` to
+`actions/setup-node` and let it manage the whole round trip. That is the wrong
+shape, and company-hq#269 measured why.
+
+`setup-node` writes a fresh cache tarball whenever the primary key **misses**,
+scoped to the ref the job ran on. A cache written on `refs/pull/N/merge` is
+restorable only by that same pull request — no other PR and not the default
+branch. So the sequence for any lockfile-changing PR was: miss → install →
+pay a `Post Run actions/setup-node` tar for an entry nothing would ever read
+→ branch dies → merge to `main` pays the identical tar a second time.
+
+Measured on real runs before the change:
+
+| Repo / job | restore | install | `Post Run setup-node` (save) | job wall |
+|---|---|---|---|---|
+| `marketing-web` / `Build` | 1s (miss) | 13s | **19s** | 67s |
+| `narduk-charts` / `package / default` | 1s (miss) | 7s | **14s** | 52s |
+| `status-apps` / browser shards (pool) | 5–7s | 19–20s | **32–54s** | — |
+| `earthdata-viewer` / chromium shard | — | 10.6s | **29s avg, 115s max** | — |
+| `nvault` / `Verify` | — | 9.7s | **31.5s avg, 315s max** | — |
+
+The debris was visible in the API as well as the clock: `narduk-charts`
+carried 8 cache entries, four of them `refs/pull/*` duplicates of a
+`refs/heads/main` entry; `vtraceroute` held a 317MB `refs/pull/2/merge` copy
+of the 317MB entry `main` already had.
+
+So these workflows now split the two halves explicitly:
+
+- **`actions/cache/restore` on every ref**, with a `restore-keys` prefix so a
+  pull request whose lockfile moved still falls back to the default-branch
+  entry — which is the entry it actually wants.
+- **`actions/cache/save` only when `github.ref_name` equals the caller's
+  default branch**, and only when the exact key missed.
+
+`github.*` resolves against the **caller's** event inside a reusable workflow,
+so `ref_name` is the caller's branch on a push and `N/merge` on a pull
+request. If `github.event.repository` is ever absent the comparison is simply
+false and the write is skipped — the safe direction.
+
+Two deliberate exceptions:
+
+- **`python-data.yml` keeps `setup-uv`'s `enable-cache: auto`.** `auto` means
+  on for GitHub-hosted, off for self-hosted, which is already correct: a
+  persistent linux-ci guest keeps `~/.cache/uv` between jobs, so uploading a
+  tarball of an already-warm cache would be a regression for the only current
+  adopter. Only `save-cache` is gated, for a future hosted caller.
+- **`reusable-weekly-drift-check.yml` keeps `cache: pnpm`.** It is a weekly
+  `schedule` on `ubuntu-latest`, so it runs on the default branch almost
+  every time — the write it makes is the one the next run reads.
+
+This is not a caller-visible change: no inputs were added or removed, and a
+caller pinned to `@v1` picks it up when `v1` moves.
+
 ## Runner routing (`runner` input)
 
 `docs-governance.yml`, `node-library.yml`, `nuxt-cloudflare.yml` and
