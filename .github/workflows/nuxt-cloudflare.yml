@@ -225,8 +225,13 @@ on:
         default: true
       e2e-browsers-path:
         description: >-
-          PLAYWRIGHT_BROWSERS_PATH for the browser jobs. Empty leaves it unset.
-          Pair with `e2e-install-browsers: false` when the pool pre-installs.
+          PLAYWRIGHT_BROWSERS_PATH for the browser jobs. Empty leaves whatever
+          the runner already exports ALONE — it is written to $GITHUB_ENV only
+          when non-empty, because a job-level `env:` would export an empty
+          value and clobber the pool's own setting. Pair with
+          `e2e-install-browsers: false` when the pool pre-installs; on the
+          estate's ephemeral Playwright guests the value is
+          `/opt/playwright-ephemeral/browsers`.
         required: false
         type: string
         default: ""
@@ -274,6 +279,15 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
+          # v7 caches the package manager BY DEFAULT (`package-manager-cache`
+          # defaults to true) — dropping the `cache:` input does NOT turn it
+          # off. Without this line the explicit restore/save below is a SECOND
+          # cache running alongside the built-in one, and the `Post Run
+          # actions/setup-node` tar the split was meant to remove is still
+          # there: measured 27s on marketing-web `Build` after the split, on
+          # top of a 22s explicit save. Two caches for one dependency tree is
+          # strictly worse than the one it replaced.
+          package-manager-cache: false
 
       # Dependency cache: restore everywhere, write only on the default branch
       # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh
@@ -448,8 +462,6 @@ jobs:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.e2e-plan.outputs.shards) }}
-    env:
-      PLAYWRIGHT_BROWSERS_PATH: ${{ inputs.e2e-browsers-path }}
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -458,12 +470,38 @@ jobs:
         with:
           persist-credentials: false
 
+      # Conditional, NOT a job-level `env:` block. This used to be
+      # `env: PLAYWRIGHT_BROWSERS_PATH: ${{ inputs.e2e-browsers-path }}`, which
+      # is set unconditionally — so a caller that left the input empty did not
+      # get "unset", it got an EMPTY value that CLOBBERED the one the isolated
+      # pool's runner service exports. Playwright then fell back to its default
+      # $HOME/.cache/ms-playwright, which is empty on those guests, and the
+      # shards died with `browserType.launch: Executable doesn't exist at
+      # /opt/playwright-ephemeral/.cache/ms-playwright/...` — an error that
+      # reads like a missing install rather than like an override, which is
+      # what made it expensive to diagnose (earthdata-viewer, company-hq#278).
+      # Writing to $GITHUB_ENV only when the input is non-empty leaves the
+      # inherited value alone, which is what the input's description always
+      # claimed it did.
+      - name: Set Playwright browsers path
+        if: inputs.e2e-browsers-path != ''
+        run: echo "PLAYWRIGHT_BROWSERS_PATH=${{ inputs.e2e-browsers-path }}" >> "$GITHUB_ENV"
+
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
+          # v7 caches the package manager BY DEFAULT (`package-manager-cache`
+          # defaults to true) — dropping the `cache:` input does NOT turn it
+          # off. Without this line the explicit restore/save below is a SECOND
+          # cache running alongside the built-in one, and the `Post Run
+          # actions/setup-node` tar the split was meant to remove is still
+          # there: measured 27s on marketing-web `Build` after the split, on
+          # top of a 22s explicit save. Two caches for one dependency tree is
+          # strictly worse than the one it replaced.
+          package-manager-cache: false
 
       # Dependency cache: restore everywhere, write only on the default branch
       # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh
@@ -619,6 +657,15 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
+          # v7 caches the package manager BY DEFAULT (`package-manager-cache`
+          # defaults to true) — dropping the `cache:` input does NOT turn it
+          # off. Without this line the explicit restore/save below is a SECOND
+          # cache running alongside the built-in one, and the `Post Run
+          # actions/setup-node` tar the split was meant to remove is still
+          # there: measured 27s on marketing-web `Build` after the split, on
+          # top of a 22s explicit save. Two caches for one dependency tree is
+          # strictly worse than the one it replaced.
+          package-manager-cache: false
 
       # Dependency cache: restore everywhere, write only on the default branch
       # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh
@@ -728,6 +775,15 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
+          # v7 caches the package manager BY DEFAULT (`package-manager-cache`
+          # defaults to true) — dropping the `cache:` input does NOT turn it
+          # off. Without this line the explicit restore/save below is a SECOND
+          # cache running alongside the built-in one, and the `Post Run
+          # actions/setup-node` tar the split was meant to remove is still
+          # there: measured 27s on marketing-web `Build` after the split, on
+          # top of a 22s explicit save. Two caches for one dependency tree is
+          # strictly worse than the one it replaced.
+          package-manager-cache: false
 
       # Dependency cache: restore everywhere, write only on the default branch
       # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh

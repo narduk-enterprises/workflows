@@ -117,6 +117,15 @@ jobs:
         if: inputs.node-version != ''
         with:
           node-version: ${{ inputs.node-version }}
+          # v7 caches the package manager BY DEFAULT (`package-manager-cache`
+          # defaults to true) — dropping the `cache:` input does NOT turn it
+          # off. Without this line the explicit restore/save below is a SECOND
+          # cache running alongside the built-in one, and the `Post Run
+          # actions/setup-node` tar the split was meant to remove is still
+          # there: measured 27s on marketing-web `Build` after the split, on
+          # top of a 22s explicit save. Two caches for one dependency tree is
+          # strictly worse than the one it replaced.
+          package-manager-cache: false
 
       # Dependency cache: restore everywhere, write only on the default branch
       # (company-hq#269). `setup-node`'s built-in `cache:` writes on every key
