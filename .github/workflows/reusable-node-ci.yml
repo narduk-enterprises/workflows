@@ -20,7 +20,7 @@ on:
         type: string
         default: "pnpm"
       runner:
-        description: "Runner label. Default ubuntu-latest; public repos must never pass a self-hosted label."
+        description: "Runner label. Default ubuntu-latest; a public (or possibly-future-public) caller must never pass a self-hosted label."
         required: false
         type: string
         default: "ubuntu-latest"

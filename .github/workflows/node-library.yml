@@ -23,11 +23,16 @@ name: Reusable Node Library CI
 # RUNNER ROUTING: `runner` is a caller-controlled, JSON-encoded string input —
 # a plain string ("ubuntu-latest"), a JSON array, or a JSON object matching
 # Config/github-runner-fleet.json's `runsOn` shape — decoded with fromJSON()
-# at each job's `runs-on:`. This repo is PUBLIC: public callers must NEVER
-# pass a self-hosted label here (a fork PR would execute attacker-controlled
-# code on estate infrastructure). Only private, manifest-routed callers may
-# pass a self-hosted runs-on value, resolved via
-# `python3 scripts/github_runner_fleet.py route` in agent-infrastructure.
+# at each job's `runs-on:`. A caller that is PUBLIC — or that may become
+# public — must NEVER pass a self-hosted label here, because a fork PR would
+# then execute attacker-controlled code on estate infrastructure. Only
+# private, manifest-routed callers may pass a self-hosted runs-on value,
+# resolved via `python3 scripts/github_runner_fleet.py route` in
+# agent-infrastructure. The rule rests on the CALLER, not on this repo: this
+# repo is private with organization-scoped Actions access (D-VIS-1, 2026-07-24
+# — an earlier header here claimed it was public, which reversed CI-5 and was
+# never true after D-VIS-1; workflows#2). `runner` is a free-form
+# caller-supplied value and this workflow cannot police it.
 
 on:
   workflow_call:
@@ -50,9 +55,11 @@ on:
           object ({"group":"linux-ci","labels":[...]}) matching the
           runner-fleet manifest's `runsOn` shape. Decoded with fromJSON(), so
           the value must be valid JSON — a bare string needs its own quotes.
-          Defaults to GitHub-hosted ubuntu-latest. PUBLIC CALLERS MUST NEVER
-          PASS A SELF-HOSTED LABEL: this repo is public and a fork PR would
-          run attacker-controlled code on estate self-hosted infrastructure.
+          Defaults to GitHub-hosted ubuntu-latest. A PUBLIC (or
+          possibly-future-public) CALLER MUST NEVER PASS A SELF-HOSTED LABEL:
+          a fork PR would run attacker-controlled code on estate self-hosted
+          infrastructure. The constraint is the caller's visibility, not this
+          repo's (private, org-scoped Actions access — D-VIS-1, workflows#2).
         required: false
         type: string
         default: '"ubuntu-latest"'
@@ -81,6 +88,26 @@ on:
         required: false
         type: string
         default: "."
+      install-args:
+        description: >-
+          Extra arguments appended to `pnpm install --frozen-lockfile` /
+          `npm ci`. Exists because narduk-charts cannot install without
+          `--legacy-peer-deps` (histoire 1.0.0-beta peer ranges), and a
+          template that cannot express that is a template that repo cannot
+          adopt. Keep it to install flags — it is not a general escape hatch.
+        required: false
+        type: string
+        default: ""
+      extra-scripts:
+        description: >-
+          Space-separated package scripts run after build, each with
+          --if-present, in the same lane so they see the build output. This is
+          what lets a caller retire a whole local job instead of half of one:
+          narduk-charts' size-limit gate needs `npm run build` to have already
+          run, so as a separate job it would mean a second full install+build.
+        required: false
+        type: string
+        default: ""
       package-matrix:
         description: >-
           JSON array of {label, filter} lanes, one per workspace package —
@@ -148,14 +175,21 @@ jobs:
 
       - name: Install dependencies (pnpm)
         if: inputs.package-manager == 'pnpm'
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile ${{ inputs.install-args }}
         env:
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
       - name: Install dependencies (npm)
         if: inputs.package-manager == 'npm'
-        run: npm ci
+        run: npm ci ${{ inputs.install-args }}
+        # Same registry-auth env the pnpm branch already had. Without it the
+        # auth step above writes .npmrc.auth and npm never reads it, so an npm
+        # caller with private @narduk-enterprises/* dependencies would fail on
+        # a 401 that looks like a token problem rather than a wiring one.
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
 
       - name: Lint
         if: inputs.run-lint
@@ -228,6 +262,28 @@ jobs:
               npm run --if-present build
             fi
           fi
+
+      - name: Extra scripts
+        if: inputs.extra-scripts != ''
+        run: |
+          set -euo pipefail
+          for script in ${{ inputs.extra-scripts }}; do
+            echo "::group::$script"
+            if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+              if [ -n "${{ matrix.filter }}" ]; then
+                pnpm --filter "${{ matrix.filter }}" run --if-present "$script"
+              else
+                pnpm run --if-present "$script"
+              fi
+            else
+              if [ -n "${{ matrix.filter }}" ]; then
+                npm run "$script" --workspace "${{ matrix.filter }}" --if-present
+              else
+                npm run --if-present "$script"
+              fi
+            fi
+            echo "::endgroup::"
+          done
 
   required:
     name: Required

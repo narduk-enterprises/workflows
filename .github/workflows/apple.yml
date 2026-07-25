@@ -1,0 +1,285 @@
+name: Reusable Apple CI
+
+# CI gate for Apple-platform repositories (Swift packages, iOS/macOS apps).
+# Fills the gap company-hq#173 (R-14) names: "adopt the shared workflow" has
+# been the standing answer for CI duplication, and until this file existed
+# there was nothing for the Apple family to adopt, so every Apple repo
+# necessarily kept its own copy.
+#
+# PER-JOB ROUTING IS THE POINT OF THIS FILE, not an optimisation. The estate
+# owns exactly one always-on Mac slot, so agent-infrastructure AGENTS.md ("CI &
+# self-hosted runners") requires routing per JOB, not per repo: only work that
+# genuinely needs Xcode/macOS (xcodebuild, `swift test` against Apple
+# frameworks, codesign) belongs on the Mac runner. Everything that merely
+# parses Swift or reads a plist — SwiftLint via the official Linux release
+# binary, shell/grep boundary checks, plist checks via python3 `plistlib` —
+# runs on Linux so it never occupies the Mac slot. agent-hub-v3 is the worked
+# example that pattern came from. Hence two separately-routed jobs:
+#
+#   lint  -> `lint-runner`  (Linux; defaults to GitHub-hosted ubuntu-latest)
+#   xcode -> `apple-runner` (the repo-scoped Mac; REQUIRED, no default)
+#
+# `apple-runner` deliberately has NO default. A reusable workflow that
+# defaults to a self-hosted label hands estate infrastructure to whichever
+# caller forgets to think about it; making it required forces every adopter to
+# resolve its route from Config/github-runner-fleet.json first.
+#
+# RELEASE/SIGNING IS OUT OF SCOPE, like node-library.yml's publish job.
+# Archive, codesign, notarize, TestFlight and Sparkle need temporary
+# keychains, the host-wide Apple build lock and per-repo credentials; that
+# stays the `apple-release-pipeline` skill's per-repo workflow, and folding it
+# in here would put release credentials behind a PR-triggered gate.
+#
+# NO SECRETS ARE DECLARED. This workflow takes no `secrets:` at all, so
+# nothing it runs can reach a caller's credentials even by accident — a
+# reusable workflow only receives what it declares (there is no ambient
+# inheritance without `secrets: inherit`). A repo whose build needs private
+# SwiftPM access keeps that step in its own workflow rather than widening this
+# one.
+#
+# THE "Required" CONVENTION (this is the point of this repo): this workflow's
+# last job is named exactly `Required`, `needs:` every other job, runs with
+# `if: always()`, and fails unless each needed job succeeded or was
+# intentionally skipped (an opted-out input, never a silent pass). Callers
+# name their calling job id `ci`, so GitHub composes the identical required
+# check context `ci / Required` on every adopting repo. See README.
+#
+# RUNNER ROUTING: both runner inputs are caller-controlled, JSON-encoded
+# strings — a plain string ("ubuntu-latest"), a JSON array, or a JSON object
+# matching Config/github-runner-fleet.json's `runsOn` shape — decoded with
+# fromJSON() at each job's `runs-on:`. Resolve the value with
+# `python3 scripts/github_runner_fleet.py route` in agent-infrastructure and
+# paste the returned `runsOn` verbatim; never hand-copy labels. A caller that
+# is public — or that may become public — must never pass a self-hosted label,
+# because a fork PR would then execute attacker-controlled code on estate
+# infrastructure. That rule holds regardless of this repo's own visibility
+# (private, org-scoped Actions access, per D-VIS-1): `runner` is a free-form
+# caller-supplied value and this workflow cannot police it.
+
+on:
+  workflow_call:
+    inputs:
+      apple-runner:
+        description: >-
+          JSON-encoded runner for the Xcode/Swift job. REQUIRED and
+          deliberately without a default — resolve it from the runner-fleet
+          manifest's `appleRepositories` entry for your repo (normally
+          '["self-hosted","macOS","apple-imac"]'; the laptop is an on-demand
+          fallback that needs a stated reason). Decoded with fromJSON(), so
+          the value must be valid JSON.
+        required: true
+        type: string
+      lint-runner:
+        description: >-
+          JSON-encoded runner for the Linux lint/boundary job: a plain string
+          ("ubuntu-latest"), a JSON array, or a JSON object
+          ({"group":"linux-ci","labels":[...]}) matching the runner-fleet
+          manifest's `runsOn` shape. Private repos approved for the `linux-ci`
+          organization group should pass that route's `runsOn` object verbatim;
+          repos not in that group stay on GitHub-hosted ubuntu-latest (this
+          job holds no secrets). Never pass a self-hosted value from a public
+          or potentially-public caller.
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      working-directory:
+        description: "Directory containing Package.swift / the Xcode project"
+        required: false
+        type: string
+        default: "."
+      developer-dir:
+        description: >-
+          DEVELOPER_DIR for the Xcode job. Self-hosted runners' xcode-select
+          can point at CommandLineTools, whose swift-package dyld-aborts on a
+          missing llbuild symbol, so pin the full toolchain rather than
+          inheriting the runner's ambient selection. Empty leaves
+          DEVELOPER_DIR unset.
+        required: false
+        type: string
+        default: "/Applications/Xcode.app/Contents/Developer"
+      build-command:
+        description: "Command run for the build step (swift build, xcodebuild build, a repo script, ...)"
+        required: false
+        type: string
+        default: "swift build"
+      test-command:
+        description: "Command run for the test step (swift test, xcodebuild test, a repo script, ...)"
+        required: false
+        type: string
+        default: "swift test"
+      run-build:
+        description: "Run build-command"
+        required: false
+        type: boolean
+        default: true
+      run-tests:
+        description: "Run test-command"
+        required: false
+        type: boolean
+        default: true
+      xcode-timeout-minutes:
+        description: "Timeout for the Xcode/Swift job. The Mac slot is scarce; size this to real work."
+        required: false
+        type: number
+        default: 45
+      run-swiftlint:
+        description: >-
+          Run SwiftLint on the Linux runner, using the official Linux release
+          binary (it parses Swift without compiling, so it does not need a
+          Mac). Opt-in: enabling it on a repo with no .swiftlint.yml runs the
+          full default rule set and will usually be red on first contact, so
+          adopt a repo-owned config in the same change.
+        required: false
+        type: boolean
+        default: false
+      swiftlint-version:
+        description: "SwiftLint release tag to download (realm/SwiftLint)"
+        required: false
+        type: string
+        default: "0.65.0"
+      swiftlint-sha256:
+        description: >-
+          Expected sha256 of swiftlint_linux_amd64.zip for `swiftlint-version`.
+          Verified before the archive is unpacked — a downloaded executable
+          from a third-party release is checked, not trusted. Defaults to the
+          0.65.0 digest; a caller that bumps swiftlint-version MUST bump this
+          too (`gh api repos/realm/SwiftLint/releases/tags/<tag> --jq
+          '.assets[] | select(.name=="swiftlint_linux_amd64.zip") | .digest'`).
+        required: false
+        type: string
+        default: "79306a34e5c7cc55a220cd108cbb861dcad5f10138dcdf261e2624ae8b0a486b"
+      swiftlint-args:
+        description: "Arguments passed to the swiftlint binary"
+        required: false
+        type: string
+        default: "lint --quiet"
+      linux-checks:
+        description: >-
+          Extra shell run on the Linux job after SwiftLint — the home for the
+          gates AGENTS.md keeps off the Mac: shell/grep boundary checks and
+          plist checks via `python3` plistlib (not PlistBuddy/plutil, which
+          are macOS-only). Runs with bash from `working-directory` and can cd
+          elsewhere. Empty skips it.
+        required: false
+        type: string
+        default: ""
+      lint-timeout-minutes:
+        description: "Timeout for the Linux lint/boundary job"
+        required: false
+        type: number
+        default: 15
+
+jobs:
+  lint:
+    name: lint
+    # Skipped entirely when the caller opted out of both Linux gates, which
+    # `Required` below treats as an intentional skip rather than a pass.
+    if: inputs.run-swiftlint || inputs.linux-checks != ''
+    runs-on: ${{ fromJSON(inputs.lint-runner) }}
+    timeout-minutes: ${{ inputs.lint-timeout-minutes }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install SwiftLint (official Linux release binary)
+        if: inputs.run-swiftlint
+        env:
+          SWIFTLINT_VERSION: ${{ inputs.swiftlint-version }}
+          SWIFTLINT_SHA256: ${{ inputs.swiftlint-sha256 }}
+        run: |
+          set -euo pipefail
+          # Self-hosted runners provide no ambient SwiftLint, and the runner
+          # label describes registration, not the service PATH — provision it
+          # explicitly (agent-infrastructure issue #32).
+          dest="${RUNNER_TEMP}/swiftlint"
+          mkdir -p "$dest"
+          url="https://github.com/realm/SwiftLint/releases/download/${SWIFTLINT_VERSION}/swiftlint_linux_amd64.zip"
+          curl --fail --location --silent --show-error --retry 3 \
+            --output "${dest}/swiftlint_linux_amd64.zip" "$url"
+          echo "${SWIFTLINT_SHA256}  ${dest}/swiftlint_linux_amd64.zip" | sha256sum --check --strict
+          unzip -q -o "${dest}/swiftlint_linux_amd64.zip" -d "$dest"
+          # The archive layout has moved between releases (bare binary vs
+          # bin/swiftlint); locate it rather than assuming.
+          binary="$(find "$dest" -type f -name swiftlint -print -quit)"
+          if [ -z "$binary" ]; then
+            echo "::error::swiftlint binary not found in swiftlint_linux_amd64.zip"
+            exit 1
+          fi
+          chmod +x "$binary"
+          dirname "$binary" >> "$GITHUB_PATH"
+
+      - name: SwiftLint
+        if: inputs.run-swiftlint
+        run: swiftlint ${{ inputs.swiftlint-args }}
+
+      - name: Boundary and plist checks
+        if: inputs.linux-checks != ''
+        run: ${{ inputs.linux-checks }}
+
+  xcode:
+    name: xcode
+    runs-on: ${{ fromJSON(inputs.apple-runner) }}
+    timeout-minutes: ${{ inputs.xcode-timeout-minutes }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      DEVELOPER_DIR: ${{ inputs.developer-dir }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Report toolchain
+        run: |
+          echo "runner: ${RUNNER_NAME:-unknown} ($(uname -m))"
+          xcodebuild -version || true
+          swift --version || true
+
+      - name: Build
+        if: inputs.run-build
+        run: ${{ inputs.build-command }}
+
+      - name: Test
+        if: inputs.run-tests
+        run: ${{ inputs.test-command }}
+
+  required:
+    name: Required
+    if: always()
+    needs: [lint, xcode]
+    # Aggregation is pure shell; keep it off the scarce Mac slot.
+    runs-on: ${{ fromJSON(inputs.lint-runner) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require the Xcode job to succeed and the Linux gate to succeed-or-skip
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          XCODE_RESULT: ${{ needs.xcode.result }}
+        run: |
+          status=0
+          # xcode has no `if:` — it must always report success.
+          if [ "$XCODE_RESULT" != "success" ]; then
+            echo "::error::xcode job reported '$XCODE_RESULT' (must succeed)"
+            status=1
+          fi
+          # lint is opt-in — "skipped" means the caller enabled neither
+          # SwiftLint nor linux-checks; only an actual failure blocks Required.
+          case "$LINT_RESULT" in
+            success | skipped) ;;
+            *)
+              echo "::error::lint job reported '$LINT_RESULT' (must succeed or be skipped)"
+              status=1
+              ;;
+          esac
+          exit "$status"

@@ -1,0 +1,326 @@
+name: Reusable Python Data CI
+
+# CI gate for the Python / data-pipeline repo family (narduk-data and the
+# repos the reshape creates around it). Fills the second half of the gap
+# company-hq#173 (R-14) names: the Apple and Python-data families were not
+# lagging on adoption, they had no target, so the duplication was structural.
+#
+# DESIGNED AGAINST narduk-data, NOT AGAINST AN IDEA OF ONE (per the #173 audit
+# comment, which names narduk-data a real design input rather than a
+# hypothetical adopter). Its four workflows pull in different directions —
+# ci.yml is pip/venv/pytest, earth-data-ci.yml is path-filtered `uv` in a
+# nested working directory, runner-canary.yml is a disposable post-transfer
+# probe, and schema-gate.yml is a cross-repo Swift/Python contract test that
+# straddles the Apple/Python boundary this file and apple.yml split between
+# them. So the bar this file is built for is the honest one: the APPLICABLE
+# generic workflows move, not every workflow in the repo. schema-gate.yml
+# stays bespoke under either template, by design.
+#
+# Both dependency managers are first-class for the same reason: narduk-data
+# uses pip in ci.yml and uv in earth-data-ci.yml, and a template that supports
+# only one would leave half the flagship repo unable to adopt.
+#
+# THE `extra-checks` INPUT EXISTS BECAUSE OF A REAL LOSS. A caller cannot add
+# steps to a called workflow's job, so any repo-specific gate that must run
+# against the installed environment (earth-data's corpus-catalog schema
+# validation and its deploy-cutover self-test both do) would otherwise have to
+# stay behind as a second job that duplicates the whole install — or be
+# dropped, which is worse. It runs inside the same environment, after the
+# tests, and is covered by `ci / Required`.
+#
+# NO SECRETS ARE DECLARED. This workflow takes no `secrets:` at all, so
+# nothing it runs can reach a caller's credentials even by accident — a
+# reusable workflow only receives what it declares (there is no ambient
+# inheritance without `secrets: inherit`). narduk-data's cross-repo gates that
+# genuinely need GEO_SCHEMA_GATE_PAT keep their own workflow rather than
+# widening this one; a data-pipeline CI gate is exactly where a broad token
+# should not be.
+#
+# TOOLCHAINS ARE PROVISIONED EXPLICITLY, never assumed. A runner label
+# describes registration, not the service PATH (agent-infrastructure issue
+# #32), so uv, Python and ruff are each installed by a step rather than
+# inherited from the host.
+#
+# THE "Required" CONVENTION (this is the point of this repo): this workflow's
+# last job is named exactly `Required`, `needs:` every other job, runs with
+# `if: always()`, and fails unless each needed job succeeded or was
+# intentionally skipped (an opted-out input, never a silent pass). Callers
+# name their calling job id `ci`, so GitHub composes the identical required
+# check context `ci / Required` on every adopting repo. See README.
+#
+# RUNNER ROUTING: `runner` is a caller-controlled, JSON-encoded string input —
+# a plain string ("ubuntu-latest"), a JSON array, or a JSON object matching
+# Config/github-runner-fleet.json's `runsOn` shape — decoded with fromJSON()
+# at each job's `runs-on:`. Resolve it with
+# `python3 scripts/github_runner_fleet.py route` in agent-infrastructure and
+# paste the returned `runsOn` verbatim; never hand-copy labels. A caller that
+# is public — or that may become public — must never pass a self-hosted label,
+# because a fork PR would then execute attacker-controlled code on estate
+# infrastructure. That rule holds regardless of this repo's own visibility
+# (private, org-scoped Actions access, per D-VIS-1): `runner` is a free-form
+# caller-supplied value and this workflow cannot police it.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: >-
+          JSON-encoded runner for every job in this workflow: a plain string
+          ("ubuntu-latest"), a JSON array
+          (["self-hosted","Linux","X64","proxmox","linux-ci"]), or a JSON
+          object ({"group":"linux-ci","labels":[...]}) matching the
+          runner-fleet manifest's `runsOn` shape. Decoded with fromJSON(), so
+          the value must be valid JSON — a bare string needs its own quotes.
+          Defaults to GitHub-hosted ubuntu-latest.
+        required: false
+        type: string
+        default: '"ubuntu-latest"'
+      python-version:
+        description: "Python version to provision"
+        required: false
+        type: string
+        default: "3.12"
+      working-directory:
+        description: "Directory containing pyproject.toml / uv.lock — every step runs from here"
+        required: false
+        type: string
+        default: "."
+      dependency-manager:
+        description: "Dependency manager: uv or pip"
+        required: false
+        type: string
+        default: "uv"
+      venv-path:
+        description: >-
+          Virtual environment path, relative to working-directory. Set as
+          UV_PROJECT_ENVIRONMENT in uv mode and created by `python -m venv` in
+          pip mode; its bin/ is prepended to PATH for every later step, so
+          `extra-checks` can cd anywhere and still run the installed
+          environment. Keep it off the shared runner's default `.venv` when
+          the repo has one (narduk-data uses `.venv-ci`).
+        required: false
+        type: string
+        default: ".venv"
+      uv-sync-args:
+        description: "Arguments appended to `uv sync` (uv mode only)"
+        required: false
+        type: string
+        default: "--locked --extra test"
+      check-lock:
+        description: >-
+          Run `uv lock --check` before syncing (uv mode only) so a lockfile
+          that drifted from pyproject.toml fails loudly instead of being
+          silently re-resolved.
+        required: false
+        type: boolean
+        default: true
+      pip-install-args:
+        description: >-
+          Arguments passed to `python -m pip install` (pip mode only), e.g.
+          `-e ".[test]"` or `pytest pillow`. Empty installs nothing.
+        required: false
+        type: string
+        default: ""
+      run-ruff:
+        description: >-
+          Run `ruff check` on the lint job. Opt-in: pointing ruff at a repo
+          that has never had a static-analysis gate is usually red on first
+          contact, and a template should not decide for the caller when to
+          take that on.
+        required: false
+        type: boolean
+        default: false
+      ruff-version:
+        description: "Exact ruff version to install — pinned, so a ruff release cannot turn a green repo red"
+        required: false
+        type: string
+        default: "0.15.18"
+      ruff-paths:
+        description: "Paths passed to `ruff check`, relative to working-directory"
+        required: false
+        type: string
+        default: "."
+      run-tests:
+        description: "Run pytest"
+        required: false
+        type: boolean
+        default: true
+      test-command:
+        description: >-
+          Command that runs the test suite, from working-directory with the
+          environment's bin/ on PATH. Override it for a repo that needs
+          several isolated pytest invocations or `unittest discover`.
+        required: false
+        type: string
+        default: "python -m pytest tests -q"
+      extra-checks:
+        description: >-
+          Extra shell run after the tests, from working-directory, with the
+          installed environment on PATH. The home for repo-specific gates that
+          must see the installed package (schema validation, deploy self-tests)
+          and would otherwise need a second job duplicating the whole install.
+          May cd elsewhere. Empty skips it.
+        required: false
+        type: string
+        default: ""
+      extra-env:
+        description: >-
+          Newline-separated KEY=VALUE pairs exported to $GITHUB_ENV for the
+          test job before anything installs — for the environment a suite needs
+          but a template cannot guess (narduk-data's earth-data tenant sets
+          PYTHONPATH to the workspace root to make a monorepo ownership
+          boundary explicit). Values must not be secrets: this workflow
+          declares none, and $GITHUB_ENV is not a secret store.
+        required: false
+        type: string
+        default: ""
+      test-timeout-minutes:
+        description: "Timeout for the test job"
+        required: false
+        type: number
+        default: 30
+      fetch-depth:
+        description: "actions/checkout fetch-depth"
+        required: false
+        type: number
+        default: 1
+
+jobs:
+  lint:
+    name: lint
+    if: inputs.run-ruff
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install ruff
+        run: python -m pip install --disable-pip-version-check "ruff==${{ inputs.ruff-version }}"
+
+      - name: Ruff
+        run: ruff check ${{ inputs.ruff-paths }}
+
+  test:
+    name: test
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: ${{ inputs.test-timeout-minutes }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    env:
+      UV_PROJECT_ENVIRONMENT: ${{ inputs.venv-path }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ inputs.fetch-depth }}
+
+      - name: Export caller environment
+        if: inputs.extra-env != ''
+        env:
+          EXTRA_ENV: ${{ inputs.extra-env }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$EXTRA_ENV" | while IFS= read -r line; do
+            [ -n "$line" ] || continue
+            case "$line" in
+              *=*) echo "$line" >> "$GITHUB_ENV" ;;
+              *) echo "::error::extra-env line is not KEY=VALUE: $line"; exit 1 ;;
+            esac
+          done
+
+      - name: Install uv
+        if: inputs.dependency-manager == 'uv'
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: inputs.dependency-manager == 'pip'
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Check lockfile is up to date
+        if: inputs.dependency-manager == 'uv' && inputs.check-lock
+        run: uv lock --check
+
+      - name: Install project (uv)
+        if: inputs.dependency-manager == 'uv'
+        run: uv sync ${{ inputs.uv-sync-args }}
+
+      - name: Install project (pip)
+        if: inputs.dependency-manager == 'pip'
+        run: |
+          set -euo pipefail
+          python3 -m venv "${{ inputs.venv-path }}"
+          "${{ inputs.venv-path }}/bin/python" -m pip install --disable-pip-version-check -U pip
+          if [ -n "${{ inputs.pip-install-args }}" ]; then
+            "${{ inputs.venv-path }}/bin/python" -m pip install ${{ inputs.pip-install-args }}
+          fi
+
+      - name: Put the environment on PATH
+        run: |
+          set -euo pipefail
+          # Prepending to $GITHUB_PATH rather than `source .../activate` in
+          # every step: activation dies with the step's shell, and later steps
+          # (extra-checks especially) may run from a different directory.
+          bin="$PWD/${{ inputs.venv-path }}/bin"
+          if [ ! -x "$bin/python" ]; then
+            echo "::error::no interpreter at $bin/python after install — check venv-path"
+            exit 1
+          fi
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/python" --version
+
+      - name: Run tests
+        if: inputs.run-tests
+        run: ${{ inputs.test-command }}
+
+      - name: Extra checks
+        if: inputs.extra-checks != ''
+        run: ${{ inputs.extra-checks }}
+
+  required:
+    name: Required
+    if: always()
+    needs: [lint, test]
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require the test job to succeed and the lint gate to succeed-or-skip
+        env:
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          status=0
+          # test has no `if:` — it must always report success.
+          if [ "$TEST_RESULT" != "success" ]; then
+            echo "::error::test job reported '$TEST_RESULT' (must succeed)"
+            status=1
+          fi
+          # lint is opt-in — "skipped" means the caller left run-ruff off;
+          # only an actual failure blocks Required.
+          case "$LINT_RESULT" in
+            success | skipped) ;;
+            *)
+              echo "::error::lint job reported '$LINT_RESULT' (must succeed or be skipped)"
+              status=1
+              ;;
+          esac
+          exit "$status"

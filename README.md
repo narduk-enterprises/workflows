@@ -2,17 +2,26 @@
 
 Shared reusable GitHub Actions workflows for the narduk-enterprises estate (CI-5).
 
-> **This repository is public on purpose.** GitHub only serves reusable
-> workflows across owners when the host repo is public (short of GitHub
-> Enterprise, which the estate rejected). Public visibility lets every owner —
-> `narduk-enterprises`, incubator, clients, and personal `loganrenz/*` repos —
-> call these workflows directly. The workflows hold no secrets (all
-> `workflow_call` secrets are optional and skip cleanly).
+> **This repository is private, with Actions access set to `organization`.**
+> That is what makes the private→private cross-repo call resolve for every
+> `narduk-enterprises` repo, and it is the current state of the world:
+> **D-VIS-1** (company-hq `DECISIONS.md`, 2026-07-24) removed public repos
+> from the company orgs and reversed CI-5's "workflows repo goes PUBLIC".
+> An earlier version of this section claimed the repo was public on purpose;
+> it was wrong after D-VIS-1, and the claim was doing real damage because it
+> was the *stated justification* for the self-hosted-runner warning below
+> (`workflows#2`). The workflows still hold no secrets — every
+> `workflow_call` secret is optional and skips cleanly, and `apple.yml` /
+> `python-data.yml` declare none at all.
 >
-> **Callers must pin `@v1` or a full commit SHA — never `@main` — and must
-> never pass a self-hosted runner label.** A fork PR on a public caller can
-> run attacker-controlled code, so estate self-hosted runners are off-limits here;
-> reusable jobs default to GitHub-hosted `ubuntu-latest`.
+> **Callers must pin `@v1` or a full commit SHA — never `@main` — and a
+> public (or possibly-future-public) caller must never pass a self-hosted
+> runner label.** That warning is still correct, but it rests on the *caller*,
+> not on this repo: `runner` is a free-form caller-supplied value, a repo can
+> go public later, and a fork PR on a public caller can run
+> attacker-controlled code on estate infrastructure. Reusable jobs default to
+> GitHub-hosted `ubuntu-latest`; `apple.yml`'s Mac route is the one input with
+> no default, deliberately.
 
 Fix CI in one place, not 100. Application repos call these workflows via
 `workflow_call` instead of blob-copying YAML. This repo replaces the broken
@@ -26,24 +35,50 @@ three app-shaped CI gates below, each producing the identical
 `ci / Required` check context so branch protection and org rulesets can
 require the same string across every repo of that type. See
 [§2 "Proposed standard"](https://github.com/narduk-enterprises/company-hq/blob/main/strategy/workflow-consistency-proposal.md#2-proposed-standard)
-in that proposal for the full rationale. **Not built in this pass** (flagged
-there as not evidence-based, or explicitly out of scope): `apple.yml`,
-`python-data.yml`, a `nuxt-cloudflare-deploy.yml` sibling for push-to-main
-deploys with real Cloudflare secrets, actual consumer adoption, and any
-branch-protection/ruleset change.
+in that proposal for the full rationale.
+
+`apple.yml` and `python-data.yml` were the two named gaps left after that pass,
+and company-hq#173 (R-14) is the issue that closed them: "adopt the shared
+workflow" had been the standing answer for CI duplication, and for the Apple
+and Python-data families there was nothing to adopt — so their duplication was
+structural, not neglectful, and naming a workflow that did not exist made the
+gap look like an adoption backlog. Both now exist and both have a real adopter
+(see "Adopters" below). Still **not built**: a `nuxt-cloudflare-deploy.yml`
+sibling for push-to-main deploys with real Cloudflare secrets, and a browser /
+Playwright reusable workflow (filed separately as M-3 — nothing here routes
+e2e to the dedicated pool yet).
 
 ## Catalog
 
 | Workflow | Purpose |
 |----------|---------|
+| `apple.yml` | CI gate for Apple repos (Swift packages, iOS/macOS apps): SwiftLint (official Linux binary) and boundary/plist checks on a Linux runner, `swift build` / `swift test` / `xcodebuild` on the repo-scoped Mac. **Two separately-routed runner inputs — that split is the point.** Release/signing stays per-repo |
+| `python-data.yml` | CI gate for Python / data-pipeline repos: `uv` (lockfile check + sync) or pip/venv, pytest, opt-in pinned `ruff check`, plus an `extra-checks` hook so a repo-specific gate that needs the installed environment does not have to stay behind as a duplicate-install job |
 | `docs-governance.yml` | Thin generic gate for docs/handbook-shaped repos: checkout, optionally provision Python/Node, run one repo-provided check command. Generalizes company-hq's `handbook-spine-check.yml` / `untangle-project-sync.yml` shape |
 | `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: lint/typecheck/test/build, each `--if-present`, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern. See [relationship to `reusable-node-ci.yml`](#relationship-between-node-libraryyml-and-reusable-node-ciyml) below |
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), build, optional Playwright e2e, optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: lint, typecheck, test, build (pnpm or npm). Zero live callers as of 2026-07-24 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
 | `reusable-weekly-drift-check.yml` | Weekly template-drift + quality check for fleet apps: typecheck, unit tests, and `narduk-fleet check-drift` |
 
-All five are `on: workflow_call` only — none of them declare their own
+All seven are `on: workflow_call` only — none of them declare their own
 triggers, and none declare `concurrency:` (see "How to consume" below for why).
+
+### Adopters
+
+A reusable workflow with no adopter is the same defect as an adopter with no
+workflow, so this table is part of the catalog rather than a footnote. "Enforced"
+means `ci / Required` is an actual required status check on the repo's default
+branch, read back from the API — not that the caller parses.
+
+| Workflow | First adopter | Enforced |
+|----------|---------------|----------|
+| `apple.yml` | `narduk-enterprises/GeoGridKit` | not yet |
+| `python-data.yml` | `narduk-enterprises/narduk-data` (`earth-data-ci.yml`) | not yet |
+| `docs-governance.yml` | `narduk-enterprises/company-hq` | yes — repo ruleset `require-docs-governance` |
+| `node-library.yml` | `narduk-enterprises/narduk-charts` | yes — repo ruleset `require-ci-required` |
+| `nuxt-cloudflare.yml` | `hydrogen` | no — `hydrogen` has no branch protection; it called `@v1` unenforced for months, which is the failure mode this column exists to make visible |
+| `reusable-node-ci.yml` | none | — |
+| `reusable-weekly-drift-check.yml` | `narduk-template-smoke-app` | — |
 
 ## The `ci / Required` convention
 
@@ -87,9 +122,12 @@ discovered by inspection.
 
 ## Runner routing (`runner` input)
 
-`docs-governance.yml`, `node-library.yml`, and `nuxt-cloudflare.yml` each
-accept a `runner` input: a **JSON-encoded string**, decoded with `fromJSON()`
-at every job's `runs-on:`. It accepts three shapes:
+`docs-governance.yml`, `node-library.yml`, `nuxt-cloudflare.yml` and
+`python-data.yml` each accept a `runner` input: a **JSON-encoded string**,
+decoded with `fromJSON()` at every job's `runs-on:`. `apple.yml` takes the
+same encoding but splits it into **two** inputs — `lint-runner` and
+`apple-runner` — because routing Apple CI per job rather than per repo is the
+whole reason that file exists. It accepts three shapes:
 
 ```yaml
 runner: '"ubuntu-latest"'                                              # plain string (the default)
@@ -103,16 +141,18 @@ The value must be **valid JSON** — a bare string still needs its own quotes,
 which is why the default is the four-character JSON string `"ubuntu-latest"`,
 not the bare word.
 
-**PUBLIC CALLERS MUST NEVER PASS A SELF-HOSTED LABEL.** This repo is public;
-a fork PR on a public caller can run attacker-controlled code, so a
-self-hosted `runner` value on a public repo hands that PR estate
-infrastructure. Only private, manifest-routed callers may pass a self-hosted
-value — resolve it first with
+**A PUBLIC CALLER MUST NEVER PASS A SELF-HOSTED LABEL.** The constraint lives
+on the caller, not on this repo (which is private — see the top of this file
+and `workflows#2`): a fork PR on a public caller can run attacker-controlled
+code, so a self-hosted `runner` value on a public repo hands that PR estate
+infrastructure. A repo can also become public later, and `runner` is a
+free-form string these workflows cannot police. Only private, manifest-routed
+callers may pass a self-hosted value — resolve it first with
 `python3 scripts/github_runner_fleet.py route` (or
 `scripts/onboard-proxmox-runner.sh --route-only`) in the `agent-infrastructure`
 checkout, then copy the returned `runsOn` object verbatim. Every workflow file
 in this repo repeats this rule in a loud top-of-file comment; don't rely on
-this README alone when adding a fourth.
+this README alone when adding the next one.
 
 `reusable-node-ci.yml`'s existing `runner` input is a **plain string only**
 (`runs-on: ${{ inputs.runner }}`, no `fromJSON`) — it predates this
@@ -154,8 +194,108 @@ jobs:
 ```
 
 Set `concurrency` in the **caller** — workflow-level concurrency does not
-propagate from called reusable workflows, and none of the five workflows in
-this repo declare their own.
+propagate from called reusable workflows, and none of the workflows in this
+repo declare their own.
+
+`apple.yml` and `python-data.yml` declare **no `secrets:` block at all**, so a
+caller must not pass one. That is deliberate: a reusable workflow receives only
+what it declares (there is no ambient inheritance without `secrets: inherit`),
+so the strongest way to say "this gate cannot reach your credentials" is to
+declare nothing. A repo whose Apple build needs private SwiftPM access, or
+whose data gate needs a cross-repo PAT, keeps that step in its own workflow
+rather than widening the shared one.
+
+### `apple.yml`
+
+```yaml
+jobs:
+  ci:
+    uses: narduk-enterprises/workflows/.github/workflows/apple.yml@v1
+    with:
+      # Repo-scoped Mac from Config/github-runner-fleet.json `appleRepositories`.
+      # REQUIRED — there is no default, on purpose.
+      apple-runner: '["self-hosted","macOS","apple-imac"]'
+      run-swiftlint: true
+      build-command: swift build
+      test-command: swift test
+```
+
+Two runner inputs, routed per job, because the estate has one always-on Mac
+slot and `AGENTS.md` requires that only work needing Xcode/macOS occupy it:
+
+- `apple-runner` — `xcodebuild`, `swift build`/`swift test`, anything needing
+  the Apple toolchain. Required, no default.
+- `lint-runner` — SwiftLint (the official Linux release binary parses Swift
+  without compiling), plus `linux-checks` for shell/grep boundary gates and
+  plist checks via `python3` `plistlib` (not PlistBuddy/`plutil`, which are
+  macOS-only). Defaults to `"ubuntu-latest"`; a repo approved for the
+  `linux-ci` organization group should pass that route's `runsOn` object
+  instead:
+
+```yaml
+      lint-runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
+      linux-checks: |
+        python3 scripts/check_plists.py
+        ! grep -rn "import UIKit" Sources/MyCore
+```
+
+`run-swiftlint` is **opt-in** and the SwiftLint archive is verified against a
+pinned `swiftlint-sha256` before it is unpacked. Enabling SwiftLint on a repo
+with no `.swiftlint.yml` runs the full default rule set and is usually red on
+first contact — GeoGridKit's first run produced 158 errors — so adopt a
+repo-owned config in the same change. Prefer `only_rules:` over
+`disabled_rules:` there: an allowlist cannot be broken by a future SwiftLint
+release adding a rule.
+
+Archive/sign/notarize/TestFlight/Sparkle are **not** here, for the same reason
+`node-library.yml` omits publish: they need temporary keychains, the host-wide
+Apple build lock and per-repo credentials, and folding them in would put
+release credentials behind a PR-triggered gate. That stays the
+`apple-release-pipeline` skill's per-repo workflow.
+
+### `python-data.yml`
+
+`uv` (the default), with a lockfile check:
+
+```yaml
+jobs:
+  ci:
+    uses: narduk-enterprises/workflows/.github/workflows/python-data.yml@v1
+    with:
+      runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
+      working-directory: services/my-pipeline
+      venv-path: .venv-ci
+      uv-sync-args: "--locked --extra test"
+      test-command: python -m pytest tests -q
+```
+
+pip/venv, for the repos that have not moved to `uv`:
+
+```yaml
+    with:
+      dependency-manager: pip
+      pip-install-args: '-e ".[test]"'
+```
+
+Notes:
+
+- The environment's `bin/` is prepended to `$GITHUB_PATH` after install rather
+  than `source`-ing an activate script, because activation dies with the step's
+  shell. That is what makes `extra-checks` work from any directory.
+- `extra-checks` is a multi-line shell hook that runs after the tests, in the
+  same environment, and is covered by `ci / Required`. It exists because a
+  caller cannot add steps to a called workflow's job, so a repo-specific gate
+  that needs the installed package would otherwise have to stay behind as a
+  second job duplicating the entire install.
+- `run-ruff` is **opt-in** and `ruff-version` is pinned exactly, so a ruff
+  release cannot turn a green repo red. Pointing ruff at a repo that never had
+  a static-analysis gate is usually red on first contact — narduk-data's
+  `earth-data-pipeline` has 36 violations today, including six `F821`
+  undefined-name — so the template does not decide for the caller when to take
+  that on.
+- Several isolated pytest invocations (narduk-data's `ci.yml` needs them,
+  because two suites share a module basename with no `__init__.py`) go in
+  `test-command` as a multi-line string, or in `extra-checks`.
 
 ### `node-library.yml`
 
@@ -169,6 +309,21 @@ jobs:
     secrets:
       NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
 ```
+
+`install-args` and `extra-scripts` were added for narduk-charts' adoption
+(company-hq#172) and are worth knowing about, because between them they are
+the difference between retiring a local job and retiring half of one:
+
+```yaml
+    with:
+      package-manager: npm
+      install-args: "--legacy-peer-deps" # charts cannot `npm ci` without it
+      extra-scripts: size                # runs after build, in the same lane
+```
+
+`extra-scripts` runs each named package script with `--if-present` *after*
+`build`, in the same job, so a gate that needs build output (`size-limit`)
+does not require a second job with a second full install and build.
 
 With a per-package matrix (generalizes narduk-libs' `package-gates`):
 
@@ -331,17 +486,18 @@ executed here.
   newly-required inputs, removed jobs, changed secret names) get a new major.
 - To adopt a fix, callers bump their pinned tag/SHA deliberately — nothing
   changes under them silently unless they chose a moving `vN` major tag.
-- **`docs-governance.yml`, `node-library.yml`, and `nuxt-cloudflare.yml` ship
-  in this PR without a tag pointing at them yet.** The existing `v1` tag
-  predates this PR (it was cut for the original two workflows) and is not
-  moved here — moving a tag is a maintainer action taken deliberately, not a
-  side effect of merging new files. The caller snippets above show `@v1` to
-  match the estate's existing pin convention (`narduk-template-smoke-app`
-  pins `@v1`), but until a maintainer advances (or re-cuts) `v1` to include
-  this commit — or cuts a new major — the first real adopter of one of these
-  three files should pin the exact commit SHA of this PR's merge commit
-  instead of `@v1`, then move to the tag once one covers it. This is called
-  out explicitly in the PR that adds these files.
+- **`v1` is a moving major tag and is advanced by hand after a merge**, never
+  as a side effect of merging. The CI-5 phase 2 files shipped ahead of the tag
+  and `v1` was advanced to cover them afterwards; `apple.yml`,
+  `python-data.yml` and `node-library.yml`'s two new optional inputs are
+  backward-compatible additions to the same major, so `v1` moves again rather
+  than a `v2` being cut. An adopter merged before the tag moves must pin the
+  exact commit SHA and switch to `@v1` once the tag covers it.
+- Adding a workflow, or adding an **optional** input with a default, is
+  within-major. Renaming or newly requiring an input, removing a job, renaming
+  a job (which renames the composed check context and silently orphans every
+  branch-protection rule that required it), or changing a secret name is a new
+  major.
 
 ## Maintainer conventions
 
