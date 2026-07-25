@@ -1,0 +1,143 @@
+name: CI
+
+# The only non-callable workflow in this repository, and the only thing that
+# looks at a callable before seven adopters do.
+#
+# Until this landed, every file in `.github/workflows` was `on: workflow_call`,
+# so nothing here ran on a pull request and nothing validated a callable before
+# an adopter executed it (company-hq#269, "Noted, not filed" — left to Logan as
+# a call during a CI-*speed* pass; added here on the hardening pass). A defect
+# in this repo does not fail one repo. It fails every repo pinned to the tag
+# that carries it, and it fails them at the moment `v1` moves, which is exactly
+# when nobody is looking at this repository.
+#
+# Two complementary checks, because they catch different things:
+#   actionlint         — is the workflow VALID? (schema, expressions, shellcheck
+#                        over every `run:` block). Found a broken
+#                        `# shellcheck disable=` directive in nuxt-cloudflare.yml
+#                        on its first run, which had silently disabled
+#                        shellcheck for that entire script.
+#   lint_callables.py  — is the callable SAFE TO SHIP? (timeouts, permissions,
+#                        SHA pins, `Required` completeness, concurrency).
+#                        Those are local conventions, not GitHub schema, so
+#                        actionlint cannot know about them.
+#
+# ~20s wall. It is deliberately cheap: a gate that costs real minutes on a repo
+# whose whole purpose is saving other repos minutes would be self-defeating.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege at the top so a job added later inherits it rather than the
+# caller's grant. Nothing in this workflow writes anything.
+permissions:
+  contents: read
+
+# Caller-level concurrency. This is the correct place for it — see README
+# "Concurrency is the caller's job". Note this workflow is NOT a callable, so
+# unlike the files it lints it may (and should) set this.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+jobs:
+  validate:
+    name: Validate workflows
+    # ---------------------------------------------------------------------
+    # RUNNER ROUTE — READ BEFORE CHANGING. This is GitHub-hosted and that is a
+    # KNOWN, DECLARED POLICY GAP, not a considered exception and not drift I am
+    # papering over.
+    #
+    # The manifest is the routing authority (CI-RUNNER-POLICY §4). Asked, it
+    # refuses:
+    #
+    #   $ python3 scripts/github_runner_fleet.py route \
+    #       --repository narduk-enterprises/workflows --visibility private
+    #   ERROR: narduk-enterprises/workflows is not approved for organization
+    #          runner class linux-ci; update the manifest first
+    #
+    # `workflows` appears nowhere in Config/github-runner-fleet.json. So there
+    # is no self-hosted route to obey.
+    #
+    # And this job is NOT a member of any of the three named GitHub-hosted
+    # exceptions in CI-RUNNER-POLICY §2. It is not narduk-infrastructure's
+    # external watchdog (1); it does not gate a privileged self-hosted job nor
+    # isolate third-party build code from credentialed infra (2); it is not
+    # nvault's release-cli publish job (3). Do not reason it into (2) because it
+    # happens to hold no secrets — "holds no secrets" is a precondition of that
+    # class, not the class itself.
+    #
+    # Resolving the gap properly is one of two things, neither of which belongs
+    # to a workflow file: a manifest entry (fleet, D-FLEET-1) or a fourth
+    # exception (a dated DECISIONS.md entry + an edit to CI-RUNNER-POLICY.md).
+    # Filed as narduk-enterprises/workflows#10. Until one lands, the gate runs
+    # hosted, holding zero secrets beyond `github.token` and reading only this
+    # repository's own workflow YAML.
+    # ---------------------------------------------------------------------
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # actionlint shells out to shellcheck to check every `run:` block. If
+      # shellcheck is absent it skips that integration SILENTLY and still exits
+      # 0 — which would make this gate quietly weaker than it looks, and
+      # shellcheck is what caught the real defect that shipped with this gate.
+      # Assert it rather than assume the image ships it.
+      - name: Assert shellcheck is present
+        run: |
+          set -euo pipefail
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            echo "::error::shellcheck is missing — actionlint would skip run-block linting and still pass"
+            exit 1
+          fi
+          shellcheck --version | head -2
+
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          # Pinned version + checksum rather than `curl | bash` from the
+          # project's install script: a linter that gates seven repos'
+          # workflows is itself supply chain.
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL --retry 3 -o "$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" actionlint
+          ./actionlint -version
+
+      - name: actionlint
+        run: ./actionlint -no-color -oneline .github/workflows/*.yml
+
+      - name: Structural gate (timeouts, permissions, pins, Required, concurrency)
+        run: python3 scripts/lint_callables.py
+
+      # Cheap belt-and-braces: actionlint parses YAML itself, but a file it
+      # cannot classify as a workflow is skipped rather than failed, so an
+      # unparseable stray .yml would slip past both checks above.
+      - name: YAML parse
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, sys, yaml
+          bad = []
+          for p in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              try:
+                  yaml.safe_load(p.read_text())
+              except yaml.YAMLError as exc:
+                  bad.append(f"{p}: {exc}")
+          for b in bad:
+              print(f"::error::{b}")
+          print(f"parsed {len(list(pathlib.Path('.github/workflows').glob('*.yml')))} file(s)")
+          sys.exit(1 if bad else 0)
+          PY
