@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Structural gate for this repo's reusable workflows.
+
+`actionlint` checks that a workflow is *valid*. It cannot check that a callable
+in this repo is *safe to hand seven adopters*, because those rules are local
+conventions, not GitHub schema. This script checks the conventions.
+
+Why a gate at all: every file here is `on: workflow_call`, so until this landed
+nothing in this repository validated a callable before an adopter ran it
+(company-hq#269, "Noted, not filed"). A defect here does not fail one repo, it
+fails every repo pinned to the tag that carries it.
+
+Each rule below exists because breaking it has a specific, known blast radius:
+
+  R1  top-level `permissions:`         a job added later inherits least
+                                       privilege instead of the caller's grant
+  R2  every job has `timeout-minutes`  a hung job otherwise runs to GitHub's
+                                       6-hour default while holding one of six
+                                       `linux-ci` slots, three browser guests,
+                                       or the single Mac slot
+  R3  every job has `permissions:`     job-level replaces (never merges with)
+                                       the workflow level, so an omission is
+                                       silent
+  R4  actions pinned to a full SHA     a moved tag is a supply-chain change
+      with a `# vX.Y.Z` comment        nobody reviews; the comment is what
+                                       makes the pin auditable
+  R5  `Required` needs EVERY job       adding a job without adding it to
+                                       `needs:` produces a green `ci / Required`
+                                       that never saw the new job — a required
+                                       check that silently stops checking
+  R6  no workflow-level `concurrency`  `${{ github.workflow }}` in a called
+      in a callable                    workflow resolves to the CALLER's name,
+                                       so a group here can cancel the caller's
+                                       own run. See README "Concurrency".
+  R7  declared secrets are optional    `required: true` would hard-fail every
+                                       caller that does not hold the secret
+
+Run: python3 scripts/lint_callables.py [paths...]
+Exit 0 clean, 1 on any finding. No third-party imports beyond PyYAML.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+import yaml
+
+SHA_PIN = re.compile(r"^[0-9a-f]{40}$")
+# `uses: owner/repo@<sha> # v1.2.3` — the trailing comment is required.
+USES_LINE = re.compile(r"^\s*(?:-\s*)?uses:\s*(\S+)\s*(#.*)?$")
+VERSION_COMMENT = re.compile(r"#\s*v?\d+(\.\d+)*")
+# `timeout-minutes: ${{ inputs.foo }}` — legal only if `foo` has a finite default.
+INPUT_EXPR = re.compile(r"^\$\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*\}\}$")
+
+# Local composite/local-path uses are exempt from SHA pinning: `./...` and
+# `owner/repo/.github/workflows/x.yml@<ref>` calls resolved inside this repo.
+LOCAL_USES = ("./", "docker://")
+
+
+class Findings:
+    def __init__(self) -> None:
+        self.items: list[str] = []
+
+    def add(self, path: Path, msg: str) -> None:
+        self.items.append(f"{path}: {msg}")
+
+
+def workflow_call_inputs(doc: dict) -> dict:
+    # PyYAML parses the bare key `on:` as the boolean True.
+    on = doc.get("on", doc.get(True))
+    if not isinstance(on, dict):
+        return {}
+    call = on.get("workflow_call")
+    if not isinstance(call, dict):
+        return {}
+    return call
+
+
+def check_timeout(path: Path, job_id: str, job: dict, inputs: dict, f: Findings) -> None:
+    value = job.get("timeout-minutes")
+    if value is None:
+        f.add(path, f"R2 job '{job_id}' has no timeout-minutes (would inherit GitHub's 6-hour default)")
+        return
+    if isinstance(value, (int, float)):
+        return
+    m = INPUT_EXPR.match(str(value).strip())
+    if not m:
+        f.add(path, f"R2 job '{job_id}' timeout-minutes is neither a number nor a plain inputs.* reference: {value!r}")
+        return
+    name = m.group(1)
+    spec = inputs.get(name)
+    if not isinstance(spec, dict):
+        f.add(path, f"R2 job '{job_id}' timeout-minutes references undeclared input '{name}'")
+        return
+    default = spec.get("default")
+    if not isinstance(default, (int, float)):
+        # An input with no default that a caller omits must still be finite.
+        f.add(
+            path,
+            f"R2 job '{job_id}' timeout-minutes uses input '{name}', which has no finite numeric default "
+            f"(got {default!r}) — a caller that omits it would get no timeout at all",
+        )
+
+
+def check_uses_pins(path: Path, f: Findings) -> None:
+    for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+        m = USES_LINE.match(line)
+        if not m:
+            continue
+        ref, comment = m.group(1), m.group(2) or ""
+        if ref.startswith(LOCAL_USES):
+            continue
+        if "@" not in ref:
+            f.add(path, f"R4 line {lineno}: `uses: {ref}` has no ref at all")
+            continue
+        pin = ref.rsplit("@", 1)[1]
+        if not SHA_PIN.match(pin):
+            f.add(path, f"R4 line {lineno}: `uses: {ref}` is not pinned to a full 40-character commit SHA")
+            continue
+        if not VERSION_COMMENT.search(comment):
+            f.add(
+                path,
+                f"R4 line {lineno}: `uses: {ref}` is SHA-pinned but carries no `# vX.Y.Z` comment, "
+                "so nobody can tell what version it is without a network call",
+            )
+
+
+def check_required_job(path: Path, doc: dict, f: Findings) -> None:
+    jobs = doc.get("jobs") or {}
+    required = {jid: j for jid, j in jobs.items() if (j.get("name") or jid) == "Required"}
+    if not required:
+        return
+    for jid, job in required.items():
+        cond = str(job.get("if", "")).strip()
+        if "always()" not in cond:
+            f.add(path, f"R5 job '{jid}' is named Required but its `if:` is {cond!r} — it must be `always()`")
+        needs = job.get("needs") or []
+        if isinstance(needs, str):
+            needs = [needs]
+        missing = sorted(set(jobs) - set(needs) - {jid})
+        if missing:
+            f.add(
+                path,
+                f"R5 job '{jid}' does not `needs:` {missing} — `ci / Required` would report green "
+                "without ever having seen those jobs",
+            )
+
+
+def check_file(path: Path, f: Findings) -> None:
+    doc = yaml.safe_load(path.read_text())
+    if not isinstance(doc, dict):
+        f.add(path, "does not parse as a YAML mapping")
+        return
+
+    call = workflow_call_inputs(path and doc)
+    is_callable = bool(call) or "workflow_call" in str(doc.get("on", doc.get(True)))
+
+    if doc.get("permissions") is None:
+        f.add(path, "R1 no top-level `permissions:` block")
+
+    if is_callable and doc.get("concurrency") is not None:
+        f.add(
+            path,
+            "R6 workflow-level `concurrency:` in a `workflow_call` workflow — the group is evaluated in the "
+            "CALLER's context and can cancel the caller's own run. Concurrency belongs to the caller.",
+        )
+
+    for name, spec in (call.get("secrets") or {}).items():
+        if isinstance(spec, dict) and spec.get("required") is True:
+            f.add(path, f"R7 secret '{name}' is `required: true` — every caller without it hard-fails")
+
+    inputs = call.get("inputs") or {}
+    for job_id, job in (doc.get("jobs") or {}).items():
+        if not isinstance(job, dict):
+            continue
+        check_timeout(path, job_id, job, inputs, f)
+        if job.get("permissions") is None:
+            f.add(path, f"R3 job '{job_id}' has no `permissions:` block (job level replaces, never merges)")
+
+    check_uses_pins(path, f)
+    check_required_job(path, doc, f)
+
+
+def main(argv: list[str]) -> int:
+    paths = [Path(p) for p in argv[1:]] or sorted(Path(".github/workflows").glob("*.yml"))
+    if not paths:
+        print("no workflow files found", file=sys.stderr)
+        return 1
+    f = Findings()
+    for path in paths:
+        check_file(path, f)
+    for item in f.items:
+        print(f"::error::{item}")
+    print(f"\nlint_callables: {len(paths)} file(s) checked, {len(f.items)} finding(s)")
+    return 1 if f.items else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

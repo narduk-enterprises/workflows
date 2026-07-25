@@ -258,9 +258,95 @@ jobs:
       NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
 ```
 
-Set `concurrency` in the **caller** — workflow-level concurrency does not
-propagate from called reusable workflows, and none of the workflows in this
-repo declare their own.
+#### Concurrency is the caller's job, and putting it here would be actively dangerous
+
+**Every caller must set its own workflow-level `concurrency`, as in the
+template above. No workflow in this repo declares one, and none ever should.**
+This is a hard rule, not a gap waiting to be filled — the structural gate in
+`.github/workflows/ci.yml` fails the build if a callable grows a
+`concurrency:` block (rule R6).
+
+The reason is stronger than "it does not propagate". It is that a group here is
+evaluated in the **caller's** context, which GitHub states plainly:
+
+> A called workflow uses the name of its caller workflow in
+> `${{ github.workflow }}`, so using this context as the value of
+> `jobs.<job_id>.concurrency.group` in both caller and called workflows will
+> cause the caller workflow to be cancelled when the called workflow runs.
+>
+> — [Reusing workflow configurations](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations)
+
+So the obvious-looking group — `${{ github.workflow }}-${{ github.ref }}`,
+which is what almost everyone writes — would collide with the caller's own
+group and **cancel the run that is calling us**. Seven repos would start
+cancelling their own CI the moment `v1` moved, and the symptom (a run that
+cancels itself for no visible reason) points at the adopter, not at here.
+
+A callable-level group that was carefully uniquified to avoid the collision
+would still buy nothing: `cancel-in-progress` on the caller's workflow-level
+group already supersedes the *entire* previous run, jobs of this callable
+included. A second gate underneath it can only add a way to be wrong.
+
+`concurrency` **is** a permitted key on a job that calls a reusable workflow,
+so a caller with an unusual need can scope it at `jobs.ci.concurrency` — but
+per the same doc, do not reuse the callable's group value there either.
+
+#### Path filtering: use the boolean inputs, never `paths` / `paths-ignore`
+
+**Do not put `paths:` or `paths-ignore:` on a caller's `on:` trigger.** If the
+workflow does not run, `ci / Required` is never reported, and GitHub shows a
+required check that never arrives as permanently "Expected" — the pull request
+becomes unmergeable and stays that way. That is company-hq#146, and it does not
+fail loudly; it just quietly stops being mergeable.
+
+The safe mechanism **already exists** and needs no change to these workflows:
+the opt-in gates are ordinary boolean inputs, so a caller can compute them from
+its own diff and pass the result. A gate turned off this way reports `skipped`,
+which every `Required` job already accepts, and `Required` itself still runs and
+still reports. The context never disappears.
+
+```yaml
+jobs:
+  changes: # cheap; no checkout of the heavy tree needed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: { contents: read, pull-requests: read }
+    outputs:
+      code: ${{ steps.f.outputs.code }}
+    steps:
+      - uses: dorny/paths-filter@<full-sha> # vX.Y.Z
+        id: f
+        with:
+          filters: |
+            code:
+              - '!(**/*.md|docs/**)'
+
+  ci: # still named `ci`; still composes `ci / Required`
+    needs: changes
+    uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v1
+    with:
+      run-e2e: ${{ needs.changes.outputs.code == 'true' }}
+      wrangler-dry-run: ${{ needs.changes.outputs.code == 'true' }}
+```
+
+Which gates each callable exposes this way:
+
+| Callable | Caller-gatable | Always runs |
+|---|---|---|
+| `nuxt-cloudflare.yml` | `run-e2e` (`e2e`, `e2e-plan`, `e2e-report`), `wrangler-dry-run`, `run-tests` | `build` |
+| `apple.yml` | `run-swiftlint` / `linux-checks` (`lint`), `run-build`, `run-tests` | `xcode` |
+| `python-data.yml` | `run-ruff` (`lint`), `run-tests` | `test` |
+| `node-library.yml` | `run-lint`, `run-typecheck`, `run-tests`, `run-build` | `package` |
+| `reusable-weekly-drift-check.yml` | all three jobs | — |
+| `docs-governance.yml`, `reusable-node-ci.yml` | — | the single job |
+
+**The "always runs" column is deliberate and is not a gap to be closed.** Those
+jobs are the ones the required check actually certifies. Giving them a path
+condition means `ci / Required` can report green on a change that was never
+built — a false green, which is strictly worse than the wasted minutes it saves,
+and which nobody discovers by looking at a passing pull request. If a caller
+wants a docs-only change to cost less, it turns off the *opt-in* gates above and
+still builds.
 
 `apple.yml` and `python-data.yml` declare **no `secrets:` block at all**, so a
 caller must not pass one. That is deliberate: a reusable workflow receives only
@@ -361,6 +447,33 @@ Notes:
 - Several isolated pytest invocations (narduk-data's `ci.yml` needs them,
   because two suites share a module basename with no `__init__.py`) go in
   `test-command` as a multi-line string, or in `extra-checks`.
+- **`extra-env` values are expanded on the runner. Write `$GITHUB_WORKSPACE`,
+  never `${{ github.workspace }}`** (workflows#4):
+
+  ```yaml
+      # RIGHT — expanded on the runner by the workflow itself
+      extra-env: |
+        PYTHONPATH=$GITHUB_WORKSPACE
+
+      # WRONG — silently becomes `PYTHONPATH=` and breaks a later step
+      extra-env: |
+        PYTHONPATH=${{ github.workspace }}
+  ```
+
+  `with:` inputs are evaluated in the **caller**, and a `jobs.<id>.uses:` job is
+  never assigned a runner, so `github.workspace` there is the empty string.
+  Until this was fixed the workflow accepted `PYTHONPATH=` as a well-formed
+  `KEY=VALUE` and the failure surfaced four steps later as
+  `ModuleNotFoundError: No module named 'pipelines'`, with nothing anywhere
+  naming `extra-env`.
+
+  `$NAME` and `${NAME}` are expanded against the runner's environment. Nothing
+  else is: no `$(...)`, no backticks, no `${NAME:-default}`, no globbing, no
+  `eval`. An empty value — or one whose every reference is unset — is now a
+  **hard error** naming this trap, because a silently-unset variable is the
+  worst outcome. `scripts/test_extra_env.py` locks all of that down against the
+  step text extracted from the YAML itself, so the tests cannot drift from the
+  shipped script.
 
 ### `node-library.yml`
 
@@ -652,9 +765,57 @@ executed here.
 
 ## Maintainer conventions
 
+- **`.github/workflows/ci.yml` gates this repo** (~7s). `actionlint` +
+  `scripts/lint_callables.py` + `scripts/test_extra_env.py`. The structural gate
+  enforces every convention in this list, so none of them can regress silently:
+  see the rule table (R1–R7) at the top of `scripts/lint_callables.py`. Run it
+  locally before pushing: `python3 scripts/lint_callables.py`.
 - Third-party and first-party actions are pinned to full commit SHAs with a
-  version comment, targeting the current Actions Node runtime.
-- Jobs declare minimal `permissions` and explicit `timeout-minutes`.
+  version comment, targeting the current Actions Node runtime (enforced: R4).
+  All nine pins currently resolve to their claimed tags and every one runs on
+  `node24`. `astral-sh/setup-uv` is deliberately held at `v8.3.2` rather than
+  `v9.0.0`: v9's sole breaking change flips `prune-cache` to `false`, which
+  would grow cache usage for every adopter, and v8.3.2 is already on the current
+  runtime — so the bump would be a behaviour change with no hardening benefit.
+- Jobs declare minimal `permissions` and explicit `timeout-minutes` (enforced:
+  R1/R2/R3).
+
+### Timeout basis
+
+Every job has had a finite `timeout-minutes` since the day it was written — the
+guard is not new. What was missing was a *basis*. Measured 2026-07-25 from the
+jobs endpoint (execution time only, queue excluded; skipped and cancelled jobs
+excluded from the statistics) across the 15 live `@v1` adopters:
+
+| Callable | Job | Timeout | p50 | p95 | max | n | ×p95 |
+|---|---|---|---|---|---|---|---|
+| `apple.yml` | `lint` | 15 (`lint-timeout-minutes`) | 8s | 12s | 12s | 4 | 75× |
+| `apple.yml` | `xcode` | 45 (`xcode-timeout-minutes`) | 74s | 229s | 231s | 6 | 11.8× |
+| `docs-governance.yml` | `check` | 15 | 10s | 14s | 14s | 14 | 64× |
+| `node-library.yml` | `package` | 30 | 78s | 287s | 298s | 21 | **6.3×** |
+| `nuxt-cloudflare.yml` | `Build` | 30 | 67s | 145s | 151s | 33 | 12.4× |
+| `nuxt-cloudflare.yml` | `E2E` | 30 | 75s | 89s | 90s | 9 | 20× |
+| `nuxt-cloudflare.yml` | `E2E report` | 15 | 37s | 41s | 42s | 5 | 22× |
+| `nuxt-cloudflare.yml` | `E2E plan` | 5 | 5s | 6s | 6s | 3 | 50× |
+| `nuxt-cloudflare.yml` | `Deploy dry run` | 15 | 18s | 20s | 20s | 6 | 45× |
+| `python-data.yml` | `test` | 30 (`test-timeout-minutes`) | 82s | 444s | 722s | 10 | **4.1×** |
+| `python-data.yml` | `lint` | 10 | — | — | — | 0 | opt-in; skipped in every sampled run |
+| *(all)* | `Required` | 5 | 4–5s | 5–6s | 6s | 64 | 50× |
+| `reusable-node-ci.yml` | `ci` | 20 | — | — | — | 0 | no adopters |
+| `reusable-weekly-drift-check.yml` | all three | 15/15/10 | — | — | — | 0 | no adopters |
+
+**Nothing needed changing.** The target band is 4–6× observed p95; the two jobs
+with enough data to matter — `node-library / package` (6.3×) and
+`python-data / test` (4.1×) — both land in it, and everything else is a short
+job where the floor is set by "long enough that a slow runner is not a false
+red", not by p95. `apple / xcode` at 11.8× is the loosest, and deliberately so:
+it holds the estate's **single** Mac slot, but n=6 across three small Swift
+repos is far too thin a basis for tightening a real iOS archive down to ~20
+minutes. It is a caller-tunable input; an adopter that knows its build should
+set it.
+
+When adding a job, size its timeout from the same place — the jobs endpoint,
+per job, never extrapolated from a run count.
 - This is a private repo shared org-wide: Actions access is set to
   `organization` so other narduk-enterprises repos can call these workflows.
 - New reusable workflows follow both estate-wide conventions added by CI-5

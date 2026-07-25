@@ -34,6 +34,22 @@ name: Reusable Node Library CI
 # never true after D-VIS-1; workflows#2). `runner` is a free-form
 # caller-supplied value and this workflow cannot police it.
 
+# Least-privilege baseline for every job in this workflow. A called workflow's
+# token is capped by the caller's grant and can only be narrowed from here,
+# never widened — so this costs a caller nothing and protects against the one
+# real failure mode: a job added later that forgets its own `permissions:` and
+# would otherwise inherit whatever the caller happened to grant.
+#
+# It has no runtime effect today, deliberately: every job below already
+# declares its own block, and job-level `permissions:` REPLACES the workflow
+# level rather than merging with it. That is also why this is not a way to
+# tighten the jobs that need `packages: read` — narrowing them here would do
+# nothing, and narrowing them at job level makes the run fail to START with
+# `startup_failure` and no logs at all (found during software-delivery's
+# adoption). Job-level grants below are audited, not inherited.
+permissions:
+  contents: read
+
 on:
   workflow_call:
     inputs:

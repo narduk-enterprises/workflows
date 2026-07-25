@@ -60,6 +60,22 @@ name: Reusable Python Data CI
 # (private, org-scoped Actions access, per D-VIS-1): `runner` is a free-form
 # caller-supplied value and this workflow cannot police it.
 
+# Least-privilege baseline for every job in this workflow. A called workflow's
+# token is capped by the caller's grant and can only be narrowed from here,
+# never widened — so this costs a caller nothing and protects against the one
+# real failure mode: a job added later that forgets its own `permissions:` and
+# would otherwise inherit whatever the caller happened to grant.
+#
+# It has no runtime effect today, deliberately: every job below already
+# declares its own block, and job-level `permissions:` REPLACES the workflow
+# level rather than merging with it. That is also why this is not a way to
+# tighten the jobs that need `packages: read` — narrowing them here would do
+# nothing, and narrowing them at job level makes the run fail to START with
+# `startup_failure` and no logs at all (found during software-delivery's
+# adoption). Job-level grants below are audited, not inherited.
+permissions:
+  contents: read
+
 on:
   workflow_call:
     inputs:
@@ -169,8 +185,16 @@ on:
           test job before anything installs — for the environment a suite needs
           but a template cannot guess (narduk-data's earth-data tenant sets
           PYTHONPATH to the workspace root to make a monorepo ownership
-          boundary explicit). Values must not be secrets: this workflow
-          declares none, and $GITHUB_ENV is not a secret store.
+          boundary explicit, which is `PYTHONPATH=$GITHUB_WORKSPACE`).
+          `$NAME` and `${NAME}` are expanded ON THE RUNNER against its
+          environment; nothing else is — no $(...), no backticks, no
+          ${NAME:-default}, no globbing. WRITE RUNNER PATHS AS $GITHUB_WORKSPACE,
+          NEVER AS A `github.workspace` CALLER EXPRESSION: that is evaluated
+          in the caller, where a `uses:` job has no runner and it expands to the
+          empty string (workflows#4). See the README for both spellings. An empty or empty-expanding value is a hard
+          error rather than a silently-unset variable. Values must not be
+          secrets: this workflow declares none, and $GITHUB_ENV is not a secret
+          store.
         required: false
         type: string
         default: ""
@@ -229,19 +253,111 @@ jobs:
           persist-credentials: false
           fetch-depth: ${{ inputs.fetch-depth }}
 
+      # `extra-env` values are expanded HERE, on the runner, not in the caller
+      # (workflows#4). The caller cannot do it: a `jobs.<id>.uses:` job is never
+      # assigned a runner, so `${{ github.workspace }}` in the caller's `with:`
+      # block expands to the EMPTY STRING. Before this step expanded anything,
+      # the documented motivating example — narduk-data's earth-data tenant
+      # setting PYTHONPATH to the workspace root — was not expressible at all:
+      # the runner received `PYTHONPATH=`, this step happily accepted it as a
+      # well-formed KEY=VALUE, and the failure surfaced four steps later as
+      # `ModuleNotFoundError: No module named 'pipelines'` with nothing anywhere
+      # naming `extra-env` (narduk-data run 30168242438).
+      #
+      # WHAT IS EXPANDED, EXACTLY: `$NAME` and `${NAME}` against the runner's
+      # environment. Nothing else. No `$(...)`, no backticks, no
+      # `${NAME:-default}`, no globbing, no `eval`, no `envsubst` (which is not
+      # guaranteed on the self-hosted LXC images). A `$` that is not followed by
+      # a valid identifier stays literal. Each of those is unit-tested.
+      #
+      # This is not a new attack surface — `test-command` and `extra-checks` are
+      # already caller-supplied shell that runs verbatim — but it is deliberate
+      # and bounded rather than an `eval`, so a caller cannot turn an
+      # environment variable into command execution.
+      #
+      # AND AN EMPTY RESULT IS NOW A HARD ERROR, before it can become a
+      # confusing test failure somewhere else. That covers both the raw `KEY=`
+      # the caller trap produces and the subtler `KEY=$UNSET_VAR`.
       - name: Export caller environment
         if: inputs.extra-env != ''
+        shell: bash
         env:
           EXTRA_ENV: ${{ inputs.extra-env }}
         run: |
           set -euo pipefail
-          printf '%s\n' "$EXTRA_ENV" | while IFS= read -r line; do
+
+          # SC2016 (expressions don't expand in single quotes) is the POINT of
+          # this function: the single-quoted fragments below are literal text
+          # being reconstructed, not references meant to expand.
+          # shellcheck disable=SC2016
+          expand_runtime_refs() {
+            local s=$1 out='' name
+            while [[ $s == *'$'* ]]; do
+              out+=${s%%\$*}
+              s=${s#*\$}
+              if [[ $s == \{* ]]; then
+                if [[ $s != *\}* ]]; then out+='${'; s=${s#\{}; continue; fi
+                name=${s#\{}; name=${name%%\}*}
+                if [[ ! $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+                  out+='${'"$name"'}'; s=${s#*\}}; continue
+                fi
+                s=${s#*\}}
+              elif [[ $s =~ ^([A-Za-z_][A-Za-z0-9_]*) ]]; then
+                name=${BASH_REMATCH[1]}; s=${s#"$name"}
+              else
+                out+='$'; continue
+              fi
+              out+=${!name-}
+            done
+            printf '%s' "$out$s"
+          }
+
+          # Read from a file, not a pipe: a `while` on the right of a pipe runs
+          # in a subshell, so it cannot accumulate a status across lines and
+          # report EVERY bad line in one go.
+          printf '%s\n' "$EXTRA_ENV" > "$RUNNER_TEMP/extra-env.in"
+          status=0
+          while IFS= read -r line; do
             [ -n "$line" ] || continue
             case "$line" in
-              *=*) echo "$line" >> "$GITHUB_ENV" ;;
-              *) echo "::error::extra-env line is not KEY=VALUE: $line"; exit 1 ;;
+              *=*) ;;
+              *) echo "::error::extra-env line is not KEY=VALUE: $line"; status=1; continue ;;
             esac
-          done
+            key=${line%%=*}
+            value=${line#*=}
+
+            if [[ ! $key =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+              echo "::error::extra-env key is not a valid environment variable name: '$key'"
+              status=1; continue
+            fi
+            if [ -z "$value" ]; then
+              echo "::error::extra-env value for '$key' is empty. If you wrote something like"
+              echo "::error::  extra-env: PYTHONPATH=<a github.workspace caller expression>"
+              echo "::error::that expands in the CALLER, where a \`uses:\` job has no runner and"
+              echo "::error::github.workspace is the empty string. Write PYTHONPATH=\$GITHUB_WORKSPACE"
+              echo "::error::instead — this step expands runner variables itself."
+              status=1; continue
+            fi
+
+            expanded=$(expand_runtime_refs "$value")
+
+            if [ -z "$expanded" ]; then
+              echo "::error::extra-env value for '$key' expanded to nothing (from '$value')."
+              echo "::error::Every variable it references is unset on this runner."
+              status=1; continue
+            fi
+            case "$expanded" in
+              *$'\n'*)
+                echo "::error::extra-env value for '$key' expanded to a multi-line value;"
+                echo "::error::writing it to \$GITHUB_ENV would inject additional variables."
+                status=1; continue
+                ;;
+            esac
+
+            printf '%s=%s\n' "$key" "$expanded" >> "$GITHUB_ENV"
+            echo "exported $key"
+          done < "$RUNNER_TEMP/extra-env.in"
+          exit "$status"
 
       - name: Install uv
         if: inputs.dependency-manager == 'uv'
