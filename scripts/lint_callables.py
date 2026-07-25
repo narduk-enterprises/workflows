@@ -34,6 +34,14 @@ Each rule below exists because breaking it has a specific, known blast radius:
                                        own run. See README "Concurrency".
   R7  declared secrets are optional    `required: true` would hard-fail every
                                        caller that does not hold the secret
+  R8  every dependency-cache step is   a self-hosted guest's package store is
+      guarded to GitHub-hosted only    PERSISTENT and SHARED, so `cache/save`
+                                       tars it while other lanes write into it
+                                       and `cache/restore` lays the torn
+                                       archive back over a live store. That is
+                                       the confirmed source of the estate's
+                                       `ERR_PNPM_BAD_PACKAGE_JSON` corruption
+                                       (vtraceroute#4, company-hq#269)
 
 Run: python3 scripts/lint_callables.py [paths...]
 Exit 0 clean, 1 on any finding. No third-party imports beyond PyYAML.
@@ -148,6 +156,41 @@ def check_required_job(path: Path, doc: dict, f: Findings) -> None:
             )
 
 
+HOSTED_GUARD = "runner.environment == 'github-hosted'"
+CACHE_STEP_NAMES = {
+    "Resolve dependency cache directory",
+    "Restore dependency cache",
+    "Save dependency cache",
+}
+
+
+def check_cache_guards(path: Path, doc: dict, f: Findings) -> None:
+    """R8: no dependency-cache step may run on a self-hosted runner.
+
+    The store there is persistent and shared, so tarballing it captures other
+    lanes mid-write. Restore is guarded too, not just save: an unsound writer
+    poisons every reader of the same key.
+    """
+    for job_id, job in (doc.get("jobs") or {}).items():
+        if not isinstance(job, dict):
+            continue
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            name = step.get("name", "")
+            uses = str(step.get("uses", ""))
+            if "actions/cache" not in uses and name not in CACHE_STEP_NAMES:
+                continue
+            cond = " ".join(str(step.get("if", "")).split())
+            if HOSTED_GUARD not in cond:
+                f.add(
+                    path,
+                    f"R8 job '{job_id}' step '{name or uses}' touches the dependency cache without "
+                    f"`if: {HOSTED_GUARD}` — on a self-hosted guest the store is persistent and shared, "
+                    "so saving tars it mid-write and restoring lays the torn archive back over it",
+                )
+
+
 def check_file(path: Path, f: Findings) -> None:
     doc = yaml.safe_load(path.read_text())
     if not isinstance(doc, dict):
@@ -181,6 +224,7 @@ def check_file(path: Path, f: Findings) -> None:
 
     check_uses_pins(path, f)
     check_required_job(path, doc, f)
+    check_cache_guards(path, doc, f)
 
 
 def main(argv: list[str]) -> int:
