@@ -9,6 +9,28 @@ name: Reusable Nuxt + Cloudflare CI
 # sibling (matching hydrogen's existing two-job ci/deploy split) that is NOT
 # built in this pass — see the workflows repo README for what's deferred.
 #
+# THE BROWSER-SHARD SHAPE (added for company-hq#278). The `run-e2e` input
+# above shipped as a single job on the SAME runner as the build, which is not
+# the shape any real browser adopter in the estate uses: status-apps,
+# operator-portal, earthdata-viewer, narduk-libs and nvault all shard
+# Playwright across a DEDICATED isolated pool and merge blob reports
+# afterwards. Because the callable could not express that, five repos
+# hand-rolled it and a sixth (been-sober-for) hand-rolled it WRONG — chromium
+# installed per run on the general linux-ci guest, the runner-class violation
+# company-hq#276 is about. A gate shape the shared workflow cannot express is
+# a gate shape every repo re-invents, so `e2e-runner`, `e2e-shards`,
+# `e2e-args`, `e2e-install-browsers` and `e2e-browsers-path` exist to make the
+# correct shape the easy one. Every one of them is additive with a default
+# that reproduces the previous single-lane behaviour exactly.
+#
+# ROUTE ADDITIONS ARE NOT THIS FILE'S TO GRANT. `e2e-runner` accepts whatever
+# the caller passes; being able to NAME the isolated pool is not the same as
+# being APPROVED for it. A repo absent from the runner-fleet manifest's
+# playwright group leaves `e2e-runner` empty and takes the route addition
+# through the fleet flow first (company-hq#155 -> #276). Passing a group a
+# repo is not registered for produces a job that queues forever, which reads
+# exactly like a hung runner.
+#
 # THE "Required" CONVENTION (this is the point of this repo): this workflow's
 # last job is named exactly `Required`, `needs:` every other job, runs with
 # `if: always()`, and fails unless each needed job succeeded or was
@@ -101,6 +123,65 @@ on:
         required: false
         type: string
         default: "chromium"
+      e2e-runner:
+        description: >-
+          JSON-encoded runner for the browser jobs ONLY, when they must not run
+          where `runner` points. Empty (the default) reuses `runner`, which is
+          the previous behaviour and stays correct for a caller with no
+          isolated pool.
+
+          This input exists because "browser tests run on the same runner as
+          the build" is a runner-class violation, not a preference. The estate
+          routes Playwright to a dedicated isolated pool
+          ({"group":"playwright-isolated",...}) precisely so a browser job
+          never shares a guest with credentialed CI, and until this input
+          existed a caller wanting that had to hand-roll the whole gate — which
+          is exactly how been-sober-for ended up installing chromium on the
+          general linux-ci guest (company-hq#276).
+
+          Resolve the value from the runner-fleet manifest and paste the
+          route's `runsOn` object verbatim. A repo that is not in the manifest's
+          playwright group must NOT pass one here — leave it empty and take the
+          route addition through the fleet flow first.
+        required: false
+        type: string
+        default: ""
+      e2e-shards:
+        description: >-
+          Number of Playwright shards. 1 (the default) runs the suite as a
+          single job, unchanged. Greater than 1 fans the e2e job out over that
+          many parallel lanes, appending
+          `--shard=<n>/<total> --reporter=blob` to the e2e script, and adds an
+          `E2E report` job that merges the blob reports into one HTML report.
+          Generalizes the status-apps (2 shards) / operator-portal /
+          earthdata-viewer (3 shards) pattern.
+        required: false
+        type: number
+        default: 1
+      e2e-args:
+        description: >-
+          Extra arguments appended to the e2e script after `--`, alongside any
+          shard/reporter arguments this workflow adds
+          (e.g. `--project=chromium --workers=1`).
+        required: false
+        type: string
+        default: ""
+      e2e-install-browsers:
+        description: >-
+          Run `playwright install --with-deps`. Set false on a pool that
+          pre-installs its browsers into an image — the isolated pool keeps
+          them at /opt/playwright-ci/browsers, and re-downloading them per run
+          is the disk and time cost the pool exists to avoid.
+        required: false
+        type: boolean
+        default: true
+      e2e-browsers-path:
+        description: >-
+          PLAYWRIGHT_BROWSERS_PATH for the browser jobs. Empty leaves it unset.
+          Pair with `e2e-install-browsers: false` when the pool pre-installs.
+        required: false
+        type: string
+        default: ""
       wrangler-dry-run:
         description: "Run an opt-in `wrangler deploy --dry-run` validation gate"
         required: false
@@ -201,12 +282,161 @@ jobs:
             npm run --if-present ${{ inputs.build-script }}
           fi
 
-  e2e:
-    name: E2E
+  # The shard list cannot be built in an expression — there is no range() in
+  # the workflow expression language — so it is computed here and consumed by
+  # the e2e matrix. Skipped entirely when the caller left e2e off, which
+  # `Required` treats as an intentional skip.
+  e2e-plan:
+    name: E2E plan
     if: inputs.run-e2e
     needs: build
     runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      - name: Compute shard list
+        id: plan
+        env:
+          TOTAL: ${{ inputs.e2e-shards }}
+        run: |
+          set -euo pipefail
+          if ! [ "$TOTAL" -ge 1 ] 2>/dev/null; then
+            echo "::error::e2e-shards must be an integer >= 1 (got '$TOTAL')"
+            exit 1
+          fi
+          echo "shards=[$(seq 1 "$TOTAL" | paste -sd, -)]" >> "$GITHUB_OUTPUT"
+
+  e2e:
+    name: E2E ${{ matrix.shard }}/${{ inputs.e2e-shards }}
+    if: inputs.run-e2e
+    needs: [build, e2e-plan]
+    # `e2e-runner` when the caller routes browsers to an isolated pool,
+    # otherwise `runner` — same guest as the build, the previous behaviour.
+    runs-on: ${{ fromJSON(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner) }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.e2e-plan.outputs.shards) }}
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ inputs.e2e-browsers-path }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: ${{ inputs.package-manager }}
+          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      - name: Configure package registry auth
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: |
+          if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
+            echo "skipping package-registry auth: no NARDUK_PLATFORM_GH_PACKAGES_READ token passed"
+            exit 0
+          fi
+          if [ -f ./scripts/package-registry-auth.mjs ]; then
+            node ./scripts/package-registry-auth.mjs
+          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
+            node ./tools/configure-package-registry-auth.mjs
+          else
+            echo "skipping package-registry auth: no auth bootstrap script present"
+          fi
+
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci
+
+      - name: Install Playwright browsers
+        if: inputs.e2e-install-browsers
+        run: |
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm exec playwright install --with-deps ${{ inputs.e2e-browsers }}
+          else
+            npx playwright install --with-deps ${{ inputs.e2e-browsers }}
+          fi
+
+      - name: Run e2e suite
+        env:
+          SHARD: ${{ matrix.shard }}
+          TOTAL: ${{ inputs.e2e-shards }}
+          EXTRA_ARGS: ${{ inputs.e2e-args }}
+        run: |
+          set -euo pipefail
+          ARGS=()
+          # A single lane runs the suite exactly as before — no --shard, no
+          # blob reporter, so a caller that never asked for sharding sees no
+          # change in what runs or what it reports.
+          if [ "$TOTAL" -gt 1 ]; then
+            ARGS+=("--shard=${SHARD}/${TOTAL}" "--reporter=blob")
+          fi
+          # shellcheck disable=SC2206 -- deliberate word splitting: e2e-args is
+          # a caller-supplied argument list, not a single argument.
+          ARGS+=(${EXTRA_ARGS})
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            if [ ${#ARGS[@]} -gt 0 ]; then
+              pnpm run --if-present ${{ inputs.e2e-script }} -- "${ARGS[@]}"
+            else
+              pnpm run --if-present ${{ inputs.e2e-script }}
+            fi
+          else
+            if [ ${#ARGS[@]} -gt 0 ]; then
+              npm run --if-present ${{ inputs.e2e-script }} -- "${ARGS[@]}"
+            else
+              npm run --if-present ${{ inputs.e2e-script }}
+            fi
+          fi
+
+      - name: Upload Playwright evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # Per-shard name: upload-artifact v4+ rejects a duplicate artifact
+          # name, so a fixed name would fail the moment a caller shards.
+          name: playwright-evidence-${{ matrix.shard }}
+          path: |
+            ${{ inputs.working-directory }}/blob-report
+            ${{ inputs.working-directory }}/playwright-report
+            ${{ inputs.working-directory }}/test-results
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Sharded runs produce N partial blob reports and no readable result. This
+  # job is what turns them back into one HTML report — the merge step
+  # status-apps, operator-portal and earthdata-viewer each hand-rolled.
+  # `if: always()` so a failing shard still produces the report that explains
+  # WHY it failed; `Required` still fails on the shard, not on this job.
+  e2e-report:
+    name: E2E report
+    if: always() && inputs.run-e2e && inputs.e2e-shards > 1
+    needs: e2e
+    # Merging is pure Node work with no browser — keep it off the scarce
+    # isolated browser pool.
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 15
     permissions:
       contents: read
       packages: read
@@ -254,30 +484,32 @@ jobs:
         if: inputs.package-manager == 'npm'
         run: npm ci
 
-      - name: Install Playwright browsers
+      - name: Download shard evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ${{ inputs.working-directory }}/all-blob-reports
+          pattern: playwright-evidence-*
+          merge-multiple: true
+
+      - name: Merge blob reports
         run: |
+          set -euo pipefail
+          if [ ! -d all-blob-reports/blob-report ]; then
+            echo "::warning::no blob reports found to merge"
+            exit 0
+          fi
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm exec playwright install --with-deps ${{ inputs.e2e-browsers }}
+            pnpm exec playwright merge-reports --reporter html all-blob-reports/blob-report
           else
-            npx playwright install --with-deps ${{ inputs.e2e-browsers }}
+            npx playwright merge-reports --reporter html all-blob-reports/blob-report
           fi
 
-      - name: Run e2e suite
-        run: |
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm run --if-present ${{ inputs.e2e-script }}
-          else
-            npm run --if-present ${{ inputs.e2e-script }}
-          fi
-
-      - name: Upload Playwright evidence
+      - name: Upload merged report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: playwright-evidence
-          path: |
-            ${{ inputs.working-directory }}/playwright-report
-            ${{ inputs.working-directory }}/test-results
+          name: playwright-report-merged
+          path: ${{ inputs.working-directory }}/playwright-report
           if-no-files-found: ignore
           retention-days: 7
 
@@ -351,7 +583,7 @@ jobs:
   required:
     name: Required
     if: always()
-    needs: [build, e2e, deploy-dry-run]
+    needs: [build, e2e-plan, e2e, e2e-report, deploy-dry-run]
     runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 5
     permissions:
@@ -360,7 +592,9 @@ jobs:
       - name: Require build to succeed and opt-in gates to succeed-or-skip
         env:
           BUILD_RESULT: ${{ needs.build.result }}
+          E2E_PLAN_RESULT: ${{ needs.e2e-plan.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
+          E2E_REPORT_RESULT: ${{ needs.e2e-report.result }}
           DEPLOY_DRY_RUN_RESULT: ${{ needs.deploy-dry-run.result }}
         run: |
           status=0
@@ -383,6 +617,12 @@ jobs:
             esac
           }
           require_success build "$BUILD_RESULT"
+          allow_skip e2e-plan "$E2E_PLAN_RESULT"
           allow_skip e2e "$E2E_RESULT"
+          # e2e-report runs only when the caller sharded; when it runs it must
+          # not fail silently either — an unmergeable report means the shard
+          # evidence is unreadable, which is how a sharded suite quietly stops
+          # being reviewable.
+          allow_skip e2e-report "$E2E_REPORT_RESULT"
           allow_skip deploy-dry-run "$DEPLOY_DRY_RUN_RESULT"
           exit "$status"
