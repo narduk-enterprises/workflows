@@ -258,9 +258,38 @@ jobs:
       NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
 ```
 
-Set `concurrency` in the **caller** — workflow-level concurrency does not
-propagate from called reusable workflows, and none of the workflows in this
-repo declare their own.
+#### Concurrency is the caller's job, and putting it here would be actively dangerous
+
+**Every caller must set its own workflow-level `concurrency`, as in the
+template above. No workflow in this repo declares one, and none ever should.**
+This is a hard rule, not a gap waiting to be filled — the structural gate in
+`.github/workflows/ci.yml` fails the build if a callable grows a
+`concurrency:` block (rule R6).
+
+The reason is stronger than "it does not propagate". It is that a group here is
+evaluated in the **caller's** context, which GitHub states plainly:
+
+> A called workflow uses the name of its caller workflow in
+> `${{ github.workflow }}`, so using this context as the value of
+> `jobs.<job_id>.concurrency.group` in both caller and called workflows will
+> cause the caller workflow to be cancelled when the called workflow runs.
+>
+> — [Reusing workflow configurations](https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations)
+
+So the obvious-looking group — `${{ github.workflow }}-${{ github.ref }}`,
+which is what almost everyone writes — would collide with the caller's own
+group and **cancel the run that is calling us**. Seven repos would start
+cancelling their own CI the moment `v1` moved, and the symptom (a run that
+cancels itself for no visible reason) points at the adopter, not at here.
+
+A callable-level group that was carefully uniquified to avoid the collision
+would still buy nothing: `cancel-in-progress` on the caller's workflow-level
+group already supersedes the *entire* previous run, jobs of this callable
+included. A second gate underneath it can only add a way to be wrong.
+
+`concurrency` **is** a permitted key on a job that calls a reusable workflow,
+so a caller with an unusual need can scope it at `jobs.ci.concurrency` — but
+per the same doc, do not reuse the callable's group value there either.
 
 `apple.yml` and `python-data.yml` declare **no `secrets:` block at all**, so a
 caller must not pass one. That is deliberate: a reusable workflow receives only
@@ -361,6 +390,33 @@ Notes:
 - Several isolated pytest invocations (narduk-data's `ci.yml` needs them,
   because two suites share a module basename with no `__init__.py`) go in
   `test-command` as a multi-line string, or in `extra-checks`.
+- **`extra-env` values are expanded on the runner. Write `$GITHUB_WORKSPACE`,
+  never `${{ github.workspace }}`** (workflows#4):
+
+  ```yaml
+      # RIGHT — expanded on the runner by the workflow itself
+      extra-env: |
+        PYTHONPATH=$GITHUB_WORKSPACE
+
+      # WRONG — silently becomes `PYTHONPATH=` and breaks a later step
+      extra-env: |
+        PYTHONPATH=${{ github.workspace }}
+  ```
+
+  `with:` inputs are evaluated in the **caller**, and a `jobs.<id>.uses:` job is
+  never assigned a runner, so `github.workspace` there is the empty string.
+  Until this was fixed the workflow accepted `PYTHONPATH=` as a well-formed
+  `KEY=VALUE` and the failure surfaced four steps later as
+  `ModuleNotFoundError: No module named 'pipelines'`, with nothing anywhere
+  naming `extra-env`.
+
+  `$NAME` and `${NAME}` are expanded against the runner's environment. Nothing
+  else is: no `$(...)`, no backticks, no `${NAME:-default}`, no globbing, no
+  `eval`. An empty value — or one whose every reference is unset — is now a
+  **hard error** naming this trap, because a silently-unset variable is the
+  worst outcome. `scripts/test_extra_env.py` locks all of that down against the
+  step text extracted from the YAML itself, so the tests cannot drift from the
+  shipped script.
 
 ### `node-library.yml`
 

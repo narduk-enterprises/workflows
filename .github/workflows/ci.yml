@@ -122,6 +122,11 @@ jobs:
       - name: Structural gate (timeouts, permissions, pins, Required, concurrency)
         run: python3 scripts/lint_callables.py
 
+      # Extracts the shipped step text out of python-data.yml and executes it,
+      # so the tests cannot drift from the callable they describe (workflows#4).
+      - name: extra-env behaviour tests
+        run: python3 scripts/test_extra_env.py
+
       # Cheap belt-and-braces: actionlint parses YAML itself, but a file it
       # cannot classify as a workflow is skipped rather than failed, so an
       # unparseable stray .yml would slip past both checks above.
