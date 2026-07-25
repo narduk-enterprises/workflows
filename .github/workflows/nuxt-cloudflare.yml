@@ -310,7 +310,14 @@ jobs:
           echo "shards=[$(seq 1 "$TOTAL" | paste -sd, -)]" >> "$GITHUB_OUTPUT"
 
   e2e:
-    name: E2E ${{ matrix.shard }}/${{ inputs.e2e-shards }}
+    # Just `E2E` — GitHub appends the matrix value itself (`E2E (1)`,
+    # `E2E (2)`, ...). A hand-written `E2E ${{ matrix.shard }}/...` renders
+    # the raw template text in the checks list when the job is SKIPPED,
+    # because a skipped matrix job has no matrix context to interpolate —
+    # a check whose name is visibly an unevaluated expression looks broken
+    # to anyone reading the PR, which is most of the time given e2e is
+    # opt-in and off by default.
+    name: E2E
     if: inputs.run-e2e
     needs: [build, e2e-plan]
     # `e2e-runner` when the caller routes browsers to an isolated pool,
