@@ -44,9 +44,18 @@ and Python-data families there was nothing to adopt — so their duplication was
 structural, not neglectful, and naming a workflow that did not exist made the
 gap look like an adoption backlog. Both now exist and both have a real adopter
 (see "Adopters" below). Still **not built**: a `nuxt-cloudflare-deploy.yml`
-sibling for push-to-main deploys with real Cloudflare secrets, and a browser /
-Playwright reusable workflow (filed separately as M-3 — nothing here routes
-e2e to the dedicated pool yet).
+sibling for push-to-main deploys with real Cloudflare secrets.
+
+The **browser / Playwright gap** (M-3 — "nothing here routes e2e to the
+dedicated pool yet") is **closed**, and not by a separate workflow.
+company-hq#278 established that every app of a class uses that class's
+callable, which made the browser shape a `nuxt-cloudflare.yml` gap rather than
+a missing eighth file: five repos had already hand-rolled the same sharded
+`playwright-isolated` pattern (`status-apps`, `operator-portal`,
+`earthdata-viewer`, `narduk-libs`, `nvault`) and a sixth had hand-rolled it
+*wrong*, installing chromium on the general `linux-ci` guest
+(`been-sober-for`, company-hq#276). See
+[`e2e-runner` / `e2e-shards` below](#browser-shards-and-the-isolated-pool).
 
 ## Catalog
 
@@ -56,7 +65,7 @@ e2e to the dedicated pool yet).
 | `python-data.yml` | CI gate for Python / data-pipeline repos: `uv` (lockfile check + sync) or pip/venv, pytest, opt-in pinned `ruff check`, plus an `extra-checks` hook so a repo-specific gate that needs the installed environment does not have to stay behind as a duplicate-install job |
 | `docs-governance.yml` | Thin generic gate for docs/handbook-shaped repos: checkout, optionally provision Python/Node, run one repo-provided check command. Generalizes company-hq's `handbook-spine-check.yml` / `untangle-project-sync.yml` shape |
 | `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: lint/typecheck/test/build, each `--if-present`, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern. See [relationship to `reusable-node-ci.yml`](#relationship-between-node-libraryyml-and-reusable-node-ciyml) below |
-| `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), build, optional Playwright e2e, optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
+| `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), build, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: lint, typecheck, test, build (pnpm or npm). Zero live callers as of 2026-07-24 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
 | `reusable-weekly-drift-check.yml` | Weekly template-drift + quality check for fleet apps: typecheck, unit tests, and `narduk-fleet check-drift` |
 
@@ -363,6 +372,49 @@ workflow's job — that stays a separate `nuxt-cloudflare-deploy.yml` sibling
 (deferred, not built in this pass), matching hydrogen's existing two-job
 `ci` / `deploy` split rather than folding deploy secrets into the CI gate.
 
+#### Browser shards and the isolated pool
+
+`run-e2e: true` on its own runs the suite as one job on the **same** runner as
+the build. That is the right shape for a caller with no isolated pool, and it
+stays the default — but it is not the shape any real browser adopter in the
+estate uses, and "the callable can't express it" is why five of them
+hand-rolled the same thing:
+
+```yaml
+jobs:
+  ci:
+    uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v1
+    with:
+      run-e2e: true
+      # Browsers go to the dedicated pool — NOT the guest that runs the build.
+      # Paste the route's `runsOn` object verbatim; never hand-copy labels.
+      e2e-runner: '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}'
+      e2e-shards: 3               # adds --shard=n/3 --reporter=blob + a merge job
+      e2e-args: "--project=chromium --workers=1"
+      e2e-install-browsers: false # the pool image already has them
+      e2e-browsers-path: /opt/playwright-ci/browsers
+```
+
+Three things worth stating plainly, because each one is a way this goes wrong:
+
+- **`e2e-runner` names a pool; it does not grant access to one.** A repo that
+  is not in the runner-fleet manifest's `playwright-isolated` group must leave
+  it empty. Passing a group the repo is not registered for produces a job that
+  queues forever, which reads exactly like a hung runner rather than like a
+  permissions error. Route additions travel through the fleet manifest flow
+  (company-hq#155 → #276), not through this input.
+- **Sharding without merging is worse than not sharding.** `e2e-shards > 1`
+  therefore also adds an `E2E report` job that merges the blob reports into
+  one HTML report, on the plain `runner` — merging is Node work with no
+  browser and has no business on the scarce isolated pool. It runs with
+  `if: always()` so a *failing* shard still produces the report explaining why.
+- **Everything here is backward-compatible by construction.** `e2e-shards: 1`
+  (the default) emits no `--shard`, no blob reporter, and no merge job, so a
+  caller that never asked for sharding sees byte-identical behaviour. The one
+  visible change is the per-shard artifact name
+  (`playwright-evidence-<n>`), because `upload-artifact` v4+ rejects duplicate
+  artifact names and a fixed name would fail the instant anyone sharded.
+
 ### `docs-governance.yml`
 
 Path-filtering is the **caller's** job — this workflow doesn't know the
@@ -498,6 +550,13 @@ executed here.
   a job (which renames the composed check context and silently orphans every
   branch-protection rule that required it), or changing a secret name is a new
   major.
+- `nuxt-cloudflare.yml`'s browser-shard inputs (`e2e-runner`, `e2e-shards`,
+  `e2e-args`, `e2e-install-browsers`, `e2e-browsers-path`) and its two new
+  jobs are within-major on the same rule: five optional inputs whose defaults
+  reproduce the previous behaviour, plus added jobs. **Adding a job is not a
+  breaking change here specifically because the composed context comes from
+  the caller's job id and this workflow's `Required` job** — neither of which
+  moved. `v1` moved again rather than a `v2` being cut.
 
 ## Maintainer conventions
 
