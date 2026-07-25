@@ -274,8 +274,35 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
-          cache: ${{ inputs.package-manager }}
-          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      # Dependency cache: restore everywhere, write only on the default branch
+      # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh
+      # tarball on every key MISS, scoped to the ref the job ran on — and a
+      # cache written on `refs/pull/N/merge` is restorable only by that same
+      # pull request. Every lockfile-changing PR therefore paid a `Post Run
+      # actions/setup-node` tar to produce an entry nothing would ever read,
+      # and the merge to `main` paid the identical tar again. Measured before
+      # this change: 19s on marketing-web `Build`, a 67s job. Restoring on
+      # every ref keeps the win — a PR falls back through `restore-keys` to
+      # the default-branch entry, which is the one it actually wants.
+      - name: Resolve dependency cache directory
+        id: dep-cache-dir
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: dep-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.dep-cache-dir.outputs.path }}
+          key: node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ hashFiles(format('{0}/pnpm-lock.yaml', inputs.working-directory), format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
 
       - name: Configure package registry auth
         env:
@@ -305,6 +332,22 @@ jobs:
       - name: Install dependencies (npm)
         if: inputs.package-manager == 'npm'
         run: npm ci
+
+      # Only the default branch writes, and only this job and `e2e` write at
+      # all. `e2e-report` and `deploy-dry-run` share `inputs.runner` with this
+      # job, so by the time they install, the entry this step wrote is an
+      # exact-key hit for them — adding a save there would only race for a key
+      # that already exists. `e2e` is separate because it may be routed to a
+      # different runner class, which gives the cache a different path and so
+      # a genuinely different entry.
+      - name: Save dependency cache
+        if: >-
+          steps.dep-cache.outputs.cache-hit != 'true'
+          && github.ref_name == github.event.repository.default_branch
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.dep-cache-dir.outputs.path }}
+          key: ${{ steps.dep-cache.outputs.cache-primary-key }}
 
       - name: Typecheck Worker
         run: |
@@ -421,8 +464,35 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
-          cache: ${{ inputs.package-manager }}
-          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      # Dependency cache: restore everywhere, write only on the default branch
+      # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh
+      # tarball on every key MISS, scoped to the ref the job ran on — and a
+      # cache written on `refs/pull/N/merge` is restorable only by that same
+      # pull request. Every lockfile-changing PR therefore paid a `Post Run
+      # actions/setup-node` tar to produce an entry nothing would ever read,
+      # and the merge to `main` paid the identical tar again. Measured before
+      # this change: 19s on marketing-web `Build`, a 67s job. Restoring on
+      # every ref keeps the win — a PR falls back through `restore-keys` to
+      # the default-branch entry, which is the one it actually wants.
+      - name: Resolve dependency cache directory
+        id: dep-cache-dir
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: dep-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.dep-cache-dir.outputs.path }}
+          key: node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ hashFiles(format('{0}/pnpm-lock.yaml', inputs.working-directory), format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
 
       - name: Configure package registry auth
         env:
@@ -450,6 +520,20 @@ jobs:
       - name: Install dependencies (npm)
         if: inputs.package-manager == 'npm'
         run: npm ci
+
+      # Written separately from `build` because this job may be routed to a
+      # different runner class (the isolated browser pool), where the cache
+      # lands under a different path and is therefore a different entry.
+      # Restoring still pays for itself on a disposable one-job guest — it is
+      # only the per-pull-request WRITE that was being thrown away.
+      - name: Save dependency cache
+        if: >-
+          steps.dep-cache.outputs.cache-hit != 'true'
+          && github.ref_name == github.event.repository.default_branch
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.dep-cache-dir.outputs.path }}
+          key: ${{ steps.dep-cache.outputs.cache-primary-key }}
 
       - name: Install Playwright browsers
         if: inputs.e2e-install-browsers
@@ -535,8 +619,35 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
-          cache: ${{ inputs.package-manager }}
-          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      # Dependency cache: restore everywhere, write only on the default branch
+      # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh
+      # tarball on every key MISS, scoped to the ref the job ran on — and a
+      # cache written on `refs/pull/N/merge` is restorable only by that same
+      # pull request. Every lockfile-changing PR therefore paid a `Post Run
+      # actions/setup-node` tar to produce an entry nothing would ever read,
+      # and the merge to `main` paid the identical tar again. Measured before
+      # this change: 19s on marketing-web `Build`, a 67s job. Restoring on
+      # every ref keeps the win — a PR falls back through `restore-keys` to
+      # the default-branch entry, which is the one it actually wants.
+      - name: Resolve dependency cache directory
+        id: dep-cache-dir
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: dep-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.dep-cache-dir.outputs.path }}
+          key: node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ hashFiles(format('{0}/pnpm-lock.yaml', inputs.working-directory), format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
 
       - name: Configure package registry auth
         env:
@@ -617,8 +728,35 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
-          cache: ${{ inputs.package-manager }}
-          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      # Dependency cache: restore everywhere, write only on the default branch
+      # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh
+      # tarball on every key MISS, scoped to the ref the job ran on — and a
+      # cache written on `refs/pull/N/merge` is restorable only by that same
+      # pull request. Every lockfile-changing PR therefore paid a `Post Run
+      # actions/setup-node` tar to produce an entry nothing would ever read,
+      # and the merge to `main` paid the identical tar again. Measured before
+      # this change: 19s on marketing-web `Build`, a 67s job. Restoring on
+      # every ref keeps the win — a PR falls back through `restore-keys` to
+      # the default-branch entry, which is the one it actually wants.
+      - name: Resolve dependency cache directory
+        id: dep-cache-dir
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: dep-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.dep-cache-dir.outputs.path }}
+          key: node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ hashFiles(format('{0}/pnpm-lock.yaml', inputs.working-directory), format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
 
       - name: Configure package registry auth
         env:

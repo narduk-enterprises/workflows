@@ -152,8 +152,41 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
-          cache: ${{ inputs.package-manager }}
-          cache-dependency-path: ${{ inputs.working-directory }}/${{ inputs.package-manager == 'pnpm' && 'pnpm-lock.yaml' || 'package-lock.json' }}
+
+      # Dependency cache: restore everywhere, write only on the default branch
+      # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh
+      # tarball on every key MISS, scoped to whatever ref the job ran on — and
+      # a cache written on `refs/pull/N/merge` is restorable only by that same
+      # pull request. So every lockfile-changing PR paid a `Post Run
+      # actions/setup-node` tar to produce an entry nothing would ever read
+      # again, then the merge to `main` paid the identical tar a second time.
+      # Measured before this change: 14s (narduk-charts `package / default`,
+      # a 52s job) and 19s (marketing-web `Build`, a 67s job), against a
+      # restore that took 1s because it had missed. The PR-scoped debris is
+      # visible in the API too — narduk-charts carried 8 cache entries, four
+      # of them `refs/pull/*` duplicates of a `refs/heads/main` entry.
+      #
+      # Restoring on every ref keeps the win (a PR falls back to the
+      # default-branch entry through `restore-keys`, which is the entry it
+      # actually wants) and drops the write nobody reads.
+      - name: Resolve dependency cache directory
+        id: dep-cache-dir
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: dep-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.dep-cache-dir.outputs.path }}
+          key: node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ hashFiles(format('{0}/pnpm-lock.yaml', inputs.working-directory), format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
 
       - name: Configure package registry auth
         env:
@@ -190,6 +223,22 @@ jobs:
         env:
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
+
+      # Only the default branch writes. `cache-hit` is the EXACT-key hit; a
+      # `restore-keys` fallback leaves it false, which is correct here — that
+      # is precisely the case where the store gained packages worth saving.
+      # `github.*` refers to the CALLER's event, so `ref_name` is the caller's
+      # branch (`main`) on a push and `N/merge` on a pull request. If
+      # `github.event.repository` is ever absent the comparison is false and
+      # the job simply skips the write, which is the safe direction.
+      - name: Save dependency cache
+        if: >-
+          steps.dep-cache.outputs.cache-hit != 'true'
+          && github.ref_name == github.event.repository.default_branch
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.dep-cache-dir.outputs.path }}
+          key: ${{ steps.dep-cache.outputs.cache-primary-key }}
 
       - name: Lint
         if: inputs.run-lint
