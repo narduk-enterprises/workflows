@@ -157,6 +157,18 @@ on:
         required: false
         type: string
         default: '[{"label":"default","filter":""}]'
+      package-batch-size:
+        description: "Maximum packages per opt-in runner batch"
+        required: false
+        type: number
+        default: 3
+      package-batches:
+        description: >-
+          Opt-in JSON array of {label, packages}; each packages array contains
+          {label, filter} objects. Empty preserves one package per job.
+        required: false
+        type: string
+        default: ''
     secrets:
       NARDUK_PLATFORM_GH_PACKAGES_READ:
         required: false
@@ -166,6 +178,7 @@ env:
 
 jobs:
   package:
+    if: inputs.package-batches == ''
     name: package / ${{ matrix.label }}
     runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 30
@@ -615,10 +628,90 @@ jobs:
             echo "::endgroup::"
           done
 
+  package-batch:
+    if: inputs.package-batches != ''
+    name: package batch / ${{ matrix.label }}
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.package-batches) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+      - name: Validate package batch
+        env:
+          SIZE: ${{ inputs.package-batch-size }}
+          PACKAGES: ${{ toJSON(matrix.packages) }}
+        run: |
+          set -euo pipefail
+          python3 -c 'import json,os; n=int(os.environ["SIZE"]); p=json.loads(os.environ["PACKAGES"]); assert n > 0 and len(p) <= n, f"batch size {len(p)} exceeds {n}"'
+      - name: Configure package registry auth
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: |
+          set -euo pipefail
+          if [ -n "$NARDUK_PLATFORM_GH_PACKAGES_READ" ] && [ -f ./scripts/package-registry-auth.mjs ]; then node ./scripts/package-registry-auth.mjs; fi
+      - name: Point pnpm at a workspace-local store (self-hosted)
+        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
+        run: |
+          set -euo pipefail
+          mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
+          if [ "$mount_point" != "/" ] && [ -d "$mount_point/pnpm-store" ] && [ -w "$mount_point/pnpm-store" ]; then echo "npm_config_store_dir=$mount_point/pnpm-store" >> "$GITHUB_ENV"; fi
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile ${{ inputs.install-args }}
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci ${{ inputs.install-args }}
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      - name: Run package batch
+        env:
+          PACKAGES: ${{ toJSON(matrix.packages) }}
+          PM: ${{ inputs.package-manager }}
+          EXTRA: ${{ inputs.extra-scripts }}
+          RESULTS: ${{ github.workspace }}/package-results.jsonl
+        run: |
+          set -euo pipefail
+          : > "$RESULTS"; batch_status=0
+          while IFS= read -r package; do
+            label=$(printf '%s' "$package" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).label))')
+            filter=$(printf '%s' "$package" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).filter||""))')
+            echo "::group::package/$label"; status=0
+            for script in lint typecheck build; do
+              if [ "$PM" = pnpm ]; then
+                [ -n "$filter" ] && pnpm --filter "$filter" run "$script" || { [ -n "$filter" ] || pnpm run "$script"; }
+              else
+                [ -n "$filter" ] && npm run "$script" --workspace "$filter" || { [ -n "$filter" ] || npm run "$script"; }
+              fi
+              status=$?; [ "$status" -eq 0 ] || break
+            done
+            if [ "$status" -eq 0 ]; then for script in $EXTRA; do pnpm --filter "$filter" run "$script" || status=$?; [ "$status" -eq 0 ] || break; done; fi
+            printf '{"label":%s,"status":%s}\n' "$(printf '%s' "$label" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.stringify(s)))')" "$status" >> "$RESULTS"
+            echo "package=$label status=$status"; echo "::endgroup::"; [ "$status" -eq 0 ] || batch_status=$status
+          done < <(printf '%s' "$PACKAGES" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>JSON.parse(s).forEach(p=>console.log(JSON.stringify(p))))')
+          cat "$RESULTS" >> "$GITHUB_STEP_SUMMARY"; exit "$batch_status"
+
   required:
     name: Required
     if: always()
-    needs: package
+    needs: [package, package-batch]
     runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 5
     permissions:
@@ -627,8 +720,9 @@ jobs:
       - name: Require every package lane to succeed
         env:
           PACKAGE_RESULT: ${{ needs.package.result }}
+          BATCH_RESULT: ${{ needs.package-batch.result }}
         run: |
-          case "$PACKAGE_RESULT" in
-            success) exit 0 ;;
+          case "$PACKAGE_RESULT:$BATCH_RESULT" in
+            success:skipped|skipped:success) exit 0 ;;
             *) echo "::error::package job reported '$PACKAGE_RESULT'"; exit 1 ;;
           esac
