@@ -696,9 +696,9 @@ jobs:
             echo "::group::package/$label"; status=0
             for script in lint typecheck build; do
               if [ "$PM" = pnpm ]; then
-                [ -n "$filter" ] && pnpm --filter "$filter" run "$script" || { [ -n "$filter" ] || pnpm run "$script"; }
+                if [ -n "$filter" ]; then pnpm --filter "$filter" run "$script"; else pnpm run "$script"; fi
               else
-                [ -n "$filter" ] && npm run "$script" --workspace "$filter" || { [ -n "$filter" ] || npm run "$script"; }
+                if [ -n "$filter" ]; then npm run "$script" --workspace "$filter"; else npm run "$script"; fi
               fi
               status=$?; [ "$status" -eq 0 ] || break
             done
