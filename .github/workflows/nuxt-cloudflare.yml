@@ -36,6 +36,21 @@ name: Reusable Nuxt + Cloudflare CI
 # new gate the moment `v1` moved, and a never-before-run suite turning a
 # default branch red is not backward-compatible however the input is labelled.
 #
+# A GREEN LANE THAT RAN NOTHING (`require-scripts`, workflows#14 finished
+# here). Every gate below runs a package script, and they all used to run it
+# with `--if-present` — so a gate whose script does not exist matched nothing,
+# exited 0, and reported GREEN. `run-tests: true` is a caller ASSERTING tests
+# exist, and this file was taking that on faith. node-library.yml got the fix;
+# this file did not, and it is the worse case: 4 of its 5 adopters were running
+# at least one dead lane, mostly because the `web:typecheck` and `build`
+# defaults here are absent in most of the class. Each gate now probes for the
+# script first — warning today, hard failure under `require-scripts: true`,
+# and a silent skip when the caller passes an EMPTY script name to declare the
+# lane genuinely absent. That last distinction is what makes the check
+# adoptable by the repos that need it most. The gates are behaviour-tested
+# against real package.json fixtures by scripts/test_script_gates.py, which
+# executes the shipped step text rather than a copy of it.
+#
 # ROUTE ADDITIONS ARE NOT THIS FILE'S TO GRANT. `e2e-runner` accepts whatever
 # the caller passes; being able to NAME the isolated pool is not the same as
 # being APPROVED for it. A repo absent from the runner-fleet manifest's
@@ -172,6 +187,43 @@ on:
         required: false
         type: string
         default: ""
+      require-scripts:
+        description: >-
+          Fail a gate whose npm script does not exist, instead of passing
+          silently. Mirrors `node-library.yml`'s input of the same name
+          (workflows#14), which this file did not get in that pass — so until
+          now EVERY gate here ran `--if-present` unprotected: a missing script
+          matched nothing, exited 0, and reported a GREEN lane that ran no
+          tests, no typecheck and no build at all.
+
+          This class is where the trap bites hardest, and that is measured. Of
+          the five nuxt-cloudflare adopters audited in workflows#14, FOUR were
+          running at least one dead lane — mostly on the `web:typecheck`
+          default, since marketing-web, vtraceroute, software-delivery and
+          earthdata-viewer all define `typecheck` and no `web:typecheck`, and
+          software-delivery additionally has no `build` script at all.
+
+          DEFAULT IS `false` for the same measured reason it is in
+          node-library.yml: turning it on by default would redden four of five
+          adopters the moment the `v1` tag moved, which is not a
+          backward-compatible change however the input is labelled. Until a
+          repo flips this, a missing script is reported as a `::warning::` and
+          in the job summary, naming the script, so the loss is visible on
+          every run instead of invisible.
+
+          TO FLIP IT, A CALLER FIRST DECLARES ITS ABSENT LANES. Pass an EMPTY
+          STRING for a script input whose lane genuinely does not exist in the
+          repo (`typecheck-web-script: ""` on a Worker with no web surface,
+          `build-script: ""` on one with no build step). An empty name is the
+          caller SAYING the lane is off, and is skipped cleanly with no
+          warning — as distinct from naming a script that is simply missing,
+          which is the defect this input catches. Without that distinction
+          `require-scripts` would be unadoptable by exactly the repos that
+          need it, because this file's `web:typecheck` and `build` defaults
+          are absent in most of the class.
+        required: false
+        type: boolean
+        default: false
       run-e2e:
         description: "Run the optional Playwright e2e suite (opt-in)"
         required: false
@@ -430,53 +482,180 @@ jobs:
           path: ${{ steps.dep-cache-dir.outputs.path }}
           key: ${{ steps.dep-cache.outputs.cache-primary-key }}
 
+      # EVERY GATE BELOW PROBES BEFORE IT RUNS. `--if-present` reports a green
+      # lane for a script that does not exist, so "ran nothing" and "passed"
+      # are the same colour. Each gate therefore asks whether the script is
+      # there first, and reacts per `require-scripts` (warn today, fail when
+      # the caller opts in). An EMPTY script name is different from a missing
+      # one: it is the caller declaring the lane absent, and is skipped
+      # silently. See the `require-scripts` input for the measured reason the
+      # default is not yet a hard failure.
+      #
+      # The inputs moved into `env:` in the same change. They used to be
+      # interpolated straight into the shell text, which made every script
+      # name a command-injection surface from the caller's `with:` block.
       - name: Typecheck Worker
+        env:
+          GATE: Typecheck Worker
+          SCRIPT: ${{ inputs.typecheck-worker-script }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm run --if-present ${{ inputs.typecheck-worker-script }}
-          else
-            npm run --if-present ${{ inputs.typecheck-worker-script }}
+          set -euo pipefail
+          if [ -z "$SCRIPT" ]; then
+            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
+            exit 0
           fi
+          # `npm pkg get` yields `{}` for a missing script and the bare JSON
+          # value for a present one, so test the VALUE's type — never the
+          # presence of a quote. Verified against real fixtures, including
+          # colon-bearing names like `web:typecheck`, by
+          # scripts/test_script_gates.py.
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
 
       - name: Typecheck Nuxt
+        env:
+          GATE: Typecheck Nuxt
+          SCRIPT: ${{ inputs.typecheck-web-script }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm run --if-present ${{ inputs.typecheck-web-script }}
-          else
-            npm run --if-present ${{ inputs.typecheck-web-script }}
+          set -euo pipefail
+          if [ -z "$SCRIPT" ]; then
+            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
+            exit 0
           fi
+          # `npm pkg get` yields `{}` for a missing script and the bare JSON
+          # value for a present one, so test the VALUE's type — never the
+          # presence of a quote. Verified against real fixtures, including
+          # colon-bearing names like `web:typecheck`, by
+          # scripts/test_script_gates.py.
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
 
       - name: Unit tests
         if: inputs.run-tests
+        env:
+          GATE: Unit tests
+          SCRIPT: ${{ inputs.test-script }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm run --if-present ${{ inputs.test-script }}
-          else
-            npm run --if-present ${{ inputs.test-script }}
+          set -euo pipefail
+          if [ -z "$SCRIPT" ]; then
+            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
+            exit 0
           fi
+          # `npm pkg get` yields `{}` for a missing script and the bare JSON
+          # value for a present one, so test the VALUE's type — never the
+          # presence of a quote. Verified against real fixtures, including
+          # colon-bearing names like `web:typecheck`, by
+          # scripts/test_script_gates.py.
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
 
       - name: Build
+        env:
+          GATE: Build
+          SCRIPT: ${{ inputs.build-script }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm run --if-present ${{ inputs.build-script }}
-          else
-            npm run --if-present ${{ inputs.build-script }}
+          set -euo pipefail
+          if [ -z "$SCRIPT" ]; then
+            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
+            exit 0
           fi
+          # `npm pkg get` yields `{}` for a missing script and the bare JSON
+          # value for a present one, so test the VALUE's type — never the
+          # presence of a quote. Verified against real fixtures, including
+          # colon-bearing names like `web:typecheck`, by
+          # scripts/test_script_gates.py.
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
 
       # After build, in the same lane, so a gate that needs build output does
       # not pay for a second install. Same contract as node-library.yml's
-      # extra-scripts.
+      # extra-scripts — including the presence probe, applied per script: an
+      # extra-scripts entry is always something the caller wrote down by name,
+      # so a typo in one of them is precisely the silent-loss case.
       - name: Extra scripts
         if: inputs.extra-scripts != ''
+        env:
+          GATE: Extra scripts
+          SCRIPTS: ${{ inputs.extra-scripts }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
           set -euo pipefail
-          for script in ${{ inputs.extra-scripts }}; do
-            echo "::group::$script"
-            if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-              pnpm run --if-present "$script"
-            else
-              npm run --if-present "$script"
+          # Deliberate word splitting: extra-scripts is a space-separated list.
+          # shellcheck disable=SC2086
+          for SCRIPT in $SCRIPTS; do
+            echo "::group::$SCRIPT"
+            raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+            present=$(printf '%s' "$raw" | node -e \
+              'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+            if [ "$present" != "yes" ]; then
+              msg="$GATE names \"$SCRIPT\" but no such script exists — that entry ran NOTHING"
+              echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+              if [ "$REQUIRE" = "true" ]; then
+                echo "::error::$msg (require-scripts is on)"
+                exit 1
+              fi
+              echo "::warning::$msg. Set require-scripts: true to make this a hard failure."
+              echo "::endgroup::"
+              continue
             fi
+            if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
             echo "::endgroup::"
           done
 
@@ -655,11 +834,37 @@ jobs:
 
       - name: Run e2e suite
         env:
+          GATE: Run e2e suite
+          SCRIPT: ${{ inputs.e2e-script }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
           SHARD: ${{ matrix.shard }}
           TOTAL: ${{ inputs.e2e-shards }}
           EXTRA_ARGS: ${{ inputs.e2e-args }}
         run: |
           set -euo pipefail
+          # Same probe as the build lane's gates, and it matters MORE here: a
+          # caller reached this step by explicitly setting `run-e2e: true`, and
+          # a browser lane that provisions a runner, installs chromium and then
+          # matches no script is the most expensive way in the estate to report
+          # a green check for zero coverage.
+          if [ -z "$SCRIPT" ]; then
+            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
+            exit 0
+          fi
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
+            exit 0
+          fi
           ARGS=()
           # A single lane runs the suite exactly as before — no --shard, no
           # blob reporter, so a caller that never asked for sharding sees no
@@ -680,17 +885,17 @@ jobs:
           # actionlint gate in ci.yml on its first run.
           # shellcheck disable=SC2206
           ARGS+=(${EXTRA_ARGS})
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+          if [ "$PM" = "pnpm" ]; then
             if [ ${#ARGS[@]} -gt 0 ]; then
-              pnpm run --if-present ${{ inputs.e2e-script }} -- "${ARGS[@]}"
+              pnpm run "$SCRIPT" -- "${ARGS[@]}"
             else
-              pnpm run --if-present ${{ inputs.e2e-script }}
+              pnpm run "$SCRIPT"
             fi
           else
             if [ ${#ARGS[@]} -gt 0 ]; then
-              npm run --if-present ${{ inputs.e2e-script }} -- "${ARGS[@]}"
+              npm run "$SCRIPT" -- "${ARGS[@]}"
             else
-              npm run --if-present ${{ inputs.e2e-script }}
+              npm run "$SCRIPT"
             fi
           fi
 

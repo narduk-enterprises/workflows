@@ -569,6 +569,58 @@ after `build-script` in the same lane, so a gate needing build output doesn't
 pay for a second install. earthdata-viewer's vendored-package pin check is the
 first case.
 
+#### `require-scripts`: a lane that matched no script is not a passing lane
+
+Every gate in this file used to run `--if-present`, which means a gate whose
+script does **not** exist matches nothing, exits 0, and reports a **green lane
+that ran nothing**. `run-tests: true` is a caller *asserting* tests exist; the
+callable was taking that assertion on faith.
+
+`node-library.yml` got the fix in workflows#14. This file did not, and it is
+the worse case — **4 of its 5 adopters were running at least one dead lane**,
+because the `web:typecheck` and `build` defaults are absent in most of the
+class (marketing-web, vtraceroute, software-delivery and earthdata-viewer all
+define `typecheck` and no `web:typecheck`; software-delivery has no `build` at
+all).
+
+Every gate now probes for the script first, and reacts by `require-scripts`:
+
+| `require-scripts` | script missing | effect |
+|---|---|---|
+| `false` (default) | named but absent | `::warning::` + a job-summary line naming the script; lane still green |
+| `true` | named but absent | `::error::` and the job **fails** |
+| either | **empty script name** | lane skipped silently — the caller declared it absent |
+
+**The default is `false`, and that is measured, not timid** — the same
+reasoning as node-library's: flipping it by default would redden four of five
+adopters the moment `v1` moved, which is not backward-compatible however the
+input is labelled.
+
+**To flip it, a caller first declares its absent lanes** by passing an empty
+script name. This is what makes `require-scripts` adoptable at all, because
+this file's defaults (`web:typecheck`, `build`) do not exist in most of the
+class — without the distinction between *"I have no web surface"* and *"I named
+a script that isn't there"*, the repos that most need the check could never
+turn it on:
+
+```yaml
+    with:
+      typecheck-worker-script: typecheck
+      typecheck-web-script: ""   # no web surface in this repo
+      build-script: ""           # no build step; wrangler dry-run IS the build
+      run-tests: true
+      require-scripts: true      # now every remaining lane is proven to run
+```
+
+`software-delivery` is the reference caller for that shape.
+
+The gate text is not tested as a copy: `scripts/test_script_gates.py` extracts
+each gate's `run:` block from the YAML and executes that exact text against real
+`package.json` fixtures (54 cases across both Node callables), including
+colon-bearing names like `web:typecheck` — the probe resolves scripts through
+`npm pkg get scripts.<name>`, a dot-path, and a name that broke that lookup
+would report every colon-bearing script as missing.
+
 #### Browser shards and the isolated pool
 
 `run-e2e: true` on its own runs the suite as one job on the **same** runner as
