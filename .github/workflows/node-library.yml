@@ -302,6 +302,67 @@ jobs:
             echo "skipping package-registry auth: no auth bootstrap script present"
           fi
 
+      # SELF-HOSTED: THE PNPM STORE MUST SIT ON THE WORKSPACE'S OWN FILESYSTEM.
+      #
+      # pnpm materialises `node_modules` by HARD-LINKING out of its store, and
+      # a hard link cannot cross a device boundary. When store and workspace
+      # are on different filesystems pnpm silently degrades to a full file
+      # COPY — no warning, no error, just a slower install and a private copy
+      # of every dependency on disk.
+      #
+      # That is the live shape on `linux-ci` (CT 210). The runner's HOME is on
+      # the guest's root volume (`pve-vm-210-disk-0`, st_dev 64519); the
+      # workspace is on the separate transient volume (`pve-vm-210-disk-1`,
+      # st_dev 64534). So pnpm's default store at
+      # `$HOME/.local/share/pnpm/store` is ALWAYS cross-device from the
+      # workspace, and every install on that guest has been copying. Measured
+      # there on one nuxt+vue+typescript+vitest tree (212 MiB of
+      # `node_modules`), warm store, `--offline`, three runs each:
+      #
+      #   store on the ROOT volume   3.93s / 3.03s / 2.83s   st_nlink=1   220 MiB
+      #   store on the SAME volume   2.71s / 2.02s / 2.32s   st_nlink=2    17 MiB
+      #
+      # `st_nlink` is the proof, not the clock: 1 means every file was copied,
+      # 2 means it was linked to the store. And the disk column is the bigger
+      # win — 13x less transient volume consumed per materialised workspace, on
+      # the volume whose 80% mark BLOCKS new allocations and whose hourly
+      # reclaimer deletes real checkouts to stay under it.
+      #
+      # DERIVED, NOT HARDCODED. The store goes at the mount point of the
+      # workspace's own filesystem, because "same device as the workspace" is
+      # the actual requirement and a literal guest path would be a guess about
+      # every other guest. When the workspace is on `/` the default store
+      # already shares its device and this step does nothing. The directory
+      # itself must be pre-provisioned runner-owned — the transient mount root
+      # is root-owned, so the job cannot create it — and a missing or
+      # unwritable one leaves pnpm's default store in place. The failure mode
+      # is a slower install, never a failed one.
+      #
+      # GITHUB-HOSTED RUNNERS KEEP THE DEFAULT STORE. They are ephemeral, the
+      # `actions/cache` restore above puts the store back on the same
+      # filesystem as the workspace already, and there is no transient mount to
+      # move it to. This is the same runner-class split as the cache block
+      # above, for the same reason: the two runner classes have genuinely
+      # different storage, not a preference.
+      #
+      # company-hq#269, been-sober-for#74.
+      - name: Point pnpm at a workspace-local store (self-hosted)
+        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
+        run: |
+          set -euo pipefail
+          mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
+          if [ "$mount_point" = "/" ]; then
+            echo "workspace is on the root filesystem; pnpm's default store already shares its device"
+            exit 0
+          fi
+          store="$mount_point/pnpm-store"
+          if [ ! -d "$store" ] || [ ! -w "$store" ]; then
+            echo "no writable store at $store; keeping pnpm's default store (installs will copy, not link)"
+            exit 0
+          fi
+          echo "npm_config_store_dir=$store" >> "$GITHUB_ENV"
+          echo "pnpm store -> $store (same filesystem as $GITHUB_WORKSPACE)"
+
       - name: Install dependencies (pnpm)
         if: inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile ${{ inputs.install-args }}
