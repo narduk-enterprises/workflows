@@ -54,6 +54,13 @@ Each rule below exists because breaking it has a specific, known blast radius:
                                         volume whose 80% mark blocks new
                                         allocations (company-hq#269,
                                         been-sober-for#74)
+  R10 a `run:` block that pipes into    without pipefail, `cmd | tee file`
+      `tee` must enable pipefail        returns tee's exit status (usually 0),
+                                        so a failing build/test/lint still
+                                        paints the step green — a gate that
+                                        cannot go red. set -o pipefail (or
+                                        set -euo pipefail) makes the pipeline
+                                        fail on cmd's status
 
 Run: python3 scripts/lint_callables.py [paths...]
 Exit 0 clean, 1 on any finding. No third-party imports beyond PyYAML.
@@ -245,6 +252,64 @@ def check_store_placement(path: Path, doc: dict, f: Findings) -> None:
             )
 
 
+# `cmd | tee file` (or `tee` as the last stage of a longer pipe). Word-boundary
+# on both sides so comments that merely *mention* tee, and identifiers like
+# `guaranteed`, do not trip the rule. Matches the pipeline form only — bare
+# `tee file < input` is uncommon here and does not have the same status-mask
+# shape (its status is tee's by definition, not a masked left-hand command).
+TEE_PIPELINE = re.compile(r"\|\s*tee\b")
+# Any of the usual ways a step enables pipefail for its shell.
+# Anchor this to a shell command line so a comment mentioning "pipefail"
+# cannot satisfy R10.
+PIPEFAIL = re.compile(
+    r"(?m)^\s*set\s+(?:-[a-zA-Z]*o\s+pipefail|-o\s+pipefail)\s*(?:#.*)?$"
+)
+
+
+def _run_script(step: dict) -> str:
+    """Return the shell text of a step's `run:` field, or '' if absent/non-shell."""
+    run = step.get("run")
+    if isinstance(run, str):
+        return run
+    return ""
+
+
+def check_tee_pipefail(path: Path, doc: dict, f: Findings) -> None:
+    """R10: `| tee` in a run block requires pipefail in that same step.
+
+    Without pipefail the pipeline's exit status is tee's (almost always 0), so
+    a failing left-hand command still reports success. That is the
+    "check that cannot fail" class. Prefer fixing with `set -euo pipefail` at
+    the top of the step (the house style here) rather than rewriting the
+    capture; either is fine as long as the real exit code propagates.
+    """
+    for job_id, job in (doc.get("jobs") or {}).items():
+        if not isinstance(job, dict):
+            continue
+        # Job- or workflow-level defaults.run.shell with pipefail also count,
+        # but this repo sets pipefail inside each step rather than via defaults.
+        # Scan step text only so the rule stays local and reviewable.
+        for step in job.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            script = _run_script(step)
+            if not script or not TEE_PIPELINE.search(script):
+                continue
+            if PIPEFAIL.search(script):
+                continue
+            # defaults.run.shell: bash {0} with -o pipefail would also clear
+            # this, but we do not declare that form anywhere; require the
+            # explicit set so a reader of the step can see the guarantee.
+            name = step.get("name") or "(unnamed step)"
+            f.add(
+                path,
+                f"R10 job '{job_id}' step '{name}' pipes into `tee` without enabling pipefail "
+                "in that step — the pipeline would report tee's status (usually 0) even when "
+                "the left-hand command fails. Add `set -euo pipefail` (or `set -o pipefail`) "
+                "at the top of the step, or capture without a pipe",
+            )
+
+
 def check_file(path: Path, f: Findings) -> None:
     doc = yaml.safe_load(path.read_text())
     if not isinstance(doc, dict):
@@ -280,6 +345,7 @@ def check_file(path: Path, f: Findings) -> None:
     check_required_job(path, doc, f)
     check_cache_guards(path, doc, f)
     check_store_placement(path, doc, f)
+    check_tee_pipefail(path, doc, f)
 
 
 def main(argv: list[str]) -> int:
