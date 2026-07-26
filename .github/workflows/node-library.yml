@@ -164,8 +164,10 @@ on:
         default: 3
       package-batches:
         description: >-
-          Opt-in JSON array of {label, packages}; each packages array contains
-          {label, filter} objects. Empty preserves one package per job.
+          Opt-in JSON array of {label, packages}; packages is a JSON-encoded
+          string containing {label, filter} objects. Empty preserves one
+          package per job. A non-empty value must contain at least one batch
+          and each batch must contain at least one package.
         required: false
         type: string
         default: ''
@@ -177,6 +179,51 @@ env:
   NUXT_TELEMETRY_DISABLED: 1
 
 jobs:
+  validate-package-batches:
+    if: inputs.package-batches != ''
+    name: validate package batches
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Reject an empty or malformed batch set
+        env:
+          BATCHES: ${{ inputs.package-batches }}
+          MAX_SIZE: ${{ inputs.package-batch-size }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+
+          batches = json.loads(os.environ["BATCHES"])
+          if not isinstance(batches, list) or not batches:
+              raise SystemExit("package-batches must contain at least one batch")
+          max_size = int(os.environ["MAX_SIZE"])
+          labels = []
+          for batch in batches:
+              if not isinstance(batch, dict) or not batch.get("label"):
+                  raise SystemExit("every package batch needs a non-empty label")
+              packages = json.loads(batch.get("packages", ""))
+              if not isinstance(packages, list) or not packages:
+                  raise SystemExit(f"batch {batch['label']} contains no packages")
+              if len(packages) > max_size:
+                  raise SystemExit(
+                      f"batch {batch['label']} has {len(packages)} packages; "
+                      f"maximum is {max_size}"
+                  )
+              for package in packages:
+                  if not isinstance(package, dict) or not package.get("label"):
+                      raise SystemExit(f"batch {batch['label']} has an invalid package")
+                  labels.append(package["label"])
+          if not labels:
+              raise SystemExit("package-batches produced zero packages")
+          if len(labels) != len(set(labels)):
+              raise SystemExit("package-batches contains duplicate package labels")
+          print(f"validated {len(batches)} batches / {len(labels)} packages")
+          PY
+
   package:
     if: inputs.package-batches == ''
     name: package / ${{ matrix.label }}
@@ -630,6 +677,7 @@ jobs:
 
   package-batch:
     if: inputs.package-batches != ''
+    needs: validate-package-batches
     name: package batch / ${{ matrix.label }}
     runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 45
@@ -653,10 +701,10 @@ jobs:
       - name: Validate package batch
         env:
           SIZE: ${{ inputs.package-batch-size }}
-          PACKAGES: ${{ toJSON(matrix.packages) }}
+          PACKAGES: ${{ matrix.packages }}
         run: |
           set -euo pipefail
-          python3 -c 'import json,os; n=int(os.environ["SIZE"]); p=json.loads(os.environ["PACKAGES"]); assert n > 0 and len(p) <= n, f"batch size {len(p)} exceeds {n}"'
+          python3 -c 'import json,os; n=int(os.environ["SIZE"]); p=json.loads(os.environ["PACKAGES"]); assert n > 0 and p and len(p) <= n, f"invalid batch size/package set: {len(p)}"'
       - name: Configure package registry auth
         env:
           NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
@@ -683,7 +731,7 @@ jobs:
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       - name: Run package batch
         env:
-          PACKAGES: ${{ toJSON(matrix.packages) }}
+          PACKAGES: ${{ matrix.packages }}
           PM: ${{ inputs.package-manager }}
           EXTRA: ${{ inputs.extra-scripts }}
           RESULTS: ${{ github.workspace }}/package-results.jsonl
@@ -711,7 +759,7 @@ jobs:
   required:
     name: Required
     if: always()
-    needs: [package, package-batch]
+    needs: [package, package-batch, validate-package-batches]
     runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 5
     permissions:
@@ -721,8 +769,9 @@ jobs:
         env:
           PACKAGE_RESULT: ${{ needs.package.result }}
           BATCH_RESULT: ${{ needs.package-batch.result }}
+          BATCH_INPUT_RESULT: ${{ needs.validate-package-batches.result }}
         run: |
-          case "$PACKAGE_RESULT:$BATCH_RESULT" in
-            success:skipped|skipped:success) exit 0 ;;
-            *) echo "::error::package job reported '$PACKAGE_RESULT'"; exit 1 ;;
+          case "$PACKAGE_RESULT:$BATCH_RESULT:$BATCH_INPUT_RESULT" in
+            success:skipped:skipped|skipped:success:success) exit 0 ;;
+            *) echo "::error::package=$PACKAGE_RESULT batch=$BATCH_RESULT validation=$BATCH_INPUT_RESULT"; exit 1 ;;
           esac
