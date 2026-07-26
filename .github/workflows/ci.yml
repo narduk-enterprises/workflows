@@ -122,6 +122,11 @@ jobs:
       - name: Structural gate (timeouts, permissions, pins, Required, concurrency)
         run: python3 scripts/lint_callables.py
 
+      # R10: `| tee` without pipefail reintroduces exit-code masking. The live
+      # workflows currently have zero `| tee` uses; this keeps it that way.
+      - name: tee-pipefail regression tests
+        run: python3 scripts/test_tee_pipefail.py
+
       # Extracts the shipped step text out of python-data.yml and executes it,
       # so the tests cannot drift from the callable they describe (workflows#4).
       - name: extra-env behaviour tests

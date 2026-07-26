@@ -813,7 +813,7 @@ executed here.
 - **`.github/workflows/ci.yml` gates this repo** (~7s). `actionlint` +
   `scripts/lint_callables.py` + `scripts/test_extra_env.py`. The structural gate
   enforces every convention in this list, so none of them can regress silently:
-  see the rule table (R1–R7) at the top of `scripts/lint_callables.py`. Run it
+  see the rule table (R1–R10) at the top of `scripts/lint_callables.py`. Run it
   locally before pushing: `python3 scripts/lint_callables.py`.
 - Third-party and first-party actions are pinned to full commit SHAs with a
   version comment, targeting the current Actions Node runtime (enforced: R4).
