@@ -67,7 +67,7 @@ a missing eighth file: five repos had already hand-rolled the same sharded
 | `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: lint/typecheck/test/build, each `--if-present`, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern. See [relationship to `reusable-node-ci.yml`](#relationship-between-node-libraryyml-and-reusable-node-ciyml) below |
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: lint, typecheck, test, build (pnpm or npm). Zero live callers as of 2026-07-24 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
-| `reusable-weekly-drift-check.yml` | Weekly template-drift + quality check for fleet apps: typecheck, unit tests, and `narduk-fleet check-drift` |
+| `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 
 All seven are `on: workflow_call` only — none of them declare their own
 triggers, and none declare `concurrency:` (see "How to consume" below for why).
@@ -87,7 +87,7 @@ branch, read back from the API — not that the caller parses.
 | `node-library.yml` | `narduk-enterprises/narduk-charts` | yes — repo ruleset `require-ci-required` |
 | `nuxt-cloudflare.yml` | `hydrogen` | no — `hydrogen` has no branch protection; it called `@v1` unenforced for months, which is the failure mode this column exists to make visible |
 | `reusable-node-ci.yml` | none | — |
-| `reusable-weekly-drift-check.yml` | `narduk-template-smoke-app` | — |
+| `reusable-weekly-drift-check.yml` | retired — zero live callers verified across `narduk-enterprises` and `narduk-incubator` | — |
 
 ## The `ci / Required` convention
 
@@ -704,19 +704,12 @@ caller today, but shares its shape):
         python3 untangle/sync-to-project.py --project-number 1 --dry-run
 ```
 
-### Weekly drift check (unchanged)
+### Weekly drift check (retired 2026-07-26)
 
-```yaml
-jobs:
-  drift:
-    uses: narduk-enterprises/workflows/.github/workflows/reusable-weekly-drift-check.yml@v1
-    with:
-      run-typecheck: true
-      run-tests: true
-      run-drift-check: true
-    secrets:
-      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-```
+`reusable-weekly-drift-check.yml` was removed after a fresh organization-wide
+caller search found no live consumer (`workflows#20`, Actions-optimization
+audit). `narduk-template-smoke-app` is disabled and documentation references
+were not runtime callers.
 
 ### Generic Node CI (unchanged)
 

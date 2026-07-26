@@ -187,6 +187,15 @@ on:
         required: false
         type: string
         default: ""
+      extra-gate-scripts:
+        description: >-
+          Space-separated package scripts for an opt-in gate that runs in
+          parallel with the build. Scripts run in the supplied order after a
+          fresh install. When configured, every named script must exist and
+          pass; this gate is included in Required and cannot be skipped.
+        required: false
+        type: string
+        default: ""
       require-scripts:
         description: >-
           Fail a gate whose npm script does not exist, instead of passing
@@ -726,6 +735,68 @@ jobs:
   # the workflow expression language — so it is computed here and consumed by
   # the e2e matrix. Skipped entirely when the caller left e2e off, which
   # `Required` treats as an intentional skip.
+  extra-gate:
+    name: Extra gate
+    if: inputs.extra-gate-scripts != ''
+    runs-on: ${{ fromJSON(inputs.runner) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+      - name: Configure package registry auth
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: |
+          set -euo pipefail
+          if [ -n "$NARDUK_PLATFORM_GH_PACKAGES_READ" ] && [ -f ./scripts/package-registry-auth.mjs ]; then
+            node ./scripts/package-registry-auth.mjs
+          fi
+      - name: Point pnpm at a workspace-local store (self-hosted)
+        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
+        run: |
+          set -euo pipefail
+          mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
+          if [ "$mount_point" != "/" ] && [ -d "$mount_point/pnpm-store" ] && [ -w "$mount_point/pnpm-store" ]; then
+            echo "npm_config_store_dir=$mount_point/pnpm-store" >> "$GITHUB_ENV"
+          fi
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci
+      - name: Run ordered extra gate scripts
+        env:
+          SCRIPTS: ${{ inputs.extra-gate-scripts }}
+          PM: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          for SCRIPT in $SCRIPTS; do
+            raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+            present=$(printf '%s' "$raw" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+            if [ "$present" != "yes" ]; then
+              echo "::error::Extra gate names \"$SCRIPT\" but no such script exists"
+              exit 1
+            fi
+            if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+          done
+
   e2e-plan:
     name: E2E plan
     if: inputs.run-e2e
@@ -1306,7 +1377,7 @@ jobs:
   required:
     name: Required
     if: always()
-    needs: [build, e2e-plan, e2e, e2e-report, deploy-dry-run]
+    needs: [build, extra-gate, e2e-plan, e2e, e2e-report, deploy-dry-run]
     runs-on: ${{ fromJSON(inputs.runner) }}
     timeout-minutes: 5
     permissions:
@@ -1319,6 +1390,7 @@ jobs:
           E2E_RESULT: ${{ needs.e2e.result }}
           E2E_REPORT_RESULT: ${{ needs.e2e-report.result }}
           DEPLOY_DRY_RUN_RESULT: ${{ needs.deploy-dry-run.result }}
+          EXTRA_GATE_RESULT: ${{ needs.extra-gate.result }}
         run: |
           status=0
           # build has no `if:` — it must always report success.
@@ -1340,6 +1412,12 @@ jobs:
             esac
           }
           require_success build "$BUILD_RESULT"
+          if [ -n "${{ inputs.extra-gate-scripts }}" ]; then
+            require_success extra-gate "$EXTRA_GATE_RESULT"
+          elif [ "$EXTRA_GATE_RESULT" != "skipped" ]; then
+            echo "::error::extra-gate reported '$EXTRA_GATE_RESULT' while not configured"
+            status=1
+          fi
           allow_skip e2e-plan "$E2E_PLAN_RESULT"
           allow_skip e2e "$E2E_RESULT"
           # e2e-report runs only when the caller sharded; when it runs it must
