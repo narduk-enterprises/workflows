@@ -102,6 +102,19 @@ def main() -> int:
     failures = 0
     total = 0
 
+    # workflows#15: pnpm forwards a literal `--` into wrapper scripts while
+    # npm strips it. The shipped pnpm e2e branch must omit the separator.
+    e2e = gate_script(NUXT_CF, "e2e", "Run e2e suite")
+    pnpm_start = e2e.index('if [ "$PM" = "pnpm" ]; then')
+    npm_start = e2e.index("else", pnpm_start)
+    pnpm_branch = e2e[pnpm_start:npm_start]
+    npm_branch = e2e[npm_start:]
+    total += 1
+    ok = 'pnpm run "$SCRIPT" --' not in pnpm_branch and 'npm run "$SCRIPT" --' in npm_branch
+    print(("PASS  " if ok else "FAIL  ") + "pnpm e2e args omit literal separator")
+    if not ok:
+        failures += 1
+
     # ---- node-library.yml: the original contract, unchanged --------------
     for workflow, job, gate, script_name in NODE_LIB_GATES:
         script = gate_script(workflow, job, gate)
