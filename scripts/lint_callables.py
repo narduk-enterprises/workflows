@@ -259,7 +259,11 @@ def check_store_placement(path: Path, doc: dict, f: Findings) -> None:
 # shape (its status is tee's by definition, not a masked left-hand command).
 TEE_PIPELINE = re.compile(r"\|\s*tee\b")
 # Any of the usual ways a step enables pipefail for its shell.
-PIPEFAIL = re.compile(r"(?:set\s+-[a-zA-Z]*o\s+pipefail|set\s+-o\s+pipefail|pipefail)")
+# Anchor this to a shell command line so a comment mentioning "pipefail"
+# cannot satisfy R10.
+PIPEFAIL = re.compile(
+    r"(?m)^\s*set\s+(?:-[a-zA-Z]*o\s+pipefail|-o\s+pipefail)\s*(?:#.*)?$"
+)
 
 
 def _run_script(step: dict) -> str:

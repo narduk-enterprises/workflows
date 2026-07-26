@@ -100,6 +100,19 @@ jobs:
         False,
     ),
     (
+        "comment that merely mentions pipefail is still a finding",
+        """
+jobs:
+  build:
+    steps:
+      - name: Build
+        run: |
+          # pipefail is required for this pipeline, but this comment does not enable it
+          npm test | tee test.log
+""",
+        True,
+    ),
+    (
         "word 'guaranteed' is not a false positive",
         """
 jobs:
