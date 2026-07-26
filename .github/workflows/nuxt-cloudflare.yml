@@ -973,7 +973,9 @@ jobs:
           ARGS+=(${EXTRA_ARGS})
           if [ "$PM" = "pnpm" ]; then
             if [ ${#ARGS[@]} -gt 0 ]; then
-              pnpm run "$SCRIPT" -- "${ARGS[@]}"
+              # pnpm forwards `--` to the package script, unlike npm. Keep
+              # the wrapper contract identical for both package managers.
+              pnpm run "$SCRIPT" "${ARGS[@]}"
             else
               pnpm run "$SCRIPT"
             fi
