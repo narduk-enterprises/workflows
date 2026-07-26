@@ -42,6 +42,18 @@ Each rule below exists because breaking it has a specific, known blast radius:
                                        the confirmed source of the estate's
                                        `ERR_PNPM_BAD_PACKAGE_JSON` corruption
                                        (vtraceroute#4, company-hq#269)
+  R9  a pnpm install on a self-hosted   pnpm hard-links `node_modules` out of
+      job is preceded by the store-      its store and a hard link cannot cross
+      placement step                     a device boundary. On `linux-ci` the
+                                        workspace is on the transient volume
+                                        and the default store is on the root
+                                        volume, so an install without this step
+                                        silently COPIES every file: slower, and
+                                        220 MiB of transient volume per
+                                        workspace instead of 17 MiB, on the
+                                        volume whose 80% mark blocks new
+                                        allocations (company-hq#269,
+                                        been-sober-for#74)
 
 Run: python3 scripts/lint_callables.py [paths...]
 Exit 0 clean, 1 on any finding. No third-party imports beyond PyYAML.
@@ -191,6 +203,48 @@ def check_cache_guards(path: Path, doc: dict, f: Findings) -> None:
                 )
 
 
+PNPM_INSTALL_STEP = "Install dependencies (pnpm)"
+STORE_STEP = "Point pnpm at a workspace-local store (self-hosted)"
+SELF_HOSTED_GUARD = "runner.environment == 'self-hosted'"
+
+
+def check_store_placement(path: Path, doc: dict, f: Findings) -> None:
+    """R9: a pnpm install must be preceded by the store-placement step.
+
+    Without it the store stays at pnpm's default under `$HOME`, which on a
+    self-hosted guest is a DIFFERENT FILESYSTEM from the workspace — and pnpm
+    cannot hard-link across a device boundary, so it copies instead. That
+    failure is silent: same result, slower, and a full private copy of every
+    dependency on the volume the reclaimer is fighting to keep under 80%.
+    """
+    for job_id, job in (doc.get("jobs") or {}).items():
+        if not isinstance(job, dict):
+            continue
+        steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
+        names = [s.get("name", "") for s in steps]
+        if PNPM_INSTALL_STEP not in names:
+            continue
+        if STORE_STEP not in names:
+            f.add(
+                path,
+                f"R9 job '{job_id}' installs with pnpm but has no '{STORE_STEP}' step — on a "
+                "self-hosted guest the default store is on a different filesystem from the "
+                "workspace, so pnpm copies every file instead of hard-linking it",
+            )
+            continue
+        if names.index(STORE_STEP) > names.index(PNPM_INSTALL_STEP):
+            f.add(path, f"R9 job '{job_id}' places the store AFTER the install, which is too late")
+        placement = steps[names.index(STORE_STEP)]
+        cond = " ".join(str(placement.get("if", "")).split())
+        if SELF_HOSTED_GUARD not in cond:
+            f.add(
+                path,
+                f"R9 job '{job_id}' step '{STORE_STEP}' is missing `if: {SELF_HOSTED_GUARD}` — a "
+                "GitHub-hosted runner has no transient mount and its restored cache already shares "
+                "the workspace's filesystem",
+            )
+
+
 def check_file(path: Path, f: Findings) -> None:
     doc = yaml.safe_load(path.read_text())
     if not isinstance(doc, dict):
@@ -225,6 +279,7 @@ def check_file(path: Path, f: Findings) -> None:
     check_uses_pins(path, f)
     check_required_job(path, doc, f)
     check_cache_guards(path, doc, f)
+    check_store_placement(path, doc, f)
 
 
 def main(argv: list[str]) -> int:
