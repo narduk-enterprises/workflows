@@ -65,6 +65,12 @@ def gate_script(workflow: pathlib.Path, job: str, name: str) -> str:
     raise SystemExit(f"::error::no step named {name!r} in {workflow} job {job!r}")
 
 
+def input_default(workflow: pathlib.Path, name: str) -> object:
+    doc = yaml.safe_load(workflow.read_text())
+    trigger = doc.get("on", doc.get(True))
+    return trigger["workflow_call"]["inputs"][name]["default"]
+
+
 def run(script: str, fixture: dict, *, env_extra: dict[str, str]) -> tuple[int, str, str]:
     """Execute the shipped gate text against a real package.json fixture."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -115,7 +121,14 @@ def main() -> int:
     if not ok:
         failures += 1
 
-    # ---- node-library.yml: the original contract, unchanged --------------
+    total += 1
+    ok = input_default(NUXT_CF, "typecheck-web-script") == ""
+    print(("PASS  " if ok else "FAIL  ")
+          + "Nuxt web typecheck is an honest opt-in, not a missing default")
+    if not ok:
+        failures += 1
+
+    # ---- node-library.yml: standard lanes and extra scripts ---------------
     for workflow, job, gate, script_name in NODE_LIB_GATES:
         script = gate_script(workflow, job, gate)
         cases = [
@@ -137,6 +150,38 @@ def main() -> int:
             if not check(label, gate, rc, out, summary, want_rc, want_sub,
                          want_summary_warning=want_sum):
                 failures += 1
+
+    node_extra = gate_script(NODE_LIB, "package", "Extra scripts")
+    node_extra_cases = [
+        ("every entry present -> each one actually runs",
+         {"a": "echo RAN_A", "b": "echo RAN_B"}, "a b", "true", 0, "RAN_B", False),
+        ("one entry missing + require=false -> warns, others still run",
+         {"a": "echo RAN_A"}, "nope a", "false", 0, "RAN_A", True),
+        ("one entry missing + require=true  -> FAILS loudly",
+         {"a": "echo RAN_A"}, "a nope", "true", 1, "::error::", True),
+    ]
+    for label, fixture, scripts, require, want_rc, want_sub, want_sum in node_extra_cases:
+        rc, out, summary = run(
+            node_extra,
+            fixture,
+            env_extra={
+                "GATE": "Extra scripts",
+                "SCRIPTS": scripts,
+                "REQUIRE": require,
+            },
+        )
+        total += 1
+        if not check(
+            label,
+            "Node extra scripts",
+            rc,
+            out,
+            summary,
+            want_rc,
+            want_sub,
+            want_summary_warning=want_sum,
+        ):
+            failures += 1
 
     # ---- nuxt-cloudflare.yml: same contract, plus the empty-name opt-out --
     for workflow, job, gate, script_name in NUXT_CF_GATES:

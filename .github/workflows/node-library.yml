@@ -103,10 +103,11 @@ on:
         description: >-
           Fail a gate whose npm script does not exist, instead of passing
           silently. `run-tests: true` is a caller ASSERTING that tests exist,
-          but every gate here runs with `--if-present`, so a missing script
-          matches nothing, exits 0, and reports a GREEN lane that ran no tests
-          at all. narduk-libs found this the hard way — its packages define
-          `test:unit`, not `test`.
+          but a missing script used to match nothing, exit 0, and report a
+          GREEN lane that ran no tests at all. narduk-libs found this the hard
+          way — its packages define `test:unit`, not `test`. Standard and
+          extra-script lanes now probe before execution so this input governs
+          every named package-script gate.
 
           DEFAULT IS `false`, and that is measured rather than timid. Turned on
           today it reddens 3 of the 4 adopters at once: narduk-charts and
@@ -138,11 +139,13 @@ on:
         default: ""
       extra-scripts:
         description: >-
-          Space-separated package scripts run after build, each with
-          --if-present, in the same lane so they see the build output. This is
-          what lets a caller retire a whole local job instead of half of one:
-          narduk-charts' size-limit gate needs `npm run build` to have already
-          run, so as a separate job it would mean a second full install+build.
+          Space-separated package scripts run after build in the same lane so
+          they see the build output. Each named script is probed before it
+          runs: a missing entry warns while require-scripts is false and fails
+          hard while require-scripts is true. This is what lets a caller
+          retire a whole local job instead of half of one: narduk-charts'
+          size-limit gate needs `npm run build` to have already run, so as a
+          separate job it would mean a second full install+build.
         required: false
         type: string
         default: ""
@@ -595,21 +598,56 @@ jobs:
 
       - name: Extra scripts
         if: inputs.extra-scripts != ''
+        env:
+          GATE: Extra scripts
+          SCRIPTS: ${{ inputs.extra-scripts }}
+          FILTER: ${{ matrix.filter }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
           set -euo pipefail
-          for script in ${{ inputs.extra-scripts }}; do
-            echo "::group::$script"
-            if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-              if [ -n "${{ matrix.filter }}" ]; then
-                pnpm --filter "${{ matrix.filter }}" run --if-present "$script"
+          # Deliberate word splitting: extra-scripts is a space-separated list.
+          # shellcheck disable=SC2086
+          for SCRIPT in $SCRIPTS; do
+            echo "::group::$SCRIPT"
+            if [ -n "$FILTER" ] && [ "$PM" = "pnpm" ]; then
+              present=$(pnpm --filter "$FILTER" exec node -e \
+                'const s=require("./package.json").scripts||{};process.stdout.write(s[process.argv[1]]?"yes":"no")' \
+                "$SCRIPT" 2>/dev/null || echo no)
+            else
+              if [ -n "$FILTER" ]; then
+                raw=$(npm pkg get "scripts.$SCRIPT" --workspace "$FILTER" 2>/dev/null || echo '{}')
               else
-                pnpm run --if-present "$script"
+                raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+              fi
+              present=$(printf '%s' "$raw" | node -e \
+                'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+            fi
+
+            if [ "$present" != "yes" ]; then
+              where=${FILTER:-the root package}
+              msg="$GATE names \"$SCRIPT\" for $where but no such script exists — that entry ran NOTHING"
+              echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+              if [ "$REQUIRE" = "true" ]; then
+                echo "::error::$msg (require-scripts is on)"
+                exit 1
+              fi
+              echo "::warning::$msg. Set require-scripts: true to make this a hard failure."
+              echo "::endgroup::"
+              continue
+            fi
+
+            if [ "$PM" = "pnpm" ]; then
+              if [ -n "$FILTER" ]; then
+                pnpm --filter "$FILTER" run "$SCRIPT"
+              else
+                pnpm run "$SCRIPT"
               fi
             else
-              if [ -n "${{ matrix.filter }}" ]; then
-                npm run "$script" --workspace "${{ matrix.filter }}" --if-present
+              if [ -n "$FILTER" ]; then
+                npm run "$SCRIPT" --workspace "$FILTER"
               else
-                npm run --if-present "$script"
+                npm run "$SCRIPT"
               fi
             fi
             echo "::endgroup::"

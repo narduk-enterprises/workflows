@@ -576,12 +576,10 @@ script does **not** exist matches nothing, exits 0, and reports a **green lane
 that ran nothing**. `run-tests: true` is a caller *asserting* tests exist; the
 callable was taking that assertion on faith.
 
-`node-library.yml` got the fix in workflows#14. This file did not, and it is
-the worse case — **4 of its 5 adopters were running at least one dead lane**,
-because the `web:typecheck` and `build` defaults are absent in most of the
-class (marketing-web, vtraceroute, software-delivery and earthdata-viewer all
-define `typecheck` and no `web:typecheck`; software-delivery has no `build` at
-all).
+`node-library.yml` got the first fix in workflows#14. This file did not, and
+the missing `web:typecheck` default became the dominant dead lane across its
+adopters. `typecheck-web-script` now defaults to `""`: a second web typecheck
+is opt-in, while a non-empty name remains an assertion that the script exists.
 
 Every gate now probes for the script first, and reacts by `require-scripts`:
 
@@ -591,17 +589,15 @@ Every gate now probes for the script first, and reacts by `require-scripts`:
 | `true` | named but absent | `::error::` and the job **fails** |
 | either | **empty script name** | lane skipped silently — the caller declared it absent |
 
-**The default is `false`, and that is measured, not timid** — the same
-reasoning as node-library's: flipping it by default would redden four of five
-adopters the moment `v1` moved, which is not backward-compatible however the
-input is labelled.
+**The default is still `false` during the caller-migration phase.** Flipping it
+changes a warning into a required failure for every adopter at once, so callers
+must first declare genuinely absent lanes and prove every remaining name.
 
 **To flip it, a caller first declares its absent lanes** by passing an empty
 script name. This is what makes `require-scripts` adoptable at all, because
-this file's defaults (`web:typecheck`, `build`) do not exist in most of the
-class — without the distinction between *"I have no web surface"* and *"I named
-a script that isn't there"*, the repos that most need the check could never
-turn it on:
+some repos have no build or split typecheck lane — without the distinction
+between *"I have no web surface"* and *"I named a script that isn't there"*,
+the repos that most need the check could never turn it on:
 
 ```yaml
     with:

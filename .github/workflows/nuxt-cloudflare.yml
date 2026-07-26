@@ -141,12 +141,13 @@ on:
         default: "typecheck"
       typecheck-web-script:
         description: >-
-          package.json script for the Nuxt web typecheck lane (hydrogen:
-          `web:typecheck`). Run with --if-present, so a caller with a single
-          combined typecheck script can leave this unset without failing.
+          package.json script for the optional Nuxt web typecheck lane. Empty
+          by default because most callers have one combined `typecheck`
+          script, not a worker/web split. Callers with a separate web lane
+          (hydrogen: `web:typecheck`) opt in by naming it.
         required: false
         type: string
-        default: "web:typecheck"
+        default: ""
       build-script:
         description: "package.json build script, run with --if-present"
         required: false
@@ -205,20 +206,19 @@ on:
           matched nothing, exited 0, and reported a GREEN lane that ran no
           tests, no typecheck and no build at all.
 
-          This class is where the trap bites hardest, and that is measured. Of
-          the five nuxt-cloudflare adopters audited in workflows#14, FOUR were
-          running at least one dead lane — mostly on the `web:typecheck`
-          default, since marketing-web, vtraceroute, software-delivery and
-          earthdata-viewer all define `typecheck` and no `web:typecheck`, and
-          software-delivery additionally has no `build` script at all.
+          This class is where the trap bit hardest. The old
+          `typecheck-web-script: web:typecheck` default created a second,
+          hollow typecheck lane for single-script apps. That default is now
+          empty: a separate web typecheck is opt-in, while every non-empty
+          script name remains an assertion that require-scripts can enforce.
 
-          DEFAULT IS `false` for the same measured reason it is in
-          node-library.yml: turning it on by default would redden four of five
-          adopters the moment the `v1` tag moved, which is not a
-          backward-compatible change however the input is labelled. Until a
-          repo flips this, a missing script is reported as a `::warning::` and
-          in the job summary, naming the script, so the loss is visible on
-          every run instead of invisible.
+          DEFAULT IS `false` during the coordinated caller migration. Turning
+          it on changes every remaining missing name from a warning to a hard
+          failure at the same moving tag, so callers must first declare absent
+          lanes and prove their remaining script names. Until a repo flips
+          this, a missing script is reported as a `::warning::` and in the job
+          summary, naming the script, so the loss is visible instead of
+          invisible.
 
           TO FLIP IT, A CALLER FIRST DECLARES ITS ABSENT LANES. Pass an EMPTY
           STRING for a script input whose lane genuinely does not exist in the
@@ -228,8 +228,8 @@ on:
           warning — as distinct from naming a script that is simply missing,
           which is the defect this input catches. Without that distinction
           `require-scripts` would be unadoptable by exactly the repos that
-          need it, because this file's `web:typecheck` and `build` defaults
-          are absent in most of the class.
+          need it, because some callers genuinely have no build or split
+          typecheck lane.
         required: false
         type: boolean
         default: false
