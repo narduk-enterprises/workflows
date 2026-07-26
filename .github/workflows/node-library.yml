@@ -269,9 +269,11 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+            pnpm config set store-dir "$GITHUB_WORKSPACE/.cache/pnpm-store"
+            echo "path=.cache/pnpm-store" >> "$GITHUB_OUTPUT"
           else
-            echo "path=$(npm config get cache)" >> "$GITHUB_OUTPUT"
+            npm config set cache "$GITHUB_WORKSPACE/.cache/npm"
+            echo "path=.cache/npm" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Restore dependency cache

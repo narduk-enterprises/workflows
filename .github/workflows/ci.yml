@@ -140,6 +140,9 @@ jobs:
       - name: store-placement behaviour tests
         run: python3 scripts/test_store_placement.py
 
+      - name: cache-path stability tests
+        run: python3 scripts/test_cache_paths.py
+
       # Cheap belt-and-braces: actionlint parses YAML itself, but a file it
       # cannot classify as a workflow is skipped rather than failed, so an
       # unparseable stray .yml would slip past both checks above.
