@@ -254,11 +254,31 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Report toolchain
+      - name: Validate Apple toolchain and gate configuration
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+          RUN_BUILD: ${{ inputs.run-build }}
+          RUN_TESTS: ${{ inputs.run-tests }}
+          TEST_COMMAND: ${{ inputs.test-command }}
         run: |
+          set -euo pipefail
+          if [ "$RUN_BUILD" != "true" ] && [ "$RUN_TESTS" != "true" ]; then
+            echo "::error::apple.yml must run build-command, test-command, or both; an echo-only Xcode job is not a gate"
+            exit 1
+          fi
+          if [ "$RUN_BUILD" = "true" ] && [ -z "$BUILD_COMMAND" ]; then
+            echo "::error::run-build is true but build-command is empty"
+            exit 1
+          fi
+          if [ "$RUN_TESTS" = "true" ] && [ -z "$TEST_COMMAND" ]; then
+            echo "::error::run-tests is true but test-command is empty"
+            exit 1
+          fi
+          command -v xcodebuild
+          command -v swift
           echo "runner: ${RUNNER_NAME:-unknown} ($(uname -m))"
-          xcodebuild -version || true
-          swift --version || true
+          xcodebuild -version
+          swift --version
 
       - name: Build
         if: inputs.run-build

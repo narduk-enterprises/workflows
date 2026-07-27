@@ -146,6 +146,24 @@ on:
         required: false
         type: boolean
         default: false
+      run-pyright:
+        description: >-
+          Run real static type analysis with Pyright in the installed project
+          environment. Opt-in for backward compatibility, but unlike
+          py_compile this checks names and types rather than syntax alone.
+        required: false
+        type: boolean
+        default: false
+      pyright-version:
+        description: "Exact Pyright version; pinned so tool drift cannot change the gate"
+        required: false
+        type: string
+        default: "1.1.411"
+      pyright-args:
+        description: "Arguments passed to Pyright from working-directory"
+        required: false
+        type: string
+        default: "."
       ruff-version:
         description: "Exact ruff version to install — pinned, so a ruff release cannot turn a green repo red"
         required: false
@@ -252,6 +270,26 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: ${{ inputs.fetch-depth }}
+
+      - name: Validate dependency manager and fail-capable gates
+        env:
+          DEPENDENCY_MANAGER: ${{ inputs.dependency-manager }}
+          EXTRA_CHECKS: ${{ inputs.extra-checks }}
+          RUN_PYRIGHT: ${{ inputs.run-pyright }}
+          RUN_TESTS: ${{ inputs.run-tests }}
+        run: |
+          set -euo pipefail
+          case "$DEPENDENCY_MANAGER" in
+            uv | pip) ;;
+            *)
+              echo "::error::dependency-manager must be uv or pip (got '$DEPENDENCY_MANAGER')"
+              exit 1
+              ;;
+          esac
+          if [ "$RUN_TESTS" != "true" ] && [ "$RUN_PYRIGHT" != "true" ] && [ -z "$EXTRA_CHECKS" ]; then
+            echo "::error::python-data test job must run pytest, Pyright, or extra-checks; install-only is not a gate"
+            exit 1
+          fi
 
       # `extra-env` values are expanded HERE, on the runner, not in the caller
       # (workflows#4). The caller cannot do it: a `jobs.<id>.uses:` job is never
@@ -361,7 +399,7 @@ jobs:
 
       - name: Install uv
         if: inputs.dependency-manager == 'uv'
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           python-version: ${{ inputs.python-version }}
           # `enable-cache` is deliberately left at its `auto` default: auto
@@ -383,6 +421,12 @@ jobs:
         if: inputs.dependency-manager == 'pip'
         with:
           python-version: ${{ inputs.python-version }}
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: inputs.run-pyright
+        with:
+          node-version: "24"
+          package-manager-cache: false
 
       - name: Check lockfile is up to date
         if: inputs.dependency-manager == 'uv' && inputs.check-lock
@@ -416,6 +460,26 @@ jobs:
           echo "$bin" >> "$GITHUB_PATH"
           "$bin/python" --version
 
+      - name: Install pinned Pyright
+        if: inputs.run-pyright
+        env:
+          PYRIGHT_VERSION: ${{ inputs.pyright-version }}
+        run: |
+          set -euo pipefail
+          prefix="$RUNNER_TEMP/python-data-pyright"
+          npm install --prefix "$prefix" --ignore-scripts --no-audit --no-fund "pyright@${PYRIGHT_VERSION}"
+          bin="$prefix/node_modules/.bin"
+          if [ ! -x "$bin/pyright" ]; then
+            echo "::error::Pyright binary is missing after pinned install"
+            exit 1
+          fi
+          echo "$bin" >> "$GITHUB_PATH"
+          "$bin/pyright" --version
+
+      - name: Pyright
+        if: inputs.run-pyright
+        run: pyright ${{ inputs.pyright-args }}
+
       - name: Run tests
         if: inputs.run-tests
         run: ${{ inputs.test-command }}
@@ -433,7 +497,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Require the test job to succeed and the lint gate to succeed-or-skip
+      - name: Require the test/static job to succeed and the lint gate to succeed-or-skip
         env:
           LINT_RESULT: ${{ needs.lint.result }}
           TEST_RESULT: ${{ needs.test.result }}
