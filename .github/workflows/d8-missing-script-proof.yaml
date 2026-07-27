@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   proof:
-    uses: ./.github/workflows/reusable-node-ci.yml
+    uses: narduk-enterprises/workflows/.github/workflows/reusable-node-ci.yml@codex/w-gatefix-d8
     with:
       package-manager: npm
       working-directory: .gate-proof
