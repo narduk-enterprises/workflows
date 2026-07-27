@@ -57,6 +57,16 @@ def main() -> None:
     assert document["jobs"]["xcode"]["runs-on"] == "${{ fromJSON(inputs.apple-runner) }}"
     assert document["jobs"]["required"]["runs-on"] == "${{ fromJSON(inputs.lint-runner) }}"
     assert document["jobs"]["required"]["needs"] == ["lint", "xcode"]
+    install_swiftlint = next(
+        item
+        for item in document["jobs"]["lint"]["steps"]
+        if item.get("name") == "Install SwiftLint (official Linux release binary)"
+    )["run"]
+    assert "sha256sum --check --strict" in install_swiftlint
+    assert "python3 -m zipfile -e" in install_swiftlint
+    assert 'find "$dest" -type f -name swiftlint -print -quit' in install_swiftlint
+    assert "/usr/lib/libsourcekitdInProc.so" in install_swiftlint
+    assert "LINUX_SOURCEKIT_LIB_PATH=" in install_swiftlint
 
     validation = step(
         document, "Validate Apple toolchain and gate configuration"
