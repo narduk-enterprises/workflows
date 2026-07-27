@@ -677,6 +677,28 @@ Three things worth stating plainly, because each one is a way this goes wrong:
   (`playwright-evidence-<n>`), because `upload-artifact` v4+ rejects duplicate
   artifact names and a fixed name would fail the instant anyone sharded.
 
+#### Reusing build output in E2E
+
+An E2E launcher that normally rebuilds the application may opt into a
+same-run artifact handoff:
+
+```yaml
+      run-e2e: true
+      e2e-build-artifact-path: apps/web/.output
+```
+
+The build job uploads that relative path only after its gates pass. Every E2E
+shard downloads it to the same path and receives
+`E2E_PREBUILT_ARTIFACT=1`. The consumer's launcher must treat that variable as
+an assertion: validate the expected entry points and fail when any are absent,
+rather than silently rebuilding. A missing upload already fails through
+`if-no-files-found: error`.
+
+The artifact name includes `github.run_id` and `github.run_attempt`, so a retry
+cannot consume an earlier attempt's output. Retention is one day. The input
+defaults to empty, which adds no artifact steps or environment variable for
+existing callers.
+
 #### The isolated Playwright toolchain gate
 
 `playwright-isolated` is download-free and image-owned. The current pool pins

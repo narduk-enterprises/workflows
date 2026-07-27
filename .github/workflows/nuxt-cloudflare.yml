@@ -253,6 +253,17 @@ on:
         required: false
         type: string
         default: "test:e2e"
+      e2e-build-artifact-path:
+        description: >-
+          Relative path, under working-directory, to build output that the
+          build job must upload and every E2E shard must download before the
+          suite runs. Empty (the default) preserves the previous behavior.
+          When set, a missing output is a hard failure and the suite receives
+          E2E_PREBUILT_ARTIFACT=1 so its launcher can require and reuse the
+          downloaded output instead of rebuilding it.
+        required: false
+        type: string
+        default: ""
       e2e-browsers:
         description: >-
           Space-separated required browser engines. On a non-isolated runner
@@ -744,6 +755,19 @@ jobs:
             echo "::endgroup::"
           done
 
+      # Opt-in only. The artifact is produced after every build-lane gate has
+      # passed, so E2E cannot consume output from a partially successful gate.
+      # run_attempt prevents a rerun from downloading an artifact left by an
+      # earlier attempt of the same run.
+      - name: Upload prebuilt E2E application
+        if: inputs.e2e-build-artifact-path != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: e2e-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ inputs.working-directory }}/${{ inputs.e2e-build-artifact-path }}
+          if-no-files-found: error
+          retention-days: 1
+
   # The shard list cannot be built in an expression — there is no range() in
   # the workflow expression language — so it is computed here and consumed by
   # the e2e matrix. Skipped entirely when the caller left e2e off, which
@@ -867,6 +891,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Download prebuilt E2E application
+        if: inputs.e2e-build-artifact-path != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: e2e-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ inputs.working-directory }}/${{ inputs.e2e-build-artifact-path }}
 
       - name: Guard isolated Playwright route
         env:
@@ -1244,6 +1275,7 @@ jobs:
           SHARD: ${{ matrix.shard }}
           TOTAL: ${{ inputs.e2e-shards }}
           EXTRA_ARGS: ${{ inputs.e2e-args }}
+          E2E_PREBUILT_ARTIFACT: ${{ inputs.e2e-build-artifact-path != '' && '1' || '' }}
         run: |
           set -euo pipefail
           # Unlike optional build-lane scripts, run-e2e=true is an assertion
