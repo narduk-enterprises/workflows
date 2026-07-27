@@ -67,6 +67,13 @@ def main() -> None:
     assert 'find "$dest" -type f -name swiftlint -print -quit' in install_swiftlint
     assert "/usr/lib/libsourcekitdInProc.so" in install_swiftlint
     assert "LINUX_SOURCEKIT_LIB_PATH=" in install_swiftlint
+    swiftlint = next(
+        item
+        for item in document["jobs"]["lint"]["steps"]
+        if item.get("name") == "SwiftLint"
+    )["run"]
+    assert '${RUNNER_TEMP}/swiftlint-cache' in swiftlint
+    assert '--cache-path "$cache_path"' in swiftlint
 
     validation = step(
         document, "Validate Apple toolchain and gate configuration"
