@@ -500,9 +500,10 @@ the difference between retiring a local job and retiring half of one:
       extra-scripts: size                # runs after build, in the same lane
 ```
 
-`extra-scripts` runs each named package script with `--if-present` *after*
-`build`, in the same job, so a gate that needs build output (`size-limit`)
-does not require a second job with a second full install and build.
+`extra-scripts` runs each named package script *after* `build`, in the same job,
+so a gate that needs build output (`size-limit`) does not require a second job
+with a second full install and build. Each name is probed first and fails when
+it is absent by default.
 
 With a per-package matrix (generalizes narduk-libs' `package-gates`):
 
@@ -513,12 +514,26 @@ jobs:
     with:
       package-matrix: |
         [
-          {"label": "narduk-core", "filter": "@narduk-enterprises/narduk-core"},
-          {"label": "narduk-auth", "filter": "@narduk-enterprises/narduk-auth"}
+          {
+            "label": "narduk-core",
+            "filter": "@narduk-enterprises/narduk-core",
+            "extra-scripts": "check:dist"
+          },
+          {
+            "label": "narduk-auth",
+            "filter": "@narduk-enterprises/narduk-auth",
+            "extra-scripts": ""
+          }
         ]
     secrets:
       NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
 ```
+
+Matrix lanes own their extras. The optional lane-level `extra-scripts` field
+overrides the legacy shared input even when it is `""`; that explicit empty
+value means the lane has no extra gates. Omitting the field preserves the
+shared-input behavior for existing callers, while declaring it on every lane
+prevents one package's requirement from leaking into another.
 
 ### `nuxt-cloudflare.yml`
 
@@ -586,19 +601,18 @@ Every gate now probes for the script first, and reacts by `require-scripts`:
 
 | `require-scripts` | script missing | effect |
 |---|---|---|
-| `false` (default) | named but absent | `::warning::` + a job-summary line naming the script; lane still green |
-| `true` | named but absent | `::error::` and the job **fails** |
+| `false` (explicit remediation opt-out) | named but absent | `::warning::` + a job-summary line naming the script; lane still green |
+| `true` (default) | named but absent | `::error::` and the job **fails** |
 | either | **empty script name** | lane skipped silently — the caller declared it absent |
 
-**The default is still `false` during the caller-migration phase.** Flipping it
-changes a warning into a required failure for every adopter at once, so callers
-must first declare genuinely absent lanes and prove every remaining name.
+The default is now `true`. The migration first declared absent lanes and proved
+every remaining name; callers retain `false` only as an explicit, temporary
+remediation opt-out.
 
-**To flip it, a caller first declares its absent lanes** by passing an empty
-script name. This is what makes `require-scripts` adoptable at all, because
-some repos have no build or split typecheck lane — without the distinction
-between *"I have no web surface"* and *"I named a script that isn't there"*,
-the repos that most need the check could never turn it on:
+A caller declares absent lanes by passing an empty script name. This is what
+makes `require-scripts` usable when some repos genuinely have no build or split
+typecheck lane — *"I have no web surface"* remains distinct from *"I named a
+script that isn't there"*:
 
 ```yaml
     with:

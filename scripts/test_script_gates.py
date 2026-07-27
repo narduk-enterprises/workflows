@@ -127,11 +127,19 @@ def main() -> int:
     if not ok:
         failures += 1
 
+    for workflow in (NODE_LIB, NUXT_CF):
+        total += 1
+        ok = input_default(workflow, "require-scripts") is True
+        print(("PASS  " if ok else "FAIL  ")
+              + f"{workflow.name} require-scripts defaults fail-closed")
+        if not ok:
+            failures += 1
+
     # ---- node-library.yml: standard lanes and extra scripts ---------------
     for workflow, job, gate, script_name in NODE_LIB_GATES:
         script = gate_script(workflow, job, gate)
         cases = [
-            ("missing + require=false -> warns but PASSES (today's default)",
+            ("missing + require=false -> warns but PASSES (explicit opt-out)",
              {"other": "echo x"}, "false", 0, "::warning::", True),
             ("missing + require=true  -> FAILS loudly",
              {"other": "echo x"}, "true", 1, "::error::", True),
@@ -165,7 +173,8 @@ def main() -> int:
             fixture,
             env_extra={
                 "GATE": "Extra scripts",
-                "SCRIPTS": scripts,
+                "LANE_SCRIPTS_JSON": "null",
+                "LEGACY_SCRIPTS": scripts,
                 "REQUIRE": require,
             },
         )
@@ -182,11 +191,54 @@ def main() -> int:
         ):
             failures += 1
 
+    # A matrix entry's field wins even when it is empty. Run the exact shipped
+    # step twice with a shared fallback that names lane A's gate: lane A owns
+    # and runs it; lane B explicitly owns no extras and must neither inherit,
+    # warn about, nor fail on A's requirement.
+    rc_a, out_a, summary_a = run(
+        node_extra,
+        {"lane:a": "echo RAN_LANE_A"},
+        env_extra={
+            "GATE": "Extra scripts",
+            "LANE_SCRIPTS_JSON": json.dumps("lane:a"),
+            "LEGACY_SCRIPTS": "lane:a",
+            "REQUIRE": "true",
+        },
+    )
+    rc_b, out_b, summary_b = run(
+        node_extra,
+        {},
+        env_extra={
+            "GATE": "Extra scripts",
+            "LANE_SCRIPTS_JSON": json.dumps(""),
+            "LEGACY_SCRIPTS": "lane:a",
+            "REQUIRE": "true",
+        },
+    )
+    total += 1
+    ok = (
+        rc_a == 0
+        and "RAN_LANE_A" in out_a
+        and not summary_a
+        and rc_b == 0
+        and "declared no extra scripts" in out_b
+        and "::warning::" not in out_b
+        and not summary_b
+    )
+    print(("PASS  " if ok else "FAIL  ")
+          + "Node extra scripts lane A requirement cannot leak into lane B")
+    if not ok:
+        failures += 1
+        print(
+            f"      lane A rc={rc_a}, summary={summary_a!r}, out={out_a[:300]!r}\n"
+            f"      lane B rc={rc_b}, summary={summary_b!r}, out={out_b[:300]!r}"
+        )
+
     # ---- nuxt-cloudflare.yml: same contract, plus the empty-name opt-out --
     for workflow, job, gate, script_name in NUXT_CF_GATES:
         script = gate_script(workflow, job, gate)
         cases = [
-            ("missing + require=false -> warns but PASSES (today's default)",
+            ("missing + require=false -> warns but PASSES (explicit opt-out)",
              {"other": "echo x"}, script_name, "false", 0, "::warning::", True),
             ("missing + require=true  -> FAILS loudly",
              {"other": "echo x"}, script_name, "true", 1, "::error::", True),

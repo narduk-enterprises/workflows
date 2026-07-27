@@ -109,19 +109,13 @@ on:
           extra-script lanes now probe before execution so this input governs
           every named package-script gate.
 
-          DEFAULT IS `false`, and that is measured rather than timid. Turned on
-          today it reddens 3 of the 4 adopters at once: narduk-charts and
-          narduk-mapkit define no `lint` script while `run-lint` defaults true,
-          and x-event-recap sets `run-tests: true` with no `test` script. Those
-          are real silent losses that should be fixed — but reddening them on a
-          tag move nobody is watching is how a shared workflow loses adopters.
-
-          Until a repo flips this, a missing script is reported as a
-          `::warning::` and in the job summary, naming the script and the
-          package, so the loss is visible on every run instead of invisible.
+          DEFAULT IS `true`. The estate migration proved every declared
+          standard lane and added per-matrix extra-script declarations before
+          this flipped, so a missing named script is now a hard failure unless
+          a caller explicitly opts back out during a bounded remediation.
         required: false
         type: boolean
-        default: false
+        default: true
       working-directory:
         description: "Directory containing the root package.json / lockfile"
         required: false
@@ -139,24 +133,24 @@ on:
         default: ""
       extra-scripts:
         description: >-
-          Space-separated package scripts run after build in the same lane so
-          they see the build output. Each named script is probed before it
-          runs: a missing entry warns while require-scripts is false and fails
-          hard while require-scripts is true. This is what lets a caller
-          retire a whole local job instead of half of one: narduk-charts'
-          size-limit gate needs `npm run build` to have already run, so as a
-          separate job it would mean a second full install+build.
+          Legacy shared fallback: space-separated package scripts run after
+          build in every matrix lane that omits its own `extra-scripts` field.
+          A lane-level field takes precedence even when it is the empty string,
+          so one package's requirements cannot leak into another package.
+          Non-matrix callers can keep using this input unchanged.
         required: false
         type: string
         default: ""
       package-matrix:
         description: >-
-          JSON array of {label, filter} lanes, one per workspace package —
-          generalizes narduk-libs' package-gates matrix input. `filter` is
-          passed to `pnpm --filter` / `npm --workspace`; leave it "" to run
-          scripts at the repo root instead of a specific package. Default is
-          a single whole-repo lane, so non-monorepo callers (narduk-charts,
-          narduk-skills, narduk-eslint-config) can ignore this input entirely.
+          JSON array of {label, filter, extra-scripts} lanes, one per workspace
+          package — generalizes narduk-libs' package-gates matrix input.
+          `filter` is passed to `pnpm --filter` / `npm --workspace`; leave it
+          "" to run scripts at the repo root. The optional lane-level
+          `extra-scripts` string overrides the shared input, including when it
+          is explicitly empty. Matrix callers should declare it on every lane
+          so each package runs only scripts it genuinely owns. The default
+          remains a single whole-repo lane for non-monorepo callers.
         required: false
         type: string
         default: '[{"label":"default","filter":""}]'
@@ -597,15 +591,41 @@ jobs:
           fi
 
       - name: Extra scripts
-        if: inputs.extra-scripts != ''
+        if: inputs.extra-scripts != '' || matrix['extra-scripts'] != ''
         env:
           GATE: Extra scripts
-          SCRIPTS: ${{ inputs.extra-scripts }}
+          # `toJSON` preserves the distinction the contract needs:
+          #   null -> lane omitted the field; use the legacy shared fallback
+          #   ""   -> lane explicitly declares no extra scripts
+          #   text -> lane owns exactly those scripts
+          LANE_SCRIPTS_JSON: ${{ toJSON(matrix['extra-scripts']) }}
+          LEGACY_SCRIPTS: ${{ inputs.extra-scripts }}
           FILTER: ${{ matrix.filter }}
           PM: ${{ inputs.package-manager }}
           REQUIRE: ${{ inputs.require-scripts }}
         run: |
           set -euo pipefail
+          if [ "$LANE_SCRIPTS_JSON" = "null" ]; then
+            SCRIPTS=$LEGACY_SCRIPTS
+          else
+            SCRIPTS=$(printf '%s' "$LANE_SCRIPTS_JSON" | node -e '
+              let raw = "";
+              process.stdin.on("data", chunk => raw += chunk).on("end", () => {
+                let value;
+                try { value = JSON.parse(raw); }
+                catch { console.error("::error::matrix extra-scripts is not valid JSON"); process.exit(1); }
+                if (typeof value !== "string") {
+                  console.error("::error::matrix extra-scripts must be a string");
+                  process.exit(1);
+                }
+                process.stdout.write(value);
+              });
+            ')
+          fi
+          if [ -z "$SCRIPTS" ]; then
+            echo "$GATE: this matrix lane declared no extra scripts, skipping"
+            exit 0
+          fi
           # Deliberate word splitting: extra-scripts is a space-separated list.
           # shellcheck disable=SC2086
           for SCRIPT in $SCRIPTS; do
