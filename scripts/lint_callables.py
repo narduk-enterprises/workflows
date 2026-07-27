@@ -61,6 +61,12 @@ Each rule below exists because breaking it has a specific, known blast radius:
                                         cannot go red. set -o pipefail (or
                                         set -euo pipefail) makes the pipeline
                                         fail on cmd's status
+  R11 isolated Playwright is fail       the image is the browser supply-chain
+      closed and download-free          boundary. Installer opt-ins, path
+                                        overrides, warning-only/missing gates,
+                                        continue-on-error, or accepting a
+                                        skipped enabled E2E job turn drift into
+                                        a false green (company-hq#343)
 
 Run: python3 scripts/lint_callables.py [paths...]
 Exit 0 clean, 1 on any finding. No third-party imports beyond PyYAML.
@@ -310,6 +316,94 @@ def check_tee_pipefail(path: Path, doc: dict, f: Findings) -> None:
             )
 
 
+def check_fail_closed_playwright(path: Path, doc: dict, f: Findings) -> None:
+    """R11: the isolated browser lane cannot download, skip, or soften drift."""
+    jobs = doc.get("jobs") or {}
+    for job_id, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        if "continue-on-error" in job:
+            f.add(path, f"R11 job '{job_id}' declares continue-on-error — a required gate may not soften failure")
+        for step in job.get("steps") or []:
+            if isinstance(step, dict) and "continue-on-error" in step:
+                f.add(
+                    path,
+                    f"R11 job '{job_id}' step '{step.get('name') or step.get('uses') or '(unnamed)'}' "
+                    "declares continue-on-error — a required gate may not soften failure",
+                )
+
+    e2e = jobs.get("e2e")
+    if not isinstance(e2e, dict) or "e2e-runner" not in str(e2e.get("runs-on", "")):
+        return
+    steps = [step for step in (e2e.get("steps") or []) if isinstance(step, dict)]
+    by_name = {step.get("name"): step for step in steps if step.get("name")}
+    required_names = {
+        "Guard isolated Playwright route",
+        "Assert isolated Playwright toolchain",
+        "Install Playwright browsers",
+        "Run e2e suite",
+    }
+    missing = sorted(required_names - set(by_name))
+    if missing:
+        f.add(path, f"R11 e2e job lacks fail-closed Playwright step(s): {missing}")
+        return
+
+    guard = by_name["Guard isolated Playwright route"]
+    assertion = by_name["Assert isolated Playwright toolchain"]
+    installer = by_name["Install Playwright browsers"]
+    suite = by_name["Run e2e suite"]
+    names = [step.get("name") for step in steps]
+    first_install = min(
+        names.index(name)
+        for name in ("Install dependencies (pnpm)", "Install dependencies (npm)")
+        if name in names
+    )
+    if names.index("Guard isolated Playwright route") > first_install:
+        f.add(path, "R11 isolated-route guard runs after dependency installation — browser acquisition could already occur")
+    if names.index("Assert isolated Playwright toolchain") > names.index("Run e2e suite"):
+        f.add(path, "R11 Playwright image equality is asserted after the suite, which is too late")
+
+    for label, step in (("route guard", guard), ("toolchain assertion", assertion)):
+        condition = str(step.get("if", ""))
+        script = _run_script(step)
+        if "always()" in condition:
+            f.add(path, f"R11 Playwright {label} uses always() — it is a gate, not a diagnostic")
+        if "|| true" in script:
+            f.add(path, f"R11 Playwright {label} contains `|| true` — failure would be swallowed")
+
+    assertion_condition = " ".join(str(assertion.get("if", "")).split())
+    for marker in ("playwright-isolated", "proxmox-playwright-x64"):
+        if marker not in assertion_condition:
+            f.add(path, f"R11 toolchain assertion condition does not cover isolated route marker {marker!r}")
+
+    installer_condition = " ".join(str(installer.get("if", "")).split())
+    for fragment in (
+        "inputs.e2e-install-browsers",
+        "!contains",
+        "playwright-isolated",
+        "proxmox-playwright-x64",
+    ):
+        if fragment not in installer_condition:
+            f.add(path, f"R11 browser installer is not proven unreachable on the isolated route (missing {fragment!r})")
+
+    suite_script = _run_script(suite)
+    for forbidden in ("--if-present", "::warning::", "|| true"):
+        if forbidden in suite_script:
+            f.add(path, f"R11 E2E suite gate contains forbidden fail-open shape {forbidden!r}")
+
+    required = next(
+        (job for job in jobs.values() if isinstance(job, dict) and (job.get("name") or "") == "Required"),
+        None,
+    )
+    required_text = "\n".join(
+        _run_script(step) for step in (required or {}).get("steps", []) if isinstance(step, dict)
+    )
+    if "require_success e2e \"$E2E_RESULT\"" not in required_text:
+        f.add(path, "R11 Required does not demand success from enabled E2E; a skipped toolchain gate could satisfy CI")
+    if "allow_skip e2e " in required_text:
+        f.add(path, "R11 Required still accepts a skipped enabled E2E job")
+
+
 def check_file(path: Path, f: Findings) -> None:
     doc = yaml.safe_load(path.read_text())
     if not isinstance(doc, dict):
@@ -346,6 +440,7 @@ def check_file(path: Path, f: Findings) -> None:
     check_cache_guards(path, doc, f)
     check_store_placement(path, doc, f)
     check_tee_pipefail(path, doc, f)
+    check_fail_closed_playwright(path, doc, f)
 
 
 def main(argv: list[str]) -> int:

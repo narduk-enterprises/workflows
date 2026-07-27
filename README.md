@@ -96,11 +96,12 @@ This is the actual point of the repo, not an implementation detail.
 `docs-governance.yml`, `node-library.yml`, and `nuxt-cloudflare.yml` each end
 with a job named **exactly** `Required`. That job `needs:` every other job the
 workflow defines, runs with `if: always()`, and explicitly checks each
-`needs.<job>.result` — a job that's mandatory must report `success`; a job
-that's gated behind an opt-in input (Playwright e2e, the wrangler dry-run gate,
-a package-matrix lane) may report `success` **or** `skipped`, but never
-`failure` or `cancelled`. `if: always()` jobs succeed by default if you don't
-check anything explicitly — these don't skip that check.
+`needs.<job>.result` — a job that's enabled must report `success`; it may
+report `skipped` only when its controlling input is off. In particular,
+`run-e2e: true` makes the plan, every E2E shard, and (when sharded) the report
+merge mandatory. A skipped enabled job is failure, not an acceptable
+substitute for a toolchain check that never ran. `if: always()` jobs succeed by
+default if you don't check anything explicitly — these don't skip that check.
 
 This generalizes a pattern narduk-libs already proved in production: its `ci.yml`
 runs a 12-lane package matrix, then a `verify` job that `needs: package-gates`
@@ -637,7 +638,8 @@ jobs:
       e2e-shards: 3               # adds --shard=n/3 --reporter=blob + a merge job
       e2e-args: "--project=chromium --workers=1"
       e2e-install-browsers: false # the pool image already has them
-      e2e-browsers-path: /opt/playwright-ci/browsers
+      e2e-browsers: chromium      # exact image revision is asserted + launched
+      e2e-browsers-path: ""       # preserve the guest-exported image-backed path
 ```
 
 Three things worth stating plainly, because each one is a way this goes wrong:
@@ -652,13 +654,47 @@ Three things worth stating plainly, because each one is a way this goes wrong:
   therefore also adds an `E2E report` job that merges the blob reports into
   one HTML report, on the plain `runner` — merging is Node work with no
   browser and has no business on the scarce isolated pool. It runs with
-  `if: always()` so a *failing* shard still produces the report explaining why.
+  `if: !cancelled()` so a *failing* shard still produces the report explaining
+  why without claiming a runner after the operator cancels the run.
 - **Everything here is backward-compatible by construction.** `e2e-shards: 1`
   (the default) emits no `--shard`, no blob reporter, and no merge job, so a
   caller that never asked for sharding sees byte-identical behaviour. The one
   visible change is the per-shard artifact name
   (`playwright-evidence-<n>`), because `upload-artifact` v4+ rejects duplicate
   artifact names and a fixed name would fail the instant anyone sharded.
+
+#### The isolated Playwright toolchain gate
+
+`playwright-isolated` is download-free and image-owned. The current pool pins
+Playwright `1.61.1`: Chromium headless shell revision `1228` (Chromium
+`149.0.7827.55`) and WebKit revision `2311` (WebKit `26.5`). The image keeps
+the package, `browsers.json`, and browser payloads root-owned/read-only under
+`/opt/playwright-ci`; the ephemeral guest exports a job-visible symlink tree
+through `PLAYWRIGHT_BROWSERS_PATH`.
+
+Before a shard starts its suite, the callable now fails unless all of these are
+true:
+
+- the caller directly pins `@playwright/test` to an exact version (no caret,
+  tilde, tag, or range);
+- that pin, the installed `@playwright/test`, installed `playwright-core`, and
+  image Playwright version are identical;
+- the caller and image `browsers.json` SHA-256 values match, and each requested
+  engine's revision/upstream version matches;
+- the selected executable exists, resolves into the immutable image browser
+  tree, has root-owned non-writable ancestry, and passes a real headless launch
+  canary;
+- `PLAYWRIGHT_BROWSERS_PATH` is the absolute `/opt` path exported by the guest,
+  never a workspace or `$RUNNER_TEMP` cache.
+
+The isolated-route guard runs before dependency installation. It rejects
+`e2e-install-browsers: true` and every `e2e-browsers-path` override, while the
+installer step independently excludes both the `playwright-isolated` group and
+`proxmox-playwright-x64` label. A mismatch names consumer/image versions,
+manifest digests, browser revisions, and the upgrade choice, then exits
+non-zero without invoking an installer. Hosted browser jobs may still opt into
+the explicit installer because they own their toolchain rather than consuming
+this pool.
 
 ### `docs-governance.yml`
 
@@ -807,9 +843,10 @@ executed here.
 ## Maintainer conventions
 
 - **`.github/workflows/ci.yml` gates this repo** (~7s). `actionlint` +
-  `scripts/lint_callables.py` + `scripts/test_extra_env.py`. The structural gate
+  `scripts/lint_callables.py` + behavior tests including
+  `scripts/test_playwright_toolchain.py`. The structural gate
   enforces every convention in this list, so none of them can regress silently:
-  see the rule table (R1–R10) at the top of `scripts/lint_callables.py`. Run it
+  see the rule table (R1–R11) at the top of `scripts/lint_callables.py`. Run it
   locally before pushing: `python3 scripts/lint_callables.py`.
 - Third-party and first-party actions are pinned to full commit SHAs with a
   version comment, targeting the current Actions Node runtime (enforced: R4).
