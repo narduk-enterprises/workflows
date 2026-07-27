@@ -766,6 +766,7 @@ jobs:
           name: e2e-build-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ inputs.working-directory }}/${{ inputs.e2e-build-artifact-path }}
           if-no-files-found: error
+          include-hidden-files: true
           retention-days: 1
 
   # The shard list cannot be built in an expression — there is no range() in

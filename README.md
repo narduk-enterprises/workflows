@@ -692,7 +692,9 @@ shard downloads it to the same path and receives
 `E2E_PREBUILT_ARTIFACT=1`. The consumer's launcher must treat that variable as
 an assertion: validate the expected entry points and fail when any are absent,
 rather than silently rebuilding. A missing upload already fails through
-`if-no-files-found: error`.
+`if-no-files-found: error`. Hidden files are included because Nuxt's canonical
+output directory is `.output`; the input is an explicit caller-selected path,
+not a repository-wide artifact sweep.
 
 The artifact name includes `github.run_id` and `github.run_attempt`, so a retry
 cannot consume an earlier attempt's output. Retention is one day. The input

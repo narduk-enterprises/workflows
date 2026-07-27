@@ -45,6 +45,7 @@ def validate(document: dict) -> None:
         "name": ARTIFACT_NAME,
         "path": ARTIFACT_PATH,
         "if-no-files-found": "error",
+        "include-hidden-files": True,
         "retention-days": 1,
     }
     assert download["if"] == condition
@@ -82,6 +83,9 @@ def main() -> None:
             d["jobs"]["build"], "Upload prebuilt E2E application"
         )["with"].__setitem__("name", "e2e-build"),
         lambda d: named_step(
+            d["jobs"]["build"], "Upload prebuilt E2E application"
+        )["with"].__setitem__("include-hidden-files", False),
+        lambda d: named_step(
             d["jobs"]["e2e"], "Download prebuilt E2E application"
         )["with"].__setitem__("path", "."),
         lambda d: named_step(d["jobs"]["e2e"], "Run e2e suite")["env"].pop(
@@ -99,7 +103,7 @@ def main() -> None:
             continue
         raise AssertionError("artifact regression mutation did not fail")
 
-    print("prebuilt E2E artifact contract passed (4 negative mutations)")
+    print("prebuilt E2E artifact contract passed (5 negative mutations)")
 
 
 if __name__ == "__main__":
