@@ -240,7 +240,10 @@ jobs:
 
       - name: SwiftLint
         if: inputs.run-swiftlint
-        run: swiftlint ${{ inputs.swiftlint-args }}
+        run: |
+          cache_path="${RUNNER_TEMP}/swiftlint-cache"
+          mkdir -p "$cache_path"
+          swiftlint ${{ inputs.swiftlint-args }} --cache-path "$cache_path"
 
       - name: Boundary and plist checks
         if: inputs.linux-checks != ''
