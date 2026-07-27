@@ -10,11 +10,12 @@ name: Reusable Apple CI
 # owns exactly one always-on Mac slot, so agent-infrastructure AGENTS.md ("CI &
 # self-hosted runners") requires routing per JOB, not per repo: only work that
 # genuinely needs Xcode/macOS (xcodebuild, `swift test` against Apple
-# frameworks, codesign) belongs on the Mac runner. Everything that merely
-# parses Swift or reads a plist — SwiftLint via the official Linux release
-# binary, shell/grep boundary checks, plist checks via python3 `plistlib` —
-# runs on Linux so it never occupies the Mac slot. agent-hub-v3 is the worked
-# example that pattern came from. Hence two separately-routed jobs:
+# frameworks, codesign) belongs on the Mac runner. SwiftLint does not compile
+# the project, but its official Linux binary still dynamically loads SourceKit;
+# the Linux runner therefore provides the pinned Swift SourceKit runtime layer.
+# SwiftLint, shell/grep boundary checks, and plist checks via python3 `plistlib`
+# stay on Linux so they never occupy the Mac slot. Hence two separately-routed
+# jobs:
 #
 #   lint  -> `lint-runner`  (Linux; defaults to GitHub-hosted ubuntu-latest)
 #   xcode -> `apple-runner` (the repo-scoped Mac; REQUIRED, no default)
@@ -141,10 +142,11 @@ on:
       run-swiftlint:
         description: >-
           Run SwiftLint on the Linux runner, using the official Linux release
-          binary (it parses Swift without compiling, so it does not need a
-          Mac). Opt-in: enabling it on a repo with no .swiftlint.yml runs the
-          full default rule set and will usually be red on first contact, so
-          adopt a repo-owned config in the same change.
+          binary. It does not compile the project and does not need a Mac, but
+          it dynamically loads libsourcekitdInProc.so from the runner's pinned
+          Swift SourceKit runtime layer. Opt-in: enabling it on a repo with no
+          .swiftlint.yml runs the full default rule set and will usually be red
+          on first contact, so adopt a repo-owned config in the same change.
         required: false
         type: boolean
         default: false
@@ -219,7 +221,7 @@ jobs:
           curl --fail --location --silent --show-error --retry 3 \
             --output "${dest}/swiftlint_linux_amd64.zip" "$url"
           echo "${SWIFTLINT_SHA256}  ${dest}/swiftlint_linux_amd64.zip" | sha256sum --check --strict
-          unzip -q -o "${dest}/swiftlint_linux_amd64.zip" -d "$dest"
+          python3 -m zipfile -e "${dest}/swiftlint_linux_amd64.zip" "$dest"
           # The archive layout has moved between releases (bare binary vs
           # bin/swiftlint); locate it rather than assuming.
           binary="$(find "$dest" -type f -name swiftlint -print -quit)"
@@ -229,6 +231,12 @@ jobs:
           fi
           chmod +x "$binary"
           dirname "$binary" >> "$GITHUB_PATH"
+          sourcekit_library="/usr/lib/libsourcekitdInProc.so"
+          if [ ! -r "$sourcekit_library" ]; then
+            echo "::error::SwiftLint requires the pinned Linux SourceKit runtime at $sourcekit_library"
+            exit 1
+          fi
+          echo "LINUX_SOURCEKIT_LIB_PATH=$sourcekit_library" >> "$GITHUB_ENV"
 
       - name: SwiftLint
         if: inputs.run-swiftlint

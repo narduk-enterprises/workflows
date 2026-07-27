@@ -378,12 +378,13 @@ slot and `AGENTS.md` requires that only work needing Xcode/macOS occupy it:
 
 - `apple-runner` — `xcodebuild`, `swift build`/`swift test`, anything needing
   the Apple toolchain. Required, no default.
-- `lint-runner` — SwiftLint (the official Linux release binary parses Swift
-  without compiling), plus `linux-checks` for shell/grep boundary gates and
-  plist checks via `python3` `plistlib` (not PlistBuddy/`plutil`, which are
-  macOS-only). Defaults to `"ubuntu-latest"`; a repo approved for the
-  `linux-ci` organization group should pass that route's `runsOn` object
-  instead:
+- `lint-runner` — SwiftLint plus `linux-checks` for shell/grep boundary gates
+  and plist checks via `python3` `plistlib` (not PlistBuddy/`plutil`, which are
+  macOS-only). SwiftLint does not compile the project, but its official Linux
+  binary still dynamically loads `libsourcekitdInProc.so`; self-hosted
+  `linux-ci` runners provide the pinned Swift SourceKit runtime layer. Defaults
+  to `"ubuntu-latest"`; a repo approved for the `linux-ci` organization group
+  should pass that route's `runsOn` object instead:
 
 ```yaml
       lint-runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
@@ -399,6 +400,12 @@ first contact — GeoGridKit's first run produced 158 errors — so adopt a
 repo-owned config in the same change. Prefer `only_rules:` over
 `disabled_rules:` there: an allowlist cannot be broken by a future SwiftLint
 release adding a rule.
+
+The checksum verifies the downloaded SwiftLint archive; it does not provide the
+Swift SourceKit runtime. The install step separately fails closed unless
+`/usr/lib/libsourcekitdInProc.so` is readable, exports that exact path through
+`LINUX_SOURCEKIT_LIB_PATH`, and still locates the unpacked `swiftlint` binary
+with `find` because upstream archive layouts have changed.
 
 Archive/sign/notarize/TestFlight/Sparkle are **not** here, for the same reason
 `node-library.yml` omits publish: they need temporary keychains, the host-wide
