@@ -84,8 +84,28 @@ def run(script: str, fixture: dict, *, env_extra: dict[str, str]) -> tuple[int, 
         pathlib.Path(tmp, "package.json").write_text(json.dumps({"name": "f", "scripts": fixture}))
         summary = pathlib.Path(tmp, "summary")
         summary.touch()
+        # The repository's own CI does not provision pnpm because it has no
+        # Node project to install. Give behavior tests a deterministic shim
+        # that exercises the shipped `pnpm run <script>` branch while using
+        # npm only as the local package-script executor. Any other pnpm shape
+        # fails, so the shim cannot accidentally bless a malformed command.
+        bin_dir = pathlib.Path(tmp, "bin")
+        bin_dir.mkdir()
+        pnpm = bin_dir / "pnpm"
+        pnpm.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            'if [ "$#" -lt 2 ] || [ "$1" != "run" ]; then\n'
+            '  echo "unexpected pnpm invocation: $*" >&2\n'
+            "  exit 64\n"
+            "fi\n"
+            "shift\n"
+            'exec npm run "$@"\n'
+        )
+        pnpm.chmod(0o755)
         env = {
             **os.environ,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "FILTER": "",
             "PM": "npm",
             # e2e-only knobs; harmless for the other gates and required by the
