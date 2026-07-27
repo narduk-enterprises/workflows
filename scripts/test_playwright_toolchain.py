@@ -91,10 +91,9 @@ def make_fixture(root: pathlib.Path) -> dict[str, pathlib.Path]:
 const path = require('node:path')
 function engine(directory, executable) {
   return {
-    executablePath() {
-      return path.join(process.env.PLAYWRIGHT_BROWSERS_PATH, directory, executable)
-    },
-    async launch() {
+    async launch(options) {
+      if (options.executablePath !== path.join(process.env.PLAYWRIGHT_BROWSERS_PATH, directory, executable))
+        throw new Error(`wrong executable selected: ${options.executablePath}`)
       return {
         async newPage() {
           return {
@@ -108,7 +107,7 @@ function engine(directory, executable) {
   }
 }
 module.exports = {
-  chromium: engine('chromium_headless_shell-1228', 'chrome-linux/headless_shell'),
+  chromium: engine('chromium_headless_shell-1228', 'chrome-headless-shell-linux64/chrome-headless-shell'),
   webkit: engine('webkit-2311', 'pw_run.sh'),
 }
 """
@@ -121,7 +120,10 @@ module.exports = {
     write_json(image / "npm/node_modules/playwright-core/browsers.json", BROWSERS)
 
     executables = [
-        ("chromium_headless_shell-1228", "chrome-linux/headless_shell"),
+        (
+            "chromium_headless_shell-1228",
+            "chrome-headless-shell-linux64/chrome-headless-shell",
+        ),
         ("webkit-2311", "pw_run.sh"),
     ]
     for directory, executable in executables:
@@ -219,7 +221,10 @@ def main() -> int:
         failed += not check("browser revision drift fails", rc, output, 1, "browser manifest mismatch")
 
         fixture = make_fixture(root / "missing-browser")
-        (fixture["image"] / "browsers/chromium_headless_shell-1228/chrome-linux/headless_shell").unlink()
+        (
+            fixture["image"]
+            / "browsers/chromium_headless_shell-1228/chrome-headless-shell-linux64/chrome-headless-shell"
+        ).unlink()
         rc, output = run_toolchain(fixture)
         total += 1
         failed += not check("missing selected browser fails", rc, output, 1, "executable is missing")

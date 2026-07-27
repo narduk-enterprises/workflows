@@ -1158,13 +1158,23 @@ jobs:
 
             const requested = [...new Set((process.env.REQUIRED_BROWSERS || '').trim().split(/\s+/).filter(Boolean))]
             if (!requested.length) fail('e2e-browsers must name at least one required engine')
-            const supported = { chromium: 'chromium-headless-shell', webkit: 'webkit' }
+            const supported = {
+              chromium: {
+                manifestName: 'chromium-headless-shell',
+                executableParts: ['chrome-headless-shell-linux64', 'chrome-headless-shell'],
+              },
+              webkit: {
+                manifestName: 'webkit',
+                executableParts: ['pw_run.sh'],
+              },
+            }
             const playwright = localRequire('@playwright/test')
             for (const engineName of requested) {
-              const manifestName = supported[engineName]
-              if (!manifestName) {
+              const selection = supported[engineName]
+              if (!selection) {
                 fail(`unsupported isolated browser "${engineName}"; supported engines are chromium and webkit`)
               }
+              const { manifestName, executableParts } = selection
               const expected = consumerManifest.browsers.find(item => item.name === manifestName)
               const observed = imageManifest.browsers.find(item => item.name === manifestName)
               if (!expected || !observed) fail(`${manifestName} is absent from a browser manifest`)
@@ -1175,8 +1185,9 @@ jobs:
               }
 
               const engine = playwright[engineName]
-              if (!engine?.executablePath || !engine?.launch) fail(`@playwright/test does not expose ${engineName}`)
-              const selected = engine.executablePath()
+              if (!engine?.launch) fail(`@playwright/test does not expose ${engineName}`)
+              const browserDirectory = `${manifestName.replaceAll('-', '_')}-${observed.revision}`
+              const selected = join(jobPath, browserDirectory, ...executableParts)
               if (!selected || !existsSync(selected)) fail(`${engineName} executable is missing: ${selected || '(empty path)'}`)
               const realized = realpathSync(selected)
               if (!beneath(realized, imageBrowsersRoot)) {
@@ -1189,7 +1200,7 @@ jobs:
               }
               add(`${engineName} executable`, realized)
 
-              const browser = await engine.launch({ headless: true })
+              const browser = await engine.launch({ headless: true, executablePath: selected })
               try {
                 const page = await browser.newPage()
                 await page.setContent('<title>playwright-isolated-canary</title>')
