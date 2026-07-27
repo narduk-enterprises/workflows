@@ -1,0 +1,24 @@
+name: D-8 Missing Script Proof
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: d8-missing-script-proof-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proof:
+    uses: ./.github/workflows/reusable-node-ci.yml
+    with:
+      package-manager: npm
+      working-directory: .gate-proof
+      run-lint: true
+      run-typecheck: false
+      run-tests: false
+      run-build: false
+      require-scripts: true
