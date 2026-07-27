@@ -1,0 +1,55 @@
+name: D-8 Missing Script Proof
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: d8-missing-script-proof-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  proof:
+    name: Missing lint script must fail
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Execute the exact shipped `run:` block, not a copy. The fixture has no
+      # lint script and require-scripts is on, so this step must go RED.
+      - name: Execute the shipped lint gate against the missing-script fixture
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import subprocess
+
+          from scripts.test_script_gates import REUSABLE_NODE, gate_script
+
+          summary = pathlib.Path(os.environ["RUNNER_TEMP"], "d8-proof-summary.md")
+          summary.touch()
+          script = gate_script(REUSABLE_NODE, "ci", "Lint")
+          result = subprocess.run(
+              ["bash", "-c", script],
+              cwd=".gate-proof",
+              env={
+                  **os.environ,
+                  "GATE": "Lint",
+                  "SCRIPT": "lint",
+                  "PM": "npm",
+                  "REQUIRE": "true",
+                  "GITHUB_STEP_SUMMARY": str(summary),
+              },
+              text=True,
+          )
+          print(summary.read_text())
+          raise SystemExit(result.returncode)
+          PY
