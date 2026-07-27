@@ -1096,8 +1096,12 @@ jobs:
 
             const localRequire = createRequire(join(process.cwd(), 'package.json'))
             const testPackagePath = localRequire.resolve('@playwright/test/package.json')
-            const corePackagePath = localRequire.resolve('playwright-core/package.json')
+            const testRequire = createRequire(testPackagePath)
+            const playwrightPackagePath = testRequire.resolve('playwright/package.json')
+            const playwrightRequire = createRequire(playwrightPackagePath)
+            const corePackagePath = playwrightRequire.resolve('playwright-core/package.json')
             const consumerPackage = readJson(testPackagePath)
+            const consumerPlaywrightPackage = readJson(playwrightPackagePath)
             const consumerCorePackage = readJson(corePackagePath)
             const consumerManifestPath = join(dirname(corePackagePath), 'browsers.json')
             const consumerManifest = readJson(consumerManifestPath)
@@ -1111,6 +1115,7 @@ jobs:
 
             add('consumer package pin', declared)
             add('consumer @playwright/test', consumerPackage.version)
+            add('consumer playwright', consumerPlaywrightPackage.version)
             add('consumer playwright-core', consumerCorePackage.version)
             add('image Playwright', imagePackage.version)
             add('consumer browsers.json SHA-256', consumerManifestSha)
@@ -1124,11 +1129,12 @@ jobs:
             }
             const versions = new Set([
               consumerPackage.version,
+              consumerPlaywrightPackage.version,
               consumerCorePackage.version,
               imagePackage.version,
             ])
             if (versions.size !== 1) {
-              fail(`Playwright version mismatch: consumer=${consumerPackage.version}, core=${consumerCorePackage.version}, image=${imagePackage.version}`)
+              fail(`Playwright version mismatch: test=${consumerPackage.version}, runtime=${consumerPlaywrightPackage.version}, core=${consumerCorePackage.version}, image=${imagePackage.version}`)
             }
             if (consumerManifestSha !== imageManifestSha) {
               fail(`browser manifest mismatch: consumer=${consumerManifestSha}, image=${imageManifestSha}`)

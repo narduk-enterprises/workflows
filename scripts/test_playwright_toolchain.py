@@ -73,10 +73,19 @@ def make_fixture(root: pathlib.Path) -> dict[str, pathlib.Path]:
         {"name": "@playwright/test", "version": VERSION, "main": "index.js"},
     )
     write_json(
-        project / "node_modules/playwright-core/package.json",
+        project / "node_modules/@playwright/test/node_modules/playwright/package.json",
+        {"name": "playwright", "version": VERSION},
+    )
+    write_json(
+        project
+        / "node_modules/@playwright/test/node_modules/playwright/node_modules/playwright-core/package.json",
         {"name": "playwright-core", "version": VERSION},
     )
-    write_json(project / "node_modules/playwright-core/browsers.json", BROWSERS)
+    write_json(
+        project
+        / "node_modules/@playwright/test/node_modules/playwright/node_modules/playwright-core/browsers.json",
+        BROWSERS,
+    )
 
     fake_module = r"""
 const path = require('node:path')
@@ -200,7 +209,11 @@ def main() -> int:
         fixture = make_fixture(root / "wrong-revision")
         changed = json.loads(json.dumps(BROWSERS))
         changed["browsers"][0]["revision"] = "9999"
-        write_json(fixture["project"] / "node_modules/playwright-core/browsers.json", changed)
+        write_json(
+            fixture["project"]
+            / "node_modules/@playwright/test/node_modules/playwright/node_modules/playwright-core/browsers.json",
+            changed,
+        )
         rc, output = run_toolchain(fixture)
         total += 1
         failed += not check("browser revision drift fails", rc, output, 1, "browser manifest mismatch")
