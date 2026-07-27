@@ -1,0 +1,831 @@
+name: Reusable Browser Tests
+
+# Private-repository Playwright CI for the estate's isolated browser pool.
+#
+# The caller must resolve BOTH runner inputs from the fleet manifest. Browser
+# jobs are admitted only after `contract` proves the exact organization-group
+# route returned for the dedicated pool:
+#
+#   {"group":"playwright-isolated",
+#    "labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}
+#
+# The browser jobs receive no declared secrets and no deploy/production
+# credentials. They consume a same-run build artifact, start only app-local
+# test state through the caller's Playwright config, and use the automatic
+# short-lived GITHUB_TOKEN only for checkout, artifact transfer, and optional
+# package reads.
+#
+# Open pool defects are handled fail closed rather than assumed away:
+# - agent-infrastructure#323: the immutable /opt browser tree is never written
+#   or repaired. Caller pin, installed packages, image package, browsers.json,
+#   selected executable ownership, and a real launch must all match.
+# - agent-infrastructure#267: this workflow does not alter firewall/DNS state,
+#   add sleeps, or hide egress failure. GitHub/package access must work or the
+#   job fails normally.
+# - agent-infrastructure#248/#237: workflow code never claims/releases leases
+#   or clears quarantine. A missing/quarantined runner cannot become a skipped
+#   success; enabled shard results are mandatory in Required.
+#
+# Chromium is three shards by default. WebKit is opt-in and starts only after
+# Chromium succeeds, also with three shards and max-parallel three. Reports
+# merge on ordinary Linux CI, never on the scarce browser pool.
+#
+# Concurrency belongs in the caller. A called workflow evaluates concurrency
+# in the caller's context and can accidentally cancel its own caller; the
+# repository structural gate rejects workflow-level concurrency here.
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      linux-runner:
+        description: >-
+          Required JSON runsOn object for build-artifact validation, report
+          merge, and Required. Resolve workload linux-ci from the fleet
+          manifest and paste runsOn verbatim.
+        required: true
+        type: string
+      browser-runner:
+        description: >-
+          Required JSON runsOn object for browser shards. Resolve workload
+          browser from the fleet manifest and paste runsOn verbatim. The
+          validate job rejects every route except the dedicated
+          playwright-isolated organization group with the
+          proxmox-playwright-x64 pool labels.
+        required: true
+        type: string
+      node-version:
+        description: "Node.js version provisioned explicitly on every runner"
+        required: false
+        type: string
+        default: "22"
+      package-manager:
+        description: "Package manager: pnpm or npm"
+        required: false
+        type: string
+        default: "pnpm"
+      working-directory:
+        description: "Directory containing package.json and the Playwright dependency"
+        required: false
+        type: string
+        default: "."
+      build-artifact-path:
+        description: >-
+          Relative path under working-directory uploaded earlier in this same
+          run by the caller's build gate. The artifact name is fixed to
+          e2e-build-<run_id>-<run_attempt>, preventing cross-run or prior-attempt
+          consumption.
+        required: true
+        type: string
+      build-artifact-marker:
+        description: >-
+          File relative to build-artifact-path that proves the downloaded
+          production build is complete (for example server/index.mjs).
+        required: true
+        type: string
+      playwright-version:
+        description: >-
+          Exact @playwright/test version expected from the caller and immutable
+          pool image. Ranges and version skew fail before tests start.
+        required: true
+        type: string
+      e2e-script:
+        description: "Required package.json script that runs Playwright and forwards CLI arguments"
+        required: false
+        type: string
+        default: "test:e2e"
+      chromium-args:
+        description: "Arguments added to Chromium shards before --shard and --reporter"
+        required: false
+        type: string
+        default: "--project=chromium --workers=1"
+      webkit-args:
+        description: "Arguments added to WebKit shards before --shard and --reporter"
+        required: false
+        type: string
+        default: "--project=webkit --workers=1"
+      shards:
+        description: "Shard count for each enabled browser engine"
+        required: false
+        type: number
+        default: 3
+      run-webkit:
+        description: "Run WebKit after Chromium (intended for main/nightly/release callers)"
+        required: false
+        type: boolean
+        default: false
+      browser-timeout-minutes:
+        description: "Timeout for each browser shard"
+        required: false
+        type: number
+        default: 45
+      report-timeout-minutes:
+        description: "Timeout for the ordinary-Linux report merge"
+        required: false
+        type: number
+        default: 15
+    outputs:
+      build-artifact:
+        description: "Same-run build artifact consumed by every shard"
+        value: ${{ jobs.contract.outputs.build-artifact }}
+      report-artifact:
+        description: "Merged HTML report artifact retained for 14 days"
+        value: ${{ jobs.report.outputs.report-artifact }}
+      playwright-version:
+        description: "Exact Playwright version validated against the pool image"
+        value: ${{ jobs.contract.outputs.playwright-version }}
+
+jobs:
+  contract:
+    name: Validate routes and browser contract
+    # This must run before any caller-controlled self-hosted route is evaluated.
+    # A labels-only or wrong-group route therefore fails on a credential-free
+    # hosted runner instead of scheduling the validation itself on the wrong
+    # organization host.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      shards: ${{ steps.contract.outputs.shards }}
+      build-artifact: ${{ steps.contract.outputs.build-artifact }}
+      playwright-version: ${{ steps.contract.outputs.playwright-version }}
+    steps:
+      - name: Validate dedicated route and inputs
+        id: contract
+        env:
+          BROWSER_ROUTE: ${{ inputs.browser-runner }}
+          BUILD_ARTIFACT_PATH: ${{ inputs.build-artifact-path }}
+          BUILD_ARTIFACT_MARKER: ${{ inputs.build-artifact-marker }}
+          E2E_SCRIPT: ${{ inputs.e2e-script }}
+          EXPECTED_PLAYWRIGHT_VERSION: ${{ inputs.playwright-version }}
+          LINUX_ROUTE: ${{ inputs.linux-runner }}
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+          SHARDS: ${{ inputs.shards }}
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const path = require('node:path')
+          const errors = []
+          const parseRoute = (name, raw) => {
+            try {
+              return JSON.parse(raw || '')
+            } catch (error) {
+              errors.push(`${name} is not valid JSON: ${error.message}`)
+              return undefined
+            }
+          }
+          const validateRoute = (name, route, group, labels) => {
+            if (!route || Array.isArray(route) || typeof route !== 'object') {
+              errors.push(`${name} must be the manifest runsOn object, not a string or labels-only array`)
+              return
+            }
+            if (route.group !== group) {
+              errors.push(`${name} group must be ${group} (got ${JSON.stringify(route.group)})`)
+            }
+            if (JSON.stringify(route.labels) !== JSON.stringify(labels)) {
+              errors.push(`${name} labels must equal the manifest route: ${JSON.stringify(labels)}`)
+            }
+            if (Object.keys(route).sort().join(',') !== 'group,labels') {
+              errors.push(`${name} may contain only the manifest group and labels fields`)
+            }
+          }
+          validateRoute(
+            'browser-runner',
+            parseRoute('browser-runner', process.env.BROWSER_ROUTE),
+            'playwright-isolated',
+            ['self-hosted', 'Linux', 'X64', 'proxmox-playwright-x64'],
+          )
+          validateRoute(
+            'linux-runner',
+            parseRoute('linux-runner', process.env.LINUX_ROUTE),
+            'linux-ci',
+            ['self-hosted', 'Linux', 'X64', 'proxmox', 'linux-ci'],
+          )
+          if (!/^[1-9][0-9]*$/.test(process.env.SHARDS || '')) {
+            errors.push(`shards must be an integer >= 1 (got ${JSON.stringify(process.env.SHARDS)})`)
+          }
+          const validateRelative = (name, value, allowDot = false) => {
+            if (!value) {
+              errors.push(`${name} must not be empty`)
+              return
+            }
+            if (path.isAbsolute(value) || value.includes('\\')) {
+              errors.push(`${name} must be a portable relative path`)
+              return
+            }
+            const normalized = path.posix.normalize(value)
+            if ((!allowDot && normalized === '.') || normalized === '..' || normalized.startsWith('../')) {
+              errors.push(`${name} must stay inside working-directory`)
+            }
+          }
+          validateRelative('working-directory', process.env.WORKING_DIRECTORY, true)
+          validateRelative('build-artifact-path', process.env.BUILD_ARTIFACT_PATH)
+          validateRelative('build-artifact-marker', process.env.BUILD_ARTIFACT_MARKER)
+          if (!process.env.E2E_SCRIPT) errors.push('e2e-script must not be empty')
+          if (!['pnpm', 'npm'].includes(process.env.PACKAGE_MANAGER)) {
+            errors.push('package-manager must be pnpm or npm')
+          }
+          if (!/^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/.test(process.env.EXPECTED_PLAYWRIGHT_VERSION || '')) {
+            errors.push('playwright-version must be an exact version, not a range or tag')
+          }
+          if (errors.length) {
+            for (const error of errors) console.error(`::error::${error}`)
+            process.exit(1)
+          }
+          NODE
+          artifact="e2e-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          {
+            echo "shards=[$(seq 1 "${SHARDS}" | paste -sd, -)]"
+            echo "build-artifact=$artifact"
+            echo "playwright-version=${EXPECTED_PLAYWRIGHT_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate same-run production build
+    needs: contract
+    runs-on: ${{ fromJSON(inputs.linux-runner) }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download same-run production build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.contract.outputs.build-artifact }}
+          path: ${{ inputs.working-directory }}/${{ inputs.build-artifact-path }}
+
+      - name: Require production build marker
+        env:
+          MARKER: ${{ inputs.working-directory }}/${{ inputs.build-artifact-path }}/${{ inputs.build-artifact-marker }}
+        run: |
+          set -euo pipefail
+          if [ ! -f "$MARKER" ]; then
+            echo "::error::same-run production build marker is missing: $MARKER"
+            exit 1
+          fi
+          echo "validated same-run production build marker: $MARKER"
+
+  chromium:
+    name: Chromium
+    needs: [contract, validate]
+    runs-on: ${{ fromJSON(inputs.browser-runner) }}
+    timeout-minutes: ${{ inputs.browser-timeout-minutes }}
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: ${{ fromJSON(needs.contract.outputs.shards) }}
+    env:
+      CI: "1"
+      E2E_PREBUILT_ARTIFACT: "1"
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Guard isolated Playwright route
+        env:
+          ROUTE: ${{ inputs.browser-runner }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const route = JSON.parse(process.env.ROUTE)
+          if (route.group !== 'playwright-isolated' || !route.labels?.includes('proxmox-playwright-x64')) {
+            console.error('::error::browser shard is not routed to the dedicated Playwright pool')
+            process.exit(1)
+          }
+          console.log('dedicated Playwright route confirmed; job-time browser installation is forbidden')
+          NODE
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download same-run production build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.contract.outputs.build-artifact }}
+          path: ${{ inputs.working-directory }}/${{ inputs.build-artifact-path }}
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+
+      - name: Configure package registry auth
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -f ./scripts/package-registry-auth.mjs ]; then
+            node ./scripts/package-registry-auth.mjs
+          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
+            node ./tools/configure-package-registry-auth.mjs
+          else
+            echo "no package-registry bootstrap script present; continuing with the ephemeral GITHUB_TOKEN only"
+          fi
+
+      - name: Point pnpm at a workspace-local store (self-hosted)
+        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
+        run: &place_pnpm_store |
+          set -euo pipefail
+          mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
+          if [ "$mount_point" = "/" ]; then
+            echo "workspace is on root; pnpm's default store is same-device"
+            exit 0
+          fi
+          store="$mount_point/pnpm-store"
+          if [ ! -d "$store" ] || [ ! -w "$store" ]; then
+            echo "no writable same-device pnpm store at $store; using pnpm default"
+            exit 0
+          fi
+          echo "npm_config_store_dir=$store" >> "$GITHUB_ENV"
+
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci
+
+      - name: Assert isolated Playwright toolchain
+        env:
+          EXPECTED_PLAYWRIGHT_VERSION: ${{ inputs.playwright-version }}
+          PLAYWRIGHT_ALLOWED_BROWSER_PREFIX: /opt
+          PLAYWRIGHT_TOOLCHAIN_OWNER_UID: "0"
+          PLAYWRIGHT_TOOLCHAIN_ROOT: /opt/playwright-ci
+          REQUIRED_BROWSERS: chromium
+        run: &assert_playwright_toolchain |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync, existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
+          import { createHash } from 'node:crypto'
+          import { createRequire } from 'node:module'
+          import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+
+          const rows = []
+          const summary = process.env.GITHUB_STEP_SUMMARY
+          const add = (label, value) => rows.push(`| ${label} | \`${String(value).replaceAll('|', '\\|')}\` |`)
+          const digest = path => createHash('sha256').update(readFileSync(path)).digest('hex')
+          const readJson = path => JSON.parse(readFileSync(path, 'utf8'))
+          const fail = message => { throw new Error(message) }
+          const beneath = (path, root) => {
+            const rel = relative(root, path)
+            return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
+          }
+          const ownerUid = Number(process.env.PLAYWRIGHT_TOOLCHAIN_OWNER_UID)
+          const requireRootOwnedReadOnly = (path, label) => {
+            const observed = statSync(path)
+            if (observed.uid !== ownerUid || (observed.mode & 0o022) !== 0) {
+              fail(`${label} is not root-owned and read-only: ${path}`)
+            }
+          }
+
+          try {
+            if (!Number.isInteger(ownerUid) || ownerUid < 0) fail('invalid toolchain owner uid')
+            const expectedVersion = process.env.EXPECTED_PLAYWRIGHT_VERSION
+            const imageRoot = resolve(process.env.PLAYWRIGHT_TOOLCHAIN_ROOT || '')
+            const imagePackagePath = join(imageRoot, 'npm/node_modules/playwright/package.json')
+            const imageManifestPath = join(imageRoot, 'npm/node_modules/playwright-core/browsers.json')
+            const imageBrowsersRoot = realpathSync(join(imageRoot, 'browsers'))
+            for (const [path, label] of [
+              [imagePackagePath, 'image Playwright package'],
+              [imageManifestPath, 'image browser manifest'],
+              [imageBrowsersRoot, 'image browser root'],
+            ]) {
+              if (!existsSync(path)) fail(`${label} is missing: ${path}`)
+              requireRootOwnedReadOnly(path, label)
+            }
+
+            const manifest = readJson('package.json')
+            const declared = manifest.devDependencies?.['@playwright/test']
+              ?? manifest.dependencies?.['@playwright/test']
+            if (!declared) fail('package.json must directly pin @playwright/test')
+            if (declared !== expectedVersion) {
+              fail(`caller pin ${JSON.stringify(declared)} does not equal required exact version ${JSON.stringify(expectedVersion)}`)
+            }
+
+            const localRequire = createRequire(join(process.cwd(), 'package.json'))
+            const testPackagePath = localRequire.resolve('@playwright/test/package.json')
+            const testRequire = createRequire(testPackagePath)
+            const playwrightPackagePath = testRequire.resolve('playwright/package.json')
+            const playwrightRequire = createRequire(playwrightPackagePath)
+            const corePackagePath = playwrightRequire.resolve('playwright-core/package.json')
+            const consumerPackage = readJson(testPackagePath)
+            const consumerPlaywrightPackage = readJson(playwrightPackagePath)
+            const consumerCorePackage = readJson(corePackagePath)
+            const consumerManifestPath = join(dirname(corePackagePath), 'browsers.json')
+            const consumerManifest = readJson(consumerManifestPath)
+            const imagePackage = readJson(imagePackagePath)
+            const imageManifest = readJson(imageManifestPath)
+            const consumerManifestSha = digest(consumerManifestPath)
+            const imageManifestSha = digest(imageManifestPath)
+            const versions = new Set([
+              expectedVersion,
+              consumerPackage.version,
+              consumerPlaywrightPackage.version,
+              consumerCorePackage.version,
+              imagePackage.version,
+            ])
+            add('required Playwright', expectedVersion)
+            add('consumer package pin', declared)
+            add('installed @playwright/test', consumerPackage.version)
+            add('installed playwright-core', consumerCorePackage.version)
+            add('image Playwright', imagePackage.version)
+            add('consumer browsers.json SHA-256', consumerManifestSha)
+            add('image browsers.json SHA-256', imageManifestSha)
+            if (versions.size !== 1) {
+              fail(`Playwright version mismatch: expected=${expectedVersion}, test=${consumerPackage.version}, runtime=${consumerPlaywrightPackage.version}, core=${consumerCorePackage.version}, image=${imagePackage.version}`)
+            }
+            if (consumerManifestSha !== imageManifestSha) {
+              fail(`browser manifest mismatch: consumer=${consumerManifestSha}, image=${imageManifestSha}`)
+            }
+
+            const jobPath = process.env.PLAYWRIGHT_BROWSERS_PATH
+            if (!jobPath || !isAbsolute(jobPath)) fail('PLAYWRIGHT_BROWSERS_PATH must be the absolute image-backed guest path')
+            const resolvedJobPath = resolve(jobPath)
+            const forbiddenRoots = [process.env.RUNNER_TEMP, process.env.GITHUB_WORKSPACE]
+              .filter(Boolean).map(path => resolve(path))
+            if (forbiddenRoots.some(root => beneath(resolvedJobPath, root))) {
+              fail(`job-local browser path is forbidden: ${resolvedJobPath}`)
+            }
+            const allowedPrefix = resolve(process.env.PLAYWRIGHT_ALLOWED_BROWSER_PREFIX || '')
+            if (!beneath(resolvedJobPath, allowedPrefix)) {
+              fail(`browser path must live under ${allowedPrefix}: ${resolvedJobPath}`)
+            }
+
+            const supported = {
+              chromium: {
+                manifestName: 'chromium-headless-shell',
+                executableParts: ['chrome-headless-shell-linux64', 'chrome-headless-shell'],
+              },
+              webkit: { manifestName: 'webkit', executableParts: ['pw_run.sh'] },
+            }
+            const requested = [...new Set((process.env.REQUIRED_BROWSERS || '').trim().split(/\s+/).filter(Boolean))]
+            if (!requested.length) fail('at least one browser engine is required')
+            const playwright = localRequire('@playwright/test')
+            for (const engineName of requested) {
+              const selection = supported[engineName]
+              if (!selection) fail(`unsupported isolated browser ${JSON.stringify(engineName)}`)
+              const expected = consumerManifest.browsers.find(item => item.name === selection.manifestName)
+              const observed = imageManifest.browsers.find(item => item.name === selection.manifestName)
+              if (!expected || !observed) fail(`${selection.manifestName} is absent from a browser manifest`)
+              if (expected.revision !== observed.revision || expected.browserVersion !== observed.browserVersion) {
+                fail(`${engineName} revision mismatch`)
+              }
+              const selected = join(
+                jobPath,
+                `${selection.manifestName.replaceAll('-', '_')}-${observed.revision}`,
+                ...selection.executableParts,
+              )
+              if (!existsSync(selected)) fail(`${engineName} executable is missing: ${selected}`)
+              const realized = realpathSync(selected)
+              if (!beneath(realized, imageBrowsersRoot)) fail(`${engineName} executable escapes immutable image: ${realized}`)
+              for (let path = realized; ; path = dirname(path)) {
+                requireRootOwnedReadOnly(path, `${engineName} executable path`)
+                if (path === imageBrowsersRoot) break
+                if (path === dirname(path)) fail(`${engineName} ancestry did not reach image root`)
+              }
+              const engine = playwright[engineName]
+              if (!engine?.launch) fail(`@playwright/test does not expose ${engineName}`)
+              const browser = await engine.launch({ headless: true, executablePath: selected })
+              try {
+                const page = await browser.newPage()
+                await page.setContent('<title>playwright-isolated-canary</title>')
+                if (await page.title() !== 'playwright-isolated-canary') fail(`${engineName} launch canary returned wrong title`)
+              } finally {
+                await browser.close()
+              }
+              add(`${engineName} executable`, realized)
+              add(`${engineName} launch canary`, 'passed')
+            }
+            add('status', 'PASS — exact immutable image toolchain selected')
+          } catch (error) {
+            add('status', `FAIL — ${error.message}`)
+            console.error(`::error::Playwright toolchain mismatch: ${error.message}`)
+            console.error('Change the consumer exact pin or rebuild/promote the pool image; job-time browser download is forbidden.')
+            process.exitCode = 1
+          } finally {
+            if (summary) appendFileSync(summary, `### Isolated Playwright toolchain\n\n| Field | Observed |\n|---|---|\n${rows.join('\n')}\n`)
+          }
+          NODE
+
+      - name: Run Playwright shard
+        env:
+          ENGINE_ARGS: ${{ inputs.chromium-args }}
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+          SCRIPT: ${{ inputs.e2e-script }}
+          SHARD: ${{ matrix.shard }}
+          TOTAL: ${{ inputs.shards }}
+        run: |
+          set -euo pipefail
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null)
+          present=$(printf '%s' "$raw" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            echo "::error::browser gate names \"$SCRIPT\" but no such package script exists"
+            exit 1
+          fi
+          # shellcheck disable=SC2206
+          args=(${ENGINE_ARGS})
+          args+=("--shard=${SHARD}/${TOTAL}" "--reporter=blob")
+          if [ "$PACKAGE_MANAGER" = "pnpm" ]; then
+            pnpm run "$SCRIPT" "${args[@]}"
+          elif [ "$PACKAGE_MANAGER" = "npm" ]; then
+            npm run "$SCRIPT" -- "${args[@]}"
+          else
+            echo "::error::package-manager must be pnpm or npm"
+            exit 1
+          fi
+
+      - name: Upload Chromium blob report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-blob-${{ github.run_id }}-${{ github.run_attempt }}-chromium-${{ matrix.shard }}
+          path: |
+            ${{ inputs.working-directory }}/blob-report
+            ${{ inputs.working-directory }}/test-results
+          if-no-files-found: ignore
+          retention-days: 1
+
+  webkit:
+    name: WebKit
+    if: inputs.run-webkit
+    needs: [contract, validate, chromium]
+    runs-on: ${{ fromJSON(inputs.browser-runner) }}
+    timeout-minutes: ${{ inputs.browser-timeout-minutes }}
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        shard: ${{ fromJSON(needs.contract.outputs.shards) }}
+    env:
+      CI: "1"
+      E2E_PREBUILT_ARTIFACT: "1"
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Guard isolated Playwright route
+        env:
+          ROUTE: ${{ inputs.browser-runner }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const route = JSON.parse(process.env.ROUTE)
+          if (route.group !== 'playwright-isolated' || !route.labels?.includes('proxmox-playwright-x64')) {
+            console.error('::error::browser shard is not routed to the dedicated Playwright pool')
+            process.exit(1)
+          }
+          NODE
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download same-run production build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.contract.outputs.build-artifact }}
+          path: ${{ inputs.working-directory }}/${{ inputs.build-artifact-path }}
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+
+      - name: Configure package registry auth
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -f ./scripts/package-registry-auth.mjs ]; then
+            node ./scripts/package-registry-auth.mjs
+          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
+            node ./tools/configure-package-registry-auth.mjs
+          else
+            echo "no package-registry bootstrap script present; continuing with the ephemeral GITHUB_TOKEN only"
+          fi
+
+      - name: Point pnpm at a workspace-local store (self-hosted)
+        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
+        run: *place_pnpm_store
+
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci
+
+      - name: Assert isolated Playwright toolchain
+        env:
+          EXPECTED_PLAYWRIGHT_VERSION: ${{ inputs.playwright-version }}
+          PLAYWRIGHT_ALLOWED_BROWSER_PREFIX: /opt
+          PLAYWRIGHT_TOOLCHAIN_OWNER_UID: "0"
+          PLAYWRIGHT_TOOLCHAIN_ROOT: /opt/playwright-ci
+          REQUIRED_BROWSERS: webkit
+        # GitHub Actions supports YAML anchors and aliases. Reusing the exact
+        # script prevents Chromium/WebKit image assertions from drifting; the
+        # required engine comes from the environment above.
+        run: *assert_playwright_toolchain
+
+      - name: Run Playwright shard
+        env:
+          ENGINE_ARGS: ${{ inputs.webkit-args }}
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+          SCRIPT: ${{ inputs.e2e-script }}
+          SHARD: ${{ matrix.shard }}
+          TOTAL: ${{ inputs.shards }}
+        run: |
+          set -euo pipefail
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null)
+          present=$(printf '%s' "$raw" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            echo "::error::browser gate names \"$SCRIPT\" but no such package script exists"
+            exit 1
+          fi
+          # shellcheck disable=SC2206
+          args=(${ENGINE_ARGS})
+          args+=("--shard=${SHARD}/${TOTAL}" "--reporter=blob")
+          if [ "$PACKAGE_MANAGER" = "pnpm" ]; then
+            pnpm run "$SCRIPT" "${args[@]}"
+          elif [ "$PACKAGE_MANAGER" = "npm" ]; then
+            npm run "$SCRIPT" -- "${args[@]}"
+          else
+            echo "::error::package-manager must be pnpm or npm"
+            exit 1
+          fi
+
+      - name: Upload WebKit blob report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: playwright-blob-${{ github.run_id }}-${{ github.run_attempt }}-webkit-${{ matrix.shard }}
+          path: |
+            ${{ inputs.working-directory }}/blob-report
+            ${{ inputs.working-directory }}/test-results
+          if-no-files-found: ignore
+          retention-days: 1
+
+  report:
+    name: Browser report
+    if: ${{ !cancelled() && needs.contract.result == 'success' && needs.validate.result == 'success' }}
+    needs: [contract, validate, chromium, webkit]
+    runs-on: ${{ fromJSON(inputs.linux-runner) }}
+    timeout-minutes: ${{ inputs.report-timeout-minutes }}
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+    outputs:
+      report-artifact: ${{ steps.meta.outputs.name }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+
+      - name: Configure package registry auth
+        env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ -f ./scripts/package-registry-auth.mjs ]; then
+            node ./scripts/package-registry-auth.mjs
+          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
+            node ./tools/configure-package-registry-auth.mjs
+          fi
+
+      - name: Point pnpm at a workspace-local store (self-hosted)
+        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
+        run: *place_pnpm_store
+
+      - name: Install dependencies (pnpm)
+        if: inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+
+      - name: Install dependencies (npm)
+        if: inputs.package-manager == 'npm'
+        run: npm ci
+
+      - name: Download this attempt's blob reports
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: playwright-blob-${{ github.run_id }}-${{ github.run_attempt }}-*
+          path: ${{ inputs.working-directory }}/all-blob-reports
+          merge-multiple: true
+
+      - name: Merge blob reports
+        run: |
+          set -euo pipefail
+          blob_dir=all-blob-reports/blob-report
+          if [ ! -d "$blob_dir" ]; then
+            echo "::error::blob report directory from this run attempt is missing"
+            exit 1
+          fi
+          first_blob=$(find "$blob_dir" -type f -name '*.zip' -print -quit)
+          if [ -z "$first_blob" ]; then
+            echo "::error::no blob report from this run attempt was available to merge"
+            exit 1
+          fi
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm exec playwright merge-reports --reporter=html "$blob_dir"
+          else
+            npx playwright merge-reports --reporter=html "$blob_dir"
+          fi
+
+      - name: Name report artifact
+        id: meta
+        run: echo "name=playwright-report-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload merged HTML and traces
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: ${{ inputs.working-directory }}/playwright-report
+          if-no-files-found: error
+          retention-days: 14
+
+  required:
+    name: Required
+    if: always()
+    needs: [contract, validate, chromium, webkit, report]
+    # Keep failure aggregation off caller-controlled self-hosted routes. If the
+    # route contract itself is invalid, Required still runs and fails visibly.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require every enabled browser gate
+        env:
+          CHROMIUM_RESULT: ${{ needs.chromium.result }}
+          CONTRACT_RESULT: ${{ needs.contract.result }}
+          REPORT_RESULT: ${{ needs.report.result }}
+          RUN_WEBKIT: ${{ inputs.run-webkit }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          WEBKIT_RESULT: ${{ needs.webkit.result }}
+        run: |
+          set -euo pipefail
+          status=0
+          require_success() {
+            name=$1
+            result=$2
+            if [ "$result" != "success" ]; then
+              echo "::error::$name reported '$result' (must succeed)"
+              status=1
+            fi
+          }
+          require_success contract "$CONTRACT_RESULT"
+          require_success validate "$VALIDATE_RESULT"
+          require_success chromium "$CHROMIUM_RESULT"
+          require_success report "$REPORT_RESULT"
+          if [ "$RUN_WEBKIT" = "true" ]; then
+            require_success webkit "$WEBKIT_RESULT"
+          elif [ "$WEBKIT_RESULT" != "skipped" ]; then
+            echo "::error::webkit reported '$WEBKIT_RESULT' while run-webkit is false (must be skipped)"
+            status=1
+          fi
+          exit "$status"

@@ -145,6 +145,15 @@ jobs:
       - name: Playwright toolchain fail-closed tests
         run: python3 scripts/test_playwright_toolchain.py
 
+      - name: Standalone browser callable fail-closed tests
+        run: python3 scripts/test_reusable_browser_tests.py
+
+      - name: Python static-analysis gate tests
+        run: python3 scripts/test_python_static_gate.py
+
+      - name: Apple routing and fail-capable gate tests
+        run: python3 scripts/test_apple_gate.py
+
       # And again for the self-hosted pnpm store placement: the step's whole
       # value is that it degrades quietly on a guest whose store directory is
       # not provisioned, and "quietly" is exactly the property that rots

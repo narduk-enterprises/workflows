@@ -47,6 +47,7 @@ WORKFLOWS = (
     Path(".github/workflows/nuxt-cloudflare.yml"),
     Path(".github/workflows/node-library.yml"),
     Path(".github/workflows/reusable-node-ci.yml"),
+    Path(".github/workflows/reusable-browser-tests.yml"),
 )
 
 

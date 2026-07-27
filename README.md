@@ -11,8 +11,8 @@ Shared reusable GitHub Actions workflows for the narduk-enterprises estate (CI-5
 > it was wrong after D-VIS-1, and the claim was doing real damage because it
 > was the *stated justification* for the self-hosted-runner warning below
 > (`workflows#2`). The workflows still hold no secrets — every
-> `workflow_call` secret is optional and skips cleanly, and `apple.yml` /
-> `python-data.yml` declare none at all.
+> `workflow_call` secret is optional and skips cleanly, and `apple.yml`,
+> `python-data.yml`, and `reusable-browser-tests.yml` declare none at all.
 >
 > **Callers must pin `@v1` or a full commit SHA — never `@main` — and a
 > public (or possibly-future-public) caller must never pass a self-hosted
@@ -46,30 +46,28 @@ gap look like an adoption backlog. Both now exist and both have a real adopter
 (see "Adopters" below). Still **not built**: a `nuxt-cloudflare-deploy.yml`
 sibling for push-to-main deploys with real Cloudflare secrets.
 
-The **browser / Playwright gap** (M-3 — "nothing here routes e2e to the
-dedicated pool yet") is **closed**, and not by a separate workflow.
-company-hq#278 established that every app of a class uses that class's
-callable, which made the browser shape a `nuxt-cloudflare.yml` gap rather than
-a missing eighth file: five repos had already hand-rolled the same sharded
-`playwright-isolated` pattern (`status-apps`, `operator-portal`,
-`earthdata-viewer`, `narduk-libs`, `nvault`) and a sixth had hand-rolled it
-*wrong*, installing chromium on the general `linux-ci` guest
-(`been-sober-for`, company-hq#276). See
-[`e2e-runner` / `e2e-shards` below](#browser-shards-and-the-isolated-pool).
+The standalone **browser / Playwright gap** named by company-hq#197 is now
+`reusable-browser-tests.yml`. It consumes a same-run production build, fans
+Chromium (and opt-in WebKit) into three shards on the manifest-routed isolated
+pool, and merges reports back on ordinary Linux CI. The older browser inputs in
+`nuxt-cloudflare.yml` remain for backward compatibility; adopters that separate
+browser CI use the dedicated callable instead of re-embedding the pool contract
+in their app-class workflow.
 
 ## Catalog
 
 | Workflow | Purpose |
 |----------|---------|
 | `apple.yml` | CI gate for Apple repos (Swift packages, iOS/macOS apps): SwiftLint (official Linux binary) and boundary/plist checks on a Linux runner, `swift build` / `swift test` / `xcodebuild` on the repo-scoped Mac. **Two separately-routed runner inputs — that split is the point.** Release/signing stays per-repo |
-| `python-data.yml` | CI gate for Python / data-pipeline repos: `uv` (lockfile check + sync) or pip/venv, pytest, opt-in pinned `ruff check`, plus an `extra-checks` hook so a repo-specific gate that needs the installed environment does not have to stay behind as a duplicate-install job |
+| `python-data.yml` | CI gate for Python / data-pipeline repos: explicit `uv` or Python provisioning, pytest, opt-in exact-version Ruff and **Pyright** (real static checking, not `py_compile`), plus an `extra-checks` hook |
+| `reusable-browser-tests.yml` | Private-repo browser CI: validates the exact manifest browser-group object before any shard is scheduled, consumes a same-run production build, asserts the immutable Playwright package/browser image and real launch, runs three Chromium shards plus opt-in WebKit, then merges 14-day HTML/trace evidence on Linux CI |
 | `docs-governance.yml` | Thin generic gate for docs/handbook-shaped repos: checkout, optionally provision Python/Node, run one repo-provided check command. Generalizes company-hq's `handbook-spine-check.yml` / `untangle-project-sync.yml` shape |
 | `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: script-probed lint/typecheck/test/build, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern. See [relationship to `reusable-node-ci.yml`](#relationship-between-node-libraryyml-and-reusable-node-ciyml) below |
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: script-probed lint, typecheck, test, build (pnpm or npm), fail-closed by default through `require-scripts`. Zero live callers as of 2026-07-27 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 
-All six shipped callables are `on: workflow_call` only — none of them declare their own
+All seven shipped callables are `on: workflow_call` only — none of them declare their own
 triggers, and none declare `concurrency:` (see "How to consume" below for why).
 
 ### Adopters
@@ -83,6 +81,7 @@ branch, read back from the API — not that the caller parses.
 |----------|---------------|----------|
 | `apple.yml` | `narduk-enterprises/GeoGridKit` | not yet |
 | `python-data.yml` | `narduk-enterprises/narduk-data` (`earth-data-ci.yml`) | not yet |
+| `reusable-browser-tests.yml` | `narduk-enterprises/been-sober-for` (first proof PR) | not yet |
 | `docs-governance.yml` | `narduk-enterprises/company-hq` | yes — repo ruleset `require-docs-governance` |
 | `node-library.yml` | `narduk-enterprises/narduk-charts` | yes — repo ruleset `require-ci-required` |
 | `nuxt-cloudflare.yml` | `hydrogen` | no — `hydrogen` has no branch protection; it called `@v1` unenforced for months, which is the failure mode this column exists to make visible |
@@ -336,7 +335,8 @@ Which gates each callable exposes this way:
 |---|---|---|
 | `nuxt-cloudflare.yml` | `run-e2e` (`e2e`, `e2e-plan`, `e2e-report`), `wrangler-dry-run`, `run-tests` | `build` |
 | `apple.yml` | `run-swiftlint` / `linux-checks` (`lint`), `run-build`, `run-tests` | `xcode` |
-| `python-data.yml` | `run-ruff` (`lint`), `run-tests` | `test` |
+| `python-data.yml` | `run-ruff` (`lint`), `run-tests`, `run-pyright` | `test` |
+| `reusable-browser-tests.yml` | `run-webkit` (`webkit`) | `validate`, `chromium`, `report` |
 | `node-library.yml` | `run-lint`, `run-typecheck`, `run-tests`, `run-build` | `package` |
 | `reusable-weekly-drift-check.yml` | all three jobs | — |
 | `docs-governance.yml`, `reusable-node-ci.yml` | — | the single job |
@@ -349,7 +349,8 @@ and which nobody discovers by looking at a passing pull request. If a caller
 wants a docs-only change to cost less, it turns off the *opt-in* gates above and
 still builds.
 
-`apple.yml` and `python-data.yml` declare **no `secrets:` block at all**, so a
+`apple.yml`, `python-data.yml`, and `reusable-browser-tests.yml` declare **no
+`secrets:` block at all**, so a
 caller must not pass one. That is deliberate: a reusable workflow receives only
 what it declares (there is no ambient inheritance without `secrets: inherit`),
 so the strongest way to say "this gate cannot reach your credentials" is to
@@ -445,6 +446,11 @@ Notes:
   `earth-data-pipeline` has 36 violations today, including six `F821`
   undefined-name — so the template does not decide for the caller when to take
   that on.
+- `run-pyright` is **opt-in** for `v1` compatibility, but it is a real static
+  gate: the workflow provisions Node 24 explicitly, installs exact
+  `pyright-version` under `$RUNNER_TEMP`, and runs it in the installed Python
+  environment. This is intentionally not `py_compile`, which proves syntax and
+  nothing about names or types.
 - Several isolated pytest invocations (narduk-data's `ci.yml` needs them,
   because two suites share a module basename with no `__init__.py`) go in
   `test-command` as a multi-line string, or in `extra-checks`.
@@ -634,48 +640,67 @@ would report every colon-bearing script as missing.
 
 #### Browser shards and the isolated pool
 
-`run-e2e: true` on its own runs the suite as one job on the **same** runner as
-the build. That is the right shape for a caller with no isolated pool, and it
-stays the default — but it is not the shape any real browser adopter in the
-estate uses, and "the callable can't express it" is why five of them
-hand-rolled the same thing:
+New browser adopters separate application CI from browser execution. The
+application-class callable produces one same-run build artifact; the standalone
+browser callable consumes it without rebuilding:
 
 ```yaml
 jobs:
   ci:
     uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v1
     with:
-      run-e2e: true
-      # Browsers go to the dedicated pool — NOT the guest that runs the build.
-      # Paste the route's `runsOn` object verbatim; never hand-copy labels.
-      e2e-runner: '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}'
-      e2e-shards: 3               # adds --shard=n/3 --reporter=blob + a merge job
-      e2e-args: "--project=chromium --workers=1"
-      e2e-install-browsers: false # the pool image already has them
-      e2e-browsers: chromium      # exact image revision is asserted + launched
-      e2e-browsers-path: ""       # preserve the guest-exported image-backed path
+      runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
+      working-directory: apps/web
+      run-e2e: false
+      e2e-build-artifact-path: .output
+
+  browser:
+    needs: ci
+    uses: narduk-enterprises/workflows/.github/workflows/reusable-browser-tests.yml@v1
+    with:
+      linux-runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
+      browser-runner: '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}'
+      working-directory: apps/web
+      build-artifact-path: .output
+      build-artifact-marker: server/index.mjs
+      playwright-version: 1.61.1
+      e2e-script: test:e2e:ci
+      chromium-args: "--project=web --workers=1"
+      shards: 3
 ```
 
-Three things worth stating plainly, because each one is a way this goes wrong:
+The two route inputs are not suggestions. Resolve both from the fleet manifest
+and copy each `runsOn` object verbatim. A hosted `contract` job checks the exact
+group and ordered labels before any caller-controlled self-hosted route is
+scheduled. It also rejects absolute or escaping artifact paths, unsupported
+package managers, non-exact Playwright versions, and invalid shard counts.
+`Required` is hosted for the same reason: even a bad route still produces a
+visible failing gate instead of scheduling the failure aggregator on that bad
+route.
 
-- **`e2e-runner` names a pool; it does not grant access to one.** A repo that
-  is not in the runner-fleet manifest's `playwright-isolated` group must leave
-  it empty. Passing a group the repo is not registered for produces a job that
-  queues forever, which reads exactly like a hung runner rather than like a
-  permissions error. Route additions travel through the fleet manifest flow
-  (company-hq#155 → #276), not through this input.
-- **Sharding without merging is worse than not sharding.** `e2e-shards > 1`
-  therefore also adds an `E2E report` job that merges the blob reports into
-  one HTML report, on the plain `runner` — merging is Node work with no
-  browser and has no business on the scarce isolated pool. It runs with
-  `if: !cancelled()` so a *failing* shard still produces the report explaining
-  why without claiming a runner after the operator cancels the run.
-- **Everything here is backward-compatible by construction.** `e2e-shards: 1`
-  (the default) emits no `--shard`, no blob reporter, and no merge job, so a
-  caller that never asked for sharding sees byte-identical behaviour. The one
-  visible change is the per-shard artifact name
-  (`playwright-evidence-<n>`), because `upload-artifact` v4+ rejects duplicate
-  artifact names and a fixed name would fail the instant anyone sharded.
+Chromium and opt-in WebKit are the only jobs on
+`proxmox-playwright-x64`. Production-build validation and report merging run on
+`linux-ci`. The browser jobs declare no secrets and receive only GitHub's
+short-lived token for checkout, same-run artifact transfer, and optional
+package reads. The caller must provide workflow-level concurrency because
+overlapping runs share fixed runner paths; the callable deliberately declares
+none.
+
+The pool's current defects are treated as fail-closed constraints:
+
+- agent-infrastructure#323: the root-owned `/opt/playwright-ci` browser tree is
+  never written and no `playwright install` fallback exists. Caller pin,
+  installed packages, image package, manifests, executable ancestry, and a
+  real headless launch must all agree.
+- agent-infrastructure#267: the workflow does not alter guest firewall or DNS
+  state, add sleeps, or hide egress failure.
+- agent-infrastructure#248/#237: workflow code never manipulates leases or
+  quarantine. An unavailable guest can leave work queued, but it cannot become
+  a skipped green; every enabled shard result is mandatory in `Required`.
+
+The older `nuxt-cloudflare.yml` `e2e-*` inputs remain supported for existing
+callers and for repos without isolated-pool approval. New isolated-pool
+adoptions use the standalone callable so the pool contract has one owner.
 
 #### Reusing build output in E2E
 
@@ -873,6 +898,11 @@ executed here.
   breaking change here specifically because the composed context comes from
   the caller's job id and this workflow's `Required` job** — neither of which
   moved. `v1` moved again rather than a `v2` being cut.
+- `reusable-browser-tests.yml` is a new callable, so its required route,
+  artifact, and exact-version inputs do not break an existing caller.
+  `python-data.yml`'s `run-pyright`, exact `pyright-version`, and
+  `pyright-args` inputs are optional additions; existing Python callers keep
+  their prior behavior until they opt into static analysis.
 - `nuxt-cloudflare.yml`'s `run-tests` / `test-script` / `extra-scripts` are
   within-major on the same rule — three optional inputs, no new job, one
   conditional step each. **`run-tests` defaults to `false` precisely so that
