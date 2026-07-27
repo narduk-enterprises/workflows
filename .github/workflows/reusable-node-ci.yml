@@ -1,7 +1,8 @@
 name: Reusable Node CI
 
-# Generic Node quality gate: lint, typecheck, test, build. Runs each script
-# with --if-present so callers only need the scripts they actually have.
+# Generic Node quality gate: lint, typecheck, test, build. Every enabled lane
+# probes for its package script before running it, so a missing script cannot
+# silently report success. Callers without a lane disable its run-* input.
 # Defaults to GitHub-hosted ubuntu-latest; private repos may pass a
 # manifest-routed self-hosted label via the runner input. PUBLIC repos must
 # never pass a self-hosted label. Callers pin @vN or a SHA — never @main.
@@ -57,6 +58,16 @@ on:
         default: true
       run-build:
         description: "Run the build script"
+        required: false
+        type: boolean
+        default: true
+      require-scripts:
+        description: >-
+          Fail when an enabled lint/typecheck/test/build lane has no matching
+          package.json script. Defaults true so an enabled lane cannot report
+          green after running nothing. Set false only as an explicit temporary
+          remediation opt-out; disable the corresponding run-* input when the
+          lane is intentionally absent.
         required: false
         type: boolean
         default: true
@@ -280,36 +291,112 @@ jobs:
 
       - name: Lint
         if: inputs.run-lint
+        env:
+          GATE: Lint
+          SCRIPT: lint
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm run --if-present lint
+          set -euo pipefail
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}process.stdout.write(typeof v==="string"&&v.length>0?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or disable the lane."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then
+            pnpm run "$SCRIPT"
           else
-            npm run --if-present lint
+            npm run "$SCRIPT"
           fi
 
       - name: Typecheck
         if: inputs.run-typecheck
+        env:
+          GATE: Typecheck
+          SCRIPT: typecheck
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm run --if-present typecheck
+          set -euo pipefail
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}process.stdout.write(typeof v==="string"&&v.length>0?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or disable the lane."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then
+            pnpm run "$SCRIPT"
           else
-            npm run --if-present typecheck
+            npm run "$SCRIPT"
           fi
 
       - name: Test
         if: inputs.run-tests
+        env:
+          GATE: Test
+          SCRIPT: test
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm run --if-present test
+          set -euo pipefail
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}process.stdout.write(typeof v==="string"&&v.length>0?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or disable the lane."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then
+            pnpm run "$SCRIPT"
           else
-            npm run --if-present test
+            npm run "$SCRIPT"
           fi
 
       - name: Build
         if: inputs.run-build
+        env:
+          GATE: Build
+          SCRIPT: build
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
         run: |
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm run --if-present build
+          set -euo pipefail
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}process.stdout.write(typeof v==="string"&&v.length>0?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or disable the lane."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then
+            pnpm run "$SCRIPT"
           else
-            npm run --if-present build
+            npm run "$SCRIPT"
           fi

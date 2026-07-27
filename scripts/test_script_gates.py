@@ -11,13 +11,13 @@ whose script does not exist matched nothing, exited 0, and reported a GREEN
 lane that ran no tests at all. `run-tests: true` is a caller asserting tests
 exist. narduk-libs hit this — its packages define `test:unit`, not `test`.
 
-COVERS BOTH NODE CALLABLES. `node-library.yml` got the mechanism in
-workflows#14; `nuxt-cloudflare.yml` did not, and was the worse case — 4 of its
-5 adopters were running at least one dead lane, because its `web:typecheck`
-and `build` defaults are absent in most of the class. The two files differ in
-shape (node-library has a workspace `FILTER`, nuxt-cloudflare has none and
-instead lets a caller pass an EMPTY script name to declare a lane absent), so
-each gets the cases its own contract promises.
+COVERS ALL THREE NODE CALLABLES. `node-library.yml` got the mechanism in
+workflows#14; `nuxt-cloudflare.yml` followed in workflows#16. The legacy
+`reusable-node-ci.yml` retained eight fail-open paths (four gates times pnpm
+and npm) until D-8. The files differ in shape (node-library has a workspace
+`FILTER`, nuxt-cloudflare lets a caller pass an EMPTY script name to declare a
+lane absent, and reusable-node-ci uses run-* inputs), so each gets the cases
+its own contract promises.
 
 Run: python3 scripts/test_script_gates.py
 """
@@ -34,6 +34,7 @@ import yaml
 
 NODE_LIB = pathlib.Path(".github/workflows/node-library.yml")
 NUXT_CF = pathlib.Path(".github/workflows/nuxt-cloudflare.yml")
+REUSABLE_NODE = pathlib.Path(".github/workflows/reusable-node-ci.yml")
 
 # (workflow, job id, step name, script name the gate looks for)
 NODE_LIB_GATES = [
@@ -53,6 +54,13 @@ NUXT_CF_GATES = [
     (NUXT_CF, "build", "Typecheck Nuxt", "web:typecheck"),
     (NUXT_CF, "build", "Unit tests", "test"),
     (NUXT_CF, "build", "Build", "build"),
+]
+
+REUSABLE_NODE_GATES = [
+    (REUSABLE_NODE, "ci", "Lint", "lint"),
+    (REUSABLE_NODE, "ci", "Typecheck", "typecheck"),
+    (REUSABLE_NODE, "ci", "Test", "test"),
+    (REUSABLE_NODE, "ci", "Build", "build"),
 ]
 
 
@@ -127,7 +135,7 @@ def main() -> int:
     if not ok:
         failures += 1
 
-    for workflow in (NODE_LIB, NUXT_CF):
+    for workflow in (NODE_LIB, NUXT_CF, REUSABLE_NODE):
         total += 1
         ok = input_default(workflow, "require-scripts") is True
         print(("PASS  " if ok else "FAIL  ")
@@ -233,6 +241,46 @@ def main() -> int:
             f"      lane A rc={rc_a}, summary={summary_a!r}, out={out_a[:300]!r}\n"
             f"      lane B rc={rc_b}, summary={summary_b!r}, out={out_b[:300]!r}"
         )
+
+    # ---- reusable-node-ci.yml: all four gates, pnpm and npm --------------
+    for workflow, job, gate, script_name in REUSABLE_NODE_GATES:
+        script = gate_script(workflow, job, gate)
+        for pm in ("pnpm", "npm"):
+            cases = [
+                ("missing + require=false -> warns but PASSES (explicit opt-out)",
+                 {"other": "echo x"}, "false", 0, "::warning::", True),
+                ("missing + require=true  -> FAILS loudly",
+                 {"other": "echo x"}, "true", 1, "::error::", True),
+                ("present + require=false -> actually runs the script",
+                 {script_name: "echo RAN"}, "false", 0, "RAN", False),
+                ("present + require=true  -> actually runs the script",
+                 {script_name: "echo RAN"}, "true", 0, "RAN", False),
+                ("declared but EMPTY -> counts as missing, not as a script",
+                 {script_name: ""}, "true", 1, "::error::", True),
+            ]
+            for label, fixture, require, want_rc, want_sub, want_sum in cases:
+                rc, out, summary = run(
+                    script,
+                    fixture,
+                    env_extra={
+                        "GATE": gate,
+                        "SCRIPT": script_name,
+                        "PM": pm,
+                        "REQUIRE": require,
+                    },
+                )
+                total += 1
+                if not check(
+                    f"{pm}: {label}",
+                    gate,
+                    rc,
+                    out,
+                    summary,
+                    want_rc,
+                    want_sub,
+                    want_summary_warning=want_sum,
+                ):
+                    failures += 1
 
     # ---- nuxt-cloudflare.yml: same contract, plus the empty-name opt-out --
     for workflow, job, gate, script_name in NUXT_CF_GATES:
