@@ -53,7 +53,6 @@ NUXT_CF_GATES = [
     (NUXT_CF, "build", "Typecheck Nuxt", "web:typecheck"),
     (NUXT_CF, "build", "Unit tests", "test"),
     (NUXT_CF, "build", "Build", "build"),
-    (NUXT_CF, "e2e", "Run e2e suite", "test:e2e"),
 ]
 
 
@@ -210,6 +209,43 @@ def main() -> int:
             if not check(label, gate, rc, out, summary, want_rc, want_sub,
                          want_summary_warning=want_sum):
                 failures += 1
+
+    # run-e2e=true is not an optional package-script lane. The caller spent an
+    # isolated browser slot and asserted the suite exists, so neither an empty
+    # input nor a missing script may inherit require-scripts' warn-and-pass
+    # migration behavior.
+    e2e_cases = [
+        ("missing + require=false -> FAILS closed",
+         {"other": "echo x"}, "test:e2e", "false", 1, "::error::", False),
+        ("missing + require=true -> FAILS closed",
+         {"other": "echo x"}, "test:e2e", "true", 1, "::error::", False),
+        ("empty e2e-script -> FAILS closed",
+         {"test:e2e": "echo RAN"}, "", "false", 1, "::error::", False),
+        ("present -> actually runs the suite",
+         {"test:e2e": "echo RAN"}, "test:e2e", "false", 0, "RAN", False),
+    ]
+    for label, fixture, name, require, want_rc, want_sub, want_sum in e2e_cases:
+        rc, out, summary = run(
+            e2e,
+            fixture,
+            env_extra={
+                "GATE": "Run e2e suite",
+                "SCRIPT": name,
+                "REQUIRE": require,
+            },
+        )
+        total += 1
+        if not check(
+            label,
+            "Run e2e suite",
+            rc,
+            out,
+            summary,
+            want_rc,
+            want_sub,
+            want_summary_warning=want_sum,
+        ):
+            failures += 1
 
     # ---- nuxt-cloudflare.yml's Extra scripts loop -------------------------
     extra = gate_script(NUXT_CF, "build", "Extra scripts")

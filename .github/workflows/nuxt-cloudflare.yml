@@ -23,6 +23,16 @@ name: Reusable Nuxt + Cloudflare CI
 # correct shape the easy one. Every one of them is additive with a default
 # that reproduces the previous single-lane behaviour exactly.
 #
+# THE ISOLATED TOOLCHAIN IS IMAGE-OWNED (company-hq#343). A browser shard on
+# `playwright-isolated` must use the exact Playwright package and browser
+# revisions sealed root-owned under `/opt/playwright-ci`; it must never repair
+# drift with a job-time download. The preflight below compares the caller's
+# exact package pin, installed package/core versions, complete browsers.json
+# digest, required browser revisions, selected executable realpath and a real
+# launch canary against that immutable tree. Missing or mismatched state fails
+# before the suite starts. The hosted-runner installer remains available only
+# for non-isolated routes.
+#
 # THE UNIT-TEST LANE (added for company-hq#278, earthdata-viewer). Until
 # `run-tests` existed this workflow had NO unit-test expression at all, while
 # node-library.yml had one — so a Nuxt app with a vitest suite literally could
@@ -239,12 +249,19 @@ on:
         type: boolean
         default: false
       e2e-script:
-        description: "package.json script for the e2e suite, run with --if-present"
+        description: >-
+          package.json script for the e2e suite. When run-e2e is true this
+          script must exist and be non-empty; a missing script is always a hard
+          failure, independent of require-scripts.
         required: false
         type: string
         default: "test:e2e"
       e2e-browsers:
-        description: "Space-separated `playwright install --with-deps` browser list"
+        description: >-
+          Space-separated required browser engines. On a non-isolated runner
+          this is also passed to `playwright install --with-deps`. On
+          playwright-isolated it selects the image-owned revisions and launch
+          canaries the fail-closed preflight must prove (chromium and/or webkit).
         required: false
         type: string
         default: "chromium"
@@ -293,10 +310,10 @@ on:
         default: ""
       e2e-install-browsers:
         description: >-
-          Run `playwright install --with-deps`. Set false on a pool that
-          pre-installs its browsers into an image — the isolated pool keeps
-          them at /opt/playwright-ci/browsers, and re-downloading them per run
-          is the disk and time cost the pool exists to avoid.
+          Run `playwright install --with-deps` on a non-isolated runner.
+          MUST be false on playwright-isolated: that route rejects true before
+          dependency installation, and the installer step also excludes the
+          isolated group/label so drift can never turn into a download.
         required: false
         type: boolean
         default: true
@@ -305,10 +322,10 @@ on:
           PLAYWRIGHT_BROWSERS_PATH for the browser jobs. Empty leaves whatever
           the runner already exports ALONE — it is written to $GITHUB_ENV only
           when non-empty, because a job-level `env:` would export an empty
-          value and clobber the pool's own setting. Pair with
-          `e2e-install-browsers: false` when the pool pre-installs; on the
-          estate's ephemeral Playwright guests the value is
-          `/opt/playwright-ephemeral/browsers`.
+          value and clobber the pool's own setting. On playwright-isolated this
+          MUST be empty: the guest exports its immutable image-backed,
+          job-visible path, and the route guard rejects every caller override
+          (including $RUNNER_TEMP and workspace caches).
         required: false
         type: string
         default: ""
@@ -842,6 +859,11 @@ jobs:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON(needs.e2e-plan.outputs.shards) }}
+    env:
+      # Dependency installation must never acquire a browser as a side effect.
+      # The explicit hosted-runner installer below remains the sole supported
+      # download path, and is unreachable on playwright-isolated.
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -849,6 +871,35 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Guard isolated Playwright route
+        env:
+          BROWSERS_OVERRIDE: ${{ inputs.e2e-browsers-path }}
+          INSTALL_BROWSERS: ${{ inputs.e2e-install-browsers }}
+          ROUTE: ${{ inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const route = process.env.ROUTE || ''
+          const isolated = route.includes('playwright-isolated')
+            || route.includes('proxmox-playwright-x64')
+          if (!isolated) {
+            console.log('non-isolated browser route: image toolchain contract does not apply')
+            process.exit(0)
+          }
+          const errors = []
+          if (process.env.INSTALL_BROWSERS !== 'false') {
+            errors.push('e2e-install-browsers must be false on playwright-isolated')
+          }
+          if (process.env.BROWSERS_OVERRIDE) {
+            errors.push('e2e-browsers-path must be empty on playwright-isolated; use the guest-exported immutable path')
+          }
+          if (errors.length) {
+            for (const error of errors) console.error(`::error::${error}`)
+            process.exit(1)
+          }
+          console.log('isolated route locked: job-time browser install and path override are disabled')
+          NODE
 
       # Conditional, NOT a job-level `env:` block. This used to be
       # `env: PLAYWRIGHT_BROWSERS_PATH: ${{ inputs.e2e-browsers-path }}`, which
@@ -980,9 +1031,209 @@ jobs:
           path: ${{ steps.dep-cache-dir.outputs.path }}
           key: ${{ steps.dep-cache.outputs.cache-primary-key }}
 
-      - name: Install Playwright browsers
-        if: inputs.e2e-install-browsers
+      - name: Assert isolated Playwright toolchain
+        if: >-
+          contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'playwright-isolated')
+          || contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'proxmox-playwright-x64')
+        env:
+          PLAYWRIGHT_ALLOWED_BROWSER_PREFIX: /opt
+          PLAYWRIGHT_TOOLCHAIN_OWNER_UID: "0"
+          PLAYWRIGHT_TOOLCHAIN_ROOT: /opt/playwright-ci
+          REQUIRED_BROWSERS: ${{ inputs.e2e-browsers }}
         run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import {
+            appendFileSync,
+            existsSync,
+            readFileSync,
+            realpathSync,
+            statSync,
+          } from 'node:fs'
+          import { createHash } from 'node:crypto'
+          import { createRequire } from 'node:module'
+          import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+
+          const rows = []
+          const summary = process.env.GITHUB_STEP_SUMMARY
+          const add = (label, value) => rows.push(`| ${label} | \`${String(value).replaceAll('|', '\\|')}\` |`)
+          const digest = path => createHash('sha256').update(readFileSync(path)).digest('hex')
+          const readJson = path => JSON.parse(readFileSync(path, 'utf8'))
+          const fail = message => { throw new Error(message) }
+          const beneath = (path, root) => {
+            const rel = relative(root, path)
+            return rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
+          }
+          const ownerUid = Number(process.env.PLAYWRIGHT_TOOLCHAIN_OWNER_UID)
+          if (!Number.isInteger(ownerUid) || ownerUid < 0) {
+            fail('PLAYWRIGHT_TOOLCHAIN_OWNER_UID must be a non-negative integer')
+          }
+          const requireRootOwnedReadOnly = (path, label) => {
+            const observed = statSync(path)
+            if (observed.uid !== ownerUid || (observed.mode & 0o022) !== 0) {
+              fail(`${label} is not root-owned and read-only: ${path}`)
+            }
+          }
+
+          try {
+            const imageRoot = resolve(process.env.PLAYWRIGHT_TOOLCHAIN_ROOT || '')
+            const imagePackagePath = join(imageRoot, 'npm/node_modules/playwright/package.json')
+            const imageManifestPath = join(imageRoot, 'npm/node_modules/playwright-core/browsers.json')
+            const imageBrowsersRoot = realpathSync(join(imageRoot, 'browsers'))
+            for (const [path, label] of [
+              [imagePackagePath, 'image Playwright package'],
+              [imageManifestPath, 'image browser manifest'],
+              [imageBrowsersRoot, 'image browser root'],
+            ]) {
+              if (!existsSync(path)) fail(`${label} is missing: ${path}`)
+              requireRootOwnedReadOnly(path, label)
+            }
+
+            const manifest = readJson('package.json')
+            const declared = manifest.devDependencies?.['@playwright/test']
+              ?? manifest.dependencies?.['@playwright/test']
+            if (!declared) fail('package.json must directly pin @playwright/test for an isolated browser job')
+
+            const localRequire = createRequire(join(process.cwd(), 'package.json'))
+            const testPackagePath = localRequire.resolve('@playwright/test/package.json')
+            const testRequire = createRequire(testPackagePath)
+            const playwrightPackagePath = testRequire.resolve('playwright/package.json')
+            const playwrightRequire = createRequire(playwrightPackagePath)
+            const corePackagePath = playwrightRequire.resolve('playwright-core/package.json')
+            const consumerPackage = readJson(testPackagePath)
+            const consumerPlaywrightPackage = readJson(playwrightPackagePath)
+            const consumerCorePackage = readJson(corePackagePath)
+            const consumerManifestPath = join(dirname(corePackagePath), 'browsers.json')
+            const consumerManifest = readJson(consumerManifestPath)
+            const imagePackage = readJson(imagePackagePath)
+            const imageManifest = readJson(imageManifestPath)
+            const consumerManifestSha = digest(consumerManifestPath)
+            const imageManifestSha = digest(imageManifestPath)
+            const toolchainRevision = createHash('sha256')
+              .update(`playwright@${imagePackage.version}:${imageManifestSha}`)
+              .digest('hex')
+
+            add('consumer package pin', declared)
+            add('consumer @playwright/test', consumerPackage.version)
+            add('consumer playwright', consumerPlaywrightPackage.version)
+            add('consumer playwright-core', consumerCorePackage.version)
+            add('image Playwright', imagePackage.version)
+            add('consumer browsers.json SHA-256', consumerManifestSha)
+            add('image browsers.json SHA-256', imageManifestSha)
+            add('image toolchain revision', toolchainRevision)
+            add('image source path', imageBrowsersRoot)
+            add('job-visible path', process.env.PLAYWRIGHT_BROWSERS_PATH || '(unset)')
+
+            if (declared !== consumerPackage.version) {
+              fail(`@playwright/test must be pinned exactly as "${consumerPackage.version}" (found "${declared}")`)
+            }
+            const versions = new Set([
+              consumerPackage.version,
+              consumerPlaywrightPackage.version,
+              consumerCorePackage.version,
+              imagePackage.version,
+            ])
+            if (versions.size !== 1) {
+              fail(`Playwright version mismatch: test=${consumerPackage.version}, runtime=${consumerPlaywrightPackage.version}, core=${consumerCorePackage.version}, image=${imagePackage.version}`)
+            }
+            if (consumerManifestSha !== imageManifestSha) {
+              fail(`browser manifest mismatch: consumer=${consumerManifestSha}, image=${imageManifestSha}`)
+            }
+
+            const jobPath = process.env.PLAYWRIGHT_BROWSERS_PATH
+            if (!jobPath || !isAbsolute(jobPath)) {
+              fail('PLAYWRIGHT_BROWSERS_PATH must be the absolute image-backed path exported by the isolated guest')
+            }
+            const forbiddenRoots = [process.env.RUNNER_TEMP, process.env.GITHUB_WORKSPACE]
+              .filter(Boolean)
+              .map(path => resolve(path))
+            const resolvedJobPath = resolve(jobPath)
+            if (forbiddenRoots.some(root => beneath(resolvedJobPath, root))) {
+              fail(`job-local PLAYWRIGHT_BROWSERS_PATH is forbidden on playwright-isolated: ${resolvedJobPath}`)
+            }
+            const allowedPrefix = resolve(process.env.PLAYWRIGHT_ALLOWED_BROWSER_PREFIX || '')
+            if (!beneath(resolvedJobPath, allowedPrefix)) {
+              fail(`PLAYWRIGHT_BROWSERS_PATH must live under ${allowedPrefix} on playwright-isolated: ${resolvedJobPath}`)
+            }
+
+            const requested = [...new Set((process.env.REQUIRED_BROWSERS || '').trim().split(/\s+/).filter(Boolean))]
+            if (!requested.length) fail('e2e-browsers must name at least one required engine')
+            const supported = {
+              chromium: {
+                manifestName: 'chromium-headless-shell',
+                executableParts: ['chrome-headless-shell-linux64', 'chrome-headless-shell'],
+              },
+              webkit: {
+                manifestName: 'webkit',
+                executableParts: ['pw_run.sh'],
+              },
+            }
+            const playwright = localRequire('@playwright/test')
+            for (const engineName of requested) {
+              const selection = supported[engineName]
+              if (!selection) {
+                fail(`unsupported isolated browser "${engineName}"; supported engines are chromium and webkit`)
+              }
+              const { manifestName, executableParts } = selection
+              const expected = consumerManifest.browsers.find(item => item.name === manifestName)
+              const observed = imageManifest.browsers.find(item => item.name === manifestName)
+              if (!expected || !observed) fail(`${manifestName} is absent from a browser manifest`)
+              add(`${engineName} expected`, `revision ${expected.revision}, ${expected.browserVersion ?? 'no upstream version'}`)
+              add(`${engineName} image`, `revision ${observed.revision}, ${observed.browserVersion ?? 'no upstream version'}`)
+              if (expected.revision !== observed.revision || expected.browserVersion !== observed.browserVersion) {
+                fail(`${engineName} mismatch: consumer revision=${expected.revision} version=${expected.browserVersion}, image revision=${observed.revision} version=${observed.browserVersion}`)
+              }
+
+              const engine = playwright[engineName]
+              if (!engine?.launch) fail(`@playwright/test does not expose ${engineName}`)
+              const browserDirectory = `${manifestName.replaceAll('-', '_')}-${observed.revision}`
+              const selected = join(jobPath, browserDirectory, ...executableParts)
+              if (!selected || !existsSync(selected)) fail(`${engineName} executable is missing: ${selected || '(empty path)'}`)
+              const realized = realpathSync(selected)
+              if (!beneath(realized, imageBrowsersRoot)) {
+                fail(`${engineName} executable escapes the immutable image tree: ${realized}`)
+              }
+              for (let path = realized; ; path = dirname(path)) {
+                requireRootOwnedReadOnly(path, `${engineName} executable path`)
+                if (path === imageBrowsersRoot) break
+                if (path === dirname(path)) fail(`${engineName} executable ancestry did not reach ${imageBrowsersRoot}`)
+              }
+              add(`${engineName} executable`, realized)
+
+              const browser = await engine.launch({ headless: true, executablePath: selected })
+              try {
+                const page = await browser.newPage()
+                await page.setContent('<title>playwright-isolated-canary</title>')
+                if (await page.title() !== 'playwright-isolated-canary') {
+                  fail(`${engineName} launch canary returned the wrong page title`)
+                }
+              } finally {
+                await browser.close()
+              }
+              add(`${engineName} launch canary`, 'passed')
+            }
+
+            add('status', 'PASS — exact image toolchain selected; no installer invoked')
+            console.log(`Playwright toolchain matched image ${imagePackage.version} (${toolchainRevision})`)
+          } catch (error) {
+            add('status', `FAIL — ${error.message}`)
+            console.error(`::error::Playwright toolchain mismatch: ${error.message}`)
+            console.error('Upgrade the consumer to the pool-supported exact pin, or rebuild/promote the pool image through proxmox-playwright-ci; job-time download is forbidden.')
+            process.exitCode = 1
+          } finally {
+            if (summary) {
+              appendFileSync(summary, `### Isolated Playwright toolchain\n\n| Field | Observed |\n|---|---|\n${rows.join('\n')}\n`)
+            }
+          }
+          NODE
+
+      - name: Install Playwright browsers
+        if: >-
+          inputs.e2e-install-browsers
+          && !contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'playwright-isolated')
+          && !contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'proxmox-playwright-x64')
+        run: |
+          set -euo pipefail
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
             pnpm exec playwright install --with-deps ${{ inputs.e2e-browsers }}
           else
@@ -994,33 +1245,27 @@ jobs:
           GATE: Run e2e suite
           SCRIPT: ${{ inputs.e2e-script }}
           PM: ${{ inputs.package-manager }}
-          REQUIRE: ${{ inputs.require-scripts }}
           SHARD: ${{ matrix.shard }}
           TOTAL: ${{ inputs.e2e-shards }}
           EXTRA_ARGS: ${{ inputs.e2e-args }}
         run: |
           set -euo pipefail
-          # Same probe as the build lane's gates, and it matters MORE here: a
-          # caller reached this step by explicitly setting `run-e2e: true`, and
-          # a browser lane that provisions a runner, installs chromium and then
-          # matches no script is the most expensive way in the estate to report
-          # a green check for zero coverage.
+          # Unlike optional build-lane scripts, run-e2e=true is an assertion
+          # that this exact suite exists. Missing or empty is always fatal:
+          # `require-scripts: false` must never turn an isolated browser job
+          # into a green no-op.
           if [ -z "$SCRIPT" ]; then
-            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
-            exit 0
+            echo "::error::$GATE is enabled but e2e-script is empty"
+            exit 1
           fi
           raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
           present=$(printf '%s' "$raw" | node -e \
             'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
           if [ "$present" != "yes" ]; then
             msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
-            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
-            if [ "$REQUIRE" = "true" ]; then
-              echo "::error::$msg (require-scripts is on)"
-              exit 1
-            fi
-            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
-            exit 0
+            echo "- :x: $msg" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$msg"
+            exit 1
           fi
           ARGS=()
           # A single lane runs the suite exactly as before — no --shard, no
@@ -1383,7 +1628,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Require build to succeed and opt-in gates to succeed-or-skip
+      - name: Require enabled gates to succeed and disabled gates to skip
         env:
           BUILD_RESULT: ${{ needs.build.result }}
           E2E_PLAN_RESULT: ${{ needs.e2e-plan.result }}
@@ -1391,7 +1636,11 @@ jobs:
           E2E_REPORT_RESULT: ${{ needs.e2e-report.result }}
           DEPLOY_DRY_RUN_RESULT: ${{ needs.deploy-dry-run.result }}
           EXTRA_GATE_RESULT: ${{ needs.extra-gate.result }}
+          RUN_E2E: ${{ inputs.run-e2e }}
+          E2E_SHARDS: ${{ inputs.e2e-shards }}
+          RUN_DEPLOY_DRY_RUN: ${{ inputs.wrangler-dry-run }}
         run: |
+          set -euo pipefail
           status=0
           # build has no `if:` — it must always report success.
           require_success() {
@@ -1400,16 +1649,11 @@ jobs:
               status=1
             fi
           }
-          # e2e / deploy-dry-run are opt-in — "skipped" means the caller left
-          # the gate off, which is fine; only an actual failure blocks Required.
-          allow_skip() {
-            case "$2" in
-              success | skipped) ;;
-              *)
-                echo "::error::$1 job reported '$2' (must succeed or be skipped)"
-                status=1
-                ;;
-            esac
+          require_skipped() {
+            if [ "$2" != "skipped" ]; then
+              echo "::error::$1 job reported '$2' while disabled (must be skipped)"
+              status=1
+            fi
           }
           require_success build "$BUILD_RESULT"
           if [ -n "${{ inputs.extra-gate-scripts }}" ]; then
@@ -1418,12 +1662,25 @@ jobs:
             echo "::error::extra-gate reported '$EXTRA_GATE_RESULT' while not configured"
             status=1
           fi
-          allow_skip e2e-plan "$E2E_PLAN_RESULT"
-          allow_skip e2e "$E2E_RESULT"
-          # e2e-report runs only when the caller sharded; when it runs it must
-          # not fail silently either — an unmergeable report means the shard
-          # evidence is unreadable, which is how a sharded suite quietly stops
-          # being reviewable.
-          allow_skip e2e-report "$E2E_REPORT_RESULT"
-          allow_skip deploy-dry-run "$DEPLOY_DRY_RUN_RESULT"
+          # A skipped enabled gate is a failure, not a success substitute. This
+          # is especially important for the toolchain assertion inside e2e: a
+          # workflow-expression mistake must not turn "never checked" green.
+          if [ "$RUN_E2E" = "true" ]; then
+            require_success e2e-plan "$E2E_PLAN_RESULT"
+            require_success e2e "$E2E_RESULT"
+            if [ "$E2E_SHARDS" -gt 1 ]; then
+              require_success e2e-report "$E2E_REPORT_RESULT"
+            else
+              require_skipped e2e-report "$E2E_REPORT_RESULT"
+            fi
+          else
+            require_skipped e2e-plan "$E2E_PLAN_RESULT"
+            require_skipped e2e "$E2E_RESULT"
+            require_skipped e2e-report "$E2E_REPORT_RESULT"
+          fi
+          if [ "$RUN_DEPLOY_DRY_RUN" = "true" ]; then
+            require_success deploy-dry-run "$DEPLOY_DRY_RUN_RESULT"
+          else
+            require_skipped deploy-dry-run "$DEPLOY_DRY_RUN_RESULT"
+          fi
           exit "$status"
