@@ -64,12 +64,12 @@ a missing eighth file: five repos had already hand-rolled the same sharded
 | `apple.yml` | CI gate for Apple repos (Swift packages, iOS/macOS apps): SwiftLint (official Linux binary) and boundary/plist checks on a Linux runner, `swift build` / `swift test` / `xcodebuild` on the repo-scoped Mac. **Two separately-routed runner inputs — that split is the point.** Release/signing stays per-repo |
 | `python-data.yml` | CI gate for Python / data-pipeline repos: `uv` (lockfile check + sync) or pip/venv, pytest, opt-in pinned `ruff check`, plus an `extra-checks` hook so a repo-specific gate that needs the installed environment does not have to stay behind as a duplicate-install job |
 | `docs-governance.yml` | Thin generic gate for docs/handbook-shaped repos: checkout, optionally provision Python/Node, run one repo-provided check command. Generalizes company-hq's `handbook-spine-check.yml` / `untangle-project-sync.yml` shape |
-| `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: lint/typecheck/test/build, each `--if-present`, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern. See [relationship to `reusable-node-ci.yml`](#relationship-between-node-libraryyml-and-reusable-node-ciyml) below |
+| `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: script-probed lint/typecheck/test/build, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern. See [relationship to `reusable-node-ci.yml`](#relationship-between-node-libraryyml-and-reusable-node-ciyml) below |
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
-| `reusable-node-ci.yml` | Generic Node CI: lint, typecheck, test, build (pnpm or npm). Zero live callers as of 2026-07-24 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
+| `reusable-node-ci.yml` | Generic Node CI: script-probed lint, typecheck, test, build (pnpm or npm), fail-closed by default through `require-scripts`. Zero live callers as of 2026-07-27 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 
-All seven are `on: workflow_call` only — none of them declare their own
+All six shipped callables are `on: workflow_call` only — none of them declare their own
 triggers, and none declare `concurrency:` (see "How to consume" below for why).
 
 ### Adopters
@@ -757,7 +757,7 @@ caller search found no live consumer (`workflows#20`, Actions-optimization
 audit). `narduk-template-smoke-app` is disabled and documentation references
 were not runtime callers.
 
-### Generic Node CI (unchanged)
+### Generic Node CI
 
 ```yaml
 jobs:
@@ -767,6 +767,7 @@ jobs:
       node-version: "22"
       run-lint: true
       run-tests: true
+      require-scripts: true
     secrets:
       NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
 ```
@@ -775,20 +776,23 @@ Notes:
 
 - All secrets are optional; package-registry auth is skipped cleanly when no
   token is passed, so public/forked callers still run.
+- Every enabled lint/typecheck/test/build lane probes for its package script
+  before running it. Missing scripts fail by default. A caller with no such
+  lane disables the matching `run-*` input; `require-scripts: false` is only
+  an explicit temporary remediation opt-out and emits a visible warning.
 - **Public repos must never pass a self-hosted `runner`/label** (fork PRs
   would run attacker code on estate infrastructure) — see "Runner routing"
   above.
 
 ## Relationship between `node-library.yml` and `reusable-node-ci.yml`
 
-`reusable-node-ci.yml` already does the core of this — lint/typecheck/test/build,
-each `--if-present`, pnpm or npm — and a GitHub code search across
-`narduk-enterprises` (2026-07-24, `"uses: narduk-enterprises/workflows"`)
-found **zero** repos currently calling it: the only real cross-repo caller in
-the org is `narduk-template-smoke-app`, and it calls
-`reusable-weekly-drift-check.yml`, not this one. So `node-library.yml` doesn't
-migrate a live caller — it's additive, and `reusable-node-ci.yml` is
-unchanged in this PR.
+`reusable-node-ci.yml` already does the core of this — script-probed
+lint/typecheck/test/build, pnpm or npm — and a GitHub code search across
+`narduk-enterprises`, `narduk-incubator`, `narduk-enterprises-clients`, and
+`loganrenz` (2026-07-27, `reusable-node-ci`)
+found **zero** repos currently calling it. So `node-library.yml` did not
+migrate a live caller — it was additive — and hardening this compatibility
+surface does not disrupt a current consumer.
 
 `node-library.yml` is `reusable-node-ci.yml` plus two things `reusable-node-ci.yml`
 doesn't have:
