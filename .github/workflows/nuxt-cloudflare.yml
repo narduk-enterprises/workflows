@@ -54,7 +54,7 @@ name: Reusable Nuxt + Cloudflare CI
 # this file did not, and it is the worse case: 4 of its 5 adopters were running
 # at least one dead lane, mostly because the `web:typecheck` and `build`
 # defaults here are absent in most of the class. Each gate now probes for the
-# script first — warning today, hard failure under `require-scripts: true`,
+# script first — hard failure by default under `require-scripts: true`,
 # and a silent skip when the caller passes an EMPTY script name to declare the
 # lane genuinely absent. That last distinction is what makes the check
 # adoptable by the repos that need it most. The gates are behaviour-tested
@@ -222,16 +222,13 @@ on:
           empty: a separate web typecheck is opt-in, while every non-empty
           script name remains an assertion that require-scripts can enforce.
 
-          DEFAULT IS `false` during the coordinated caller migration. Turning
-          it on changes every remaining missing name from a warning to a hard
-          failure at the same moving tag, so callers must first declare absent
-          lanes and prove their remaining script names. Until a repo flips
-          this, a missing script is reported as a `::warning::` and in the job
-          summary, naming the script, so the loss is visible instead of
-          invisible.
+          DEFAULT IS `true`. The coordinated caller migration declared absent
+          lanes and proved every remaining script before this flipped. A
+          caller may explicitly pass false only as a bounded remediation; the
+          estate default no longer permits a named gate to warn and pass.
 
-          TO FLIP IT, A CALLER FIRST DECLARES ITS ABSENT LANES. Pass an EMPTY
-          STRING for a script input whose lane genuinely does not exist in the
+          TO DECLARE AN ABSENT LANE, pass an EMPTY STRING for a script input
+          whose lane genuinely does not exist in the
           repo (`typecheck-web-script: ""` on a Worker with no web surface,
           `build-script: ""` on one with no build step). An empty name is the
           caller SAYING the lane is off, and is skipped cleanly with no
@@ -242,7 +239,7 @@ on:
           typecheck lane.
         required: false
         type: boolean
-        default: false
+        default: true
       run-e2e:
         description: "Run the optional Playwright e2e suite (opt-in)"
         required: false
@@ -574,11 +571,10 @@ jobs:
       # EVERY GATE BELOW PROBES BEFORE IT RUNS. `--if-present` reports a green
       # lane for a script that does not exist, so "ran nothing" and "passed"
       # are the same colour. Each gate therefore asks whether the script is
-      # there first, and reacts per `require-scripts` (warn today, fail when
-      # the caller opts in). An EMPTY script name is different from a missing
+      # there first, and reacts per `require-scripts` (fail by default; warn
+      # only when a caller explicitly opts out). An EMPTY script name differs
       # one: it is the caller declaring the lane absent, and is skipped
-      # silently. See the `require-scripts` input for the measured reason the
-      # default is not yet a hard failure.
+      # silently. See the `require-scripts` input for the migration contract.
       #
       # The inputs moved into `env:` in the same change. They used to be
       # interpolated straight into the shell text, which made every script
