@@ -557,6 +557,10 @@ jobs:
     with:
       node-version: "24"
       package-manager: npm # hydrogen's current package manager; pnpm is the default
+      # Optional: delegate the complete install to a caller-owned wrapper.
+      # The callable passes the mapped secret only as NVAULT_TOKEN and skips
+      # its legacy direct package-registry materialization/install path.
+      install-script: ci:install
       typecheck-worker-script: typecheck
       typecheck-web-script: web:typecheck
       run-e2e: true
@@ -564,6 +568,13 @@ jobs:
     secrets:
       NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
 ```
+
+`install-script` is for repositories whose install wrapper exchanges an nVault
+service token for the package credential, materializes any temporary registry
+configuration itself, removes it, and only then starts the package manager.
+The value must be one package.json script name using letters, digits, `:`, `_`,
+or `-`; the callable rejects missing or unsafe names. Existing callers that
+leave it empty keep the legacy install path unchanged.
 
 Deploying with real Cloudflare credentials on push-to-main is **not** this
 workflow's job — that stays a separate `nuxt-cloudflare-deploy.yml` sibling

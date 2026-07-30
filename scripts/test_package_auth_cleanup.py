@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source-level contract: every nuxt-cloudflare auth materialization is cleaned up.
+"""Source-level contract: nuxt-cloudflare package auth stays install-scoped.
 
 Persistent self-hosted guests keep the workspace volume between jobs. The
 callable can materialise `${working-directory}/.npmrc.auth` for
@@ -7,10 +7,15 @@ callable can materialise `${working-directory}/.npmrc.auth` for
 after the install consumers so success, failed install, and cancelled jobs
 cannot leave registry credentials on the guest.
 
+Callers can instead opt into an app-owned install wrapper. In that path the
+workflow must expose the service credential only as `NVAULT_TOKEN`, suppress
+the legacy direct-materialization path, validate the package.json script name,
+and invoke it without eval.
+
 This is a pure source contract over the shipped YAML (same discipline as
-`test_e2e_build_artifact.py`): enumerate every auth-creation site, require a
-paired, correctly ordered cleanup, and seed a red missing-cleanup mutation so
-the assertion cannot pass against a workflow that dropped the step.
+`test_e2e_build_artifact.py`): enumerate every auth-creation site, require the
+paired legacy cleanup and the caller-owned alternative, then seed red
+mutations so the assertions cannot pass against a weakened workflow.
 
 Run: python3 scripts/test_package_auth_cleanup.py
 """
@@ -29,6 +34,7 @@ WORKFLOW = Path(".github/workflows/nuxt-cloudflare.yml")
 
 AUTH_STEP = "Configure package registry auth"
 CLEANUP_STEP = "Remove package auth materialization"
+CALLER_INSTALL_STEP = "Install dependencies (caller script)"
 INSTALL_STEPS = (
     "Install dependencies (pnpm)",
     "Install dependencies (npm)",
@@ -86,8 +92,9 @@ def auth_jobs(document: dict) -> dict[str, dict]:
 
 
 def validate_cleanup_step(job_id: str, step: dict) -> None:
-    assert step.get("if") == "always()", (
-        f"{job_id}: cleanup must use if: always(), got {step.get('if')!r}"
+    assert step.get("if") == "always() && inputs.install-script == ''", (
+        f"{job_id}: cleanup must always run for the legacy materialization path, "
+        f"got {step.get('if')!r}"
     )
     run = step.get("run")
     assert isinstance(run, str) and run.strip(), f"{job_id}: cleanup missing run:"
@@ -118,6 +125,9 @@ def validate_job(job_id: str, job: dict) -> None:
     auth_i = names.index(AUTH_STEP)
     cleanup_i = names.index(CLEANUP_STEP)
     assert auth_i < cleanup_i, f"{job_id}: cleanup must follow auth configuration"
+    assert auth[0].get("if") == "inputs.install-script == ''", (
+        f"{job_id}: legacy auth must be disabled when caller-owned install is selected"
+    )
 
     # Install consumers that point NPM_CONFIG_USERCONFIG at .npmrc.auth must
     # run before cleanup so the file still exists for a successful install.
@@ -130,12 +140,32 @@ def validate_job(job_id: str, job: dict) -> None:
             f"(auth={auth_i}, install={install_i}, cleanup={cleanup_i})"
         )
         install_step = named_steps(job, install_name)[0]
+        assert install_step.get("if", "").startswith("inputs.install-script == '' &&"), (
+            f"{job_id}/{install_name}: legacy install must be disabled for caller-owned install"
+        )
         env = install_step.get("env") or {}
         userconfig = env.get("NPM_CONFIG_USERCONFIG")
         if userconfig is not None:
             assert userconfig == AUTH_PATH_EXPR, (
                 f"{job_id}/{install_name}: unexpected NPM_CONFIG_USERCONFIG {userconfig!r}"
             )
+
+    caller_install = named_steps(job, CALLER_INSTALL_STEP)
+    assert len(caller_install) == 1, (
+        f"{job_id}: expected one caller-owned install step, found {len(caller_install)}"
+    )
+    caller = caller_install[0]
+    assert caller.get("if") == "inputs.install-script != ''"
+    caller_env = caller.get("env") or {}
+    assert caller_env.get("NVAULT_TOKEN") == "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}"
+    assert "NARDUK_PLATFORM_GH_PACKAGES_READ" not in caller_env
+    caller_run = caller.get("run") or ""
+    assert "case \"$INSTALL_SCRIPT\" in" in caller_run
+    assert "*[!A-Za-z0-9:_-]*" in caller_run
+    assert '"$PM" run "$INSTALL_SCRIPT"' in caller_run
+    assert "eval " not in caller_run
+    assert "NVAULT_TOKEN" not in caller_run
+    assert names.index(CALLER_INSTALL_STEP) > cleanup_i
 
 
 def validate(document: dict) -> None:
@@ -227,7 +257,7 @@ def main() -> None:
     # Seeded-red: cleanup without always() must fail.
     candidate = deepcopy(document)
     step = named_steps(candidate["jobs"]["build"], CLEANUP_STEP)[0]
-    step["if"] = "success()"
+    step["if"] = "inputs.install-script == ''"
     try:
         validate(candidate)
     except AssertionError:
@@ -246,9 +276,35 @@ def main() -> None:
     else:
         raise AssertionError("broad-delete cleanup mutation did not fail the contract")
 
+    # Seeded-red: mapping the service token as a direct package token must fail.
+    candidate = deepcopy(document)
+    step = named_steps(candidate["jobs"]["build"], CALLER_INSTALL_STEP)[0]
+    step["env"] = {
+        "NARDUK_PLATFORM_GH_PACKAGES_READ": "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}",
+        "INSTALL_SCRIPT": "${{ inputs.install-script }}",
+        "PM": "${{ inputs.package-manager }}",
+    }
+    try:
+        validate(candidate)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("direct-package-token mapping mutation did not fail the contract")
+
+    # Seeded-red: bypassing script-name validation must fail.
+    candidate = deepcopy(document)
+    step = named_steps(candidate["jobs"]["e2e"], CALLER_INSTALL_STEP)[0]
+    step["run"] = '"$PM" run "$INSTALL_SCRIPT"'
+    try:
+        validate(candidate)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("unvalidated caller-script mutation did not fail the contract")
+
     print(
-        "package-auth cleanup contract passed "
-        f"({len(AUTH_JOBS)} jobs, missing-cleanup red cases, always/path red cases)"
+        "package-auth install-scope contract passed "
+        f"({len(AUTH_JOBS)} jobs, cleanup and caller-install red cases)"
     )
 
 

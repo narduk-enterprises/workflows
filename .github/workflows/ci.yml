@@ -167,11 +167,11 @@ jobs:
       - name: prebuilt E2E artifact fail-closed tests
         run: python3 scripts/test_e2e_build_artifact.py
 
-      # Every nuxt-cloudflare job that can materialise `.npmrc.auth` must pair
-      # it with an exact-path `if: always()` cleanup (persistent self-hosted
-      # guests keep the workspace volume). Seeded-red mutations prove the
-      # contract cannot pass against a missing or broadened cleanup.
-      - name: package-auth cleanup contract tests
+      # Every nuxt-cloudflare install job must either pair legacy `.npmrc.auth`
+      # materialization with exact-path cleanup or delegate to a validated
+      # caller-owned wrapper that receives only the nVault service token.
+      # Seeded-red mutations prove both paths fail closed.
+      - name: package-auth install-scope contract tests
         run: python3 scripts/test_package_auth_cleanup.py
 
       # Cheap belt-and-braces: actionlint parses YAML itself, but a file it
