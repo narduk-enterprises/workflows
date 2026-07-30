@@ -561,6 +561,15 @@ jobs:
         if: inputs.package-manager == 'npm'
         run: npm ci
 
+      # Self-hosted guests keep the workspace volume between jobs. The auth
+      # bootstrap writes mode-0600 `.npmrc.auth` under working-directory for
+      # NPM_CONFIG_USERCONFIG; delete that exact path on every outcome so a
+      # failed install or cancelled job cannot leave registry credentials on
+      # the guest. Do not broaden this to globs or parent trees.
+      - name: Remove package auth materialization
+        if: always()
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
+
       # Only the default branch writes, and only this job and `e2e` write at
       # all. `e2e-report` and `deploy-dry-run` share `inputs.runner` with this
       # job, so by the time they install, the entry this step wrote is an
@@ -819,6 +828,11 @@ jobs:
       - name: Install dependencies (npm)
         if: inputs.package-manager == 'npm'
         run: npm ci
+      # Exact-path cleanup only: persistent self-hosted workspaces must not keep
+      # registry credentials after install (success, failure, or cancel).
+      - name: Remove package auth materialization
+        if: always()
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
       - name: Run ordered extra gate scripts
         env:
           SCRIPTS: ${{ inputs.extra-gate-scripts }}
@@ -1042,6 +1056,13 @@ jobs:
       - name: Install dependencies (npm)
         if: inputs.package-manager == 'npm'
         run: npm ci
+
+      # Self-hosted guests keep the workspace volume between jobs. Delete the
+      # exact `.npmrc.auth` materialization after install on every outcome so
+      # browser-lane failures/cancels cannot leave registry credentials behind.
+      - name: Remove package auth materialization
+        if: always()
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
 
       # Written separately from `build` because this job may be routed to a
       # different runner class (the isolated browser pool), where the cache
@@ -1486,6 +1507,12 @@ jobs:
         if: inputs.package-manager == 'npm'
         run: npm ci
 
+      # Exact-path cleanup after the install consumer; report merge does not
+      # need registry auth and must not inherit leftover credentials.
+      - name: Remove package auth materialization
+        if: always()
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
+
       - name: Download shard evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -1633,6 +1660,13 @@ jobs:
       - name: Install dependencies (npm)
         if: inputs.package-manager == 'npm'
         run: npm ci
+
+      # Exact-path cleanup after install on every outcome; dry-run validation
+      # uses local node_modules and must not leave registry credentials on a
+      # persistent guest when install fails or the job is cancelled.
+      - name: Remove package auth materialization
+        if: always()
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
 
       - name: Validate Worker bundle (dry run)
         working-directory: ${{ inputs.wrangler-working-directory != '' && inputs.wrangler-working-directory || inputs.working-directory }}
