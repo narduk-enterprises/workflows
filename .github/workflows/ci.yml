@@ -66,6 +66,18 @@ jobs:
         with:
           persist-credentials: false
 
+      # scripts/test_script_gates.py and other test_*.py extract the actual
+      # `run:` snippets out of the callables (node-library.yml,
+      # reusable-node-ci.yml, ...) and EXECUTE them to prove the gate logic,
+      # so a bare `node` binary must exist on the runner itself -- not just
+      # be nameable in some other job's own setup-node step. GitHub-hosted
+      # ubuntu-latest ships Node; the self-hosted linux-ci guest does not
+      # (fleet's bootstrap-runner-guest.sh installs no JS toolchain). Same
+      # pin this repo's own callables already use.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
       # This job's own scripts (lint_callables.py and every scripts/test_*.py)
       # import PyYAML. GitHub-hosted ubuntu-latest ships it; the self-hosted
       # linux-ci guest's provisioned package set
