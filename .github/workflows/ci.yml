@@ -46,38 +46,18 @@ concurrency:
 jobs:
   validate:
     name: Validate workflows
-    # ---------------------------------------------------------------------
-    # RUNNER ROUTE — READ BEFORE CHANGING. This is GitHub-hosted and that is a
-    # KNOWN, DECLARED POLICY GAP, not a considered exception and not drift I am
-    # papering over.
-    #
-    # The manifest is the routing authority (CI-RUNNER-POLICY §4). Asked, it
-    # refuses:
-    #
-    #   $ python3 scripts/github_runner_fleet.py route \
-    #       --repository narduk-enterprises/workflows --visibility private
-    #   ERROR: narduk-enterprises/workflows is not approved for organization
-    #          runner class linux-ci; update the manifest first
-    #
-    # `workflows` appears nowhere in Config/github-runner-fleet.json. So there
-    # is no self-hosted route to obey.
-    #
-    # And this job is NOT a member of any of the three named GitHub-hosted
-    # exceptions in CI-RUNNER-POLICY §2. It is not narduk-infrastructure's
-    # external watchdog (1); it does not gate a privileged self-hosted job nor
-    # isolate third-party build code from credentialed infra (2); it is not
-    # nvault's release-cli publish job (3). Do not reason it into (2) because it
-    # happens to hold no secrets — "holds no secrets" is a precondition of that
-    # class, not the class itself.
-    #
-    # Resolving the gap properly is one of two things, neither of which belongs
-    # to a workflow file: a manifest entry (fleet, D-FLEET-1) or a fourth
-    # exception (a dated DECISIONS.md entry + an edit to CI-RUNNER-POLICY.md).
-    # Filed as narduk-enterprises/workflows#11. Until one lands, the gate runs
-    # hosted, holding zero secrets beyond `github.token` and reading only this
-    # repository's own workflow YAML.
-    # ---------------------------------------------------------------------
-    runs-on: ubuntu-latest
+    # Resolved via fleet#110 (D-FLEET-1): `workflows` is authorized in
+    # Config/github-runner-fleet.json's `linux-ci` group, alongside the other
+    # repositories that already share it. This is not one of CI-RUNNER-POLICY
+    # §2's three named GitHub-hosted exceptions (checked the live list, not
+    # from memory) — it is the ordinary self-hosted default. Route resolved
+    # with, not hand-copied from:
+    #   python3 scripts/github_runner_fleet.py route \
+    #     --repository narduk-enterprises/workflows --visibility private --workload linux-ci
+    # Refs workflows#11.
+    runs-on:
+      group: linux-ci
+      labels: [self-hosted, Linux, X64, proxmox, linux-ci]
     timeout-minutes: 10
     permissions:
       contents: read
@@ -85,6 +65,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # This job's own scripts (lint_callables.py and every scripts/test_*.py)
+      # import PyYAML. GitHub-hosted ubuntu-latest ships it; the self-hosted
+      # linux-ci guest's provisioned package set
+      # (fleet's bootstrap-runner-guest.sh: ripgrep python3 perl git bash curl
+      # nftables iptables ca-certificates libatomic1 openssl jq shellcheck zip
+      # rsync) does not, and CI jobs on linux-ci have no sudo. Provision it
+      # into the user site-packages rather than assuming an ambient runner
+      # tool (estate convention: runner labels describe registration, not the
+      # service PATH).
+      - name: Ensure PyYAML is available (self-hosted guests provision their own toolchain)
+        run: |
+          set -euo pipefail
+          if python3 -c "import yaml" 2>/dev/null; then
+            echo "PyYAML already available"
+          else
+            echo "PyYAML missing on this guest; installing into user site-packages"
+            python3 -m pip install --user --quiet pyyaml
+            python3 -c "import yaml" || { echo "::error::PyYAML still unavailable after install"; exit 1; }
+          fi
 
       # actionlint shells out to shellcheck to check every `run:` block. If
       # shellcheck is absent it skips that integration SILENTLY and still exits
