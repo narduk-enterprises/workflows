@@ -65,9 +65,10 @@ in their app-class workflow.
 | `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: script-probed lint/typecheck/test/build, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern. See [relationship to `reusable-node-ci.yml`](#relationship-between-node-libraryyml-and-reusable-node-ciyml) below |
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: script-probed lint, typecheck, test, build (pnpm or npm), fail-closed by default through `require-scripts`. Zero live callers as of 2026-07-27 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
+| `code-review.yml` | **Advisory, default-off, not a CI gate.** Requests one containerized read-only agent review of a PR head from the estate's ephemeral pool, by firing a single `repository_dispatch` at `agent-infrastructure`. No `Required` job, never part of `ci / Required`, and every refusal path (opted out, fork, no secret, dispatch failure) exits SUCCESS. `enabled` defaults to `false`, so adopting the tag that carries it changes nothing until a repo opts in. See [Advisory code review](#advisory-code-review) |
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 
-All seven shipped callables are `on: workflow_call` only — none of them declare their own
+All eight shipped callables are `on: workflow_call` only — none of them declare their own
 triggers, and none declare `concurrency:` (see "How to consume" below for why).
 
 ### Adopters
@@ -86,6 +87,7 @@ branch, read back from the API — not that the caller parses.
 | `node-library.yml` | `narduk-enterprises/narduk-charts` | yes — repo ruleset `require-ci-required` |
 | `nuxt-cloudflare.yml` | `hydrogen` | no — `hydrogen` has no branch protection; it called `@v1` unenforced for months, which is the failure mode this column exists to make visible |
 | `reusable-node-ci.yml` | none | — |
+| `code-review.yml` | none yet — `agent-infrastructure`, `operator-portal`, and `stonx` are the allowlisted launch set | n/a — advisory by design; it must never become a required check |
 | `reusable-weekly-drift-check.yml` | retired — zero live callers verified across `narduk-enterprises` and `narduk-incubator` | — |
 
 ## The `ci / Required` convention
@@ -850,6 +852,65 @@ Notes:
 - **Public repos must never pass a self-hosted `runner`/label** (fork PRs
   would run attacker code on estate infrastructure) — see "Runner routing"
   above.
+
+## Advisory code review
+
+`code-review.yml` is the odd one out in this repository, and it is worth
+understanding why before adopting it: **it is not a CI gate.** Every other
+callable here exists to produce `ci / Required`. This one produces nothing a
+branch ruleset can require, has no `Required` job, and cannot fail your build.
+It asks the estate's ephemeral agent pool for one read-only review of a pull
+request head, and the review arrives — or does not — as a comment on the PR.
+
+That framing is load-bearing. A review request that can redden CI turns an
+optional quality aid into an outage every time the pool is busy, the dispatch
+token rotates, or the network hiccups. So every refusal path exits SUCCESS with
+a `::notice::` naming which one fired:
+
+| Condition | Result |
+|---|---|
+| `enabled` not passed (the default) | job skipped, nothing dispatched |
+| PR carries the `no-ai-review` label | `review skipped: opted out` |
+| PR head is a fork | `review skipped: ... head is a fork` |
+| `AGENT_REVIEW_DISPATCH_TOKEN` not available | `review skipped: ... not available` |
+| the dispatch call fails or returns non-204 | `::warning::`, job still green |
+| the pool is busy (decided downstream) | nothing queues, nothing retries |
+
+### Consuming it
+
+```yaml
+  code-review:
+    uses: narduk-enterprises/workflows/.github/workflows/code-review.yml@v1
+    with:
+      enabled: true
+      review-tier: cheapest-capable
+      runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
+    secrets:
+      AGENT_REVIEW_DISPATCH_TOKEN: ${{ secrets.AGENT_REVIEW_DISPATCH_TOKEN }}
+```
+
+Call it as a job **beside** your `ci` job, never inside its `needs:` chain —
+putting it upstream of `Required` would reintroduce exactly the coupling the
+advisory design removes.
+
+Adding `enabled: true` is not sufficient on its own: the receiving repository
+keeps a closed allowlist (`Config/agent-review-repos.json` in
+`agent-infrastructure`) and refuses a dispatch from anything absent from it.
+Enabling a new repo is therefore two one-line changes in two repositories, on
+purpose — one caller-side opt-in and one estate-side admission.
+
+### What the reviewer can and cannot do
+
+The container holds a read-only clone and a `contents: read` token. It cannot
+push, cannot approve, cannot dismiss a review, and cannot reach the pull
+requests API. Its whole output is one comment. Findings are required to name a
+`file:line` the reviewer actually opened, and PR content is treated as
+untrusted data rather than as instructions — the brief that says so lives in
+`agent-infrastructure` at
+`skills/proxmox-agent-execution/references/agent-review-brief.md`, so tuning the
+reviewer is a docs pull request there rather than a change here.
+
+Refs `narduk-enterprises/agent-infrastructure#333` (D-AGENT-POOL-1).
 
 ## Relationship between `node-library.yml` and `reusable-node-ci.yml`
 
