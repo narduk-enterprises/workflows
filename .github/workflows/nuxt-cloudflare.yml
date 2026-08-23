@@ -365,6 +365,10 @@ on:
         type: string
         default: ""
     secrets:
+      # CI alias for the single estate packages-read PAT. Callers pass
+      # secrets.NARDUK_PLATFORM_GH_PACKAGES_READ (org Actions, same value as
+      # Doppler GH_PACKAGES_READ) or map secrets.NVAULT_TOKEN into this input.
+      # Local installs use GH_PACKAGES_READ. Do not mint a per-app PAT.
       NARDUK_PLATFORM_GH_PACKAGES_READ:
         required: false
 
