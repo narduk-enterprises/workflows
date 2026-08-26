@@ -3,8 +3,8 @@
 
 Same discipline as `test_extra_env.py` and `test_script_gates.py`: the step text
 is EXTRACTED from the shipped callable and EXECUTED, so these tests cannot drift
-from the workflow they describe. A stub `curl` in front of `PATH` records what
-the step actually asked for.
+from the workflow they describe. Stub `nvault`, `openssl`, and `curl` binaries
+record the broker and dispatch boundaries without touching a real credential.
 
 Two properties are worth this much machinery:
 
@@ -17,9 +17,10 @@ Two properties are worth this much machinery:
     moving `v1` onto a commit carrying this file changes the behaviour of zero
     adopters. That is what makes the rollout safe.
 
-And one security property: the dispatch token reaches `curl` through a 0600
-config file, never through argv. On a self-hosted guest every listener runs as
-the same `runner` user and can read `/proc/<pid>/cmdline`.
+And one security property: the Actions secret is only an nVault service token;
+the provider App JWT and one-hour installation token reach `curl` through stdin
+config, never through argv or a file. On a self-hosted guest every listener runs
+as the same `runner` user and can read `/proc/<pid>/cmdline`.
 
 Run: python3 scripts/test_code_review_callable.py
 """
@@ -43,33 +44,76 @@ WORKFLOW = ROOT / ".github" / "workflows" / "code-review.yml"
 CALLER_REPOSITORY = "narduk-enterprises/operator-portal"
 DISPATCH_REPOSITORY = "narduk-enterprises/agent-infrastructure"
 HEAD_SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
-TOKEN = "ghs-not-a-real-token-0000"
+SERVICE_TOKEN = "nv-service-not-a-real-token-0000"
+INSTALLATION_TOKEN = "ghs-not-a-real-installation-token-0000"
 
-# A stub `curl` that records its argv, its stdin-free config file, and its data
-# payload, then prints whatever HTTP status the test asked for. It validates
-# nothing: assertions belong in tests, not in fixtures.
+# A stub `curl` that mints a fake downscoped token on the first call and records
+# the dispatch argv, stdin config, and data payload on the second call.
 STUB_CURL = '''#!/usr/bin/env python3
 import json, os, sys
 
 argv = sys.argv[1:]
-record = {"argv": argv}
-for flag, key in (("--config", "config"), ("--data", "data")):
-    if flag in argv:
-        value = argv[argv.index(flag) + 1]
-        path = value[1:] if key == "data" and value.startswith("@") else value
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                record[key] = handle.read()
-        except OSError:
-            record[key] = "<unreadable>"
-        if key == "config":
-            record["config_mode"] = oct(os.stat(path).st_mode & 0o777)
+url = argv[-1]
+config = sys.stdin.read() if "--config" in argv and argv[argv.index("--config") + 1] == "-" else ""
+
+if url.endswith("/access_tokens"):
+    print(json.dumps({
+        "token": os.environ["STUB_INSTALLATION_TOKEN"],
+        "permissions": {"contents": "write", "metadata": "read"},
+        "repositories": [{"full_name": "narduk-enterprises/agent-infrastructure"}],
+    }))
+    sys.exit(0)
+
+record = {"argv": argv, "config": config}
+if "--data" in argv:
+    value = argv[argv.index("--data") + 1]
+    path = value[1:] if value.startswith("@") else value
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            record["data"] = handle.read()
+    except OSError:
+        record["data"] = "<unreadable>"
 
 with open(os.environ["STUB_CURL_LOG"], "w", encoding="utf-8") as handle:
     json.dump(record, handle)
 
 sys.stdout.write(os.environ.get("STUB_CURL_HTTP_CODE", "204"))
 sys.exit(int(os.environ.get("STUB_CURL_EXIT", "0")))
+'''
+
+STUB_NVAULT = '''#!/usr/bin/env python3
+import os, sys
+
+if sys.argv[1:] == ["version"]:
+    print(os.environ.get("STUB_NVAULT_VERSION", "0.1.0"))
+    sys.exit(0)
+
+if not os.environ.get("NVAULT_TOKEN"):
+    sys.exit(41)
+if os.environ.get("STUB_NVAULT_RUN_EXIT", "0") != "0":
+    sys.exit(int(os.environ["STUB_NVAULT_RUN_EXIT"]))
+try:
+    boundary = sys.argv.index("--")
+except ValueError:
+    sys.exit(42)
+command = sys.argv[boundary + 1:]
+environment = os.environ.copy()
+environment.update({
+    "APP_PRIVATE_KEY": "not-a-real-private-key",
+    "APP_ID": "12345",
+    "INSTALLATION_ID": "67890",
+})
+os.execvpe(command[0], command, environment)
+'''
+
+STUB_OPENSSL = '''#!/usr/bin/env python3
+import sys
+
+sys.stdin.buffer.read()
+if len(sys.argv) > 1 and sys.argv[1] in {"base64", "dgst"}:
+    sys.stdout.write("c2FmZS10ZXN0LWJ5dGVz")
+    sys.exit(0)
+sys.exit(2)
 '''
 
 
@@ -108,19 +152,26 @@ def run_step(
     pr_number: str = "52",
     head_repository: str = CALLER_REPOSITORY,
     opted_out: str = "false",
-    token: str = TOKEN,
+    service_token: str = SERVICE_TOKEN,
     http_code: str = "204",
     curl_exit: str = "0",
     tier: str = "cheapest-capable",
-) -> tuple[subprocess.CompletedProcess[str], dict[str, Any] | None]:
+    nvault_version: str = "0.1.0",
+    nvault_run_exit: str = "0",
+) -> tuple[subprocess.CompletedProcess[str], tuple[dict[str, Any] | None, list[str]]]:
     """Execute the shipped step with a stub `curl` and return what it did."""
     with tempfile.TemporaryDirectory(prefix="code-review-step-") as directory:
         base = Path(directory)
         binaries = base / "bin"
         binaries.mkdir()
-        stub = binaries / "curl"
-        stub.write_text(STUB_CURL, encoding="utf-8")
-        stub.chmod(0o755)
+        for name, body in {
+            "curl": STUB_CURL,
+            "nvault": STUB_NVAULT,
+            "openssl": STUB_OPENSSL,
+        }.items():
+            stub = binaries / name
+            stub.write_text(body, encoding="utf-8")
+            stub.chmod(0o755)
         runner_temp = base / "runner-temp"
         runner_temp.mkdir()
         log = base / "curl.json"
@@ -132,6 +183,9 @@ def run_step(
             "STUB_CURL_LOG": str(log),
             "STUB_CURL_HTTP_CODE": http_code,
             "STUB_CURL_EXIT": curl_exit,
+            "STUB_INSTALLATION_TOKEN": INSTALLATION_TOKEN,
+            "STUB_NVAULT_VERSION": nvault_version,
+            "STUB_NVAULT_RUN_EXIT": nvault_run_exit,
             "DISPATCH_REPOSITORY": DISPATCH_REPOSITORY,
             "DISPATCH_EVENT_TYPE": "agent-review-request",
             "REVIEW_TIER": tier,
@@ -140,7 +194,7 @@ def run_step(
             "PR_HEAD_SHA": HEAD_SHA,
             "PR_HEAD_REPOSITORY": head_repository,
             "PR_OPTED_OUT": opted_out,
-            "AGENT_REVIEW_DISPATCH_TOKEN": token,
+            "NVAULT_TOKEN": service_token,
         }
         completed = subprocess.run(
             ["bash", "-c", step_script()],
@@ -151,7 +205,7 @@ def run_step(
         )
         dispatched = json.loads(log.read_text(encoding="utf-8")) if log.exists() else None
         leftovers = sorted(path.name for path in runner_temp.iterdir())
-    return completed, (dispatched, leftovers)  # type: ignore[return-value]
+    return completed, (dispatched, leftovers)
 
 
 def main() -> int:
@@ -175,8 +229,8 @@ def main() -> int:
         "not opted in produces a skipped job and dispatches nothing",
     )
     f.check(
-        call["secrets"]["AGENT_REVIEW_DISPATCH_TOKEN"].get("required") is not True,
-        "AGENT_REVIEW_DISPATCH_TOKEN must stay optional (R7): a required secret hard-fails "
+        call["secrets"]["AGENT_REVIEW_DISPATCH_NVAULT_TOKEN"].get("required") is not True,
+        "AGENT_REVIEW_DISPATCH_NVAULT_TOKEN must stay optional (R7): a required secret hard-fails "
         "every caller that enables the review before the org secret reaches it",
     )
     f.check(
@@ -217,18 +271,18 @@ def main() -> int:
         )
         # The security property.
         f.check(
-            TOKEN not in " ".join(dispatched["argv"]),
-            "the dispatch token appeared in curl's argv — on a self-hosted guest every "
+            INSTALLATION_TOKEN not in " ".join(dispatched["argv"]),
+            "the installation token appeared in curl's argv — on a self-hosted guest every "
             "listener shares the `runner` user and can read /proc/<pid>/cmdline",
         )
         f.check(
-            TOKEN in dispatched.get("config", ""),
-            "the dispatch token did not reach curl's --config file, so the Authorization "
+            INSTALLATION_TOKEN in dispatched.get("config", ""),
+            "the installation token did not reach curl's stdin config, so the Authorization "
             "header was never sent",
         )
         f.check(
-            dispatched.get("config_mode") == "0o600",
-            f"curl's config file was mode {dispatched.get('config_mode')}, not 0600",
+            SERVICE_TOKEN not in dispatched.get("config", ""),
+            "the nVault service token escaped the broker boundary into curl's provider request",
         )
     f.check(
         leftovers == [],
@@ -239,7 +293,7 @@ def main() -> int:
     refusals = {
         "opted out via the no-ai-review label": {"opted_out": "true"},
         "fork head": {"head_repository": "someone-else/operator-portal"},
-        "missing dispatch secret": {"token": ""},
+        "missing nVault service token": {"service_token": ""},
         "event carries no pull request": {"pr_number": ""},
     }
     for label, keywords in refusals.items():
@@ -263,6 +317,8 @@ def main() -> int:
         "curl transport failure": {"curl_exit": "7", "http_code": ""},
         "GitHub returned 404": {"http_code": "404"},
         "GitHub returned 401": {"http_code": "401"},
+        "nVault broker refusal": {"nvault_run_exit": "43"},
+        "wrong nVault release": {"nvault_version": "0.2.0"},
     }.items():
         completed, _ = run_step(**keywords)  # type: ignore[arg-type]
         f.check(

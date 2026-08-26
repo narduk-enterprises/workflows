@@ -8,7 +8,7 @@ name: Reusable Advisory Code Review
 # path below exits SUCCESS with a `::notice::` explaining which one fired. That
 # is a deliberate design property, not laziness: a review request that blocks a
 # merge turns an optional quality aid into an outage whenever the pool, the
-# dispatch token, or the network is having a bad day. Advisory means advisory.
+# credential broker, or the network is having a bad day. Advisory means advisory.
 #
 # `enabled` defaults to FALSE. A repo that calls this workflow without passing
 # `enabled: true` gets a skipped job and dispatches nothing — so moving the `v1`
@@ -26,7 +26,7 @@ name: Reusable Advisory Code Review
 #   * label `no-ai-review` on the PR  -> opted out
 #   * the PR head is a FORK           -> same-org only; a fork PR must not be
 #                                        able to steer estate agent capacity
-#   * no `AGENT_REVIEW_DISPATCH_TOKEN` -> the adopter has not been wired up yet
+#   * no `AGENT_REVIEW_DISPATCH_NVAULT_TOKEN` -> adopter is not wired up yet
 #
 # RUNNER ROUTING: `runner` is a caller-controlled, JSON-encoded string input,
 # decoded with fromJSON() at `runs-on:` — the same shape every other callable in
@@ -47,7 +47,8 @@ name: Reusable Advisory Code Review
 
 # Least privilege at the top so a job added later inherits it rather than the
 # caller's grant. This workflow reads nothing and writes nothing through the
-# Actions token — the cross-repo dispatch travels on the caller's own secret.
+# Actions token. The caller carries only a read-only, config-scoped nVault
+# service token; a short-lived GitHub App token is minted in memory per request.
 permissions:
   contents: read
 
@@ -86,14 +87,13 @@ on:
         type: string
         default: '"ubuntu-latest"'
     secrets:
-      AGENT_REVIEW_DISPATCH_TOKEN:
+      AGENT_REVIEW_DISPATCH_NVAULT_TOKEN:
         description: >-
-          Token authorized to POST /repos/narduk-enterprises/agent-infrastructure/dispatches.
-          OPTIONAL on purpose (R7): a caller that has not been granted it gets a
-          `::notice::` and a green job rather than a hard failure. That is the
-          correct behaviour for an advisory feature — the alternative is that
-          every repo which enables the review before the org secret reaches it
-          starts failing CI for a review it was never going to get.
+          Read-only service token scoped only to
+          github/prd/narduk-enterprises-lane-automation-app. The provider App
+          credential never becomes an Actions secret; nVault exposes it only to
+          the short-lived mint process. OPTIONAL on purpose (R7): an unwired
+          caller gets a notice and a green job rather than a hard failure.
         required: false
 
 jobs:
@@ -124,7 +124,7 @@ jobs:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
           PR_OPTED_OUT: ${{ contains(github.event.pull_request.labels.*.name, 'no-ai-review') }}
-          AGENT_REVIEW_DISPATCH_TOKEN: ${{ secrets.AGENT_REVIEW_DISPATCH_TOKEN }}
+          NVAULT_TOKEN: ${{ secrets.AGENT_REVIEW_DISPATCH_NVAULT_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -148,14 +148,28 @@ jobs:
             exit 0
           fi
 
-          if [ -z "${AGENT_REVIEW_DISPATCH_TOKEN}" ]; then
-            echo "::notice::review skipped: AGENT_REVIEW_DISPATCH_TOKEN is not available to this caller"
+          if [ -z "${NVAULT_TOKEN:-}" ]; then
+            echo "::notice::review skipped: AGENT_REVIEW_DISPATCH_NVAULT_TOKEN is not available to this caller"
             exit 0
           fi
 
+          if ! command -v nvault >/dev/null 2>&1; then
+            echo "::warning::advisory review not requested: pinned nvault CLI is unavailable on this runner"
+            exit 0
+          fi
+          if [ "$(nvault version 2>/dev/null || true)" != "0.1.0" ]; then
+            echo "::warning::advisory review not requested: nvault CLI is not the reviewed 0.1.0 release"
+            exit 0
+          fi
+          for tool in bash curl jq openssl; do
+            if ! command -v "${tool}" >/dev/null 2>&1; then
+              echo "::warning::advisory review not requested: required tool ${tool} is unavailable"
+              exit 0
+            fi
+          done
+
           payload="${RUNNER_TEMP}/agent-review-dispatch.json"
-          curl_config="${RUNNER_TEMP}/agent-review-curl.conf"
-          trap 'rm -f "${payload}" "${curl_config}"' EXIT
+          trap 'rm -f "${payload}"' EXIT
           umask 077
 
           python3 - "${payload}" <<'PY'
@@ -175,29 +189,73 @@ jobs:
           )
           PY
 
-          # The credential goes in a 0600 curl config, never in argv: on a
-          # self-hosted guest every listener runs as the same `runner` user and
-          # can read /proc/<pid>/cmdline.
-          printf 'header = "Authorization: Bearer %s"\n' "${AGENT_REVIEW_DISPATCH_TOKEN}" >"${curl_config}"
-          chmod 600 "${curl_config}"
-
+          # Resolve the provider App only inside nVault, downscope its one-hour
+          # installation token to this repository plus Contents Write (the
+          # repository_dispatch permission), and pass both JWT and installation
+          # token to curl through stdin config. Neither credential enters argv,
+          # a file, an Actions expression, an artifact, or the job summary.
           status=0
           http_code="$(
+            nvault -p github -e prd -c narduk-enterprises-lane-automation-app run -- \
+              bash -s -- "${payload}" "${DISPATCH_REPOSITORY}" <<'BASH'
+          set -euo pipefail
+          set +x
+          payload_path="$1"
+          dispatch_repository="$2"
+          : "${APP_PRIVATE_KEY:?APP_PRIVATE_KEY is missing from nVault config}"
+          : "${APP_ID:?APP_ID is missing from nVault config}"
+          : "${INSTALLATION_ID:?INSTALLATION_ID is missing from nVault config}"
+
+          b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+          now="$(date +%s)"
+          header="$(printf '%s' '{"alg":"RS256","typ":"JWT"}' | b64url)"
+          claims="$(printf '{"iat":%s,"exp":%s,"iss":%s}' "$((now - 60))" "$((now + 540))" "${APP_ID}" | b64url)"
+          signing_input="${header}.${claims}"
+          signature="$(printf '%s' "${signing_input}" | openssl dgst -sha256 -sign <(printf '%s' "${APP_PRIVATE_KEY}") | b64url)"
+          app_jwt="${signing_input}.${signature}"
+          mint_payload='{"repositories":["agent-infrastructure"],"permissions":{"contents":"write"}}'
+
+          response="$(
+            printf 'header = "Authorization: Bearer %s"\n' "${app_jwt}" |
+              curl --fail-with-body --silent --show-error --request POST \
+                --config - \
+                --header "Accept: application/vnd.github+json" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                --header "Content-Type: application/json" \
+                --max-time 20 --retry 2 --retry-connrefused \
+                --data "${mint_payload}" \
+                "https://api.github.com/app/installations/${INSTALLATION_ID}/access_tokens"
+          )"
+          installation_token="$(
+            printf '%s' "${response}" |
+              jq -er '
+                if (.permissions == {"contents":"write","metadata":"read"})
+                   and (.repositories | length == 1)
+                   and (.repositories[0].full_name == "narduk-enterprises/agent-infrastructure")
+                then .token
+                else empty
+                end
+              '
+          )"
+          [ -n "${installation_token}" ]
+
+          printf 'header = "Authorization: Bearer %s"\n' "${installation_token}" |
             curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
               --request POST \
-              --config "${curl_config}" \
+              --config - \
               --header "Accept: application/vnd.github+json" \
               --header "X-GitHub-Api-Version: 2022-11-28" \
               --header "Content-Type: application/json" \
               --max-time 20 --retry 2 --retry-connrefused \
-              --data "@${payload}" \
-              "https://api.github.com/repos/${DISPATCH_REPOSITORY}/dispatches"
+              --data "@${payload_path}" \
+              "https://api.github.com/repos/${dispatch_repository}/dispatches"
+          BASH
           )" || status=$?
 
           # Every failure below is a warning, never an error. See the header:
           # an advisory review that can redden a caller's CI is a liability.
           if [ "${status}" -ne 0 ]; then
-            echo "::warning::advisory review not requested: dispatch call failed (curl exit ${status})"
+            echo "::warning::advisory review not requested: credential broker or dispatch call failed (exit ${status})"
             exit 0
           fi
           if [ "${http_code}" != "204" ]; then

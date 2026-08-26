@@ -65,7 +65,7 @@ in their app-class workflow.
 | `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: script-probed lint/typecheck/test/build, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern. See [relationship to `reusable-node-ci.yml`](#relationship-between-node-libraryyml-and-reusable-node-ciyml) below |
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: script-probed lint, typecheck, test, build (pnpm or npm), fail-closed by default through `require-scripts`. Zero live callers as of 2026-07-27 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
-| `code-review.yml` | **Advisory, default-off, not a CI gate.** Requests one containerized read-only agent review of a PR head from the estate's ephemeral pool, by firing a single `repository_dispatch` at `agent-infrastructure`. No `Required` job, never part of `ci / Required`, and every refusal path (opted out, fork, no secret, dispatch failure) exits SUCCESS. `enabled` defaults to `false`, so adopting the tag that carries it changes nothing until a repo opts in. See [Advisory code review](#advisory-code-review) |
+| `code-review.yml` | **Advisory, default-off, not a CI gate.** Requests one containerized read-only agent review of a PR head from the estate's ephemeral pool, by firing a single `repository_dispatch` at `agent-infrastructure`. No `Required` job, never part of `ci / Required`, and every refusal path (opted out, fork, no service token, broker/dispatch failure) exits SUCCESS. `enabled` defaults to `false`, so adopting the tag that carries it changes nothing until a repo opts in. See [Advisory code review](#advisory-code-review) |
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 
 All eight shipped callables are `on: workflow_call` only — none of them declare their own
@@ -872,7 +872,7 @@ a `::notice::` naming which one fired:
 | `enabled` not passed (the default) | job skipped, nothing dispatched |
 | PR carries the `no-ai-review` label | `review skipped: opted out` |
 | PR head is a fork | `review skipped: ... head is a fork` |
-| `AGENT_REVIEW_DISPATCH_TOKEN` not available | `review skipped: ... not available` |
+| `AGENT_REVIEW_DISPATCH_NVAULT_TOKEN` not available | `review skipped: ... not available` |
 | the dispatch call fails or returns non-204 | `::warning::`, job still green |
 | the pool is busy (decided downstream) | nothing queues, nothing retries |
 
@@ -886,8 +886,15 @@ a `::notice::` naming which one fired:
       review-tier: cheapest-capable
       runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
     secrets:
-      AGENT_REVIEW_DISPATCH_TOKEN: ${{ secrets.AGENT_REVIEW_DISPATCH_TOKEN }}
+      AGENT_REVIEW_DISPATCH_NVAULT_TOKEN: ${{ secrets.AGENT_REVIEW_DISPATCH_NVAULT_TOKEN }}
 ```
+
+That Actions secret is not a GitHub token. It is a unique, read-only nVault
+service token scoped to `github/prd/narduk-enterprises-lane-automation-app`.
+The callable resolves the App credential only inside `nvault run`, requests a
+one-hour installation token downscoped to `agent-infrastructure` plus Contents
+Write, verifies the returned repository/permission set, and feeds both bearer
+credentials to `curl` through stdin config rather than argv or a file.
 
 Call it as a job **beside** your `ci` job, never inside its `needs:` chain —
 putting it upstream of `Required` would reintroduce exactly the coupling the
