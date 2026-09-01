@@ -163,6 +163,13 @@ jobs:
       - name: Python static-analysis gate tests
         run: python3 scripts/test_python_static_gate.py
 
+      # Extracts the embedded checker and the two shipped run: blocks out of
+      # closing-syntax-check.yml and executes them against a real temp git
+      # repo, proving the vendored copy actually gates a PR body AND a
+      # commit-message closing keyword (agent-infrastructure#837, #1085).
+      - name: PR closing-syntax callable behaviour tests
+        run: python3 scripts/test_closing_syntax_check.py
+
       # code-review.yml is the only callable here that must NEVER fail a
       # caller, and "never fails" is the property that rots silently: a
       # `set -e` refactor or a stray `exit 1` in a refusal branch turns an

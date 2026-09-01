@@ -66,9 +66,10 @@ in their app-class workflow.
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: script-probed lint, typecheck, test, build (pnpm or npm), fail-closed by default through `require-scripts`. Zero live callers as of 2026-07-27 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
 | `code-review.yml` | **Advisory, default-off, not a CI gate.** Requests one containerized read-only agent review of a PR head from the estate's ephemeral pool, by firing a single `repository_dispatch` at `agent-infrastructure`. No `Required` job, never part of `ci / Required`, and every refusal path (opted out, fork, no secret, dispatch failure) exits SUCCESS. `enabled` defaults to `false`, so adopting the tag that carries it changes nothing until a repo opts in. See [Advisory code review](#advisory-code-review) |
+| `closing-syntax-check.yml` | PR-closing-syntax gate (agent-infrastructure#837, #1085): rejects a PR body whose closing keyword is ambiguous (a bare comma-separated list) or sits outside a canonical closing line/list item, and rejects any commit in the PR's own commit range that carries a closing keyword at all — GitHub's squash-merge auto-close scan reads the landed commit message independently of the curated PR body. **Fully self-contained**: the checker's source (canonically `narduk-enterprises/agent-infrastructure`'s `scripts/check_pr_closing_syntax.py`) is vendored directly inside this callable, so an adopting repo needs no local copy at all — see the workflow file's own header for the sync procedure |
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 
-All eight shipped callables are `on: workflow_call` only — none of them declare their own
+All nine shipped callables are `on: workflow_call` only — none of them declare their own
 triggers, and none declare `concurrency:` (see "How to consume" below for why).
 
 ### Adopters
@@ -88,6 +89,7 @@ branch, read back from the API — not that the caller parses.
 | `nuxt-cloudflare.yml` | `hydrogen` | no — `hydrogen` has no branch protection; it called `@v1` unenforced for months, which is the failure mode this column exists to make visible |
 | `reusable-node-ci.yml` | none | — |
 | `code-review.yml` | none yet — `agent-infrastructure`, `operator-portal`, and `stonx` are the allowlisted launch set | n/a — advisory by design; it must never become a required check |
+| `closing-syntax-check.yml` | none yet — a re-home issue is filed on `narduk-enterprises-clients/pacc-trac` (agent-infrastructure#837), the repo the motivating incidents happened in; `narduk-enterprises/agent-infrastructure` stays on its own local, canonical invocation of the same (now commit-scanning) checker rather than adding a redundant cross-repo call to its own required gate | not yet |
 | `reusable-weekly-drift-check.yml` | retired — zero live callers verified across `narduk-enterprises` and `narduk-incubator` | — |
 
 ## The `ci / Required` convention
