@@ -2,13 +2,14 @@
 
 workflows holds the shared reusable GitHub Actions workflows that the rest of
 the `narduk-enterprises` estate calls instead of blob-copying YAML — fix CI in
-one place, not in a hundred repos. Eight callables live in
+one place, not in a hundred repos. Nine callables live in
 [`.github/workflows/`](./.github/workflows/), all `on: workflow_call` only
-(`apple.yml`, `code-review.yml`, `docs-governance.yml`, `node-library.yml`,
-`nuxt-cloudflare.yml`, `python-data.yml`, `reusable-browser-tests.yml`,
-`reusable-node-ci.yml`); `ci.yml` is the one non-callable, and it is this
-repo's own gate. The repo is private with Actions access set to `organization`,
-which is what makes the private→private cross-repo call resolve.
+(`apple.yml`, `closing-syntax-check.yml`, `code-review.yml`,
+`docs-governance.yml`, `node-library.yml`, `nuxt-cloudflare.yml`,
+`python-data.yml`, `reusable-browser-tests.yml`, `reusable-node-ci.yml`);
+`ci.yml` is the one non-callable, and it is this repo's own gate. The repo is
+private with Actions access set to `organization`, which is what makes the
+private→private cross-repo call resolve.
 
 The estate-wide operating manual for agents lives in
 [narduk-enterprises/agent-infrastructure](https://github.com/narduk-enterprises/agent-infrastructure)
