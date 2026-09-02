@@ -291,13 +291,107 @@ jobs:
           xcodebuild -version
           swift --version
 
+      # agent-infrastructure#965: the estate owns exactly one always-on Mac
+      # slot, so a build-command/test-command run here MUST take the same
+      # canonical host-wide lease that release/signing already takes
+      # (agent-infrastructure skills/apple-release-pipeline "Cross-repository
+      # Apple build lock") -- otherwise a caller's PR CI can overlap a local
+      # xcodebuild on the same host with no coordination at all. This job
+      # never reimplements the lock: it only invokes the installed,
+      # root-owned apple_build_lock.py, exactly like every other managed
+      # entry point (the local wrapper
+      # skills/apple-release-pipeline/scripts/xcodebuild_leased.sh, and the
+      # broker-provisioned CI/release templates). A JIT-broker-provisioned
+      # job already holds the lease (APPLE_BUILD_LOCK_HELD=1) and skips
+      # straight to running; the standard apple-imac/apple-laptop runner does
+      # not, so it waits here instead.
+      - name: Wait for Apple build lease
+        if: inputs.run-build || inputs.run-tests
+        run: |
+          set -euo pipefail
+          lock_tool="${APPLE_BUILD_LOCK_TOOL:-/Library/Application Support/NardukAppleRunner/bin/apple_build_lock.py}"
+          lock_path="${APPLE_BUILD_LOCK_PATH:-/Library/Application Support/NardukAppleRunner/state/apple-build.lock}"
+          timeout_seconds="${APPLE_BUILD_LEASE_TIMEOUT_SECONDS:-3600}"
+          poll_seconds="${APPLE_BUILD_LEASE_POLL_SECONDS:-5}"
+          if [ ! -e "$lock_tool" ]; then
+            echo "::error::canonical Apple build lease tool is not installed at $lock_tool -- refusing to run build-command/test-command unleased"
+            exit 1
+          fi
+          run_lock_tool() {
+            /usr/bin/env -u PYTHONHOME -u PYTHONPATH -u PYTHONSTARTUP -u PYTHONUSERBASE -u __PYVENV_LAUNCHER__ \
+              /usr/bin/python3 -I "$lock_tool" --lock-path "$lock_path" "$@"
+          }
+          # `audit` with the tool's own default zero timeout IS the
+          # busy/available probe: exit 0 means free, 75 means held, anything
+          # else is a hard configuration error a wait loop must not mask.
+          waited=0
+          if [ "${APPLE_BUILD_LOCK_HELD:-}" != "1" ]; then
+            while :; do
+              set +e
+              run_lock_tool audit >/dev/null
+              status=$?
+              set -e
+              if [ "$status" -eq 0 ]; then
+                break
+              fi
+              if [ "$status" -ne 75 ]; then
+                echo "::error::Apple build lease audit failed unexpectedly (exit $status)"
+                exit "$status"
+              fi
+              if [ "$waited" -ge "$timeout_seconds" ]; then
+                echo "::error::Apple build lease still busy after ${waited}s (budget ${timeout_seconds}s) -- refusing to run unleased"
+                exit 75
+              fi
+              echo "WAITING ON LEASE: Apple build lease busy -- ${waited}s elapsed of ${timeout_seconds}s budget (this is queue wait, not build/test running)"
+              sleep "$poll_seconds"
+              waited=$((waited + poll_seconds))
+            done
+            if [ "$waited" -gt 0 ]; then
+              echo "LEASE ACQUIRED after ${waited}s waiting"
+            fi
+          fi
+          remaining=$((timeout_seconds - waited))
+          if [ "$remaining" -lt 60 ]; then
+            remaining=60
+          fi
+          echo "APPLE_BUILD_LEASE_REMAINING_SECONDS=$remaining" >> "$GITHUB_ENV"
+
       - name: Build
         if: inputs.run-build
-        run: ${{ inputs.build-command }}
+        run: |
+          set -euo pipefail
+          lock_tool="${APPLE_BUILD_LOCK_TOOL:-/Library/Application Support/NardukAppleRunner/bin/apple_build_lock.py}"
+          lock_path="${APPLE_BUILD_LOCK_PATH:-/Library/Application Support/NardukAppleRunner/state/apple-build.lock}"
+          # Stage the caller's command as a real script file rather than
+          # interpolating it into a nested `bash -c "..."` string -- the
+          # latter re-parses caller-supplied text through a second layer of
+          # shell quoting/expansion and breaks on any command containing a
+          # double quote or an unintended `$expansion`.
+          script="${RUNNER_TEMP}/apple-build-command.sh"
+          cat > "$script" <<'APPLE_WORKFLOWS_BUILD_COMMAND_EOF'
+          ${{ inputs.build-command }}
+          APPLE_WORKFLOWS_BUILD_COMMAND_EOF
+          echo "RUNNING UNDER LEASE: build-command"
+          /usr/bin/env -u PYTHONHOME -u PYTHONPATH -u PYTHONSTARTUP -u PYTHONUSERBASE -u __PYVENV_LAUNCHER__ \
+            /usr/bin/python3 -I "$lock_tool" --lock-path "$lock_path" \
+            --timeout "${APPLE_BUILD_LEASE_REMAINING_SECONDS:-60}" run -- \
+            bash "$script"
 
       - name: Test
         if: inputs.run-tests
-        run: ${{ inputs.test-command }}
+        run: |
+          set -euo pipefail
+          lock_tool="${APPLE_BUILD_LOCK_TOOL:-/Library/Application Support/NardukAppleRunner/bin/apple_build_lock.py}"
+          lock_path="${APPLE_BUILD_LOCK_PATH:-/Library/Application Support/NardukAppleRunner/state/apple-build.lock}"
+          script="${RUNNER_TEMP}/apple-test-command.sh"
+          cat > "$script" <<'APPLE_WORKFLOWS_TEST_COMMAND_EOF'
+          ${{ inputs.test-command }}
+          APPLE_WORKFLOWS_TEST_COMMAND_EOF
+          echo "RUNNING UNDER LEASE: test-command"
+          /usr/bin/env -u PYTHONHOME -u PYTHONPATH -u PYTHONSTARTUP -u PYTHONUSERBASE -u __PYVENV_LAUNCHER__ \
+            /usr/bin/python3 -I "$lock_tool" --lock-path "$lock_path" \
+            --timeout "${APPLE_BUILD_LEASE_REMAINING_SECONDS:-60}" run -- \
+            bash "$script"
 
   required:
     name: Required
