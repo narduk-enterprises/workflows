@@ -577,6 +577,9 @@ jobs:
       - name: Install dependencies (npm)
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
 
       # Self-hosted guests keep the workspace volume between jobs. The auth
       # bootstrap writes mode-0600 `.npmrc.auth` under working-directory for
@@ -868,6 +871,9 @@ jobs:
       - name: Install dependencies (npm)
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
       # Exact-path cleanup only: persistent self-hosted workspaces must not keep
       # registry credentials after install (success, failure, or cancel).
       - name: Remove package auth materialization
@@ -1118,6 +1124,9 @@ jobs:
       - name: Install dependencies (npm)
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
 
       # Self-hosted guests keep the workspace volume between jobs. Delete the
       # exact `.npmrc.auth` materialization after install on every outcome so
@@ -1591,6 +1600,9 @@ jobs:
       - name: Install dependencies (npm)
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
 
       # Exact-path cleanup after the install consumer; report merge does not
       # need registry auth and must not inherit leftover credentials.
@@ -1768,6 +1780,9 @@ jobs:
       - name: Install dependencies (npm)
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
+        env:
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
 
       # Exact-path cleanup after install on every outcome; dry-run validation
       # uses local node_modules and must not leave registry credentials on a
