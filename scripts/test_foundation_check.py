@@ -93,7 +93,7 @@ def run_check_step(*, has_dep: bool, pm: str) -> tuple[int, str, str | None, str
     """Execute the "Run..." step; returns (rc, stdout+stderr, produced JSON, stub log)."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = pathlib.Path(tmp)
-        pkg = {"name": "f"}
+        pkg: dict[str, object] = {"name": "f"}
         if has_dep:
             pkg["dependencies"] = {"@narduk-enterprises/narduk-app-tools": "0.2.0"}
         (tmp_path / "package.json").write_text(json.dumps(pkg))
