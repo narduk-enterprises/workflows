@@ -67,6 +67,20 @@ Each rule below exists because breaking it has a specific, known blast radius:
                                         continue-on-error, or accepting a
                                         skipped enabled E2E job turn drift into
                                         a false green (company-hq#343)
+  R12 no job requests a permission      a job in a CALLED workflow may only
+      outside the callable's            request permissions the CALLER granted.
+      documented caller grant           Ask for one it did not and the caller's
+                                        ENTIRE run dies at startup with zero
+                                        jobs, no logs and no annotation, on
+                                        every adopter simultaneously, the
+                                        moment `v1` moves. `pull-requests:
+                                        read` added to nuxt-cloudflare.yml's
+                                        `E2E plan` job did exactly that to
+                                        every `@v1` adopter (workflows#59).
+                                        Widening a set here is a BREAKING
+                                        interface change: every caller must
+                                        grant the new permission BEFORE the
+                                        tag carrying it moves
 
 Run: python3 scripts/lint_callables.py [paths...]
 Exit 0 clean, 1 on any finding. No third-party imports beyond PyYAML.
@@ -86,6 +100,25 @@ USES_LINE = re.compile(r"^\s*(?:-\s*)?uses:\s*(\S+)\s*(#.*)?$")
 VERSION_COMMENT = re.compile(r"#\s*v?\d+(\.\d+)*")
 # `timeout-minutes: ${{ inputs.foo }}` — legal only if `foo` has a finite default.
 INPUT_EXPR = re.compile(r"^\$\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*\}\}$")
+
+# R12: the permission ceiling each callable's DOCUMENTED caller grant covers —
+# the `permissions:` block README tells adopters to put on their `ci:` job. No
+# job in that file may request a key outside its set. This is an INTERFACE, not
+# a preference: a called workflow's job asking for a permission its caller did
+# not grant fails the caller's whole run at startup (`startup_failure`, zero
+# jobs, no annotation), which is why widening one of these sets means updating
+# every adopter first and only then moving the tag (workflows#59).
+CALLER_GRANTS: dict[str, set[str]] = {
+    "apple.yml": {"contents"},
+    "closing-syntax-check.yml": {"contents"},
+    "code-review.yml": {"contents"},
+    "docs-governance.yml": {"contents"},
+    "node-library.yml": {"contents", "packages"},
+    "nuxt-cloudflare.yml": {"contents", "packages"},
+    "python-data.yml": {"contents"},
+    "reusable-browser-tests.yml": {"contents", "packages", "actions"},
+    "reusable-node-ci.yml": {"contents", "packages"},
+}
 
 # Local composite/local-path uses are exempt from SHA pinning: `./...` and
 # `owner/repo/.github/workflows/x.yml@<ref>` calls resolved inside this repo.
@@ -404,6 +437,40 @@ def check_fail_closed_playwright(path: Path, doc: dict, f: Findings) -> None:
         f.add(path, "R11 Required still accepts a skipped enabled E2E job")
 
 
+def check_permission_ceiling(path: Path, doc: dict, f: Findings) -> None:
+    """R12 — no job may request a permission outside the callable's caller grant."""
+    grant = CALLER_GRANTS.get(path.name)
+    if grant is None:
+        f.add(
+            path,
+            "R12 callable has no entry in lint_callables.CALLER_GRANTS — declare the exact "
+            "permission set its README-documented caller grant covers before shipping it",
+        )
+        return
+    for job_id, job in (doc.get("jobs") or {}).items():
+        if not isinstance(job, dict):
+            continue
+        perms = job.get("permissions")
+        if perms is None:
+            continue  # R3 already reports this
+        if not isinstance(perms, dict):
+            f.add(
+                path,
+                f"R12 job '{job_id}' uses the shorthand `permissions: {perms}` — a called "
+                "workflow must name each scope so the caller grant can be audited",
+            )
+            continue
+        extra = sorted(set(perms) - grant)
+        if extra:
+            f.add(
+                path,
+                f"R12 job '{job_id}' requests {extra} beyond the caller grant "
+                f"{sorted(grant)} — a called job asking for a permission its caller did not "
+                "grant fails the caller's ENTIRE run at startup (workflows#59). Update every "
+                "adopter's `permissions:` block and CALLER_GRANTS first, then move the tag",
+            )
+
+
 def check_file(path: Path, f: Findings) -> None:
     doc = yaml.safe_load(path.read_text())
     if not isinstance(doc, dict):
@@ -436,6 +503,8 @@ def check_file(path: Path, f: Findings) -> None:
             f.add(path, f"R3 job '{job_id}' has no `permissions:` block (job level replaces, never merges)")
 
     check_uses_pins(path, f)
+    if is_callable:
+        check_permission_ceiling(path, doc, f)
     check_required_job(path, doc, f)
     check_cache_guards(path, doc, f)
     check_store_placement(path, doc, f)

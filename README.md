@@ -1039,6 +1039,20 @@ executed here.
   a job (which renames the composed check context and silently orphans every
   branch-protection rule that required it), or changing a secret name is a new
   major.
+- **A new job-level `permissions:` scope is a BREAKING change, not an
+  addition.** A job in a called workflow may only request permissions the
+  caller granted on its `uses:` job; ask for one it did not and GitHub fails
+  the caller's *entire run* at startup — `startup_failure`, `jobs: []`, no
+  logs, no check-run annotation — before any job is created. Nothing in the
+  adopter's repository changed, so it reads as an infrastructure outage rather
+  than an interface break, and it lands on every `@v1` adopter simultaneously
+  the moment the tag moves. On 2026-09-04 `pull-requests: read` on
+  nuxt-cloudflare.yml's `E2E plan` job did exactly that to harvest-tracker,
+  marketing-web, vtraceroute and hydrogen, while the two repos pinned to older
+  commit SHAs kept running (workflows#59). Each callable's permitted set is
+  declared in `scripts/lint_callables.py`'s `CALLER_GRANTS` and enforced as
+  **R12**; widening one means updating every adopter's `permissions:` block
+  first, then the map, and only then moving the tag.
 - `nuxt-cloudflare.yml`'s browser-shard inputs (`e2e-runner`, `e2e-shards`,
   `e2e-args`, `e2e-install-browsers`, `e2e-browsers-path`) and its two new
   jobs are within-major on the same rule: five optional inputs whose defaults
