@@ -150,6 +150,14 @@ jobs:
       - name: script-gate behaviour tests
         run: python3 scripts/test_script_gates.py
 
+      # Extracts node-library.yml's `Required` job package-result case
+      # statement and executes it against every result GitHub can report for
+      # an empty-matrix-capable `package` job (success/skipped/failure/
+      # cancelled), so `skipped` (an intentionally empty package-matrix)
+      # cannot silently regress back into a false-failure.
+      - name: Required-job package-result gate tests
+        run: python3 scripts/test_required_gate.py
+
       # Execute the exact isolated-route guard and image-equality preflight
       # against green, wrong-version, wrong-revision, missing-browser and
       # job-local-cache fixtures. A toolchain check never observed failing is
