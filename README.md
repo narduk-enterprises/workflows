@@ -1030,6 +1030,10 @@ executed here.
   backward-compatible additions to the same major, so `v1` moves again rather
   than a `v2` being cut. An adopter merged before the tag moves must pin the
   exact commit SHA and switch to `@v1` once the tag covers it.
+- **A fan-out canary precedes an advance**: before moving the tag, trigger or
+  find at least one adopter run on the new commit and confirm it resolves and
+  succeeds, per Logan, 2026-09-04: "Fan-out canary before the tag advances
+  (Recommended)" (Refs company-hq#536).
 - Adding a workflow, or adding an **optional** input with a default, is
   within-major. Renaming or newly requiring an input, removing a job, renaming
   a job (which renames the composed check context and silently orphans every
