@@ -940,6 +940,11 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      # `gh api repos/<repo>/pulls/<n>/files` (e2e-skip-paths, workflows#49)
+      # needs this to read the changed-file list on a pull_request event;
+      # `contents: read` alone 403s. Read-only, and the step never runs the
+      # API call at all when e2e-skip-paths is empty (the default).
+      pull-requests: read
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       skipped: ${{ steps.skip.outputs.skipped }}
