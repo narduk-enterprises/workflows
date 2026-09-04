@@ -587,6 +587,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -594,6 +595,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -882,12 +884,14 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       - name: Install dependencies (npm)
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       # Exact-path cleanup only: persistent self-hosted workspaces must not keep
@@ -1278,6 +1282,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -1285,6 +1290,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -1838,6 +1844,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -1845,6 +1852,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 

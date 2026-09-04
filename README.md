@@ -589,6 +589,18 @@ The value must be one package.json script name using letters, digits, `:`, `_`,
 or `-`; the callable rejects missing or unsafe names. Existing callers that
 leave it empty keep the legacy install path unchanged.
 
+On the legacy (non-`install-script`) path, `NARDUK_PLATFORM_GH_PACKAGES_READ`
+(falling back to the ephemeral `github.token`) is now in the env of the
+`Install dependencies (pnpm)` / `Install dependencies (npm)` steps themselves,
+not just the earlier `Configure package registry auth` step — a step's `env:`
+does not carry to a later step. Without it, a caller whose registry-auth
+script (e.g. `@narduk-enterprises/narduk-app-tools`'s `configureRegistryAuth()`)
+writes a templated `${NARDUK_PLATFORM_GH_PACKAGES_READ}` reference into
+`.npmrc.auth` got "Failed to replace env in config" at install time, because
+the variable was undefined in that later step (narduk-libs#132). The fallback
+is inert for every existing adopter: when no secret is passed, `.npmrc.auth`
+is never written and the install step's copy of the variable is never read.
+
 Deploying with real Cloudflare credentials on push-to-main is **not** this
 workflow's job — that stays a separate `nuxt-cloudflare-deploy.yml` sibling
 (deferred, not built in this pass), matching hydrogen's existing two-job
