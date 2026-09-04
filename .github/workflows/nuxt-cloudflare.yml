@@ -380,6 +380,33 @@ on:
         required: false
         type: string
         default: ""
+      foundation-check:
+        description: >-
+          Run `narduk-app-tools foundation:check` (company-hq
+          docs/WEB-FOUNDATION-CHECK.md, D-WEBFOUND-2 Q5/Q9, D-WEBFOUND-3) after
+          install and fail the build job when it reports FAIL or UNKNOWN — the
+          spec's decided no-warning-tier rule (§5: "the app's CI must treat
+          [UNKNOWN] as a failure too"). OPT-IN and default false, on the same
+          reasoning as `run-tests` above: the web-foundation program is a
+          multi-wave migration (D-WEBFOUND-2 Q4/Q10), so most fleet apps do not
+          conform yet, and a moving `v1` major tag must never hand an existing
+          adopter a brand-new red gate it never asked for. The JSON artefact
+          is uploaded as `foundation-check` regardless of the result (a
+          failing run's artefact is the one the rollup most wants), and a
+          short summary is written to the job summary either way.
+        required: false
+        type: boolean
+        default: false
+      foundation-check-tool-version:
+        description: >-
+          Exact `@narduk-enterprises/narduk-app-tools` version to run when the
+          caller has not adopted it as a dependency (see the step's own
+          comment for the two invocation paths). Pinned, never a range —
+          bump deliberately and re-pin, the same discipline this repo applies
+          to its own action SHAs.
+        required: false
+        type: string
+        default: "0.2.0"
     secrets:
       # CI alias for the single estate packages-read PAT. Callers pass
       # secrets.NARDUK_PLATFORM_GH_PACKAGES_READ (org Actions, same value as
@@ -647,6 +674,119 @@ jobs:
         with:
           path: ${{ steps.dep-cache-dir.outputs.path }}
           key: ${{ steps.dep-cache.outputs.cache-primary-key }}
+
+      # OPT-IN web-foundation conformance gate (company-hq
+      # docs/WEB-FOUNDATION-CHECK.md §4/§5, D-WEBFOUND-2 Q5/Q9 (a), D-WEBFOUND-3).
+      # Runs right after install so `foundation:check` inspects the checkout
+      # this job just materialised. Two invocation paths, chosen from the
+      # caller's own package.json:
+      #   - already a dependency -> run the installed binary directly
+      #     (`pnpm exec` / `npx --no-install`), no network fetch needed.
+      #   - not a dependency     -> `pnpm dlx --package=...@<pin>` /
+      #     `npx --yes -p ...@<pin>`, so a caller can turn this gate on
+      #     WITHOUT first adopting the package as a dependency — §4 item 2's
+      #     "mandatory package" rule is a separate, later gate this input
+      #     must not silently force.
+      # The pinned dlx path needs its own registry auth: rather than lean on
+      # the install steps' `.npmrc.auth` (which "Remove package auth
+      # materialization" above already deleted, and which an install-script
+      # caller never creates at all), it writes a throwaway npmrc scoped to
+      # this one command, from the SAME secret the callable already receives
+      # — no new secret, per this input's own contract.
+      #
+      # The command itself never fails the step (`|| true`): per spec §5 the
+      # JSON artefact from a FAILING run is the one the rollup most wants, so
+      # it must always be produced and uploaded. "Evaluate web-foundation
+      # conformance check" below applies the decided blocking rule.
+      - name: Run web-foundation conformance check
+        if: inputs.foundation-check
+        env:
+          PM: ${{ inputs.package-manager }}
+          TOOL_VERSION: ${{ inputs.foundation-check-tool-version }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
+        run: |
+          set -uo pipefail
+          has_dep=$(node -e '
+            let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+              let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}
+              const blocks=["dependencies","devDependencies","optionalDependencies"]
+              const present=blocks.some(b=>v[b]&&Object.prototype.hasOwnProperty.call(v[b],"@narduk-enterprises/narduk-app-tools"))
+              process.stdout.write(present?"yes":"no")
+            })' < package.json 2>/dev/null || echo no)
+          if [ "$has_dep" = "yes" ]; then
+            echo "@narduk-enterprises/narduk-app-tools is an existing dependency; running the installed binary"
+            if [ "$PM" = "pnpm" ]; then
+              pnpm exec narduk-app foundation:check --json > foundation-check.json || true
+            else
+              npx --no-install narduk-app foundation:check --json > foundation-check.json || true
+            fi
+          else
+            echo "@narduk-enterprises/narduk-app-tools is not a dependency; running the pinned $TOOL_VERSION release via dlx"
+            npmrc_file="$(mktemp)"
+            trap 'rm -f "$npmrc_file"' EXIT
+            {
+              echo "@narduk-enterprises:registry=https://npm.pkg.github.com"
+              echo "//npm.pkg.github.com/:_authToken=${NARDUK_PLATFORM_GH_PACKAGES_READ}"
+            } > "$npmrc_file"
+            if [ "$PM" = "pnpm" ]; then
+              NPM_CONFIG_USERCONFIG="$npmrc_file" NPM_CONFIG_GLOBALCONFIG=/dev/null \
+                pnpm dlx --package "@narduk-enterprises/narduk-app-tools@${TOOL_VERSION}" \
+                narduk-app foundation:check --json > foundation-check.json || true
+            else
+              NPM_CONFIG_USERCONFIG="$npmrc_file" NPM_CONFIG_GLOBALCONFIG=/dev/null \
+                npx --yes -p "@narduk-enterprises/narduk-app-tools@${TOOL_VERSION}" \
+                narduk-app foundation:check --json > foundation-check.json || true
+            fi
+          fi
+
+      - name: Upload web-foundation conformance check artifact
+        if: always() && inputs.foundation-check
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: foundation-check
+          path: ${{ inputs.working-directory }}/foundation-check.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      # No warning tier (D-WEBFOUND-2 Q9 (a)): FAIL and UNKNOWN both block,
+      # and an unreadable/missing artefact is treated the same as UNKNOWN —
+      # a check that cannot see cannot pass (WEB-FOUNDATION-CHECK.md §5, "the
+      # app's CI must treat [UNKNOWN] as a failure too").
+      - name: Evaluate web-foundation conformance check
+        if: always() && inputs.foundation-check
+        run: |
+          set -uo pipefail
+          echo "## Web foundation conformance check" >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -s foundation-check.json ]; then
+            echo "- :x: **UNKNOWN** — foundation:check produced no output" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::foundation:check produced no output — treating as UNKNOWN, which blocks (company-hq docs/WEB-FOUNDATION-CHECK.md §5)"
+            exit 1
+          fi
+          result=$(node -e '
+            let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+              let v;try{v=JSON.parse(s)}catch{return process.stdout.write("PARSE_ERROR")}
+              process.stdout.write(v&&typeof v.result==="string"?v.result:"PARSE_ERROR")
+            })' < foundation-check.json)
+          if [ "$result" = "PARSE_ERROR" ]; then
+            echo "- :x: **UNKNOWN** — foundation-check.json is not a valid conformance artefact" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::foundation-check.json did not parse as a conformance artefact — treating as UNKNOWN, which blocks"
+            exit 1
+          fi
+          case "$result" in
+            PASS)
+              echo "- :white_check_mark: **PASS** — every applicable web-foundation item passed" >> "$GITHUB_STEP_SUMMARY"
+              ;;
+            FAIL|UNKNOWN)
+              echo "- :x: **$result** — see the uploaded \`foundation-check\` artifact for the failing/undecided items" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::web-foundation conformance check reported $result — blocking (D-WEBFOUND-2 Q9 (a), company-hq docs/WEB-FOUNDATION-CHECK.md §5)"
+              exit 1
+              ;;
+            *)
+              echo "- :x: **UNKNOWN** — unrecognized result \"$result\"" >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::foundation:check reported an unrecognized result \"$result\" — treating as blocking"
+              exit 1
+              ;;
+          esac
 
       # EVERY GATE BELOW PROBES BEFORE IT RUNS. `--if-present` reports a green
       # lane for a script that does not exist, so "ran nothing" and "passed"
