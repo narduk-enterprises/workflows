@@ -1159,13 +1159,18 @@ jobs:
             echo "no changed files reported for $BASE_SHA...$HEAD_SHA; running the full suite"
             exit 0
           fi
-          # The compare endpoint stops listing files at 3000. A truncated
-          # list can only make MORE files look matched than really are, so a
-          # diff at or above the cap must never be allowed to skip E2E.
+          # FAIL CLOSED at the compare endpoint's file cap. `.files` stops at
+          # 300 entries, and it stops SILENTLY: no `Link` header, no truncation
+          # flag, and `?page=2` paginates the endpoint's COMMITS, not its
+          # files, so `--paginate` cannot recover the rest. Verified live
+          # (nodejs/node, a single 2782-file commit -> 300 returned). A
+          # truncated list can only make MORE files look matched than really
+          # are, so a diff at or above the cap is "cannot determine" and must
+          # run the full suite rather than skip it.
           file_count=$(printf '%s\n' "$files" | grep -c . || true)
-          if [ "$file_count" -ge 3000 ]; then
+          if [ "$file_count" -ge 300 ]; then
             echo "skipped=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::changed-file list hit the compare API's 3000-file cap; running the full suite"
+            echo "::warning::changed-file list hit the compare API's 300-file cap (silently truncated); running the full suite"
             exit 0
           fi
           # Pure bash + grep -E glob matcher: no toolchain to provision.

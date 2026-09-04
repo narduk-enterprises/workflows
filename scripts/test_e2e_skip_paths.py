@@ -234,11 +234,48 @@ def check_behavior() -> None:
             "false",
         ),
     ]
+    cases += _compare_cap_cases()
     failures = _run_cases(cases)
     failures += _check_missing_gh_degrades_safely()
     failures += _check_failing_gh_degrades_safely()
     if failures:
         raise SystemExit(f"{failures} case(s) failed")
+
+
+def _compare_cap_cases() -> list:
+    """The compare endpoint's `.files` array stops at 300 entries SILENTLY —
+    no `Link` header, no truncation flag, and `?page=2` paginates commits
+    rather than files, so `--paginate` cannot recover the rest. A truncated
+    list can only make more files look matched than really are, so the cap
+    must fail CLOSED: at or above 300 entries the answer is "cannot
+    determine", which means run the full suite."""
+    base, head = "a" * 40, "b" * 40
+    just_under = [f"docs/page-{i:04d}.md" for i in range(299)]
+    at_cap = [f"docs/page-{i:04d}.md" for i in range(300)]
+    return [
+        (
+            "299 changed files, all matching -> still allowed to skip",
+            dict(
+                event_name="pull_request",
+                base_sha=base,
+                head_sha=head,
+                skip_patterns="docs/**",
+                files=just_under,
+            ),
+            "true",
+        ),
+        (
+            "300 changed files at the compare cap -> fail closed, run the full suite",
+            dict(
+                event_name="pull_request",
+                base_sha=base,
+                head_sha=head,
+                skip_patterns="docs/**",
+                files=at_cap,
+            ),
+            "false",
+        ),
+    ]
 
 
 def _run_cases(cases: list) -> int:
