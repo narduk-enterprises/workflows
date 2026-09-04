@@ -65,7 +65,7 @@ in their app-class workflow.
 | `reusable-browser-tests.yml` | Private-repo browser CI: validates the exact manifest browser-group object before any shard is scheduled, consumes a same-run production build, asserts the immutable Playwright package/browser image and real launch, runs three Chromium shards plus opt-in WebKit, then merges 14-day HTML/trace evidence on Linux CI |
 | `docs-governance.yml` | Thin generic gate for docs/handbook-shaped repos: checkout, optionally provision Python/Node, run one repo-provided check command. Generalizes company-hq's `handbook-spine-check.yml` / `untangle-project-sync.yml` shape |
 | `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: script-probed lint/typecheck/test/build, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern. See [relationship to `reusable-node-ci.yml`](#relationship-between-node-libraryyml-and-reusable-node-ciyml) below |
-| `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
+| `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional web-foundation conformance check, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: script-probed lint, typecheck, test, build (pnpm or npm), fail-closed by default through `require-scripts`. Zero live callers as of 2026-07-27 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
 | `code-review.yml` | **Advisory, default-off, not a CI gate.** Requests one containerized read-only agent review of a PR head from the estate's ephemeral pool, by firing a single `repository_dispatch` at `agent-infrastructure`. No `Required` job, never part of `ci / Required`, and every refusal path (opted out, fork, no secret, dispatch failure) exits SUCCESS. `enabled` defaults to `false`, so adopting the tag that carries it changes nothing until a repo opts in. See [Advisory code review](#advisory-code-review) |
 | `closing-syntax-check.yml` | PR-closing-syntax gate (agent-infrastructure#837, #1085): rejects a PR body whose closing keyword is ambiguous (a bare comma-separated list) or sits outside a canonical closing line/list item, and rejects any commit in the PR's own commit range that carries a closing keyword at all — GitHub's squash-merge auto-close scan reads the landed commit message independently of the curated PR body. **Fully self-contained**: the checker's source (canonically `narduk-enterprises/agent-infrastructure`'s `scripts/check_pr_closing_syntax.py`) is vendored directly inside this callable, so an adopting repo needs no local copy at all — see the workflow file's own header for the sync procedure |
@@ -1064,6 +1064,15 @@ executed here.
   callers who never asked for one, which is a breaking change dressed as an
   additive input. Getting the *default* wrong is how an "additive" change
   breaks people.
+- `nuxt-cloudflare.yml`'s `foundation-check` / `foundation-check-tool-version`
+  (company-hq docs/WEB-FOUNDATION-CHECK.md, D-WEBFOUND-2 Q5/Q9 (a),
+  D-WEBFOUND-3) are within-major on the same rule — two optional inputs, no
+  new job, three added steps inside the existing `build` job, `Required`'s
+  `needs:` graph unchanged. **`foundation-check` defaults to `false`** for the
+  same reason `run-tests` does: the web-foundation program is a multi-wave
+  fleet migration (D-WEBFOUND-2 Q4/Q10), most fleet apps do not conform to
+  the seven-item contract yet, and a moving `v1` tag must not hand every
+  existing adopter a brand-new red gate the day the tag advances.
 
 ## Maintainer conventions
 

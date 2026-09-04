@@ -201,6 +201,17 @@ jobs:
       - name: cache-path stability tests
         run: python3 scripts/test_cache_paths.py
 
+      # Extracts the opt-in web-foundation gate's two `run:` blocks out of
+      # nuxt-cloudflare.yml and executes them against real package.json
+      # fixtures and stubbed pnpm/npx, proving both invocation paths (already
+      # a dependency vs. pinned dlx), the throwaway-npmrc auth and cleanup,
+      # `|| true` fail-open on the check command itself, and the decided
+      # no-warning-tier blocking rule (company-hq docs/WEB-FOUNDATION-CHECK.md
+      # §5, D-WEBFOUND-2 Q9 (a)) for every artefact shape including missing,
+      # empty, malformed, and unrecognized-result JSON.
+      - name: web-foundation conformance gate behaviour tests
+        run: python3 scripts/test_foundation_check.py
+
       - name: prebuilt E2E artifact fail-closed tests
         run: python3 scripts/test_e2e_build_artifact.py
 
