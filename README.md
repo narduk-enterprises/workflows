@@ -561,6 +561,19 @@ value means the lane has no extra gates. Omitting the field preserves the
 shared-input behavior for existing callers, while declaring it on every lane
 prevents one package's requirement from leaking into another.
 
+`NARDUK_PLATFORM_GH_PACKAGES_READ` (falling back to the ephemeral
+`github.token`) is in the env of the `Install dependencies (pnpm)` /
+`Install dependencies (npm)` steps themselves, not just the earlier
+`Configure package registry auth` step — a step's `env:` does not carry to a
+later step. Without it, a caller whose registry-auth script (e.g.
+`@narduk-enterprises/narduk-app-tools`'s `configureRegistryAuth()`) writes a
+templated `${NARDUK_PLATFORM_GH_PACKAGES_READ}` reference into `.npmrc.auth`
+got "Failed to replace env in config" at install time, because the variable
+was undefined in that later step -- the same gap workflows#55 fixed in
+`nuxt-cloudflare.yml` (narduk-libs#132). The fallback is inert for every
+existing adopter: when no secret is passed, `.npmrc.auth` is never written
+and the install step's copy of the variable is never read.
+
 ### `nuxt-cloudflare.yml`
 
 ```yaml
