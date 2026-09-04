@@ -9,11 +9,13 @@ name: Reusable Browser Tests
 #   {"group":"playwright-isolated",
 #    "labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}
 #
-# The browser jobs receive no declared secrets and no deploy/production
-# credentials. They consume a same-run build artifact, start only app-local
-# test state through the caller's Playwright config, and use the automatic
-# short-lived GITHUB_TOKEN only for checkout, artifact transfer, and optional
-# package reads.
+# The browser jobs receive no deploy/production credentials. They consume a
+# same-run build artifact, start only app-local test state through the
+# caller's Playwright config, and use the automatic short-lived GITHUB_TOKEN
+# for checkout and artifact transfer. Package-registry auth optionally takes
+# the caller's NARDUK_PLATFORM_GH_PACKAGES_READ secret (see `secrets:` below)
+# for cross-repo @narduk-enterprises/* installs, falling back to the ephemeral
+# GITHUB_TOKEN when a caller passes nothing — identical to today's behavior.
 #
 # Open pool defects are handled fail closed rather than assumed away:
 # - agent-infrastructure#323: the immutable /opt browser tree is never written
@@ -136,6 +138,14 @@ on:
       playwright-version:
         description: "Exact Playwright version validated against the pool image"
         value: ${{ jobs.contract.outputs.playwright-version }}
+    secrets:
+      # CI alias for the single estate packages-read PAT. Callers pass
+      # secrets.NARDUK_PLATFORM_GH_PACKAGES_READ (org Actions, same value as
+      # Doppler GH_PACKAGES_READ) or map secrets.NVAULT_TOKEN into this input.
+      # Optional: every step below falls back to the ephemeral github.token
+      # when a caller passes nothing, so no existing caller changes behavior.
+      NARDUK_PLATFORM_GH_PACKAGES_READ:
+        required: false
 
 jobs:
   contract:
@@ -326,7 +336,7 @@ jobs:
 
       - name: Configure package registry auth
         env:
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ github.token }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
         run: |
           set -euo pipefail
           if [ -f ./scripts/package-registry-auth.mjs ]; then
@@ -620,7 +630,7 @@ jobs:
 
       - name: Configure package registry auth
         env:
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ github.token }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
         run: |
           set -euo pipefail
           if [ -f ./scripts/package-registry-auth.mjs ]; then
@@ -726,7 +736,7 @@ jobs:
 
       - name: Configure package registry auth
         env:
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ github.token }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
         run: |
           set -euo pipefail
           if [ -f ./scripts/package-registry-auth.mjs ]; then

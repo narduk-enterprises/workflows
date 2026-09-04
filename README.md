@@ -11,8 +11,10 @@ Shared reusable GitHub Actions workflows for the narduk-enterprises estate (CI-5
 > it was wrong after D-VIS-1, and the claim was doing real damage because it
 > was the *stated justification* for the self-hosted-runner warning below
 > (`workflows#2`). The workflows still hold no secrets — every
-> `workflow_call` secret is optional and skips cleanly, and `apple.yml`,
-> `python-data.yml`, and `reusable-browser-tests.yml` declare none at all.
+> `workflow_call` secret is optional and skips cleanly, and `apple.yml` and
+> `python-data.yml` declare none at all. `reusable-browser-tests.yml` declares
+> one optional secret (`NARDUK_PLATFORM_GH_PACKAGES_READ`) that falls back to
+> the ephemeral `github.token` when a caller passes nothing.
 >
 > **Callers must pin `@v1` or a full commit SHA — never `@main` — and a
 > public (or possibly-future-public) caller must never pass a self-hosted
@@ -353,14 +355,21 @@ and which nobody discovers by looking at a passing pull request. If a caller
 wants a docs-only change to cost less, it turns off the *opt-in* gates above and
 still builds.
 
-`apple.yml`, `python-data.yml`, and `reusable-browser-tests.yml` declare **no
-`secrets:` block at all**, so a
+`apple.yml` and `python-data.yml` declare **no `secrets:` block at all**, so a
 caller must not pass one. That is deliberate: a reusable workflow receives only
 what it declares (there is no ambient inheritance without `secrets: inherit`),
 so the strongest way to say "this gate cannot reach your credentials" is to
 declare nothing. A repo whose Apple build needs private SwiftPM access, or
 whose data gate needs a cross-repo PAT, keeps that step in its own workflow
 rather than widening the shared one.
+
+`reusable-browser-tests.yml` is the one exception: it declares a single
+optional `NARDUK_PLATFORM_GH_PACKAGES_READ` secret (`required: false`), mirroring
+`node-library.yml` and `nuxt-cloudflare.yml`'s existing CI-alias-for-the-PAT
+convention, so that a browser CI caller installing cross-repo
+`@narduk-enterprises/*` packages can pass a real read credential. A caller that
+passes nothing keeps today's behavior unchanged: every consuming step falls
+back to the ephemeral `github.token`.
 
 ### `apple.yml`
 
@@ -1013,6 +1022,11 @@ executed here.
   `python-data.yml`'s `run-pyright`, exact `pyright-version`, and
   `pyright-args` inputs are optional additions; existing Python callers keep
   their prior behavior until they opt into static analysis.
+  `reusable-browser-tests.yml`'s later addition of the optional
+  `NARDUK_PLATFORM_GH_PACKAGES_READ` secret (`required: false`, falling back
+  to `github.token`) is within-major on the same rule as a new optional
+  input: a caller that passes nothing gets byte-identical behavior to before
+  the secret existed (workflows#50).
 - `nuxt-cloudflare.yml`'s `run-tests` / `test-script` / `extra-scripts` are
   within-major on the same rule — three optional inputs, no new job, one
   conditional step each. **`run-tests` defaults to `false` precisely so that
