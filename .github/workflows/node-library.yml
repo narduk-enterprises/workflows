@@ -366,6 +366,7 @@ jobs:
         if: inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile ${{ inputs.install-args }}
         env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -377,6 +378,7 @@ jobs:
         # caller with private @narduk-enterprises/* dependencies would fail on
         # a 401 that looks like a token problem rather than a wiring one.
         env:
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
