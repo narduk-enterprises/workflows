@@ -998,47 +998,76 @@ jobs:
             echo "no changed files reported for PR #$PR_NUMBER; running the full suite"
             exit 0
           fi
-          FILES="$files" node --input-type=module <<'NODE'
-          import { appendFileSync } from 'node:fs'
-          // Minimal glob matcher: '**' crosses '/', '*' does not, everything
-          // else is literal. Enough for path patterns like "**/*.md" or
-          // "design/**" without pulling in a dependency for a callable that
-          // must install nothing to plan.
-          const globToRegExp = (pattern) => {
-            let out = '^'
-            for (let i = 0; i < pattern.length; i++) {
-              const c = pattern[i]
-              if (c === '*') {
-                if (pattern[i + 1] === '*') {
-                  out += '.*'
-                  i++
-                  if (pattern[i + 1] === '/') i++
-                } else {
-                  out += '[^/]*'
-                }
-              } else if ('.+^${}()|[]\\'.includes(c)) {
-                out += `\\${c}`
-              } else {
-                out += c
-              }
-            }
-            return new RegExp(`${out}$`)
+          # Pure bash + grep -E glob matcher: no toolchain to provision.
+          # '**' crosses '/', a lone '*' does not; everything else is
+          # literal. Self-hosted `linux-ci` capacity has no ambient `node`
+          # (this job deliberately never calls setup-node to stay fast and
+          # install nothing), so the matcher must not depend on it.
+          glob_to_regex() {
+            local pattern="$1" out="^" i=0 n c nextc
+            local special='.+^(){}[]|$'
+            special="${special}\\"
+            n=${#pattern}
+            while [ "$i" -lt "$n" ]; do
+              c="${pattern:$i:1}"
+              if [ "$c" = "*" ]; then
+                nextc="${pattern:$((i + 1)):1}"
+                if [ "$nextc" = "*" ]; then
+                  out+=".*"
+                  i=$((i + 2))
+                  if [ "${pattern:$i:1}" = "/" ]; then
+                    i=$((i + 1))
+                  fi
+                  continue
+                fi
+                out+="[^/]*"
+              elif case "$special" in *"$c"*) true ;; *) false ;; esac; then
+                out+="\\$c"
+              else
+                out+="$c"
+              fi
+              i=$((i + 1))
+            done
+            printf '%s$' "$out"
           }
-          const patterns = (process.env.SKIP_PATTERNS || '').trim().split(/\s+/).filter(Boolean).map(globToRegExp)
-          const files = (process.env.FILES || '').split('\n').filter(Boolean)
-          const unmatched = files.filter(file => !patterns.some(re => re.test(file)))
-          const skipped = unmatched.length === 0
-          const summary = process.env.GITHUB_STEP_SUMMARY
-          if (summary) {
-            appendFileSync(
-              summary,
-              `### E2E skip-path plan\n\n${files.length} changed file(s), ${unmatched.length} unmatched.\n\n` +
-                (unmatched.length ? `Unmatched:\n${unmatched.map(f => `- \`${f}\``).join('\n')}\n` : ''),
-            )
-          }
-          appendFileSync(process.env.GITHUB_OUTPUT, `skipped=${skipped}\n`)
-          console.log(skipped ? 'every changed file matches e2e-skip-paths: skipping E2E' : 'at least one changed file does not match e2e-skip-paths: running E2E')
-          NODE
+          unmatched=0
+          total=0
+          unmatched_list=""
+          bq='`'
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            total=$((total + 1))
+            file_matched=false
+            for pattern in $SKIP_PATTERNS; do
+              regex=$(glob_to_regex "$pattern")
+              if printf '%s' "$file" | grep -Eq -- "$regex"; then
+                file_matched=true
+                break
+              fi
+            done
+            if [ "$file_matched" = false ]; then
+              unmatched=$((unmatched + 1))
+              unmatched_list="${unmatched_list}- ${bq}${file}${bq}\n"
+            fi
+          done <<< "$files"
+          if [ "$unmatched" -eq 0 ]; then
+            skipped=true
+            reason="every changed file matches e2e-skip-paths: skipping E2E"
+          else
+            skipped=false
+            reason="at least one changed file does not match e2e-skip-paths: running E2E"
+          fi
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              printf '### E2E skip-path plan\n\n%s changed file(s), %s unmatched.\n\n' "$total" "$unmatched"
+              if [ "$unmatched" -gt 0 ]; then
+                printf 'Unmatched:\n'
+                printf '%b' "$unmatched_list"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "skipped=$skipped" >> "$GITHUB_OUTPUT"
+          echo "$reason"
         shell: bash
       - name: Compute shard list
         id: plan
