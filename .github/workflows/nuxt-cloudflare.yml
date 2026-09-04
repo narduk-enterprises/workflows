@@ -349,6 +349,22 @@ on:
         required: false
         type: string
         default: ""
+      e2e-skip-paths:
+        description: >-
+          Space-separated glob patterns (supporting `*` and `**`), relative to
+          the repository root. When `run-e2e` is true, every changed path in
+          a pull request event matches at least one pattern, and there is at
+          least one changed path, the `E2E plan` job emits an empty shard
+          list and every browser job (`E2E`, `E2E report`) is skipped —
+          `Required` still gates, expecting them `skipped` rather than
+          absent. Empty (the default) never skips. Applies to
+          `pull_request`/`pull_request_target` events only; a push (e.g. to
+          the default branch) always runs the full suite regardless of this
+          input, because that is the canonical-branch validation the skip is
+          not meant to weaken. workflows#49.
+        required: false
+        type: string
+        default: ""
       wrangler-dry-run:
         description: "Run an opt-in `wrangler deploy --dry-run` validation gate"
         required: false
@@ -926,18 +942,115 @@ jobs:
       contents: read
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
+      skipped: ${{ steps.skip.outputs.skipped }}
     steps:
+      # Decides BEFORE the shard list is computed, so "skipped" can force
+      # shards to `[]` below. Only a pull_request(_target) event is eligible:
+      # a push (main, workflow_dispatch, schedule) always runs the full
+      # suite, because that is the canonical-branch validation this input is
+      # not meant to weaken (workflows#49).
+      - name: Decide whether E2E can be skipped
+        id: skip
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SKIP_PATTERNS: ${{ inputs.e2e-skip-paths }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SKIP_PATTERNS" ]; then
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "e2e-skip-paths is empty: E2E always runs"
+            exit 0
+          fi
+          case "$EVENT_NAME" in
+            pull_request|pull_request_target) ;;
+            *)
+              echo "skipped=false" >> "$GITHUB_OUTPUT"
+              echo "event '$EVENT_NAME' is not a pull request: e2e-skip-paths never applies outside PR events"
+              exit 0
+              ;;
+          esac
+          if [ -z "$PR_NUMBER" ]; then
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "no pull request number in context; running the full suite"
+            exit 0
+          fi
+          # Self-hosted runners provision their own toolchains rather than
+          # relying on runner-ambient tools; `gh` is standard on GitHub-hosted
+          # runners but not guaranteed everywhere self-hosted `linux-ci`
+          # capacity is drawn from. Its absence must degrade to "run the full
+          # suite", never to a hard failure of the whole E2E plan.
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::gh CLI not found on this runner; e2e-skip-paths cannot be evaluated, running the full suite"
+            exit 0
+          fi
+          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+          if [ -z "$files" ]; then
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "no changed files reported for PR #$PR_NUMBER; running the full suite"
+            exit 0
+          fi
+          FILES="$files" node --input-type=module <<'NODE'
+          import { appendFileSync } from 'node:fs'
+          // Minimal glob matcher: '**' crosses '/', '*' does not, everything
+          // else is literal. Enough for path patterns like "**/*.md" or
+          // "design/**" without pulling in a dependency for a callable that
+          // must install nothing to plan.
+          const globToRegExp = (pattern) => {
+            let out = '^'
+            for (let i = 0; i < pattern.length; i++) {
+              const c = pattern[i]
+              if (c === '*') {
+                if (pattern[i + 1] === '*') {
+                  out += '.*'
+                  i++
+                  if (pattern[i + 1] === '/') i++
+                } else {
+                  out += '[^/]*'
+                }
+              } else if ('.+^${}()|[]\\'.includes(c)) {
+                out += `\\${c}`
+              } else {
+                out += c
+              }
+            }
+            return new RegExp(`${out}$`)
+          }
+          const patterns = (process.env.SKIP_PATTERNS || '').trim().split(/\s+/).filter(Boolean).map(globToRegExp)
+          const files = (process.env.FILES || '').split('\n').filter(Boolean)
+          const unmatched = files.filter(file => !patterns.some(re => re.test(file)))
+          const skipped = unmatched.length === 0
+          const summary = process.env.GITHUB_STEP_SUMMARY
+          if (summary) {
+            appendFileSync(
+              summary,
+              `### E2E skip-path plan\n\n${files.length} changed file(s), ${unmatched.length} unmatched.\n\n` +
+                (unmatched.length ? `Unmatched:\n${unmatched.map(f => `- \`${f}\``).join('\n')}\n` : ''),
+            )
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `skipped=${skipped}\n`)
+          console.log(skipped ? 'every changed file matches e2e-skip-paths: skipping E2E' : 'at least one changed file does not match e2e-skip-paths: running E2E')
+          NODE
+        shell: bash
       - name: Compute shard list
         id: plan
         env:
           TOTAL: ${{ inputs.e2e-shards }}
+          SKIPPED: ${{ steps.skip.outputs.skipped }}
         run: |
           set -euo pipefail
           if ! [ "$TOTAL" -ge 1 ] 2>/dev/null; then
             echo "::error::e2e-shards must be an integer >= 1 (got '$TOTAL')"
             exit 1
           fi
-          echo "shards=[$(seq 1 "$TOTAL" | paste -sd, -)]" >> "$GITHUB_OUTPUT"
+          if [ "$SKIPPED" = "true" ]; then
+            echo "shards=[]" >> "$GITHUB_OUTPUT"
+          else
+            echo "shards=[$(seq 1 "$TOTAL" | paste -sd, -)]" >> "$GITHUB_OUTPUT"
+          fi
 
   e2e:
     # Just `E2E` — GitHub appends the matrix value itself (`E2E (1)`,
@@ -948,7 +1061,7 @@ jobs:
     # to anyone reading the PR, which is most of the time given e2e is
     # opt-in and off by default.
     name: E2E
-    if: inputs.run-e2e
+    if: inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'
     needs: [build, e2e-plan]
     # `e2e-runner` when the caller routes browsers to an isolated pool,
     # otherwise `runner` — same guest as the build, the previous behaviour.
@@ -1053,9 +1166,22 @@ jobs:
       # this change: 19s on marketing-web `Build`, a 67s job. Restoring on
       # every ref keeps the win — a PR falls back through `restore-keys` to
       # the default-branch entry, which is the one it actually wants.
+      # workflows#49: this job's cache restore used to be github-hosted only.
+      # The reasoning for the ORIGINAL restriction lived one job up (`build`,
+      # `Point pnpm at a workspace-local store (self-hosted)`) and is about
+      # pnpm's hard-link store, not about actions/cache reachability: the
+      # GitHub Actions cache is a network blob service, not local disk, so it
+      # is reachable from a self-hosted guest exactly when job-log upload and
+      # runner registration are (both already required for the job to run at
+      # all). The npm cache directory below (`.cache/npm`, under
+      # `$GITHUB_WORKSPACE`) never crosses a device boundary the way pnpm's
+      # HOME-rooted store can, so enabling it for self-hosted npm callers
+      # carries none of the copy-not-link risk #17 fixed. pnpm keeps its
+      # existing self-hosted-only mount-point store below instead of this
+      # cache, to avoid two competing store-dir writers.
       - name: Resolve dependency cache directory
         id: dep-cache-dir
-        if: runner.environment == 'github-hosted'
+        if: runner.environment == 'github-hosted' || inputs.package-manager == 'npm'
         run: |
           set -euo pipefail
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
@@ -1068,7 +1194,7 @@ jobs:
 
       - name: Restore dependency cache
         id: dep-cache
-        if: runner.environment == 'github-hosted'
+        if: runner.environment == 'github-hosted' || inputs.package-manager == 'npm'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.dep-cache-dir.outputs.path }}
@@ -1164,7 +1290,7 @@ jobs:
       # only the per-pull-request WRITE that was being thrown away.
       - name: Save dependency cache
         if: >-
-          runner.environment == 'github-hosted'
+          (runner.environment == 'github-hosted' || inputs.package-manager == 'npm')
           &&
           steps.dep-cache.outputs.cache-hit != 'true'
           && github.ref_name == github.event.repository.default_branch
@@ -1486,8 +1612,8 @@ jobs:
   # treats `skipped` as acceptable for this job.
   e2e-report:
     name: E2E report
-    if: '!cancelled() && inputs.run-e2e && inputs.e2e-shards > 1'
-    needs: e2e
+    if: "!cancelled() && inputs.run-e2e && inputs.e2e-shards > 1 && needs.e2e-plan.outputs.skipped != 'true'"
+    needs: [e2e-plan, e2e]
     # Merging is pure Node work with no browser — keep it off the scarce
     # isolated browser pool.
     runs-on: ${{ fromJSON(inputs.runner) }}
@@ -1499,138 +1625,40 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps:
+      # This job never runs the app's own dependency tree — merge-reports is
+      # pure `@playwright/test` tooling. `actions/checkout` is only here to
+      # read the caller's pinned version out of package.json; there is no
+      # `npm ci`/`pnpm install` in this job at all (workflows#49). Measured
+      # before this change (operator-portal run 33887424724, cff1ff8b):
+      # setup-node 22s + `npm ci` 23s to run a 1s merge, 57s job total.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
-        if: inputs.package-manager == 'pnpm'
-
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ inputs.node-version }}
-          # v7 caches the package manager BY DEFAULT (`package-manager-cache`
-          # defaults to true) — dropping the `cache:` input does NOT turn it
-          # off. Without this line the explicit restore/save below is a SECOND
-          # cache running alongside the built-in one, and the `Post Run
-          # actions/setup-node` tar the split was meant to remove is still
-          # there: measured 27s on marketing-web `Build` after the split, on
-          # top of a 22s explicit save. Two caches for one dependency tree is
-          # strictly worse than the one it replaced.
-          package-manager-cache: false
 
-      # Dependency cache: restore everywhere, write only on the default branch
-      # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh
-      # tarball on every key MISS, scoped to the ref the job ran on — and a
-      # cache written on `refs/pull/N/merge` is restorable only by that same
-      # pull request. Every lockfile-changing PR therefore paid a `Post Run
-      # actions/setup-node` tar to produce an entry nothing would ever read,
-      # and the merge to `main` paid the identical tar again. Measured before
-      # this change: 19s on marketing-web `Build`, a 67s job. Restoring on
-      # every ref keeps the win — a PR falls back through `restore-keys` to
-      # the default-branch entry, which is the one it actually wants.
-      - name: Resolve dependency cache directory
-        id: dep-cache-dir
-        if: runner.environment == 'github-hosted'
+      - name: Resolve pinned @playwright/test version
+        id: playwright-version
         run: |
           set -euo pipefail
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm config set store-dir "$GITHUB_WORKSPACE/.cache/pnpm-store"
-            echo "path=.cache/pnpm-store" >> "$GITHUB_OUTPUT"
-          else
-            npm config set cache "$GITHUB_WORKSPACE/.cache/npm"
-            echo "path=.cache/npm" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Restore dependency cache
-        id: dep-cache
-        if: runner.environment == 'github-hosted'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.dep-cache-dir.outputs.path }}
-          key: node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ hashFiles(format('{0}/pnpm-lock.yaml', inputs.working-directory), format('{0}/package-lock.json', inputs.working-directory)) }}
-          restore-keys: |
-            node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
-
-      - name: Configure package registry auth
-        if: inputs.install-script == ''
-        env:
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-        run: |
-          if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
-            echo "skipping package-registry auth: no NARDUK_PLATFORM_GH_PACKAGES_READ token passed"
-            exit 0
-          fi
-          if [ -f ./scripts/package-registry-auth.mjs ]; then
-            node ./scripts/package-registry-auth.mjs
-          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
-            node ./tools/configure-package-registry-auth.mjs
-          else
-            echo "skipping package-registry auth: no auth bootstrap script present"
-          fi
-
-      # Store placement, same reasoning as the `build` job above: on a
-      # self-hosted guest the workspace is on its own volume and pnpm's default
-      # store is not, so every install copies instead of hard-linking. See the
-      # full comment there.
-      - name: Point pnpm at a workspace-local store (self-hosted)
-        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
-        run: |
-          set -euo pipefail
-          mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
-          if [ "$mount_point" = "/" ]; then
-            echo "workspace is on the root filesystem; pnpm's default store already shares its device"
-            exit 0
-          fi
-          store="$mount_point/pnpm-store"
-          if [ ! -d "$store" ] || [ ! -w "$store" ]; then
-            echo "no writable store at $store; keeping pnpm's default store (installs will copy, not link)"
-            exit 0
-          fi
-          echo "npm_config_store_dir=$store" >> "$GITHUB_ENV"
-          echo "pnpm store -> $store (same filesystem as $GITHUB_WORKSPACE)"
-
-      - name: Install dependencies (pnpm)
-        if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
-        run: pnpm install --frozen-lockfile
-        env:
-          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
-          NPM_CONFIG_GLOBALCONFIG: /dev/null
-
-      - name: Install dependencies (npm)
-        if: inputs.install-script == '' && inputs.package-manager == 'npm'
-        run: npm ci
-        env:
-          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
-          NPM_CONFIG_GLOBALCONFIG: /dev/null
-
-      # Exact-path cleanup after the install consumer; report merge does not
-      # need registry auth and must not inherit leftover credentials.
-      - name: Remove package auth materialization
-        if: always() && inputs.install-script == ''
-        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
-
-      - name: Install dependencies (caller script)
-        if: inputs.install-script != ''
-        env:
-          INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          PM: ${{ inputs.package-manager }}
-        run: |
-          set -euo pipefail
-          case "$INSTALL_SCRIPT" in
-            ''|*[!A-Za-z0-9:_-]*)
-              echo "::error::install-script must be one package.json script name"
-              exit 1
-              ;;
-          esac
-          raw=$(npm pkg get "scripts.$INSTALL_SCRIPT" 2>/dev/null || echo '{}')
-          present=$(printf '%s' "$raw" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
-          if [ "$present" != "yes" ]; then
-            echo "::error::install-script names \"$INSTALL_SCRIPT\" but no such script exists"
+          version=$(node -e '
+            const pkg = require("./package.json")
+            const version = (pkg.devDependencies && pkg.devDependencies["@playwright/test"])
+              || (pkg.dependencies && pkg.dependencies["@playwright/test"])
+              || ""
+            process.stdout.write(version)
+          ')
+          if [ -z "$version" ]; then
+            echo "::error::package.json has no @playwright/test dependency to pin merge-reports to"
             exit 1
           fi
-          "$PM" run "$INSTALL_SCRIPT"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::@playwright/test must be pinned to an exact version for E2E report (found \"$version\")"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Download shard evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -1640,17 +1668,19 @@ jobs:
           merge-multiple: true
 
       - name: Merge blob reports
+        env:
+          PLAYWRIGHT_VERSION: ${{ steps.playwright-version.outputs.version }}
         run: |
           set -euo pipefail
           if [ ! -d all-blob-reports/blob-report ]; then
             echo "::warning::no blob reports found to merge"
             exit 0
           fi
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm exec playwright merge-reports --reporter html all-blob-reports/blob-report
-          else
-            npx playwright merge-reports --reporter html all-blob-reports/blob-report
-          fi
+          # --package pulls only @playwright/test (and its transitive deps)
+          # at the caller's exact pin — not the app's dependency tree — and
+          # --yes skips npx's interactive install prompt in CI.
+          npx --yes --package "@playwright/test@${PLAYWRIGHT_VERSION}" \
+            playwright merge-reports --reporter html all-blob-reports/blob-report
 
       # STEP-level `always()` is deliberate and stays: capturing evidence is
       # the whole point of this step, and a step-level upload costs seconds, not
@@ -1846,6 +1876,7 @@ jobs:
           EXTRA_GATE_RESULT: ${{ needs.extra-gate.result }}
           RUN_E2E: ${{ inputs.run-e2e }}
           E2E_SHARDS: ${{ inputs.e2e-shards }}
+          E2E_PLAN_SKIPPED: ${{ needs.e2e-plan.outputs.skipped }}
           RUN_DEPLOY_DRY_RUN: ${{ inputs.wrangler-dry-run }}
         run: |
           set -euo pipefail
@@ -1875,11 +1906,20 @@ jobs:
           # workflow-expression mistake must not turn "never checked" green.
           if [ "$RUN_E2E" = "true" ]; then
             require_success e2e-plan "$E2E_PLAN_RESULT"
-            require_success e2e "$E2E_RESULT"
-            if [ "$E2E_SHARDS" -gt 1 ]; then
-              require_success e2e-report "$E2E_REPORT_RESULT"
-            else
+            # e2e-skip-paths (workflows#49): the plan job itself must still
+            # succeed — it made the skip decision — but a docs-only diff
+            # that the plan skipped must show E2E and E2E report as
+            # `skipped`, not absent, so `Required` still gates them.
+            if [ "$E2E_PLAN_SKIPPED" = "true" ]; then
+              require_skipped e2e "$E2E_RESULT"
               require_skipped e2e-report "$E2E_REPORT_RESULT"
+            else
+              require_success e2e "$E2E_RESULT"
+              if [ "$E2E_SHARDS" -gt 1 ]; then
+                require_success e2e-report "$E2E_REPORT_RESULT"
+              else
+                require_skipped e2e-report "$E2E_REPORT_RESULT"
+              fi
             fi
           else
             require_skipped e2e-plan "$E2E_PLAN_RESULT"

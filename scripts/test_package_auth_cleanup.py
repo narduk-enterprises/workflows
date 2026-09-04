@@ -42,11 +42,13 @@ INSTALL_STEPS = (
 
 # Jobs in nuxt-cloudflare.yml that can materialise .npmrc.auth via the
 # package-registry auth bootstrap (token present + consumer auth script).
+# `e2e-report` is deliberately absent (workflows#49): it no longer installs
+# the caller's dependency tree at all, so it never runs the auth bootstrap or
+# needs the paired cleanup — see scripts/test_e2e_report_minimal_install.py.
 AUTH_JOBS = (
     "build",
     "extra-gate",
     "e2e",
-    "e2e-report",
     "deploy-dry-run",
 )
 
