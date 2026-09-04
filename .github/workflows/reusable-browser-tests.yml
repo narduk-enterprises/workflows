@@ -258,7 +258,8 @@ jobs:
     name: Validate same-run production build
     needs: contract
     runs-on: ${{ fromJSON(inputs.linux-runner) }}
-    timeout-minutes: 10
+    # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
+    timeout-minutes: 20
     permissions:
       contents: read
       actions: read

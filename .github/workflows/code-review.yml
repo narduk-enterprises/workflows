@@ -106,7 +106,8 @@ jobs:
     # exactly what someone debugging a missing review needs to read.
     if: ${{ inputs.enabled }}
     runs-on: ${{ fromJSON(inputs.runner) }}
-    timeout-minutes: 5
+    # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:

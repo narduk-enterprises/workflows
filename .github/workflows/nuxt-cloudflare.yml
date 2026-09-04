@@ -941,7 +941,8 @@ jobs:
     if: inputs.run-e2e
     needs: build
     runs-on: ${{ fromJSON(inputs.runner) }}
-    timeout-minutes: 5
+    # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
+    timeout-minutes: 20
     permissions:
       contents: read
       # `gh api repos/<repo>/pulls/<n>/files` (e2e-skip-paths, workflows#49)
@@ -1904,7 +1905,7 @@ jobs:
     if: always()
     needs: [build, extra-gate, e2e-plan, e2e, e2e-report, deploy-dry-run]
     runs-on: ${{ fromJSON(inputs.runner) }}
-    timeout-minutes: 5
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:

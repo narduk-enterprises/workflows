@@ -70,7 +70,8 @@ jobs:
   check:
     name: check
     runs-on: ${{ fromJSON(inputs.runner) }}
-    timeout-minutes: 10
+    # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -571,7 +572,7 @@ jobs:
     if: always()
     needs: check
     runs-on: ${{ fromJSON(inputs.runner) }}
-    timeout-minutes: 5
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
