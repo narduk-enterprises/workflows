@@ -690,5 +690,15 @@ jobs:
         run: |
           case "$PACKAGE_RESULT" in
             success) exit 0 ;;
+            skipped)
+              # `package` carries no `if:`/`needs:` of its own, so the only
+              # way GitHub reports its result as "skipped" rather than
+              # "success" is an intentionally empty `package-matrix`
+              # (`strategy.matrix.include: []`) -- a caller's affected-path
+              # computation classifying every changed file as harmless
+              # (narduk-libs' compute-affected-packages.mjs is the first
+              # adopter of this). Treat that the same as nothing-to-run,
+              # not a failure.
+              exit 0 ;;
             *) echo "::error::package job reported '$PACKAGE_RESULT'"; exit 1 ;;
           esac
