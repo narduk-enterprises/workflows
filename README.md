@@ -748,6 +748,35 @@ cannot consume an earlier attempt's output. Retention is one day. The input
 defaults to empty, which adds no artifact steps or environment variable for
 existing callers.
 
+#### Skipping E2E on docs-only PRs (`e2e-skip-paths`)
+
+(workflows#49) `e2e-skip-paths` is a space-separated list of glob patterns
+(`*` and `**` supported), relative to the repository root. When `run-e2e` is
+true, the triggering event is `pull_request`/`pull_request_target`, and
+**every** changed file in that PR matches at least one pattern, `E2E plan`
+emits an empty shard list and `E2E` / `E2E report` both report `skipped` —
+`Required` still gates them, expecting `skipped` rather than an absent check,
+so a workflow-expression mistake cannot silently turn "never checked" green.
+A push event (e.g. the default branch) always runs the full suite regardless
+of this input: the skip is a PR fast path, not a weaker canonical-branch gate.
+
+```yaml
+      run-e2e: true
+      e2e-skip-paths: "**/*.md design/** docs/** .lane-evidence/** LICENSE"
+```
+
+Never include a CSS pattern here — a CSS-only diff is expected to run E2E in
+full, on purpose (overflow and mobile-layout specs exist specifically to
+catch CSS regressions).
+
+The decision is made by calling `gh api repos/<repo>/pulls/<n>/files
+--paginate` from the `E2E plan` job, so it needs no repository checkout of
+its own. `gh` is standard on GitHub-hosted runners but self-hosted runners
+provision their own toolchains — its absence degrades to "run the full
+suite" (a warning, not a failure), same as zero reported changed files or a
+missing PR number. An empty `e2e-skip-paths` (the default) never skips and
+adds no behavior for existing callers.
+
 #### The isolated Playwright toolchain gate
 
 `playwright-isolated` is download-free and image-owned. The current pool pins
