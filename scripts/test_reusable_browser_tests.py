@@ -57,7 +57,8 @@ def workflow_call(document: dict) -> dict:
 
 def validate_structure(document: dict) -> None:
     call = workflow_call(document)
-    assert "secrets" not in call
+    assert set(call["secrets"]) == {"NARDUK_PLATFORM_GH_PACKAGES_READ"}
+    assert call["secrets"]["NARDUK_PLATFORM_GH_PACKAGES_READ"]["required"] is False
     for name in ("linux-runner", "browser-runner", "build-artifact-path",
                  "build-artifact-marker", "playwright-version"):
         assert call["inputs"][name]["required"] is True
@@ -123,6 +124,12 @@ def validate_structure(document: dict) -> None:
         assert upload["with"]["retention-days"] == 1
         assert "${{ github.run_id }}" in upload["with"]["name"]
         assert "${{ github.run_attempt }}" in upload["with"]["name"]
+
+    for job in ("chromium", "webkit", "report"):
+        auth_env = step(document, job, "Configure package registry auth")["env"]
+        assert auth_env["NARDUK_PLATFORM_GH_PACKAGES_READ"] == (
+            "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}"
+        )
 
     report_upload = step(document, "report", "Upload merged HTML and traces")
     assert report_upload["with"]["retention-days"] == 14
