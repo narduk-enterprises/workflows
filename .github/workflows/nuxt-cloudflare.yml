@@ -1083,13 +1083,17 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runner) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
+    # `contents: read` and nothing else, deliberately. A job in a CALLED
+    # workflow may only request permissions the CALLER already granted; ask
+    # for one it did not and the caller's ENTIRE run dies at startup
+    # (`startup_failure`, zero jobs, no logs, no annotation) before any job is
+    # created. Every estate caller grants `contents: read` + `packages: read`,
+    # so the `pull-requests: read` this job briefly carried for
+    # `gh api .../pulls/<n>/files` took down every `@v1` nuxt-cloudflare
+    # adopter at once (workflows#59). The changed-file list below is read
+    # through the COMPARE endpoint instead, which is a Contents read.
     permissions:
       contents: read
-      # `gh api repos/<repo>/pulls/<n>/files` (e2e-skip-paths, workflows#49)
-      # needs this to read the changed-file list on a pull_request event;
-      # `contents: read` alone 403s. Read-only, and the step never runs the
-      # API call at all when e2e-skip-paths is empty (the default).
-      pull-requests: read
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       skipped: ${{ steps.skip.outputs.skipped }}
@@ -1105,7 +1109,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           SKIP_PATTERNS: ${{ inputs.e2e-skip-paths }}
         run: |
           set -euo pipefail
@@ -1122,9 +1127,9 @@ jobs:
               exit 0
               ;;
           esac
-          if [ -z "$PR_NUMBER" ]; then
+          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
             echo "skipped=false" >> "$GITHUB_OUTPUT"
-            echo "no pull request number in context; running the full suite"
+            echo "no pull request base/head sha in context; running the full suite"
             exit 0
           fi
           # Self-hosted runners provision their own toolchains rather than
@@ -1137,10 +1142,35 @@ jobs:
             echo "::warning::gh CLI not found on this runner; e2e-skip-paths cannot be evaluated, running the full suite"
             exit 0
           fi
-          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+          # The COMPARE endpoint, never `pulls/<n>/files`: comparing two
+          # commits is a Contents read and works under the `contents: read`
+          # every caller already grants, where `pulls/<n>/files` needs
+          # `pull-requests: read` and that escalation kills the caller's run
+          # at startup (workflows#59, see the permissions comment above).
+          # Any read failure degrades to running the full suite.
+          if ! files=$(gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA" \
+              --paginate --jq '.files[]?.filename'); then
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::could not compare $BASE_SHA...$HEAD_SHA; running the full suite"
+            exit 0
+          fi
           if [ -z "$files" ]; then
             echo "skipped=false" >> "$GITHUB_OUTPUT"
-            echo "no changed files reported for PR #$PR_NUMBER; running the full suite"
+            echo "no changed files reported for $BASE_SHA...$HEAD_SHA; running the full suite"
+            exit 0
+          fi
+          # FAIL CLOSED at the compare endpoint's file cap. `.files` stops at
+          # 300 entries, and it stops SILENTLY: no `Link` header, no truncation
+          # flag, and `?page=2` paginates the endpoint's COMMITS, not its
+          # files, so `--paginate` cannot recover the rest. Verified live
+          # (nodejs/node, a single 2782-file commit -> 300 returned). A
+          # truncated list can only make MORE files look matched than really
+          # are, so a diff at or above the cap is "cannot determine" and must
+          # run the full suite rather than skip it.
+          file_count=$(printf '%s\n' "$files" | grep -c . || true)
+          if [ "$file_count" -ge 300 ]; then
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::changed-file list hit the compare API's 300-file cap (silently truncated); running the full suite"
             exit 0
           fi
           # Pure bash + grep -E glob matcher: no toolchain to provision.

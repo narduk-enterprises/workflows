@@ -215,6 +215,23 @@ jobs:
       - name: prebuilt E2E artifact fail-closed tests
         run: python3 scripts/test_e2e_build_artifact.py
 
+      # R12's fail-capable proof. A callable job that requests a permission
+      # its caller did not grant kills the caller's ENTIRE run at startup --
+      # zero jobs, no logs, no annotation -- on every adopter at once, the
+      # moment the moving `v1` tag advances (workflows#59). The seeded-red
+      # case re-introduces the exact escalation that caused it.
+      - name: Callable permission-ceiling tests
+        run: python3 scripts/test_permission_ceiling.py
+
+      # These two shipped with workflows#49/#51 but were never wired into this
+      # job, so the contracts they describe were never actually gated. Both
+      # extract and execute the shipped `run:` text, so they cannot drift.
+      - name: e2e-skip-paths behaviour tests
+        run: python3 scripts/test_e2e_skip_paths.py
+
+      - name: E2E report minimal-install tests
+        run: python3 scripts/test_e2e_report_minimal_install.py
+
       # Every nuxt-cloudflare install job must either pair legacy `.npmrc.auth`
       # materialization with exact-path cleanup or delegate to a validated
       # caller-owned wrapper that receives only the nVault service token.

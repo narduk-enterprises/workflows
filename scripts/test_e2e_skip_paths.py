@@ -57,6 +57,19 @@ def check_job_wiring() -> None:
 
     plan = jobs["e2e-plan"]
     assert plan["outputs"]["skipped"] == "${{ steps.skip.outputs.skipped }}"
+    # workflows#59: this job must never request a permission its callers do
+    # not grant. `pull-requests: read` here fails EVERY caller's run at
+    # startup with zero jobs and no annotation.
+    assert plan["permissions"] == {"contents": "read"}, plan["permissions"]
+    skip_step = named_step(plan, "Decide whether E2E can be skipped")
+    api_calls = [
+        line.strip()
+        for line in skip_step["run"].splitlines()
+        if "gh api" in line and not line.lstrip().startswith("#")
+    ]
+    assert api_calls, "the skip step makes no GitHub API call"
+    assert all("/compare/" in call for call in api_calls), api_calls
+    assert not any("/pulls/" in call for call in api_calls), api_calls
 
     e2e = jobs["e2e"]
     assert e2e["if"] == "inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'"
@@ -84,8 +97,14 @@ def plan_step_script() -> str:
 
 
 def make_stub_gh(bin_dir: pathlib.Path, files: list[str]) -> None:
-    """A `gh` stub that answers `gh api .../pulls/N/files --paginate --jq ...`
-    with one filename per line, mirroring the real command's output shape."""
+    """A `gh` stub that answers `gh api .../compare/BASE...HEAD --paginate --jq ...`
+    with one filename per line, mirroring the real command's output shape.
+
+    The step reads the changed-file list through the COMPARE endpoint, not
+    `pulls/<n>/files`: comparing two commits is a Contents read and needs only
+    the `contents: read` every caller grants, where `pulls/<n>/files` needs
+    `pull-requests: read` — an escalation that fails the caller's whole run at
+    startup (workflows#59)."""
     script = bin_dir / "gh"
     body = "#!/usr/bin/env bash\nset -euo pipefail\n"
     for f in files:
@@ -101,7 +120,8 @@ def shell_quote(value: str) -> str:
 def run_skip_step(
     *,
     event_name: str,
-    pr_number: str,
+    base_sha: str,
+    head_sha: str,
     skip_patterns: str,
     files: list[str],
 ) -> tuple[subprocess.CompletedProcess, str]:
@@ -119,7 +139,8 @@ def run_skip_step(
         env["GH_TOKEN"] = "fake"
         env["REPO"] = "narduk-enterprises/operator-portal"
         env["EVENT_NAME"] = event_name
-        env["PR_NUMBER"] = pr_number
+        env["BASE_SHA"] = base_sha
+        env["HEAD_SHA"] = head_sha
         env["SKIP_PATTERNS"] = skip_patterns
         env["GITHUB_OUTPUT"] = str(output_path)
         env["GITHUB_STEP_SUMMARY"] = str(summary_path)
@@ -133,22 +154,47 @@ def run_skip_step(
 
 
 def check_behavior() -> None:
+    base, head = "a" * 40, "b" * 40
     cases = [
         (
             "empty e2e-skip-paths never skips",
-            dict(event_name="pull_request", pr_number="9", skip_patterns="", files=["README.md"]),
+            dict(
+                event_name="pull_request",
+                base_sha=base,
+                head_sha=head,
+                skip_patterns="",
+                files=["README.md"],
+            ),
             "false",
         ),
         (
             "push event never skips even with matching patterns",
-            dict(event_name="push", pr_number="", skip_patterns="**/*.md", files=["README.md"]),
+            dict(
+                event_name="push",
+                base_sha="",
+                head_sha="",
+                skip_patterns="**/*.md",
+                files=["README.md"],
+            ),
+            "false",
+        ),
+        (
+            "a pull request with no base/head sha in context -> do not skip",
+            dict(
+                event_name="pull_request",
+                base_sha="",
+                head_sha="",
+                skip_patterns="**/*.md",
+                files=["README.md"],
+            ),
             "false",
         ),
         (
             "all changed files match -> skipped",
             dict(
                 event_name="pull_request",
-                pr_number="9",
+                base_sha=base,
+                head_sha=head,
                 skip_patterns="**/*.md design/** docs/**",
                 files=["README.md", "docs/agents/foo.md", "design/x/y.png"],
             ),
@@ -158,7 +204,8 @@ def check_behavior() -> None:
             "one changed .vue file among md changes -> not skipped",
             dict(
                 event_name="pull_request",
-                pr_number="9",
+                base_sha=base,
+                head_sha=head,
                 skip_patterns="**/*.md design/** docs/**",
                 files=["README.md", "app/components/Foo.vue"],
             ),
@@ -168,7 +215,8 @@ def check_behavior() -> None:
             "CSS-only diff is never matched by a docs/markdown pattern set",
             dict(
                 event_name="pull_request",
-                pr_number="9",
+                base_sha=base,
+                head_sha=head,
                 skip_patterns="**/*.md design/** docs/** .lane-evidence/** LICENSE",
                 files=["app/assets/css/main.css"],
             ),
@@ -176,14 +224,58 @@ def check_behavior() -> None:
         ),
         (
             "no changed files reported -> safe default, do not skip",
-            dict(event_name="pull_request", pr_number="9", skip_patterns="**/*.md", files=[]),
+            dict(
+                event_name="pull_request",
+                base_sha=base,
+                head_sha=head,
+                skip_patterns="**/*.md",
+                files=[],
+            ),
             "false",
         ),
     ]
+    cases += _compare_cap_cases()
     failures = _run_cases(cases)
     failures += _check_missing_gh_degrades_safely()
+    failures += _check_failing_gh_degrades_safely()
     if failures:
         raise SystemExit(f"{failures} case(s) failed")
+
+
+def _compare_cap_cases() -> list:
+    """The compare endpoint's `.files` array stops at 300 entries SILENTLY —
+    no `Link` header, no truncation flag, and `?page=2` paginates commits
+    rather than files, so `--paginate` cannot recover the rest. A truncated
+    list can only make more files look matched than really are, so the cap
+    must fail CLOSED: at or above 300 entries the answer is "cannot
+    determine", which means run the full suite."""
+    base, head = "a" * 40, "b" * 40
+    just_under = [f"docs/page-{i:04d}.md" for i in range(299)]
+    at_cap = [f"docs/page-{i:04d}.md" for i in range(300)]
+    return [
+        (
+            "299 changed files, all matching -> still allowed to skip",
+            dict(
+                event_name="pull_request",
+                base_sha=base,
+                head_sha=head,
+                skip_patterns="docs/**",
+                files=just_under,
+            ),
+            "true",
+        ),
+        (
+            "300 changed files at the compare cap -> fail closed, run the full suite",
+            dict(
+                event_name="pull_request",
+                base_sha=base,
+                head_sha=head,
+                skip_patterns="docs/**",
+                files=at_cap,
+            ),
+            "false",
+        ),
+    ]
 
 
 def _run_cases(cases: list) -> int:
@@ -223,7 +315,8 @@ def _check_missing_gh_degrades_safely() -> int:
         env["GH_TOKEN"] = "fake"
         env["REPO"] = "narduk-enterprises/operator-portal"
         env["EVENT_NAME"] = "pull_request"
-        env["PR_NUMBER"] = "9"
+        env["BASE_SHA"] = "a" * 40
+        env["HEAD_SHA"] = "b" * 40
         env["SKIP_PATTERNS"] = "**/*.md"
         env["GITHUB_OUTPUT"] = str(output_path)
         env["GITHUB_STEP_SUMMARY"] = str(summary_path)
@@ -237,6 +330,42 @@ def _check_missing_gh_degrades_safely() -> int:
         ok = result.returncode == 0 and output == "skipped=false"
         label = "gh CLI absent -> degrades to running the full suite, never fails"
         if ok:
+            print(f"PASS  {label}")
+            return 0
+        print(f"FAIL  {label}: rc={result.returncode} output={output!r} stderr={result.stderr!r}")
+        return 1
+
+
+def _check_failing_gh_degrades_safely() -> int:
+    """A compare call that errors (rate limit, 404, network) must run the full
+    suite rather than fail the E2E plan job."""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        script = bin_dir / "gh"
+        script.write_text("#!/usr/bin/env bash\necho 'gh: Not Found (HTTP 404)' >&2\nexit 1\n")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        output_path = root / "github_output"
+        output_path.write_text("")
+        summary_path = root / "github_step_summary"
+        summary_path.write_text("")
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}:{env['PATH']}"
+        env["GH_TOKEN"] = "fake"
+        env["REPO"] = "narduk-enterprises/operator-portal"
+        env["EVENT_NAME"] = "pull_request"
+        env["BASE_SHA"] = "a" * 40
+        env["HEAD_SHA"] = "b" * 40
+        env["SKIP_PATTERNS"] = "**/*.md"
+        env["GITHUB_OUTPUT"] = str(output_path)
+        env["GITHUB_STEP_SUMMARY"] = str(summary_path)
+        result = subprocess.run(
+            ["bash", "-c", skip_step_script()], capture_output=True, text=True, env=env
+        )
+        output = output_path.read_text().strip()
+        label = "compare API failure -> degrades to running the full suite, never fails"
+        if result.returncode == 0 and output == "skipped=false":
             print(f"PASS  {label}")
             return 0
         print(f"FAIL  {label}: rc={result.returncode} output={output!r} stderr={result.stderr!r}")
