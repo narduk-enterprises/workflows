@@ -105,7 +105,33 @@ jobs:
     # WHY, and the difference between "opted out", "fork", and "no token" is
     # exactly what someone debugging a missing review needs to read.
     if: ${{ inputs.enabled }}
-    runs-on: ${{ fromJSON(inputs.runner) }}
+    # ---------------------------------------------------------------------
+    # Blacksmith overflow (D-CI-CAP-1 (c), extends D-BLACKSMITH-2; company-hq
+    # DECISIONS.md, fleet#337). Manual, kill-switched overflow for the
+    # `linux-ci` class's ordinary private CI -- never deploy or tailnet work.
+    # The org Actions variable `BLACKSMITH_RUNNERS_ENABLED` (default `false`,
+    # visibility: private repos) is the switch; a repo-level variable of the
+    # same name overrides it for exactly that repo (GitHub's normal
+    # repo > org precedence), which is how a canary is scoped to one adopter
+    # without moving the org default. Exact `true` selects the vendor's
+    # documented `blacksmith-2vcpu-ubuntu-2404` label (override via
+    # `vars.BLACKSMITH_LINUX_LABEL`) -- a label-only route, per D-BLACKSMITH-4:
+    # provider-created runner groups are not a stable contract and are never
+    # pinned here. Any other value, and any caller still on the public
+    # `"ubuntu-latest"` default, keeps the caller's own `inputs.runner` route
+    # unchanged -- this never touches a public repo's runner. This is a
+    # MANUAL switch, not automatic provider fallback: GitHub does not move an
+    # already-queued job to another runs-on target, so the fallback is
+    # flipping the variable back to false (or deleting the repo override) and
+    # rerunning. Kill conditions (D-BLACKSMITH-2/3, unchanged by this
+    # extension): disable at 2,400 equivalent 2-vCPU minutes in a monthly
+    # cycle, at any non-zero amount due, or on any unexpected billing state --
+    # whichever comes first. No payment method or paid overage is authorized.
+    # Policy-exception annotation (CI-RUNNER-POLICY.md Sec 2 exception 4, as
+    # expanded by D-CI-CAP-1 (c)): a job landing on Blacksmith here is
+    # exercising that named exception, not drift.
+    # ---------------------------------------------------------------------
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
     permissions:

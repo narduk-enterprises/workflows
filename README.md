@@ -230,6 +230,55 @@ this README alone when adding the next one.
 convention and is left as-is. Don't pass a JSON-encoded value to it; it isn't
 decoded.
 
+### Blacksmith overflow (`BLACKSMITH_RUNNERS_ENABLED`)
+
+D-CI-CAP-1 (c) (2026-09-07, extends D-BLACKSMITH-2; company-hq `DECISIONS.md`,
+fleet#337) makes Blacksmith a kill-switched overflow for the `linux-ci`
+class's ordinary private CI. Every `runs-on: ${{ fromJSON(inputs.runner) }}`
+site in `nuxt-cloudflare.yml`, `node-library.yml`, `docs-governance.yml`,
+`python-data.yml`, `closing-syntax-check.yml`, and `code-review.yml`
+(16 sites, none of them a deploy-credentialed job — `nuxt-cloudflare.yml`'s
+only deploy-shaped job, `deploy-dry-run`, runs `wrangler deploy --dry-run`
+with zero Cloudflare secrets in scope) resolves as:
+
+```
+runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
+```
+
+- **Switch**: the org Actions variable `BLACKSMITH_RUNNERS_ENABLED`
+  (default `false`, visibility restricted to private repos). Only the exact
+  string `true` selects Blacksmith. A **repo-level** variable of the same
+  name overrides the org default for exactly that repo (GitHub's normal
+  repo-over-org precedence) — the mechanism for canarying or kill-switching
+  one adopter without moving the org default.
+- **Label, not a group id**: the vendor's documented
+  `blacksmith-2vcpu-ubuntu-2404` string, overridable via
+  `vars.BLACKSMITH_LINUX_LABEL`. No Blacksmith runner-group id is pinned
+  anywhere — D-BLACKSMITH-4's live proof established that provider-created
+  groups are not a stable routing contract; only the label is.
+- **Public callers are never affected**, even if the org variable were ever
+  mistakenly flipped for one: the `inputs.runner != '"ubuntu-latest"'` guard
+  means a caller still on the public default keeps GitHub-hosted
+  `ubuntu-latest` regardless of the switch.
+- **Manual, not automatic fallback**: GitHub does not move an already-queued
+  job to another `runs-on:` target. If Blacksmith cannot schedule or its free
+  allowance is exhausted, flip the variable back to `false` (or remove the
+  repo-level override) and rerun — same operational shape as every other
+  Blacksmith cohort (D-BLACKSMITH-3).
+- **Cost boundary** (D-BLACKSMITH-2/3, unchanged): free allowance only, no
+  payment method, no paid overage; disable at 2,400 equivalent 2-vCPU
+  minutes in a monthly cycle, any non-zero amount due, or any unexpected
+  billing state, whichever comes first.
+- **Never routes here**: production/deploy jobs (all app-owned and bespoke,
+  outside these six CI-only callables), the Playwright/browser class
+  (`reusable-browser-tests.yml`'s browser-runner job is untouched — its own
+  trust boundary per company-hq `CI-RUNNER-POLICY.md` §5), and Apple builds
+  (`apple.yml` is untouched — it has its own D-APPLE-CI-1 ladder).
+- **Adding a job is not additive here without checking this section again**:
+  a new job that copies `${{ fromJSON(inputs.runner) }}` verbatim does *not*
+  get Blacksmith overflow automatically — use the expression above, or it
+  silently stays off the overflow route.
+
 ## How to consume
 
 ### Caller template
@@ -1087,6 +1136,12 @@ executed here.
   fleet migration (D-WEBFOUND-2 Q4/Q10), most fleet apps do not conform to
   the seven-item contract yet, and a moving `v1` tag must not hand every
   existing adopter a brand-new red gate the day the tag advances.
+- The D-CI-CAP-1 (c) Blacksmith-overflow change (see "Blacksmith overflow"
+  above) is within-major on the same rule: no new input, no new job, no new
+  job-level `permissions:`, and the default (`vars.BLACKSMITH_RUNNERS_ENABLED`
+  undeclared) reproduces every existing adopter's behavior byte-for-byte.
+  `v1` moves again rather than a `v2` being cut, behind the usual fan-out
+  canary.
 
 ## Maintainer conventions
 
