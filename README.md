@@ -404,13 +404,21 @@ and which nobody discovers by looking at a passing pull request. If a caller
 wants a docs-only change to cost less, it turns off the *opt-in* gates above and
 still builds.
 
-`apple.yml` and `python-data.yml` declare **no `secrets:` block at all**, so a
-caller must not pass one. That is deliberate: a reusable workflow receives only
-what it declares (there is no ambient inheritance without `secrets: inherit`),
-so the strongest way to say "this gate cannot reach your credentials" is to
-declare nothing. A repo whose Apple build needs private SwiftPM access, or
-whose data gate needs a cross-repo PAT, keeps that step in its own workflow
-rather than widening the shared one.
+`python-data.yml` declares no secrets. `apple.yml` accepts an optional
+`DEPENDENCY_SSH_KEY` for a private SwiftPM repository. Pass a **read-only deploy
+key scoped to that dependency**; never a release, signing, or account key.
+Build/test rewrite HTTPS package URLs to SSH only for the caller's GitHub
+organization, using Git's process environment. A pinned GitHub Ed25519 host
+key authenticates the server. The private key lives in a mode-0600 temporary
+file removed on success or failure; Git config, Keychain and `GITHUB_ENV` stay
+unchanged. Xcode callers should use `-scmProvider system` so resolution uses
+this process configuration. Callers that omit the secret keep their existing
+behavior. Do not pass credentials to untrusted code or fork pull requests.
+
+```yaml
+    secrets:
+      DEPENDENCY_SSH_KEY: ${{ secrets.PRIVATE_SWIFTPM_SSH_KEY }}
+```
 
 `reusable-browser-tests.yml` is the one exception: it declares a single
 optional `NARDUK_PLATFORM_GH_PACKAGES_READ` secret (`required: false`), mirroring

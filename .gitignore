@@ -1,3 +1,5 @@
 .lane-evidence/
 __pycache__/
 *.pyc
+.codegraph/
+.cursor/rules/codegraph.mdc

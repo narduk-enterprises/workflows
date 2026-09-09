@@ -31,12 +31,11 @@ name: Reusable Apple CI
 # stays the `apple-release-pipeline` skill's per-repo workflow, and folding it
 # in here would put release credentials behind a PR-triggered gate.
 #
-# NO SECRETS ARE DECLARED. This workflow takes no `secrets:` at all, so
-# nothing it runs can reach a caller's credentials even by accident — a
-# reusable workflow only receives what it declares (there is no ambient
-# inheritance without `secrets: inherit`). A repo whose build needs private
-# SwiftPM access keeps that step in its own workflow rather than widening this
-# one.
+# Private SwiftPM dependencies may opt into DEPENDENCY_SSH_KEY. Use a
+# read-only deploy key scoped to one repository. Only build/test receive it;
+# the temporary key is removed when the step exits. Git URL rewriting stays
+# process-scoped and limited to the caller's GitHub organization. Release
+# and signing credentials are never accepted here.
 #
 # THE "Required" CONVENTION (this is the point of this repo): this workflow's
 # last job is named exactly `Required`, `needs:` every other job, runs with
@@ -75,6 +74,10 @@ permissions:
 
 on:
   workflow_call:
+    secrets:
+      DEPENDENCY_SSH_KEY:
+        description: Optional read-only GitHub deploy key for a private SwiftPM dependency in the caller's organization.
+        required: false
     inputs:
       apple-runner:
         description: >-
@@ -358,8 +361,23 @@ jobs:
 
       - name: Build
         if: inputs.run-build
+        env:
+          DEPENDENCY_SSH_KEY: ${{ secrets.DEPENDENCY_SSH_KEY }}
+          DEPENDENCY_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
+          if [ -n "${DEPENDENCY_SSH_KEY:-}" ]; then
+            auth_dir="$(mktemp -d "${RUNNER_TEMP}/swiftpm-auth.XXXXXX")"
+            trap 'rm -rf -- "$auth_dir"' EXIT
+            printf '%s\n' "$DEPENDENCY_SSH_KEY" > "$auth_dir/key"
+            chmod 600 "$auth_dir/key"
+            printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$auth_dir/known_hosts"
+            export GIT_CONFIG_COUNT=1
+            export GIT_CONFIG_KEY_0="url.git@github.com:${DEPENDENCY_OWNER}/.insteadOf"
+            export GIT_CONFIG_VALUE_0="https://github.com/${DEPENDENCY_OWNER}/"
+            export GIT_SSH_COMMAND="ssh -i \"$auth_dir/key\" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\"$auth_dir/known_hosts\""
+            unset DEPENDENCY_SSH_KEY
+          fi
           lock_tool="${APPLE_BUILD_LOCK_TOOL:-/Library/Application Support/NardukAppleRunner/bin/apple_build_lock.py}"
           lock_path="${APPLE_BUILD_LOCK_PATH:-/Library/Application Support/NardukAppleRunner/state/apple-build.lock}"
           # Stage the caller's command as a real script file rather than
@@ -379,8 +397,23 @@ jobs:
 
       - name: Test
         if: inputs.run-tests
+        env:
+          DEPENDENCY_SSH_KEY: ${{ secrets.DEPENDENCY_SSH_KEY }}
+          DEPENDENCY_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
+          if [ -n "${DEPENDENCY_SSH_KEY:-}" ]; then
+            auth_dir="$(mktemp -d "${RUNNER_TEMP}/swiftpm-auth.XXXXXX")"
+            trap 'rm -rf -- "$auth_dir"' EXIT
+            printf '%s\n' "$DEPENDENCY_SSH_KEY" > "$auth_dir/key"
+            chmod 600 "$auth_dir/key"
+            printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$auth_dir/known_hosts"
+            export GIT_CONFIG_COUNT=1
+            export GIT_CONFIG_KEY_0="url.git@github.com:${DEPENDENCY_OWNER}/.insteadOf"
+            export GIT_CONFIG_VALUE_0="https://github.com/${DEPENDENCY_OWNER}/"
+            export GIT_SSH_COMMAND="ssh -i \"$auth_dir/key\" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\"$auth_dir/known_hosts\""
+            unset DEPENDENCY_SSH_KEY
+          fi
           lock_tool="${APPLE_BUILD_LOCK_TOOL:-/Library/Application Support/NardukAppleRunner/bin/apple_build_lock.py}"
           lock_path="${APPLE_BUILD_LOCK_PATH:-/Library/Application Support/NardukAppleRunner/state/apple-build.lock}"
           script="${RUNNER_TEMP}/apple-test-command.sh"

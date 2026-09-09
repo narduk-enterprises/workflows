@@ -287,10 +287,42 @@ def test_lease(document: dict) -> None:
     print("Apple lease wait/timeout/broker-held contract passed (agent-infrastructure#965)")
 
 
+def test_dependency_auth(document: dict) -> None:
+    # Execute the shipped setup and both successful/failing child exits.
+    # Verify HTTPS rewriting is owner-scoped and the temporary key disappears.
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        credential = "fake-read-only-deploy-key"
+        for name in ("Build", "Test"):
+            setup = step(document, name)["run"].split('lock_tool=')[0]
+            for value in ("", credential):
+                for code in (0, 17):
+                    script = setup + "\ngit config --get url.git@github.com:example/.insteadOf || :\n"
+                    if value:
+                        script += 'test "$(cat "$auth_dir/key")" = "fake-read-only-deploy-key"\ntest "$(stat -f %Lp "$auth_dir/key" 2>/dev/null || stat -c %a "$auth_dir/key")" = "600"\n'
+                    script += f"exit {code}\n"
+                    env = {**os.environ, "HOME": temp, "RUNNER_TEMP": temp,
+                           "GIT_CONFIG_GLOBAL": str(root / "global"), "GIT_CONFIG_NOSYSTEM": "1",
+                           "DEPENDENCY_OWNER": "example", "DEPENDENCY_SSH_KEY": value}
+                    for key in list(env):
+                        if key.startswith("GIT_CONFIG_") and key not in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"):
+                            del env[key]
+                    result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+                    assert result.returncode == code, result.stderr
+                    assert credential not in result.stdout + result.stderr
+                    assert result.stdout == ("https://github.com/example/\n" if value else "")
+                    assert not list(root.glob("swiftpm-auth.*"))
+                    assert not (root / "global").exists()
+        for job in ("lint", "required"):
+            assert "DEPENDENCY_SSH_KEY" not in str(document["jobs"][job])
+    print("Private SwiftPM auth passed (owner scope, opt-in, success/failure cleanup)")
+
+
 def main() -> None:
     document = yaml.safe_load(WORKFLOW.read_text())
+    test_dependency_auth(document)
     call = document.get("on", document.get(True))["workflow_call"]
-    assert "secrets" not in call
+    assert call["secrets"] == {"DEPENDENCY_SSH_KEY": {"description": "Optional read-only GitHub deploy key for a private SwiftPM dependency in the caller's organization.", "required": False}}
     assert call["inputs"]["apple-runner"]["required"] is True
     assert document["jobs"]["lint"]["runs-on"] == "${{ fromJSON(inputs.lint-runner) }}"
     assert document["jobs"]["xcode"]["runs-on"] == "${{ fromJSON(inputs.apple-runner) }}"
