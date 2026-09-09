@@ -326,7 +326,7 @@ def main() -> None:
     assert call["inputs"]["apple-runner"]["required"] is True
     assert document["jobs"]["lint"]["runs-on"] == "${{ fromJSON(inputs.lint-runner) }}"
     assert document["jobs"]["xcode"]["runs-on"] == "${{ fromJSON(inputs.apple-runner) }}"
-    assert document["jobs"]["required"]["runs-on"] == "${{ fromJSON(inputs.lint-runner) }}"
+    assert document["jobs"]["required"]["runs-on"] == "${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || (inputs.lint-runner)) }}"
     assert document["jobs"]["required"]["needs"] == ["lint", "xcode"]
     install_swiftlint = next(
         item

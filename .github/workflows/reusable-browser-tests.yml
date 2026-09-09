@@ -803,9 +803,9 @@ jobs:
     name: Required
     if: always()
     needs: [contract, validate, chromium, webkit, report]
-    # Keep failure aggregation off caller-controlled self-hosted routes. If the
-    # route contract itself is invalid, Required still runs and fails visibly.
-    runs-on: ubuntu-latest
+    # The organization lightweight route is independent of browser inputs.
+    # Invalid browser inputs must still produce a visible Required failure.
+    runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '"ubuntu-latest"') }}
     timeout-minutes: 5
     permissions:
       contents: read

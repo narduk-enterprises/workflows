@@ -76,7 +76,7 @@ def validate_structure(document: dict) -> None:
     assert jobs["webkit"]["runs-on"] == "${{ fromJSON(inputs.browser-runner) }}"
     assert jobs["validate"]["runs-on"] == "${{ fromJSON(inputs.linux-runner) }}"
     assert jobs["report"]["runs-on"] == "${{ fromJSON(inputs.linux-runner) }}"
-    assert jobs["required"]["runs-on"] == "ubuntu-latest"
+    assert jobs["required"]["runs-on"] == "${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '\"ubuntu-latest\"') }}"
     assert jobs["validate"]["needs"] == "contract"
     assert jobs["chromium"]["needs"] == ["contract", "validate"]
     assert jobs["webkit"]["needs"] == ["contract", "validate", "chromium"]

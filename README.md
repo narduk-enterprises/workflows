@@ -559,12 +559,45 @@ Notes:
   step text extracted from the YAML itself, so the tests cannot drift from the
   shipped script.
 
+### Central lightweight-job routing
+
+`CI_LIGHTWEIGHT_RUNNER` is an organization Actions variable containing a JSON
+`runs-on` value, initially `"ubuntu-slim"` for the authorized company gates.
+Every shared `Required` job reads it. Changing this one value changes routing
+for subsequent jobs without changing callable code or repinning callers.
+Package, browser, Apple, and deployment jobs retain their own routes.
+`node-library.required-runner` remains an explicit per-caller override; avoid
+setting it on ordinary callers that should follow the central route. Repository
+variables take precedence over organization variables, so reserve repository
+values for documented exceptions.
+
+Inline planners or final assertions need a one-time adoption of the same
+expression, preserving their job names and dependency conditions:
+
+```yaml
+runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '"ubuntu-slim"') }}
+```
+
+Use this only for bounded, secrets-free metadata and result checks with no
+private-network requirement. Their existing policy authorization still applies.
+It is a routing contract, not automatic classification by job duration. Already
+queued jobs keep their selected route. A composite action cannot select a
+runner because it starts after GitHub has assigned one.
+
+Consumers pinned before this feature need one reviewed SHA update. That initial
+adoption is unavoidable; later capacity changes require only the organization
+variable. Keep immutable workflow pins. Unsetting the variable restores each
+callable's prior fallback, and malformed JSON fails visibly. Public callers must
+continue to use GitHub-hosted runners; never give the variable a self-hosted
+route in an organization that exposes it to public callers.
+
 ### `node-library.yml`
 
 `required-runner` optionally separates the small `Required` aggregation job
 from the package runner. It accepts the same JSON runner shape as `runner`;
-empty preserves existing routing, including the Blacksmith switch. An explicit
-value takes precedence for `Required` only. The gate checks dependency results
+empty uses the organization-level `CI_LIGHTWEIGHT_RUNNER` route, falling back
+to existing routing (including Blacksmith) when that variable is absent. An
+explicit value takes precedence for `Required` only. The gate checks dependency results
 without checking out source, installing packages, or receiving registry secrets.
 For a secrets-free gate before a privileged self-hosted release, the caller may
 pass `required-runner: '"ubuntu-slim"'` under company-hq's CI runner policy
