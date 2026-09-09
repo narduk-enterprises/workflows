@@ -151,6 +151,13 @@ on:
           is explicitly empty. Matrix callers should declare it on every lane
           so each package runs only scripts it genuinely owns. The default
           remains a single whole-repo lane for non-monorepo callers.
+          For bounded batches, use a root lane (filter: "") with an
+          extra-script owning the package gates and disable the standard
+          run-* inputs. That script receives the complete lane as
+          PACKAGE_MATRIX_JSON, including caller-defined package selections.
+          The caller owns selection, strict gate validation and failure
+          aggregation; checkout, installation and credential cleanup still
+          happen once per lane here.
         required: false
         type: string
         default: '[{"label":"default","filter":""}]'
@@ -621,6 +628,7 @@ jobs:
       - name: Extra scripts
         if: inputs.extra-scripts != '' || matrix['extra-scripts'] != ''
         env:
+          PACKAGE_MATRIX_JSON: ${{ toJSON(matrix) }}
           GATE: Extra scripts
           # `toJSON` preserves the distinction the contract needs:
           #   null -> lane omitted the field; use the legacy shared fallback

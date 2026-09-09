@@ -553,6 +553,18 @@ Notes:
 
 ### `node-library.yml`
 
+A monorepo may group packages into a bounded number of install lanes. Use
+`filter: ""`, a lane-level `extra-scripts: "ci:batch"`, and set all four
+`run-*` inputs to `false`. The root `ci:batch` script receives the complete
+lane in `PACKAGE_MATRIX_JSON`; for example, a lane can carry
+`packages: ["@example/core", "@example/auth"]`. That repository-owned script
+must validate every selection, reject missing gates, retain every nonzero
+exit and print per-package results. Run the same script locally. The callable
+continues to own runner setup, one install per lane and auth cleanup; existing
+single-package lanes are unchanged. Choose the batch count from measured
+setup cost and capacity, and retain the caller's final integration aggregate.
+
+
 ```yaml
 jobs:
   ci:
