@@ -2104,8 +2104,8 @@ jobs:
     name: Required
     if: always()
     needs: [build, extra-gate, e2e-plan, e2e, e2e-report, deploy-dry-run]
-    # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
+    # Organization-wide lightweight route; unset preserves the caller fallback.
+    runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
     timeout-minutes: 20
     permissions:
       contents: read

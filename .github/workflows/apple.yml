@@ -430,8 +430,8 @@ jobs:
     name: Required
     if: always()
     needs: [lint, xcode]
-    # Aggregation is pure shell; keep it off the scarce Mac slot.
-    runs-on: ${{ fromJSON(inputs.lint-runner) }}
+    # Aggregation is pure shell; use the organization lightweight route first.
+    runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || (inputs.lint-runner)) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
     permissions:

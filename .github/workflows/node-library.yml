@@ -85,7 +85,8 @@ on:
           Overrides the package runner and Blacksmith switch for this job.
           Use an independently available runner when the caller's policy permits
           it, for example '"ubuntu-slim"' for a gate before a privileged release.
-          Empty retains the existing runner and overflow behavior.
+          Empty uses CI_LIGHTWEIGHT_RUNNER when configured; otherwise it retains
+          the existing runner and overflow behavior.
         required: false
         type: string
         default: ""
@@ -726,9 +727,9 @@ jobs:
     name: Required
     if: always()
     needs: package
-    # A caller may keep this small gate off its package queue. With no override,
-    # retain Blacksmith overflow and the original package runner selection.
-    runs-on: ${{ fromJSON(inputs.required-runner || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
+    # Explicit override, then the organization lightweight route, then the
+    # original package/overflow route for callers that have not adopted it.
+    runs-on: ${{ fromJSON(inputs.required-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
     permissions:
