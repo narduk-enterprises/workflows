@@ -299,7 +299,7 @@ def test_dependency_auth(document: dict) -> None:
                 for code in (0, 17):
                     script = setup + "\ngit config --get url.git@github.com:example/.insteadOf || :\n"
                     if value:
-                        script += 'test "$(cat "$auth_dir/key")" = "fake-read-only-deploy-key"\ntest "$(stat -f %Lp "$auth_dir/key" 2>/dev/null || stat -c %a "$auth_dir/key")" = "600"\n'
+                        script += 'test "$(cat "$auth_dir/key")" = "fake-read-only-deploy-key"\npython3 -c \'import os,stat,sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600\' "$auth_dir/key"\n'
                     script += f"exit {code}\n"
                     env = {**os.environ, "HOME": temp, "RUNNER_TEMP": temp,
                            "GIT_CONFIG_GLOBAL": str(root / "global"), "GIT_CONFIG_NOSYSTEM": "1",
