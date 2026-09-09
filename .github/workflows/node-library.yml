@@ -65,7 +65,7 @@ on:
         default: "pnpm"
       runner:
         description: >-
-          JSON-encoded runner for every job in this workflow: a plain string
+          JSON-encoded runner for package jobs and, by default, Required: a plain string
           ("ubuntu-latest"), a JSON array
           (["self-hosted","Linux","X64","proxmox","linux-ci"]), or a JSON
           object ({"group":"linux-ci","labels":[...]}) matching the
@@ -79,6 +79,16 @@ on:
         required: false
         type: string
         default: '"ubuntu-latest"'
+      required-runner:
+        description: >-
+          Optional JSON-encoded runner for the secrets-free Required gate only.
+          Overrides the package runner and Blacksmith switch for this job.
+          Use an independently available runner when the caller's policy permits
+          it, for example '"ubuntu-slim"' for a gate before a privileged release.
+          Empty retains the existing runner and overflow behavior.
+        required: false
+        type: string
+        default: ""
       run-lint:
         description: "Run the lint script"
         required: false
@@ -716,8 +726,9 @@ jobs:
     name: Required
     if: always()
     needs: package
-    # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
+    # A caller may keep this small gate off its package queue. With no override,
+    # retain Blacksmith overflow and the original package runner selection.
+    runs-on: ${{ fromJSON(inputs.required-runner || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
     permissions:
