@@ -145,6 +145,10 @@ def workflow_call_inputs(doc: dict) -> dict:
 
 
 def check_timeout(path: Path, job_id: str, job: dict, inputs: dict, f: Findings) -> None:
+    if "uses" in job:
+        # A reusable-workflow call cannot declare a job timeout. The called
+        # workflow's execution jobs own it and are checked in their own file.
+        return
     value = job.get("timeout-minutes")
     if value is None:
         f.add(path, f"R2 job '{job_id}' has no timeout-minutes (would inherit GitHub's 6-hour default)")
