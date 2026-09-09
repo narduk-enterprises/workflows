@@ -8,16 +8,10 @@ the workflow YAML and executes that exact text under bash with
 If someone edits the case statement, this test either still passes against
 the new text or it fails.
 
-The defect being locked down: GitHub Actions reports a matrix job's `result`
-as `"skipped"`, not `"success"`, when `strategy.matrix.include` resolves to
-an empty array (a documented GHA matrix-with-empty-array behavior, not a
-narduk-libs-specific quirk). The `package` job here carries no `if:`/`needs:`
-of its own, so the only way its result can be `skipped` is a caller passing
-an intentionally empty `package-matrix` -- e.g. narduk-libs'
-`compute-affected-packages.mjs` classifying every changed path as harmless
-(docs-only, root markdown, LICENSE) and legitimately selecting zero
-packages. That must pass the gate, exactly like `success` does. A `failure`
-or `cancelled` result must still fail it.
+An empty matrix must skip at job level before GitHub expands the strategy.
+Only that explicit no-op may pass a skipped dependency; failures, cancellation
+and skipped nonempty selections fail closed. CI also calls the real workflow
+with [] because a shell fixture cannot validate GitHub matrix expansion.
 
 Run: python3 scripts/test_required_gate.py
 """
@@ -40,25 +34,28 @@ def gate_script() -> str:
     raise SystemExit(f"::error::no 'Require every package lane to succeed' step in {NODE_LIB}")
 
 
-def run(script: str, package_result: str) -> tuple[int, str, str]:
+def run(script: str, package_result: str, matrix_empty: bool) -> tuple[int, str, str]:
     completed = subprocess.run(
         ["bash", "-c", script],
-        env={"PACKAGE_RESULT": package_result, "PATH": "/usr/bin:/bin"},
+        env={"PACKAGE_RESULT": package_result, "PATH": "/usr/bin:/bin", "MATRIX_EMPTY": str(matrix_empty).lower()},
         capture_output=True,
         text=True,
     )
     return completed.returncode, completed.stdout, completed.stderr
 
 
-CASES: list[tuple[str, str, int]] = [
-    ("a successful package matrix passes", "success", 0),
+CASES: list[tuple[str, str, bool, int]] = [
+    ("a successful package matrix passes", "success", False, 0),
     (
         "an intentionally empty package-matrix (skipped) passes",
         "skipped",
+        True,
         0,
     ),
-    ("a failed package lane fails the gate", "failure", 1),
-    ("a cancelled package lane fails the gate", "cancelled", 1),
+    ("a failed package lane fails the gate", "failure", False, 1),
+    ("a cancelled package lane fails the gate", "cancelled", False, 1),
+    ("skipped nonempty selection fails", "skipped", False, 1),
+    ("failure with empty input still fails", "failure", True, 1),
 ]
 
 
@@ -66,8 +63,8 @@ def main() -> None:
     script = gate_script()
     failures: list[str] = []
 
-    for description, package_result, expected_code in CASES:
-        code, _stdout, stderr = run(script, package_result)
+    for description, package_result, matrix_empty, expected_code in CASES:
+        code, _stdout, stderr = run(script, package_result, matrix_empty)
         if code != expected_code:
             failures.append(
                 f"{description}: PACKAGE_RESULT={package_result!r} expected exit "
