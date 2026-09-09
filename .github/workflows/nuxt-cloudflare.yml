@@ -407,6 +407,16 @@ on:
         required: false
         type: string
         default: "0.2.0"
+      foundation-check-auth:
+        description: >-
+          Type of the existing NARDUK_PLATFORM_GH_PACKAGES_READ secret for
+          foundation checks: package-token (default) or nvault. Select nvault
+          when the caller maps its NVAULT_TOKEN service token into that secret.
+          The resolved package token is scoped to this check, including its
+          live registry lookup, and is never exported to later steps.
+        required: false
+        type: string
+        default: "package-token"
     secrets:
       # CI alias for the single estate packages-read PAT. Callers pass
       # secrets.NARDUK_PLATFORM_GH_PACKAGES_READ (org Actions, same value as
@@ -713,7 +723,7 @@ jobs:
       #     WITHOUT first adopting the package as a dependency — §4 item 2's
       #     "mandatory package" rule is a separate, later gate this input
       #     must not silently force.
-      # The pinned dlx path needs its own registry auth: rather than lean on
+      # Both paths need registry auth for the live N-1 lookup. Rather than lean on
       # the install steps' `.npmrc.auth` (which "Remove package auth
       # materialization" above already deleted, and which an install-script
       # caller never creates at all), it writes a throwaway npmrc scoped to
@@ -729,9 +739,48 @@ jobs:
         env:
           PM: ${{ inputs.package-manager }}
           TOOL_VERSION: ${{ inputs.foundation-check-tool-version }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
+          AUTH_SOURCE: ${{ inputs.foundation-check-auth }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
         run: |
           set -uo pipefail
+          # A failed credential resolve still leaves an artifact for the
+          # always-upload/evaluate steps. Never reuse a prior run's output.
+          : > foundation-check.json
+          if ! NODE_AUTH_TOKEN=$(node --input-type=module <<'NODE'
+          const secret = process.env.NARDUK_PLATFORM_GH_PACKAGES_READ;
+          const valid = value => typeof value === 'string' && value.length > 0 && value === value.trim() && !/[\0\r\n]/.test(value);
+          try {
+            if (!valid(secret)) throw new Error('Package-read credential is missing or invalid.');
+            let token;
+            if (process.env.AUTH_SOURCE === 'package-token') {
+              token = secret;
+            } else if (process.env.AUTH_SOURCE === 'nvault') {
+              const response = await fetch('https://api.nvault.nardukenterprises.com/v1/resolve', {
+                method: 'POST',
+                headers: { accept: 'application/json', authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
+                body: '{}', cache: 'no-store', credentials: 'omit', redirect: 'error',
+                signal: AbortSignal.timeout(30000),
+              });
+              if (!response.ok) throw new Error(`nVault package-read resolve failed (HTTP ${response.status}).`);
+              const payload = await response.json();
+              token = payload?.data?.secrets?.NARDUK_PLATFORM_GH_PACKAGES_READ;
+            } else {
+              throw new Error('foundation-check-auth must be package-token or nvault.');
+            }
+            if (!valid(token)) throw new Error('Resolved package-read credential is missing or invalid.');
+            process.stdout.write(token);
+          } catch {
+            console.error('Unable to resolve foundation-check package-read credential.');
+            process.exitCode = 1;
+          }
+          NODE
+          ); then
+            echo "::error::foundation-check registry authentication is unavailable"
+            exit 0
+          fi
+          echo "::add-mask::$NODE_AUTH_TOKEN"
+          export NODE_AUTH_TOKEN
+          unset NARDUK_PLATFORM_GH_PACKAGES_READ
           has_dep=$(node -e '
             let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
               let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}
@@ -752,7 +801,7 @@ jobs:
             trap 'rm -f "$npmrc_file"' EXIT
             {
               echo "@narduk-enterprises:registry=https://npm.pkg.github.com"
-              echo "//npm.pkg.github.com/:_authToken=${NARDUK_PLATFORM_GH_PACKAGES_READ}"
+              echo "//npm.pkg.github.com/:_authToken=\${NODE_AUTH_TOKEN}"
             } > "$npmrc_file"
             if [ "$PM" = "pnpm" ]; then
               NPM_CONFIG_USERCONFIG="$npmrc_file" NPM_CONFIG_GLOBALCONFIG=/dev/null \

@@ -1199,6 +1199,16 @@ executed here.
   fleet migration (D-WEBFOUND-2 Q4/Q10), most fleet apps do not conform to
   the seven-item contract yet, and a moving `v1` tag must not hand every
   existing adopter a brand-new red gate the day the tag advances.
+- `foundation-check-auth` defaults to `package-token`. Callers whose
+  `NARDUK_PLATFORM_GH_PACKAGES_READ` secret mapping carries an nVault service
+  token set `foundation-check-auth: nvault`. The callable resolves the existing
+  package-read grant for that one step and supplies `NODE_AUTH_TOKEN` to both
+  the installed checker and the optional pinned download. The checker needs
+  this credential for its live N-1 registry lookup even when dependencies are
+  already installed. Neither the service token nor the resolved package token
+  is exported to later steps; temporary npm configuration contains only an
+  environment-variable reference. Missing or rejected credentials leave a
+  blocking UNKNOWN artifact rather than falling back to `github.token`.
 - The D-CI-CAP-1 (c) Blacksmith-overflow change (see "Blacksmith overflow"
   above) is within-major on the same rule: no new input, no new job, no new
   job-level `permissions:`, and the default (`vars.BLACKSMITH_RUNNERS_ENABLED`
