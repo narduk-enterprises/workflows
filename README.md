@@ -561,6 +561,16 @@ Notes:
 
 ### `node-library.yml`
 
+`required-runner` optionally separates the small `Required` aggregation job
+from the package runner. It accepts the same JSON runner shape as `runner`;
+empty preserves existing routing, including the Blacksmith switch. An explicit
+value takes precedence for `Required` only. The gate checks dependency results
+without checking out source, installing packages, or receiving registry secrets.
+For a secrets-free gate before a privileged self-hosted release, the caller may
+pass `required-runner: '"ubuntu-slim"'` under company-hq's CI runner policy
+exception 2. This keeps completion reporting independent of a saturated build
+queue. It does not grant other callers a hosted-runner policy exception.
+
 A monorepo may group packages into a bounded number of install lanes. Use
 `filter: ""`, a lane-level `extra-scripts: "ci:batch"`, and set all four
 `run-*` inputs to `false`. The root `ci:batch` script receives the complete
