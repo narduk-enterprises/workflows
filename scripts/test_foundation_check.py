@@ -48,6 +48,8 @@ EVAL_STEP = gate_script("build", "Evaluate web-foundation conformance check")
 
 PNPM_STUB = """#!/usr/bin/env bash
 set -euo pipefail
+test "${NODE_AUTH_TOKEN:-}" = "$EXPECTED_PACKAGE_TOKEN"
+test -z "${NARDUK_PLATFORM_GH_PACKAGES_READ:-}"
 echo "pnpm $*" >> "$STUB_LOG"
 if [ "$1" = "exec" ] && [ "$2" = "narduk-app" ]; then
   cat "$FIXTURE_JSON"
@@ -68,6 +70,8 @@ exit 64
 
 NPX_STUB = """#!/usr/bin/env bash
 set -euo pipefail
+test "${NODE_AUTH_TOKEN:-}" = "$EXPECTED_PACKAGE_TOKEN"
+test -z "${NARDUK_PLATFORM_GH_PACKAGES_READ:-}"
 echo "npx $*" >> "$STUB_LOG"
 if [ "$1" = "--no-install" ] && [ "$2" = "narduk-app" ]; then
   cat "$FIXTURE_JSON"
@@ -88,8 +92,27 @@ exit 64
 
 FIXTURE_ARTEFACT = json.dumps({"schemaVersion": 1, "result": "PASS", "exitCode": 0})
 
+FETCH_STUB = """
+globalThis.fetch = async (url, options) => {
+  if (url !== 'https://api.nvault.nardukenterprises.com/v1/resolve'
+      || options.method !== 'POST' || options.body !== '{}'
+      || options.headers.authorization !== 'Bearer test-service-token'
+      || options.redirect !== 'error' || !options.signal) {
+    throw new Error('Unexpected credential request');
+  }
+  if (process.env.STUB_RESOLVE === 'denied') return { ok: false, status: 403 };
+  return { ok: true, json: async () => ({ data: { secrets: {
+    NARDUK_PLATFORM_GH_PACKAGES_READ: process.env.STUB_RESOLVE === 'malformed'
+      ? 'invalid\\ntoken' : 'resolved-test-package-token'
+  } } }) };
+};
+"""
 
-def run_check_step(*, has_dep: bool, pm: str) -> tuple[int, str, str | None, str]:
+
+def run_check_step(
+    *, has_dep: bool, pm: str, auth_source: str = "package-token",
+    resolve: str = "ok", credential: str | None = None,
+) -> tuple[int, str, str | None, str]:
     """Execute the "Run..." step; returns (rc, stdout+stderr, produced JSON, stub log)."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = pathlib.Path(tmp)
@@ -109,6 +132,8 @@ def run_check_step(*, has_dep: bool, pm: str) -> tuple[int, str, str | None, str
 
         fixture_json = tmp_path / "fixture.json"
         fixture_json.write_text(FIXTURE_ARTEFACT)
+        fetch_stub = tmp_path / "fetch-stub.mjs"
+        fetch_stub.write_text(FETCH_STUB)
         captured_npmrc = tmp_path / "captured.npmrc"
         stub_log = tmp_path / "stub.log"
         # A dedicated, otherwise-empty TMPDIR proves the throwaway npmrc
@@ -121,7 +146,15 @@ def run_check_step(*, has_dep: bool, pm: str) -> tuple[int, str, str | None, str
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "PM": pm,
             "TOOL_VERSION": "0.2.0",
-            "NARDUK_PLATFORM_GH_PACKAGES_READ": "test-secret-token",
+            "AUTH_SOURCE": auth_source,
+            "NARDUK_PLATFORM_GH_PACKAGES_READ": credential if credential is not None else (
+                "test-service-token" if auth_source == "nvault" else "test-secret-token"
+            ),
+            "EXPECTED_PACKAGE_TOKEN": (
+                "resolved-test-package-token" if auth_source == "nvault" else "test-secret-token"
+            ),
+            "STUB_RESOLVE": resolve,
+            "NODE_OPTIONS": f"--import={fetch_stub}",
             "FIXTURE_JSON": str(fixture_json),
             "CAPTURED_NPMRC": str(captured_npmrc),
             "STUB_LOG": str(stub_log),
@@ -167,6 +200,10 @@ def main() -> int:
     ok = input_default("foundation-check-tool-version") == "0.2.0"
     failures += 0 if check("foundation-check-tool-version pins 0.2.0", ok) else 1
 
+    total += 1
+    ok = input_default("foundation-check-auth") == "package-token"
+    failures += 0 if check("existing package-token callers retain the default auth type", ok) else 1
+
     # --- "Run web-foundation conformance check" ---
 
     for pm in ("pnpm", "npm"):
@@ -207,7 +244,9 @@ def main() -> int:
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "PM": "pnpm",
             "TOOL_VERSION": "0.2.0",
+            "AUTH_SOURCE": "package-token",
             "NARDUK_PLATFORM_GH_PACKAGES_READ": "test-secret-token",
+            "EXPECTED_PACKAGE_TOKEN": "test-secret-token",
             "FIXTURE_JSON": str(fixture_json),
             "CAPTURED_NPMRC": str(captured_npmrc),
             "STUB_LOG": str(tmp_path / "stub.log"),
@@ -216,11 +255,37 @@ def main() -> int:
         npmrc_text = captured_npmrc.read_text() if captured_npmrc.exists() else ""
         ok = (
             "@narduk-enterprises:registry=https://npm.pkg.github.com" in npmrc_text
-            and "//npm.pkg.github.com/:_authToken=test-secret-token" in npmrc_text
+            and "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" in npmrc_text
+            and "test-secret-token" not in npmrc_text
         )
         failures += 0 if check(
-            "dlx path authenticates with the existing NARDUK_PLATFORM_GH_PACKAGES_READ secret",
+            "dlx uses a child-scoped token reference without persisting its value",
             ok, f"npmrc={npmrc_text!r}",
+        ) else 1
+
+    for pm in ("pnpm", "npm"):
+        for has_dep in (True, False):
+            total += 1
+            rc, out, produced, leftover = run_check_step(has_dep=has_dep, pm=pm, auth_source="nvault")
+            ok = rc == 0 and produced == FIXTURE_ARTEFACT and leftover == "[]" and "test-service-token" not in out
+            failures += 0 if check(
+                f"[{pm}] nvault dependency={has_dep}: resolves once, isolates credential, supports registry lookup",
+                ok, f"rc={rc} produced={produced!r} leftover={leftover}\n{out}",
+            ) else 1
+
+    for label, kwargs in (
+        ("nVault denial", {"auth_source": "nvault", "resolve": "denied"}),
+        ("malformed resolved token", {"auth_source": "nvault", "resolve": "malformed"}),
+        ("missing input credential", {"credential": ""}),
+        ("unknown credential type", {"auth_source": "unsupported"}),
+    ):
+        total += 1
+        rc, out, produced, leftover = run_check_step(has_dep=True, pm="pnpm", **kwargs)
+        eval_rc, _, _ = run_eval_step(artefact_content=produced)
+        ok = rc == 0 and produced == "" and leftover == "[]" and eval_rc == 1
+        failures += 0 if check(
+            f"{label}: leaves an empty artifact, then required evaluation blocks",
+            ok, f"rc={rc} produced={produced!r} eval_rc={eval_rc}\n{out}",
         ) else 1
 
     total += 1
@@ -240,6 +305,7 @@ def main() -> int:
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "PM": "pnpm",
             "TOOL_VERSION": "0.2.0",
+            "AUTH_SOURCE": "package-token",
             "NARDUK_PLATFORM_GH_PACKAGES_READ": "test-secret-token",
         }
         p = subprocess.run(["bash", "-c", RUN_STEP], cwd=tmp, env=env, capture_output=True, text=True)
