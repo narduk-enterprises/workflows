@@ -170,6 +170,8 @@ env:
 
 jobs:
   package:
+    # GitHub rejects an empty matrix before scheduling a lane.
+    if: toJSON(fromJSON(inputs.package-matrix)) != '[]'
     name: package / ${{ matrix.label }}
     # ---------------------------------------------------------------------
     # Blacksmith overflow (D-CI-CAP-1 (c), extends D-BLACKSMITH-2; company-hq
@@ -723,18 +725,15 @@ jobs:
       - name: Require every package lane to succeed
         env:
           PACKAGE_RESULT: ${{ needs.package.result }}
+          PACKAGE_MATRIX_EMPTY: ${{ toJSON(fromJSON(inputs.package-matrix)) == '[]' }}
         run: |
           case "$PACKAGE_RESULT" in
             success) exit 0 ;;
             skipped)
-              # `package` carries no `if:`/`needs:` of its own, so the only
-              # way GitHub reports its result as "skipped" rather than
-              # "success" is an intentionally empty `package-matrix`
-              # (`strategy.matrix.include: []`) -- a caller's affected-path
-              # computation classifying every changed file as harmless
-              # (narduk-libs' compute-affected-packages.mjs is the first
-              # adopter of this). Treat that the same as nothing-to-run,
-              # not a failure.
+              # Only the explicit empty-matrix guard may skip package checks.
+              [[ "$PACKAGE_MATRIX_EMPTY" == true ]] || {
+                echo "::error::nonempty package matrix was unexpectedly skipped"; exit 1;
+              }
               exit 0 ;;
             *) echo "::error::package job reported '$PACKAGE_RESULT'"; exit 1 ;;
           esac

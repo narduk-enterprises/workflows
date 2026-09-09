@@ -8,16 +8,9 @@ the workflow YAML and executes that exact text under bash with
 If someone edits the case statement, this test either still passes against
 the new text or it fails.
 
-The defect being locked down: GitHub Actions reports a matrix job's `result`
-as `"skipped"`, not `"success"`, when `strategy.matrix.include` resolves to
-an empty array (a documented GHA matrix-with-empty-array behavior, not a
-narduk-libs-specific quirk). The `package` job here carries no `if:`/`needs:`
-of its own, so the only way its result can be `skipped` is a caller passing
-an intentionally empty `package-matrix` -- e.g. narduk-libs'
-`compute-affected-packages.mjs` classifying every changed path as harmless
-(docs-only, root markdown, LICENSE) and legitimately selecting zero
-packages. That must pass the gate, exactly like `success` does. A `failure`
-or `cancelled` result must still fail it.
+An empty include matrix fails GitHub's expansion unless the job is skipped
+before expansion. The workflow must guard the matrix job itself and accept
+skipped results only when that explicit empty-matrix condition holds.
 
 Run: python3 scripts/test_required_gate.py
 """
@@ -40,10 +33,10 @@ def gate_script() -> str:
     raise SystemExit(f"::error::no 'Require every package lane to succeed' step in {NODE_LIB}")
 
 
-def run(script: str, package_result: str) -> tuple[int, str, str]:
+def run(script: str, package_result: str, empty: bool = False) -> tuple[int, str, str]:
     completed = subprocess.run(
         ["bash", "-c", script],
-        env={"PACKAGE_RESULT": package_result, "PATH": "/usr/bin:/bin"},
+        env={"PACKAGE_RESULT": package_result, "PACKAGE_MATRIX_EMPTY": str(empty).lower(), "PATH": "/usr/bin:/bin"},
         capture_output=True,
         text=True,
     )
@@ -67,12 +60,17 @@ def main() -> None:
     failures: list[str] = []
 
     for description, package_result, expected_code in CASES:
-        code, _stdout, stderr = run(script, package_result)
+        code, _stdout, stderr = run(script, package_result, empty=package_result == "skipped")
         if code != expected_code:
             failures.append(
                 f"{description}: PACKAGE_RESULT={package_result!r} expected exit "
                 f"{expected_code}, got {code} (stderr: {stderr.strip()!r})"
             )
+
+    doc = yaml.safe_load(NODE_LIB.read_text())
+    assert doc["jobs"]["package"]["if"] == "toJSON(fromJSON(inputs.package-matrix)) != '[]'"
+    assert run(script, "skipped", empty=False)[0] == 1
+    assert run(script, "failure", empty=True)[0] == 1
 
     if failures:
         for failure in failures:
