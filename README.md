@@ -869,8 +869,10 @@ adoptions use the standalone callable so the pool contract has one owner.
 
 #### Reusing build output in E2E
 
-An E2E launcher that normally rebuilds the application may opt into a
-same-run artifact handoff:
+The Nuxt callable reuses build output by default when `run-e2e` is enabled.
+It requires exactly one of `.output/server/index.mjs` or
+`apps/web/.output/server/index.mjs` under `working-directory`. Other layouts
+name their output explicitly:
 
 ```yaml
       run-e2e: true
@@ -886,10 +888,14 @@ rather than silently rebuilding. A missing upload already fails through
 output directory is `.output`; the input is an explicit caller-selected path,
 not a repository-wide artifact sweep.
 
-The artifact name includes `github.run_id` and `github.run_attempt`, so a retry
-cannot consume an earlier attempt's output. Retention is one day. The input
-defaults to empty, which adds no artifact steps or environment variable for
-existing callers.
+The artifact name includes `github.run_id` and `github.run_attempt`. Embedded
+E2E shards download the exact artifact ID exported by their successful build
+job, so rerunning failed shards can reuse that build even when the attempt
+number advances. Retention is one day. The default `auto` produces no artifact
+when E2E is disabled; an explicit path also supports the standalone browser
+callable. Set an explicitly empty path only for suites that do not test a
+built application. Launchers must honor `E2E_PREBUILT_ARTIFACT=1`: the workflow
+cannot suppress a build hardcoded inside an application script.
 
 #### Skipping E2E on docs-only PRs (`e2e-skip-paths`)
 
