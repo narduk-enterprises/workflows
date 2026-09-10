@@ -90,7 +90,7 @@ on:
         description: "Python version to provision before running `command`. Empty skips Python setup."
         required: false
         type: string
-        default: "3.13"
+        default: "3.12"
       node-version:
         description: "Node.js version to provision before running `command`. Empty skips Node/pnpm setup."
         required: false

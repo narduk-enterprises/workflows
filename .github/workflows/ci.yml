@@ -86,7 +86,7 @@ jobs:
       # pin this repo's own callables already use.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22"
+          node-version: "24"
 
       # This job's own scripts (lint_callables.py and every scripts/test_*.py)
       # import PyYAML. GitHub-hosted ubuntu-latest ships it; the self-hosted
