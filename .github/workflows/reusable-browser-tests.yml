@@ -141,7 +141,8 @@ on:
     secrets:
       # CI alias for the single estate packages-read PAT. Callers pass
       # secrets.NARDUK_PLATFORM_GH_PACKAGES_READ (org Actions, same value as
-      # Doppler GH_PACKAGES_READ) or map secrets.NVAULT_TOKEN into this input.
+      # nvault GH_PACKAGES_READ). Legacy caller-owned installers may explicitly
+      # map secrets.NVAULT_TOKEN into this input; that is a service-token contract.
       # Optional: every step below falls back to the ephemeral github.token
       # when a caller passes nothing, so no existing caller changes behavior.
       NARDUK_PLATFORM_GH_PACKAGES_READ:
@@ -337,15 +338,49 @@ jobs:
 
       - name: Configure package registry auth
         env:
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
-        run: |
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: &configure_package_registry_auth |
           set -euo pipefail
+          set +x
+          if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
+            if ! package_scope=$(node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          try {
+            const pkg = fs.existsSync('package.json') ? JSON.parse(fs.readFileSync('package.json', 'utf8')) : {};
+            const dependencies = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies, pkg.peerDependencies);
+            const direct = Object.entries(dependencies).some(([name, spec]) => /@narduk-(enterprises|geo)\//.test(`${name} ${spec}`));
+            const locked = ['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock', 'bun.lock'].some(file => fs.existsSync(file) && fs.readFileSync(file, 'utf8').includes('npm.pkg.github.com'));
+            console.log(direct || locked ? 'private' : 'public');
+          } catch {
+            console.error('Cannot determine package registry requirements from repository metadata.');
+            process.exitCode = 1;
+          }
+          NODE
+            ); then
+              exit 1
+            fi
+            if [ "$package_scope" = private ]; then
+              echo '::error::Private packages require the org NARDUK_PLATFORM_GH_PACKAGES_READ secret forwarded to this workflow. It maps to GH_PACKAGES_READ; do not substitute a GitHub App or write token.'
+              exit 1
+            fi
+            echo 'No private package dependencies and no package-read secret; skipping registry auth.'
+            exit 0
+          fi
+          if [[ "$NARDUK_PLATFORM_GH_PACKAGES_READ" == *[[:space:]]* ]]; then
+            echo '::error::Package-read credential contains whitespace; repair the mapped secret.'
+            exit 1
+          fi
           if [ -f ./scripts/package-registry-auth.mjs ]; then
             node ./scripts/package-registry-auth.mjs
           elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
             node ./tools/configure-package-registry-auth.mjs
           else
-            echo "no package-registry bootstrap script present; continuing with the ephemeral GITHUB_TOKEN only"
+            # Direct org PAT path; legacy caller bootstraps keep their existing contract.
+            umask 077
+            # Variable reference stays literal; the token never enters this file.
+            # shellcheck disable=SC2016
+            printf '@narduk-enterprises:registry=https://npm.pkg.github.com\n@narduk-geo:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=${GH_PACKAGES_READ}\n' > .npmrc.auth
           fi
 
       - name: Point pnpm at a workspace-local store (self-hosted)
@@ -368,10 +403,17 @@ jobs:
         if: inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
       - name: Install dependencies (npm)
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
         if: inputs.package-manager == 'npm'
         run: npm ci
 
@@ -631,16 +673,9 @@ jobs:
 
       - name: Configure package registry auth
         env:
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
-        run: |
-          set -euo pipefail
-          if [ -f ./scripts/package-registry-auth.mjs ]; then
-            node ./scripts/package-registry-auth.mjs
-          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
-            node ./tools/configure-package-registry-auth.mjs
-          else
-            echo "no package-registry bootstrap script present; continuing with the ephemeral GITHUB_TOKEN only"
-          fi
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: *configure_package_registry_auth
 
       - name: Point pnpm at a workspace-local store (self-hosted)
         if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
@@ -650,10 +685,17 @@ jobs:
         if: inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
       - name: Install dependencies (npm)
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
         if: inputs.package-manager == 'npm'
         run: npm ci
 
@@ -737,14 +779,9 @@ jobs:
 
       - name: Configure package registry auth
         env:
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}
-        run: |
-          set -euo pipefail
-          if [ -f ./scripts/package-registry-auth.mjs ]; then
-            node ./scripts/package-registry-auth.mjs
-          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
-            node ./tools/configure-package-registry-auth.mjs
-          fi
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: *configure_package_registry_auth
 
       - name: Point pnpm at a workspace-local store (self-hosted)
         if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
@@ -754,10 +791,17 @@ jobs:
         if: inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
       - name: Install dependencies (npm)
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
         if: inputs.package-manager == 'npm'
         run: npm ci
 

@@ -23,6 +23,8 @@ Run: python3 scripts/test_package_auth_cleanup.py
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -233,9 +235,72 @@ def cleanup_is_safe_when_absent_and_targeted() -> None:
         assert sibling.exists()
 
 
+def validate_registry_mapping(document: dict, workflow: str) -> set[str]:
+    secret_expr = "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}"
+    scripts = set()
+    for job_id, job in auth_jobs(document).items():
+        auth = named_steps(job, AUTH_STEP)[0]
+        scripts.add(auth["run"])
+        assert auth["env"].get("GH_PACKAGES_READ") == secret_expr, (workflow, job_id)
+        for install_name in INSTALL_STEPS:
+            for install in named_steps(job, install_name):
+                assert install["env"].get("GH_PACKAGES_READ") == secret_expr, (workflow, job_id, install_name)
+                assert install["env"]["NARDUK_PLATFORM_GH_PACKAGES_READ"] == secret_expr
+                assert install["env"]["NPM_CONFIG_USERCONFIG"].endswith("/.npmrc.auth"), (workflow, job_id, install_name)
+                assert install["env"]["NPM_CONFIG_GLOBALCONFIG"] == "/dev/null", (workflow, job_id, install_name)
+    assert len(scripts) == 1, workflow
+    return scripts
+
+
+def registry_auth_behavior() -> None:
+    """Execute shipped auth setup: missing auth is distinct from public deps."""
+    sentinel = "fixture-package-read-credential"
+    node_dir = str(Path(subprocess.check_output(["node", "-p", "process.execPath"], text=True, timeout=15).strip()).parent)
+    for workflow in ("nuxt-cloudflare.yml", "node-library.yml", "reusable-node-ci.yml", "reusable-browser-tests.yml"):
+        document = yaml.safe_load((Path(".github/workflows") / workflow).read_text())
+        scripts = validate_registry_mapping(document, workflow)
+        script = scripts.pop()
+        for kind, token, expected in (("private", "", 1), ("transitive", "", 1), ("public", "", 0), ("malformed", "", 1), ("private", sentinel, 0), ("private", " ", 1)):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                pkg = {"dependencies": {"@narduk-enterprises/core": "1.0.0"}} if kind == "private" else {"dependencies": {"example": "1.0.0"}}
+                (root / "package.json").write_text("{invalid" if kind == "malformed" else json.dumps(pkg))
+                if kind == "transitive":
+                    (root / "pnpm-lock.yaml").write_text("resolution: https://npm.pkg.github.com/example.tgz")
+                result = subprocess.run(["bash", "-c", script], cwd=root, env={
+                    "PATH": node_dir + os.pathsep + os.environ["PATH"], "HOME": tmp,
+                    "NARDUK_PLATFORM_GH_PACKAGES_READ": token, "GH_PACKAGES_READ": token,
+                }, capture_output=True, text=True, timeout=20)
+                assert result.returncode == expected, (workflow, kind, result.stderr)
+                assert sentinel not in result.stdout + result.stderr
+                config = root / ".npmrc.auth"
+                if token == sentinel:
+                    assert config.is_file()
+                    assert config.stat().st_mode & 0o777 == 0o600
+                    assert "_authToken=${GH_PACKAGES_READ}" in config.read_text()
+                    assert "@narduk-geo:registry=https://npm.pkg.github.com" in config.read_text()
+                    assert sentinel not in config.read_text()
+                else:
+                    assert not config.exists()
+        # Seeded red: a missing canonical install variable must fail the same
+        # contract, even when the legacy compatibility alias remains present.
+        candidate = deepcopy(document)
+        job = next(iter(auth_jobs(candidate).values()))
+        step = next(step for step in job["steps"] if step.get("name") in INSTALL_STEPS)
+        step["env"].pop("GH_PACKAGES_READ")
+        try:
+            validate_registry_mapping(candidate, workflow)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("missing canonical install variable did not fail the contract")
+    print("registry-auth behavior passed (4 callables; private/transitive/public/malformed/missing/invalid credentials)")
+
+
 def main() -> None:
     document = yaml.safe_load(WORKFLOW.read_text())
     validate(document)
+    registry_auth_behavior()
     cleanup_is_safe_when_absent_and_targeted()
 
     # Seeded-red: dropping cleanup from any single auth job must fail the contract.

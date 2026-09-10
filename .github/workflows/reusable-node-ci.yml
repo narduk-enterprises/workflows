@@ -190,20 +190,49 @@ jobs:
 
       - name: Configure package registry auth
         env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
           NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
         run: |
-          # Skip cleanly when the caller declined to pass a package-registry
-          # token so public/forked callers can still run.
+          set -euo pipefail
+          set +x
           if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
-            echo "skipping package-registry auth: no NARDUK_PLATFORM_GH_PACKAGES_READ token passed"
+            if ! package_scope=$(node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          try {
+            const pkg = fs.existsSync('package.json') ? JSON.parse(fs.readFileSync('package.json', 'utf8')) : {};
+            const dependencies = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies, pkg.peerDependencies);
+            const direct = Object.entries(dependencies).some(([name, spec]) => /@narduk-(enterprises|geo)\//.test(`${name} ${spec}`));
+            const locked = ['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock', 'bun.lock'].some(file => fs.existsSync(file) && fs.readFileSync(file, 'utf8').includes('npm.pkg.github.com'));
+            console.log(direct || locked ? 'private' : 'public');
+          } catch {
+            console.error('Cannot determine package registry requirements from repository metadata.');
+            process.exitCode = 1;
+          }
+          NODE
+            ); then
+              exit 1
+            fi
+            if [ "$package_scope" = private ]; then
+              echo '::error::Private packages require the org NARDUK_PLATFORM_GH_PACKAGES_READ secret forwarded to this workflow. It maps to GH_PACKAGES_READ; do not substitute a GitHub App or write token.'
+              exit 1
+            fi
+            echo 'No private package dependencies and no package-read secret; skipping registry auth.'
             exit 0
+          fi
+          if [[ "$NARDUK_PLATFORM_GH_PACKAGES_READ" == *[[:space:]]* ]]; then
+            echo '::error::Package-read credential contains whitespace; repair the mapped secret.'
+            exit 1
           fi
           if [ -f ./scripts/package-registry-auth.mjs ]; then
             node ./scripts/package-registry-auth.mjs
           elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
             node ./tools/configure-package-registry-auth.mjs
           else
-            echo "skipping package-registry auth: no auth bootstrap script present"
+            # Direct org PAT path; legacy caller bootstraps keep their existing contract.
+            umask 077
+            # Variable reference stays literal; the token never enters this file.
+            # shellcheck disable=SC2016
+            printf '@narduk-enterprises:registry=https://npm.pkg.github.com\n@narduk-geo:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=${GH_PACKAGES_READ}\n' > .npmrc.auth
           fi
 
       # SELF-HOSTED: THE PNPM STORE MUST SIT ON THE WORKSPACE'S OWN FILESYSTEM.
@@ -271,10 +300,17 @@ jobs:
         if: inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
       - name: Install dependencies (npm)
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
         if: inputs.package-manager == 'npm'
         run: npm ci
 

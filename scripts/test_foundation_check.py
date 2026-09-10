@@ -48,7 +48,7 @@ EVAL_STEP = gate_script("build", "Evaluate web-foundation conformance check")
 
 PNPM_STUB = """#!/usr/bin/env bash
 set -euo pipefail
-test "${NODE_AUTH_TOKEN:-}" = "$EXPECTED_PACKAGE_TOKEN"
+test "${GH_PACKAGES_READ:-}" = "$EXPECTED_PACKAGE_TOKEN"
 test -z "${NARDUK_PLATFORM_GH_PACKAGES_READ:-}"
 echo "pnpm $*" >> "$STUB_LOG"
 if [ "$1" = "exec" ] && [ "$2" = "narduk-app" ]; then
@@ -70,7 +70,7 @@ exit 64
 
 NPX_STUB = """#!/usr/bin/env bash
 set -euo pipefail
-test "${NODE_AUTH_TOKEN:-}" = "$EXPECTED_PACKAGE_TOKEN"
+test "${GH_PACKAGES_READ:-}" = "$EXPECTED_PACKAGE_TOKEN"
 test -z "${NARDUK_PLATFORM_GH_PACKAGES_READ:-}"
 echo "npx $*" >> "$STUB_LOG"
 if [ "$1" = "--no-install" ] && [ "$2" = "narduk-app" ]; then
@@ -101,8 +101,9 @@ globalThis.fetch = async (url, options) => {
     throw new Error('Unexpected credential request');
   }
   if (process.env.STUB_RESOLVE === 'denied') return { ok: false, status: 403 };
+  if (process.env.STUB_RESOLVE === 'old-alias') return { ok: true, json: async () => ({ data: { secrets: { NARDUK_PLATFORM_GH_PACKAGES_READ: 'old-alias-token' } } }) };
   return { ok: true, json: async () => ({ data: { secrets: {
-    NARDUK_PLATFORM_GH_PACKAGES_READ: process.env.STUB_RESOLVE === 'malformed'
+    GH_PACKAGES_READ: process.env.STUB_RESOLVE === 'malformed'
       ? 'invalid\\ntoken' : 'resolved-test-package-token'
   } } }) };
 };
@@ -255,7 +256,7 @@ def main() -> int:
         npmrc_text = captured_npmrc.read_text() if captured_npmrc.exists() else ""
         ok = (
             "@narduk-enterprises:registry=https://npm.pkg.github.com" in npmrc_text
-            and "//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}" in npmrc_text
+            and "//npm.pkg.github.com/:_authToken=${GH_PACKAGES_READ}" in npmrc_text
             and "test-secret-token" not in npmrc_text
         )
         failures += 0 if check(
@@ -276,6 +277,7 @@ def main() -> int:
     for label, kwargs in (
         ("nVault denial", {"auth_source": "nvault", "resolve": "denied"}),
         ("malformed resolved token", {"auth_source": "nvault", "resolve": "malformed"}),
+        ("missing canonical nVault key", {"auth_source": "nvault", "resolve": "old-alias"}),
         ("missing input credential", {"credential": ""}),
         ("unknown credential type", {"auth_source": "unsupported"}),
     ):
