@@ -460,6 +460,10 @@ jobs:
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
+      - name: Remove package auth materialization
+        if: always()
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
+
       # Only the default branch writes. `cache-hit` is the EXACT-key hit; a
       # `restore-keys` fallback leaves it false, which is correct here — that
       # is precisely the case where the store gained packages worth saving.

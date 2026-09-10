@@ -417,6 +417,10 @@ jobs:
         if: inputs.package-manager == 'npm'
         run: npm ci
 
+      - name: Remove package auth materialization
+        if: always()
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
+
       - name: Assert isolated Playwright toolchain
         env:
           EXPECTED_PLAYWRIGHT_VERSION: ${{ inputs.playwright-version }}
@@ -699,6 +703,10 @@ jobs:
         if: inputs.package-manager == 'npm'
         run: npm ci
 
+      - name: Remove package auth materialization
+        if: always()
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
+
       - name: Assert isolated Playwright toolchain
         env:
           EXPECTED_PLAYWRIGHT_VERSION: ${{ inputs.playwright-version }}
@@ -804,6 +812,10 @@ jobs:
           NPM_CONFIG_GLOBALCONFIG: /dev/null
         if: inputs.package-manager == 'npm'
         run: npm ci
+
+      - name: Remove package auth materialization
+        if: always()
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
 
       - name: Download this attempt's blob reports
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
