@@ -81,6 +81,7 @@ def test_resolve(document: dict) -> None:
         ('auto', 'false', [], 0, ''),
         ('', 'true', [], 0, ''),
         ('custom/build', 'false', ['custom/build'], 0, 'custom/build'),
+        ('render-output', 'true', ['render-output'], 0, 'render-output'),
         ('missing', 'true', [], 1, ''),
         ('../outside', 'true', [], 1, ''),
         ('/tmp', 'true', [], 1, ''),
