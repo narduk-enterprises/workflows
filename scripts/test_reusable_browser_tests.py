@@ -92,6 +92,12 @@ def validate_structure(document: dict) -> None:
         "report",
     ]
 
+    for job in ('validate', 'chromium', 'webkit'):
+        downloads = [s for s in jobs[job]['steps'] if s.get('uses', '').startswith('actions/download-artifact@')]
+        assert len(downloads) == 1
+        assert downloads[0]['with']['artifact-ids'] == '${{ inputs.build-artifact-id }}'
+        assert "inputs.build-artifact-id == ''" in downloads[0]['with']['name']
+
     chromium_assertion = step(
         document, "chromium", "Assert isolated Playwright toolchain"
     )["run"]
@@ -218,7 +224,9 @@ def main() -> None:
     good = run_contract(document)
     assert good.returncode == 0, good.stdout + good.stderr
 
+    assert run_contract(document, BUILD_ARTIFACT_ID="12345").returncode == 0
     bad_cases = [
+        {"BUILD_ARTIFACT_ID": "invalid"},
         {"BROWSER_ROUTE": json.dumps({"group": "linux-ci", "labels": []})},
         {"BROWSER_ROUTE": json.dumps(["proxmox-playwright-x64"])},
         {"LINUX_ROUTE": json.dumps(["self-hosted", "linux-ci"])},
@@ -240,7 +248,7 @@ def main() -> None:
         assert skew.returncode != 0
         assert "does not equal required exact version" in skew.stdout + skew.stderr
 
-    print("reusable browser contract passed (8 route/input failures, version-skew failure, exact image pass)")
+    print("reusable browser contract passed (9 route/input failures, version-skew failure, exact image pass)")
 
 
 if __name__ == "__main__":

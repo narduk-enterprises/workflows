@@ -863,6 +863,11 @@ The pool's current defects are treated as fail-closed constraints:
   quarantine. An unavailable guest can leave work queued, but it cannot become
   a skipped green; every enabled shard result is mandatory in `Required`.
 
+When the producer is an app-owned build job, export the upload step's
+`artifact-id` as a job output and pass it as `build-artifact-id`. This keeps
+failed-job reruns tied to the successful producer. Omitting it retains
+the existing same-run, same-attempt artifact-name convention.
+
 The older `nuxt-cloudflare.yml` `e2e-*` inputs remain supported for existing
 callers and for repos without isolated-pool approval. New isolated-pool
 adoptions use the standalone callable so the pool contract has one owner.
