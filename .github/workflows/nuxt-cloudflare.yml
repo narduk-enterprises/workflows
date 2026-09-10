@@ -269,13 +269,14 @@ on:
         description: >-
           Relative path, under working-directory, to build output that the
           build job must upload and every E2E shard must download before the
-          suite runs. Empty (the default) preserves the previous behavior.
+          suite runs. The default auto detects .output or apps/web/.output when
+          run-e2e is enabled. Empty explicitly disables the handoff.
           When set, a missing output is a hard failure and the suite receives
           E2E_PREBUILT_ARTIFACT=1 so its launcher can require and reuse the
           downloaded output instead of rebuilding it.
         required: false
         type: string
-        default: ""
+        default: "auto"
       e2e-browsers:
         description: >-
           Space-separated required browser engines. On a non-isolated runner
@@ -432,6 +433,9 @@ env:
 jobs:
   build:
     name: Build
+    outputs:
+      e2e-build-path: ${{ steps.e2e-build-path.outputs.path }}
+      e2e-build-id: ${{ steps.e2e-build-upload.outputs.artifact-id }}
     # ---------------------------------------------------------------------
     # Blacksmith overflow (D-CI-CAP-1 (c), extends D-BLACKSMITH-2; company-hq
     # DECISIONS.md, fleet#337). Manual, kill-switched overflow for the
@@ -1071,16 +1075,46 @@ jobs:
             echo "::endgroup::"
           done
 
-      # Opt-in only. The artifact is produced after every build-lane gate has
-      # passed, so E2E cannot consume output from a partially successful gate.
-      # run_attempt prevents a rerun from downloading an artifact left by an
-      # earlier attempt of the same run.
+      # Resolve only known Nuxt outputs. An ambiguous or absent build is an
+      # error, never permission for each shard to compile its own application.
+      - name: Resolve prebuilt E2E application
+        id: e2e-build-path
+        env:
+          BUILD_PATH: ${{ inputs.e2e-build-artifact-path }}
+          RUN_E2E: ${{ inputs.run-e2e }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs')
+          const path = require('node:path')
+          let output = process.env.BUILD_PATH
+          if (output === 'auto') {
+            if (process.env.RUN_E2E !== 'true') process.exit(0)
+            const candidates = ['.output', 'apps/web/.output'].filter(p =>
+              fs.existsSync(path.join(p, 'server/index.mjs')))
+            if (candidates.length !== 1) {
+              throw new Error('Expected exactly one Nuxt build (.output or apps/web/.output); set e2e-build-artifact-path explicitly for other layouts')
+            }
+            output = candidates[0]
+          }
+          if (!output) process.exit(0)
+          if (path.isAbsolute(output) || output.split(/[\\/]/).some(p => p === '..') || /[\r\n]/.test(output) || output === '.') {
+            throw new Error('e2e-build-artifact-path must name a relative build directory inside working-directory')
+          }
+          const resolved = fs.realpathSync(output)
+          if (!resolved.startsWith(fs.realpathSync('.') + path.sep) || !fs.statSync(resolved).isDirectory()) {
+            throw new Error('Build output must be a directory inside working-directory')
+          }
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `path=${output}\n`)
+          NODE
+
       - name: Upload prebuilt E2E application
-        if: inputs.e2e-build-artifact-path != ''
+        id: e2e-build-upload
+        if: steps.e2e-build-path.outputs.path != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: e2e-build-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ inputs.working-directory }}/${{ inputs.e2e-build-artifact-path }}
+          path: ${{ inputs.working-directory }}/${{ steps.e2e-build-path.outputs.path }}
           if-no-files-found: error
           include-hidden-files: true
           retention-days: 1
@@ -1405,12 +1439,26 @@ jobs:
         with:
           persist-credentials: false
 
+      # The producing job's artifact ID survives 'rerun failed jobs': the
+      # successful build may belong to an earlier attempt of this same run.
+      - name: Require prebuilt E2E artifact identity
+        if: needs.build.outputs.e2e-build-path != ''
+        env:
+          ARTIFACT_ID: ${{ needs.build.outputs.e2e-build-id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$ARTIFACT_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::successful build did not export its E2E artifact ID"
+            exit 1
+          fi
+
       - name: Download prebuilt E2E application
-        if: inputs.e2e-build-artifact-path != ''
+        if: needs.build.outputs.e2e-build-path != ''
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: e2e-build-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ inputs.working-directory }}/${{ inputs.e2e-build-artifact-path }}
+          artifact-ids: ${{ needs.build.outputs.e2e-build-id }}
+          merge-multiple: true
+          path: ${{ inputs.working-directory }}/${{ needs.build.outputs.e2e-build-path }}
 
       - name: Guard isolated Playwright route
         env:
@@ -1828,7 +1876,8 @@ jobs:
           SHARD: ${{ matrix.shard }}
           TOTAL: ${{ inputs.e2e-shards }}
           EXTRA_ARGS: ${{ inputs.e2e-args }}
-          E2E_PREBUILT_ARTIFACT: ${{ inputs.e2e-build-artifact-path != '' && '1' || '' }}
+          E2E_PREBUILT_ARTIFACT: ${{ needs.build.outputs.e2e-build-path != '' && '1' || '' }}
+          E2E_BUILD_ARTIFACT_PATH: ${{ needs.build.outputs.e2e-build-path }}
         run: |
           set -euo pipefail
           # Unlike optional build-lane scripts, run-e2e=true is an assertion
