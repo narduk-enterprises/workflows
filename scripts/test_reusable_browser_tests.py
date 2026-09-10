@@ -128,7 +128,7 @@ def validate_structure(document: dict) -> None:
     for job in ("chromium", "webkit", "report"):
         auth_env = step(document, job, "Configure package registry auth")["env"]
         assert auth_env["NARDUK_PLATFORM_GH_PACKAGES_READ"] == (
-            "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || github.token }}"
+            "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}"
         )
 
     report_upload = step(document, "report", "Upload merged HTML and traces")

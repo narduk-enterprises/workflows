@@ -673,18 +673,14 @@ value means the lane has no extra gates. Omitting the field preserves the
 shared-input behavior for existing callers, while declaring it on every lane
 prevents one package's requirement from leaking into another.
 
-`NARDUK_PLATFORM_GH_PACKAGES_READ` (falling back to the ephemeral
-`github.token`) is in the env of the `Install dependencies (pnpm)` /
-`Install dependencies (npm)` steps themselves, not just the earlier
-`Configure package registry auth` step — a step's `env:` does not carry to a
-later step. Without it, a caller whose registry-auth script (e.g.
-`@narduk-enterprises/narduk-app-tools`'s `configureRegistryAuth()`) writes a
-templated `${NARDUK_PLATFORM_GH_PACKAGES_READ}` reference into `.npmrc.auth`
-got "Failed to replace env in config" at install time, because the variable
-was undefined in that later step -- the same gap workflows#55 fixed in
-`nuxt-cloudflare.yml` (narduk-libs#132). The fallback is inert for every
-existing adopter: when no secret is passed, `.npmrc.auth` is never written
-and the install step's copy of the variable is never read.
+The org Actions secret `NARDUK_PLATFORM_GH_PACKAGES_READ` maps into
+`GH_PACKAGES_READ` on the auth and install steps. The legacy process alias is
+also supplied for existing caller bootstrap scripts; it is an interface
+compatibility detail, not another secret to create. There is no implicit
+`github.token` fallback. Missing credentials fail before private-package
+installs; public-only installs need no credential. Without a caller bootstrap,
+the callable writes a temporary user config containing a literal variable
+reference, then removes it after the install.
 
 ### `nuxt-cloudflare.yml`
 
@@ -704,27 +700,28 @@ jobs:
       run-e2e: true
       wrangler-dry-run: true
     secrets:
-      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NVAULT_TOKEN }}
 ```
 
 `install-script` is for repositories whose install wrapper exchanges an nVault
 service token for the package credential, materializes any temporary registry
-configuration itself, removes it, and only then starts the package manager.
+configuration itself, runs the package manager, and removes the configuration on exit.
 The value must be one package.json script name using letters, digits, `:`, `_`,
 or `-`; the callable rejects missing or unsafe names. Existing callers that
 leave it empty keep the legacy install path unchanged.
 
-On the legacy (non-`install-script`) path, `NARDUK_PLATFORM_GH_PACKAGES_READ`
-(falling back to the ephemeral `github.token`) is now in the env of the
-`Install dependencies (pnpm)` / `Install dependencies (npm)` steps themselves,
-not just the earlier `Configure package registry auth` step — a step's `env:`
-does not carry to a later step. Without it, a caller whose registry-auth
-script (e.g. `@narduk-enterprises/narduk-app-tools`'s `configureRegistryAuth()`)
-writes a templated `${NARDUK_PLATFORM_GH_PACKAGES_READ}` reference into
-`.npmrc.auth` got "Failed to replace env in config" at install time, because
-the variable was undefined in that later step (narduk-libs#132). The fallback
-is inert for every existing adopter: when no secret is passed, `.npmrc.auth`
-is never written and the install step's copy of the variable is never read.
+The legacy callable input can carry either a direct package PAT or, only with
+an explicitly selected caller-owned `install-script`, an nVault service token.
+It does **not** follow that the org package PAT belongs in `NVAULT_TOKEN`.
+For `install-script: ci:install`, pass the consumer's `secrets.NVAULT_TOKEN`
+into the callable input, as the example above does. That installer resolves
+`GH_PACKAGES_READ` from nVault before starting npm/pnpm. Raw PAT consumers omit
+`install-script` and pass `secrets.NARDUK_PLATFORM_GH_PACKAGES_READ` instead.
+
+Local workstations use `gh-packages-run`, and Workers Builds uses the protected
+build secret `GH_PACKAGES_READ`. Neither uses the Actions input name as a vault
+key. [The credential route](https://github.com/narduk-enterprises/agent-infrastructure/blob/main/docs/agents/credentials.md)
+provides the exact nVault selector and value-free diagnostics.
 
 Deploying with real Cloudflare credentials on push-to-main is **not** this
 workflow's job — that stays a separate `nuxt-cloudflare-deploy.yml` sibling
@@ -1020,7 +1017,7 @@ jobs:
 
 Notes:
 
-- All secrets are optional; package-registry auth is skipped cleanly when no
+- Secrets are optional for public-only dependencies; private package installs fail early when no
   token is passed, so public/forked callers still run.
 - Every enabled lint/typecheck/test/build lane probes for its package script
   before running it. Missing scripts fail by default. A caller with no such
@@ -1178,8 +1175,7 @@ executed here.
   `pyright-args` inputs are optional additions; existing Python callers keep
   their prior behavior until they opt into static analysis.
   `reusable-browser-tests.yml`'s later addition of the optional
-  `NARDUK_PLATFORM_GH_PACKAGES_READ` secret (`required: false`, falling back
-  to `github.token`) is within-major on the same rule as a new optional
+  `NARDUK_PLATFORM_GH_PACKAGES_READ` secret (`required: false`) is within-major on the same rule as a new optional
   input: a caller that passes nothing gets byte-identical behavior to before
   the secret existed (workflows#50).
 - `nuxt-cloudflare.yml`'s `run-tests` / `test-script` / `extra-scripts` are
