@@ -314,6 +314,10 @@ jobs:
         if: inputs.package-manager == 'npm'
         run: npm ci
 
+      - name: Remove package auth materialization
+        if: always()
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
+
       - name: Save dependency cache
         if: >-
           runner.environment == 'github-hosted'

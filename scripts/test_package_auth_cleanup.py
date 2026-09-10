@@ -95,8 +95,8 @@ def auth_jobs(document: dict) -> dict[str, dict]:
     return found
 
 
-def validate_cleanup_step(job_id: str, step: dict) -> None:
-    assert step.get("if") == "always() && inputs.install-script == ''", (
+def validate_cleanup_step(job_id: str, step: dict, condition: str = "always() && inputs.install-script == ''") -> None:
+    assert step.get("if") == condition, (
         f"{job_id}: cleanup must always run for the legacy materialization path, "
         f"got {step.get('if')!r}"
     )
@@ -241,6 +241,10 @@ def validate_registry_mapping(document: dict, workflow: str) -> set[str]:
     for job_id, job in auth_jobs(document).items():
         auth = named_steps(job, AUTH_STEP)[0]
         scripts.add(auth["run"])
+        cleanup = named_steps(job, CLEANUP_STEP)
+        assert len(cleanup) == 1, (workflow, job_id, "missing cleanup")
+        condition = "always() && inputs.install-script == ''" if workflow == "nuxt-cloudflare.yml" else "always()"
+        validate_cleanup_step(job_id, cleanup[0], condition)
         assert auth["env"].get("GH_PACKAGES_READ") == secret_expr, (workflow, job_id)
         for install_name in INSTALL_STEPS:
             for install in named_steps(job, install_name):
@@ -248,6 +252,7 @@ def validate_registry_mapping(document: dict, workflow: str) -> set[str]:
                 assert install["env"]["NARDUK_PLATFORM_GH_PACKAGES_READ"] == secret_expr
                 assert install["env"]["NPM_CONFIG_USERCONFIG"].endswith("/.npmrc.auth"), (workflow, job_id, install_name)
                 assert install["env"]["NPM_CONFIG_GLOBALCONFIG"] == "/dev/null", (workflow, job_id, install_name)
+                assert job["steps"].index(cleanup[0]) > job["steps"].index(install)
     assert len(scripts) == 1, workflow
     return scripts
 
@@ -294,6 +299,15 @@ def registry_auth_behavior() -> None:
             pass
         else:
             raise AssertionError("missing canonical install variable did not fail the contract")
+        candidate = deepcopy(document)
+        job = next(iter(auth_jobs(candidate).values()))
+        job["steps"] = [step for step in job["steps"] if step.get("name") != CLEANUP_STEP]
+        try:
+            validate_registry_mapping(candidate, workflow)
+        except AssertionError:
+            pass
+        else:
+            raise AssertionError("missing cleanup did not fail the contract")
     print("registry-auth behavior passed (4 callables; private/transitive/public/malformed/missing/invalid credentials)")
 
 
