@@ -114,7 +114,7 @@ on:
         description: "Node.js version"
         required: false
         type: string
-        default: "22"
+        default: "24"
       package-manager:
         description: "Package manager: pnpm or npm (hydrogen currently runs npm)"
         required: false
