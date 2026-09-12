@@ -49,6 +49,10 @@ EVAL_STEP = gate_script("build", "Evaluate web-foundation conformance check")
 PNPM_STUB = """#!/usr/bin/env bash
 set -euo pipefail
 test "${GH_PACKAGES_READ:-}" = "$EXPECTED_PACKAGE_TOKEN"
+# workflows#85: narduk-app-tools reads NODE_AUTH_TOKEN directly for its own
+# item-2.3 registry lookup, independent of either npmrc's ${GH_PACKAGES_READ}
+# templating. Both names must carry the identical resolved credential.
+test "${NODE_AUTH_TOKEN:-}" = "$EXPECTED_PACKAGE_TOKEN"
 test -z "${NARDUK_PLATFORM_GH_PACKAGES_READ:-}"
 echo "pnpm $*" >> "$STUB_LOG"
 if [ "$1" = "exec" ] && [ "$2" = "narduk-app" ]; then
@@ -71,6 +75,8 @@ exit 64
 NPX_STUB = """#!/usr/bin/env bash
 set -euo pipefail
 test "${GH_PACKAGES_READ:-}" = "$EXPECTED_PACKAGE_TOKEN"
+# workflows#85: same dual-credential requirement as the pnpm stub above.
+test "${NODE_AUTH_TOKEN:-}" = "$EXPECTED_PACKAGE_TOKEN"
 test -z "${NARDUK_PLATFORM_GH_PACKAGES_READ:-}"
 echo "npx $*" >> "$STUB_LOG"
 if [ "$1" = "--no-install" ] && [ "$2" = "narduk-app" ]; then

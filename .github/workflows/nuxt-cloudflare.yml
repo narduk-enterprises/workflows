@@ -816,6 +816,20 @@ jobs:
           fi
           echo "::add-mask::$GH_PACKAGES_READ"
           export GH_PACKAGES_READ
+          # workflows#85: #79 renamed this step's exported credential from
+          # NODE_AUTH_TOKEN to GH_PACKAGES_READ, but narduk-app-tools's own
+          # item-2.3 live registry lookup (both the installed-binary branch
+          # below, which writes no npmrc at all, and the pinned-dlx branch)
+          # reads NODE_AUTH_TOKEN directly rather than going through either
+          # npmrc's ${GH_PACKAGES_READ} templating. That silently broke
+          # package-token-mode foundation-check for every v1 adopter refreshing
+          # past afbaa6051e (buoys#39 reproduced it deterministically). This
+          # repo's own README (`nuxt-cloudflare.yml` catalog entry) never
+          # stopped documenting "supplies NODE_AUTH_TOKEN to both the
+          # installed checker and the optional pinned download" -- #79 changed
+          # the code without updating that contract. Export both names, same
+          # value, until narduk-app-tools reads GH_PACKAGES_READ instead.
+          export NODE_AUTH_TOKEN="$GH_PACKAGES_READ"
           unset NARDUK_PLATFORM_GH_PACKAGES_READ
           has_dep=$(node -e '
             let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
