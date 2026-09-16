@@ -712,15 +712,18 @@ jobs:
       node-version: "24"
       package-manager: npm # hydrogen's current package manager; pnpm is the default
       # Optional: delegate the complete install to a caller-owned wrapper.
-      # The callable passes the mapped secret only as NVAULT_TOKEN and skips
-      # its legacy direct package-registry materialization/install path.
+      # The callable passes the distinct service-token secret only as
+      # NVAULT_TOKEN and skips its legacy direct package-registry path.
       install-script: ci:install
       typecheck-worker-script: typecheck
       typecheck-web-script: web:typecheck
       run-e2e: true
       wrangler-dry-run: true
     secrets:
-      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NVAULT_TOKEN }}
+      # Foundation checks and direct registry installs use the canonical PAT.
+      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+      # Caller-owned install scripts receive the service token separately.
+      NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
 ```
 
 `install-script` is for repositories whose install wrapper exchanges an nVault
@@ -730,13 +733,17 @@ The value must be one package.json script name using letters, digits, `:`, `_`,
 or `-`; the callable rejects missing or unsafe names. Existing callers that
 leave it empty keep the legacy install path unchanged.
 
-The legacy callable input can carry either a direct package PAT or, only with
-an explicitly selected caller-owned `install-script`, an nVault service token.
-It does **not** follow that the org package PAT belongs in `NVAULT_TOKEN`.
-For `install-script: ci:install`, pass the consumer's `secrets.NVAULT_TOKEN`
-into the callable input, as the example above does. That installer resolves
-`GH_PACKAGES_READ` from nVault before starting npm/pnpm. Raw PAT consumers omit
-`install-script` and pass `secrets.NARDUK_PLATFORM_GH_PACKAGES_READ` instead.
+`NARDUK_PLATFORM_GH_PACKAGES_READ` always carries the org package-read PAT;
+foundation checks use it by default. `NVAULT_TOKEN` carries the caller's
+service token when an explicitly selected `install-script` needs nVault; that
+installer resolves `GH_PACKAGES_READ` from nVault before starting npm/pnpm.
+Generic caller-owned install scripts may omit it and validate their own
+credentials. Raw PAT consumers omit `install-script` and pass only
+`secrets.NARDUK_PLATFORM_GH_PACKAGES_READ`.
+
+`foundation-check-auth: nvault` remains a compatibility mode for callers that
+previously mapped their service token into the package-read secret. New callers
+use the default `package-token` mode and map both secrets as shown above.
 
 Local workstations use `gh-packages-run`, and Workers Builds uses the protected
 build secret `GH_PACKAGES_READ`. Neither uses the Actions input name as a vault
@@ -1226,16 +1233,18 @@ executed here.
   fleet migration (D-WEBFOUND-2 Q4/Q10), most fleet apps do not conform to
   the seven-item contract yet, and a moving `v1` tag must not hand every
   existing adopter a brand-new red gate the day the tag advances.
-- `foundation-check-auth` defaults to `package-token`. Callers whose
-  `NARDUK_PLATFORM_GH_PACKAGES_READ` secret mapping carries an nVault service
-  token set `foundation-check-auth: nvault`. The callable resolves the existing
-  package-read grant for that one step and supplies `NODE_AUTH_TOKEN` to both
-  the installed checker and the optional pinned download. The checker needs
-  this credential for its live N-1 registry lookup even when dependencies are
-  already installed. Neither the service token nor the resolved package token
-  is exported to later steps; temporary npm configuration contains only an
-  environment-variable reference. Missing or rejected credentials leave a
-  blocking UNKNOWN artifact rather than falling back to `github.token`.
+- `foundation-check-auth` defaults to `package-token`. `nvault` remains only
+  for callers whose legacy `NARDUK_PLATFORM_GH_PACKAGES_READ` mapping carries
+  an nVault service token; new callers use the canonical package PAT there and
+  map the service token separately as `NVAULT_TOKEN` for `install-script`.
+  The callable resolves the existing package-read grant for that legacy one
+  step and supplies `NODE_AUTH_TOKEN` to both the installed checker and the
+  optional pinned download. The checker needs this credential for its live N-1
+  registry lookup even when dependencies are already installed. Neither the
+  service token nor the resolved package token is exported to later steps;
+  temporary npm configuration contains only an environment-variable reference.
+  Missing or rejected credentials leave a blocking UNKNOWN artifact rather
+  than falling back to `github.token`.
 - The D-CI-CAP-1 (c) Blacksmith-overflow change (see "Blacksmith overflow"
   above) is within-major on the same rule: no new input, no new job, no new
   job-level `permissions:`, and the default (`vars.BLACKSMITH_RUNNERS_ENABLED`
