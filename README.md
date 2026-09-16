@@ -561,6 +561,14 @@ Notes:
 
 ### Central lightweight-job routing
 
+`nuxt-cloudflare.lightweight-runner` routes E2E plan, E2E report and Required
+independently of the build. Selection is explicit input, then
+`CI_LIGHTWEIGHT_RUNNER`, then the existing build/Blacksmith route. Public
+callers always use `ubuntu-latest` for these three jobs. An unset override is
+backward compatible; required check names and failure/skip semantics are unchanged.
+Report merging still installs only the pinned Playwright tooling (workflows#49).
+
+
 `CI_LIGHTWEIGHT_RUNNER` is an organization Actions variable containing a JSON
 `runs-on` value, initially `"ubuntu-slim"` for the authorized company gates.
 Every shared `Required` job reads it. Changing this one value changes routing
