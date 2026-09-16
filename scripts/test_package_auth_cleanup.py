@@ -275,6 +275,7 @@ def registry_auth_behavior() -> None:
                 result = subprocess.run(["bash", "-c", script], cwd=root, env={
                     "PATH": node_dir + os.pathsep + os.environ["PATH"], "HOME": tmp,
                     "NARDUK_PLATFORM_GH_PACKAGES_READ": token, "GH_PACKAGES_READ": token,
+                    "PACKAGE_REGISTRY_AUTH": "auto",
                 }, capture_output=True, text=True, timeout=20)
                 assert result.returncode == expected, (workflow, kind, result.stderr)
                 assert sentinel not in result.stdout + result.stderr
@@ -287,6 +288,30 @@ def registry_auth_behavior() -> None:
                     assert sentinel not in config.read_text()
                 else:
                     assert not config.exists()
+        if workflow == "node-library.yml":
+            # Public monorepos may carry workspace names under estate scopes
+            # even though no dependency is fetched from the private registry.
+            # The explicit disabled mode must bypass that name-based inference
+            # and never materialise a token-bearing npmrc file.
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "package.json").write_text(json.dumps({"dependencies": {"@narduk-enterprises/core": "workspace:*"}}))
+                result = subprocess.run(["bash", "-c", script], cwd=root, env={
+                    "PATH": node_dir + os.pathsep + os.environ["PATH"], "HOME": tmp,
+                    "NARDUK_PLATFORM_GH_PACKAGES_READ": "", "GH_PACKAGES_READ": "",
+                    "PACKAGE_REGISTRY_AUTH": "disabled",
+                }, capture_output=True, text=True, timeout=20)
+                assert result.returncode == 0, (workflow, "disabled", result.stderr)
+                assert not (root / ".npmrc.auth").exists()
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "package.json").write_text(json.dumps({"dependencies": {"example": "1.0.0"}}))
+                result = subprocess.run(["bash", "-c", script], cwd=root, env={
+                    "PATH": node_dir + os.pathsep + os.environ["PATH"], "HOME": tmp,
+                    "NARDUK_PLATFORM_GH_PACKAGES_READ": "", "GH_PACKAGES_READ": "",
+                    "PACKAGE_REGISTRY_AUTH": "unknown",
+                }, capture_output=True, text=True, timeout=20)
+                assert result.returncode == 1, (workflow, "invalid-mode", result.stderr)
         # Seeded red: a missing canonical install variable must fail the same
         # contract, even when the legacy compatibility alias remains present.
         candidate = deepcopy(document)

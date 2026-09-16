@@ -52,8 +52,8 @@ name: Reusable Apple CI
 # paste the returned `runsOn` verbatim; never hand-copy labels. A caller that
 # is public — or that may become public — must never pass a self-hosted label,
 # because a fork PR would then execute attacker-controlled code on estate
-# infrastructure. That rule holds regardless of this repo's own visibility
-# (private, org-scoped Actions access, per D-VIS-1): `runner` is a free-form
+# infrastructure. This repository is public, so public callers use hosted
+# capacity; `runner` is a free-form
 # caller-supplied value and this workflow cannot police it.
 
 # Least-privilege baseline for every job in this workflow. A called workflow's

@@ -2,15 +2,11 @@
 
 Shared reusable GitHub Actions workflows for the narduk-enterprises estate (CI-5).
 
-> **This repository is private, with Actions access set to `organization`.**
-> That is what makes the private→private cross-repo call resolve for every
-> `narduk-enterprises` repo, and it is the current state of the world:
-> **D-VIS-1** (company-hq `DECISIONS.md`, 2026-07-24) removed public repos
-> from the company orgs and reversed CI-5's "workflows repo goes PUBLIC".
-> An earlier version of this section claimed the repo was public on purpose;
-> it was wrong after D-VIS-1, and the claim was doing real damage because it
-> was the *stated justification* for the self-hosted-runner warning below
-> (`workflows#2`). The workflows still hold no secrets — every
+> **This repository is public.** Its own CI and public callers run on
+> GitHub-hosted capacity, with no org-variable or Blacksmith routing. Private
+> callers retain reusable-workflow compatibility and may use manifest-routed
+> self-hosted capacity only where their repository policy permits it. The
+> workflows hold no secrets — every
 > `workflow_call` secret is optional and skips cleanly, and `apple.yml` and
 > `python-data.yml` declare none at all. `reusable-browser-tests.yml` declares
 > one optional secret (`NARDUK_PLATFORM_GH_PACKAGES_READ`) that falls back to
@@ -212,11 +208,9 @@ The value must be **valid JSON** — a bare string still needs its own quotes,
 which is why the default is the four-character JSON string `"ubuntu-latest"`,
 not the bare word.
 
-**A PUBLIC CALLER MUST NEVER PASS A SELF-HOSTED LABEL.** The constraint lives
-on the caller, not on this repo (which is private — see the top of this file
-and `workflows#2`): a fork PR on a public caller can run attacker-controlled
-code, so a self-hosted `runner` value on a public repo hands that PR estate
-infrastructure. A repo can also become public later, and `runner` is a
+**A PUBLIC CALLER MUST NEVER PASS A SELF-HOSTED LABEL.** A fork PR on a public
+caller can run attacker-controlled code, so a self-hosted `runner` value hands
+that PR estate infrastructure. A repo can also become public later, and `runner` is a
 free-form string these workflows cannot police. Only private, manifest-routed
 callers may pass a self-hosted value — resolve it first with
 `python3 scripts/github_runner_fleet.py route` (or
@@ -256,10 +250,10 @@ runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner
   `vars.BLACKSMITH_LINUX_LABEL`. No Blacksmith runner-group id is pinned
   anywhere — D-BLACKSMITH-4's live proof established that provider-created
   groups are not a stable routing contract; only the label is.
-- **Public callers are never affected**, even if the org variable were ever
-  mistakenly flipped for one: the `inputs.runner != '"ubuntu-latest"'` guard
-  means a caller still on the public default keeps GitHub-hosted
-  `ubuntu-latest` regardless of the switch.
+- **Public `node-library.yml` callers are never affected**: its routing
+  expressions first require `github.event.repository.private == true`, so they
+  ignore both Blacksmith and `CI_LIGHTWEIGHT_RUNNER` for public repositories.
+  Their caller-supplied hosted `runner` value remains the route.
 - **Manual, not automatic fallback**: GitHub does not move an already-queued
   job to another `runs-on:` target. If Blacksmith cannot schedule or its free
   allowance is exhausted, flip the variable back to `false` (or remove the
@@ -603,8 +597,9 @@ route in an organization that exposes it to public callers.
 
 `required-runner` optionally separates the small `Required` aggregation job
 from the package runner. It accepts the same JSON runner shape as `runner`;
-empty uses the organization-level `CI_LIGHTWEIGHT_RUNNER` route, falling back
-to existing routing (including Blacksmith) when that variable is absent. An
+empty uses the organization-level `CI_LIGHTWEIGHT_RUNNER` route for private
+callers, falling back to existing routing (including Blacksmith) when that
+variable is absent; public callers retain their supplied hosted route. An
 explicit value takes precedence for `Required` only. The gate checks dependency results
 without checking out source, installing packages, or receiving registry secrets.
 For a secrets-free gate before a privileged self-hosted release, the caller may
@@ -689,6 +684,23 @@ compatibility detail, not another secret to create. There is no implicit
 installs; public-only installs need no credential. Without a caller bootstrap,
 the callable writes a temporary user config containing a literal variable
 reference, then removes it after the install.
+
+A public monorepo with only workspace packages under an estate-looking scope
+can opt out of that automatic name-based detection without forwarding a token:
+
+```yaml
+jobs:
+  ci:
+    uses: narduk-enterprises/workflows/.github/workflows/node-library.yml@v1
+    with:
+      runner: '"ubuntu-latest"'
+      required-runner: '"ubuntu-latest"'
+      package-registry-auth: disabled
+```
+
+`disabled` asserts that every installed dependency is public. The default
+`auto` remains fail-closed for private registry dependencies and preserves the
+existing package-read-secret contract for private callers.
 
 ### `nuxt-cloudflare.yml`
 
@@ -1315,8 +1327,9 @@ sizing a timeout from a run's wall-clock duration would set it wildly wrong.
 
 When adding a job, size its timeout from the same place — the jobs endpoint,
 per job, never extrapolated from a run count.
-- This is a private repo shared org-wide: Actions access is set to
-  `organization` so other narduk-enterprises repos can call these workflows.
+- This is a public repository. Its own gate and public callers use
+  GitHub-hosted runners; private callers retain reusable-workflow compatibility
+  and may use manifest-routed self-hosted runners only where policy permits.
 - New reusable workflows follow both estate-wide conventions added by CI-5
   phase 2: the workflow's last job is named exactly `Required` and `needs:`
   everything else (see above), and `runs-on:` is `${{ fromJSON(inputs.runner) }}`
