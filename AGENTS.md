@@ -8,8 +8,9 @@ one place, not in a hundred repos. Nine callables live in
 `docs-governance.yml`, `node-library.yml`, `nuxt-cloudflare.yml`,
 `python-data.yml`, `reusable-browser-tests.yml`, `reusable-node-ci.yml`);
 `ci.yml` is the one non-callable, and it is this repo's own gate. The repo is
-private with Actions access set to `organization`, which is what makes the
-private→private cross-repo call resolve.
+public; its own CI and every public caller must use GitHub-hosted runners.
+Private callers retain their existing reusable-workflow access and may use
+manifest-routed self-hosted capacity where their repository policy permits it.
 
 The estate-wide operating manual for agents lives in
 [narduk-enterprises/agent-infrastructure](https://github.com/narduk-enterprises/agent-infrastructure)

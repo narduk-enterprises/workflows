@@ -29,9 +29,9 @@ name: Reusable Node Library CI
 # private, manifest-routed callers may pass a self-hosted runs-on value,
 # resolved via `python3 scripts/github_runner_fleet.py route` in
 # agent-infrastructure. The rule rests on the CALLER, not on this repo: this
-# repo is private with organization-scoped Actions access (D-VIS-1, 2026-07-24
-# — an earlier header here claimed it was public, which reversed CI-5 and was
-# never true after D-VIS-1; workflows#2). `runner` is a free-form
+# repo is public as of the CI-capacity migration. Private callers retain their
+# existing reusable-workflow access; public callers must use hosted capacity.
+# `runner` is a free-form
 # caller-supplied value and this workflow cannot police it.
 
 # Least-privilege baseline for every job in this workflow. A called workflow's
@@ -44,9 +44,9 @@ name: Reusable Node Library CI
 # declares its own block, and job-level `permissions:` REPLACES the workflow
 # level rather than merging with it. That is also why this is not a way to
 # tighten the jobs that need `packages: read` — narrowing them here would do
-# nothing, and narrowing them at job level makes the run fail to START with
-# `startup_failure` and no logs at all (found during software-delivery's
-# adoption). Job-level grants below are audited, not inherited.
+# nothing. The package-read credential, when needed, is an explicitly forwarded
+# optional secret rather than `github.token`, so jobs need only contents read.
+# Job-level grants below are audited, not inherited.
 permissions:
   contents: read
 
@@ -75,7 +75,8 @@ on:
           possibly-future-public) CALLER MUST NEVER PASS A SELF-HOSTED LABEL:
           a fork PR would run attacker-controlled code on estate self-hosted
           infrastructure. The constraint is the caller's visibility, not this
-          repo's (private, org-scoped Actions access — D-VIS-1, workflows#2).
+          repo's visibility. This workflow repository is public, while private
+          callers retain their existing reusable-workflow access.
         required: false
         type: string
         default: '"ubuntu-latest"'
@@ -85,11 +86,22 @@ on:
           Overrides the package runner and Blacksmith switch for this job.
           Use an independently available runner when the caller's policy permits
           it, for example '"ubuntu-slim"' for a gate before a privileged release.
-          Empty uses CI_LIGHTWEIGHT_RUNNER when configured; otherwise it retains
-          the existing runner and overflow behavior.
+          Empty uses CI_LIGHTWEIGHT_RUNNER for private callers when configured;
+          public callers retain their supplied hosted runner.
         required: false
         type: string
         default: ""
+      package-registry-auth:
+        description: >-
+          Package registry authentication mode. `auto` (the default) detects
+          external npm.pkg.github.com dependencies and requires the optional
+          package-read secret for them. `disabled` asserts the install uses
+          only public registry dependencies and skips auth materialization;
+          use it for public monorepos whose workspace package names otherwise
+          resemble the estate package scopes.
+        required: false
+        type: string
+        default: "auto"
       run-lint:
         description: "Run the lint script"
         required: false
@@ -211,11 +223,10 @@ jobs:
     # expanded by D-CI-CAP-1 (c)): a job landing on Blacksmith here is
     # exercising that named exception, not drift.
     # ---------------------------------------------------------------------
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
+    runs-on: ${{ fromJSON(github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
     timeout-minutes: 30
     permissions:
       contents: read
-      packages: read
     strategy:
       fail-fast: false
       matrix:
@@ -334,9 +345,22 @@ jobs:
         env:
           GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
           NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          PACKAGE_REGISTRY_AUTH: ${{ inputs.package-registry-auth }}
         run: |
           set -euo pipefail
           set +x
+          case "$PACKAGE_REGISTRY_AUTH" in
+            auto)
+              ;;
+            disabled)
+              echo 'Package registry auth disabled by caller; installing public dependencies only.'
+              exit 0
+              ;;
+            *)
+              echo "::error::package-registry-auth must be 'auto' or 'disabled', got '$PACKAGE_REGISTRY_AUTH'"
+              exit 1
+              ;;
+          esac
           if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
             if ! package_scope=$(node --input-type=module <<'NODE'
           import fs from 'node:fs';
@@ -764,7 +788,7 @@ jobs:
     needs: package
     # Explicit override, then the organization lightweight route, then the
     # original package/overflow route for callers that have not adopted it.
-    runs-on: ${{ fromJSON(inputs.required-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
+    runs-on: ${{ fromJSON(inputs.required-runner || (github.event.repository.private == true && vars.CI_LIGHTWEIGHT_RUNNER) || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
     permissions:

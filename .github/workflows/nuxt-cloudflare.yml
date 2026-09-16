@@ -85,10 +85,8 @@ name: Reusable Nuxt + Cloudflare CI
 # then execute attacker-controlled code on estate infrastructure. Only
 # private, manifest-routed callers may pass a self-hosted runs-on value,
 # resolved via `python3 scripts/github_runner_fleet.py route` in
-# agent-infrastructure. The rule rests on the CALLER, not on this repo: this
-# repo is private with organization-scoped Actions access (D-VIS-1, 2026-07-24
-# — an earlier header here claimed it was public, which reversed CI-5 and was
-# never true after D-VIS-1; workflows#2). `runner` is a free-form
+# agent-infrastructure. This repository is public. Private callers retain
+# reusable-workflow compatibility; public callers use hosted capacity. `runner` is a free-form
 # caller-supplied value and this workflow cannot police it.
 
 # Least-privilege baseline for every job in this workflow. A called workflow's
@@ -143,8 +141,8 @@ on:
           Defaults to GitHub-hosted ubuntu-latest. A PUBLIC (or
           possibly-future-public) CALLER MUST NEVER PASS A SELF-HOSTED LABEL:
           a fork PR would run attacker-controlled code on estate self-hosted
-          infrastructure. The constraint is the caller's visibility, not this
-          repo's (private, org-scoped Actions access — D-VIS-1, workflows#2).
+          infrastructure. The constraint is the caller's visibility; this
+          repository is public while private callers retain compatibility.
         required: false
         type: string
         default: '"ubuntu-latest"'

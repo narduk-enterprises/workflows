@@ -60,8 +60,8 @@ on:
           to GitHub-hosted ubuntu-latest. A PUBLIC (or possibly-future-public)
           CALLER MUST NEVER PASS A SELF-HOSTED LABEL: a fork PR would run
           attacker-controlled code on estate self-hosted infrastructure. The
-          constraint is the caller's visibility, not this repo's (private,
-          org-scoped Actions access -- D-VIS-1, workflows#2).
+          constraint is the caller's visibility; this repository is public
+          while private callers retain compatibility.
         required: false
         type: string
         default: '"ubuntu-latest"'

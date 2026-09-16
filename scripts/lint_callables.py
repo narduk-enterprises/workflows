@@ -113,7 +113,7 @@ CALLER_GRANTS: dict[str, set[str]] = {
     "closing-syntax-check.yml": {"contents"},
     "code-review.yml": {"contents"},
     "docs-governance.yml": {"contents"},
-    "node-library.yml": {"contents", "packages"},
+    "node-library.yml": {"contents"},
     "nuxt-cloudflare.yml": {"contents", "packages"},
     "python-data.yml": {"contents"},
     "reusable-browser-tests.yml": {"contents", "packages", "actions"},
