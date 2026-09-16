@@ -76,6 +76,7 @@ def check_job_wiring() -> None:
     assert "e2e-plan" in e2e["needs"]
 
     report = jobs["e2e-report"]
+    assert "needs.e2e-plan.result == 'success'" in report["if"]
     assert "needs.e2e-plan.outputs.skipped != 'true'" in report["if"]
     assert "e2e-plan" in report["needs"]
 

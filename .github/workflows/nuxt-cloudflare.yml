@@ -123,10 +123,10 @@ on:
           Optional package.json script that owns the complete dependency install,
           including private-registry credential resolution and cleanup. When set,
           every job runs this script instead of the legacy auth-materialization
-          plus package-manager install path. The workflow_call package secret is
-          exposed to this script only as NVAULT_TOKEN so an app-owned install
-          wrapper can resolve the package credential in memory and remove it
-          before spawning the package manager.
+          plus package-manager install path. The optional distinct workflow_call
+          NVAULT_TOKEN secret is exposed to this script only as NVAULT_TOKEN,
+          so an app-owned nVault wrapper can resolve the package credential in
+          memory and remove it before spawning the package manager.
         required: false
         type: string
         default: ""
@@ -417,21 +417,27 @@ on:
         default: "0.2.0"
       foundation-check-auth:
         description: >-
-          Type of the existing NARDUK_PLATFORM_GH_PACKAGES_READ secret for
-          foundation checks: package-token (default) or nvault. Select nvault
-          when the caller maps its NVAULT_TOKEN service token into that secret.
-          The resolved package token is scoped to this check, including its
-          live registry lookup, and is never exported to later steps.
+          Type of the credential used for foundation checks. package-token is
+          the default and consumes NARDUK_PLATFORM_GH_PACKAGES_READ. nvault is
+          a legacy compatibility mode for callers that previously mapped their
+          nVault service token into that package secret. New callers pass the
+          canonical package-read secret and leave this at package-token.
         required: false
         type: string
         default: "package-token"
     secrets:
-      # CI alias for the single estate packages-read PAT. Callers pass
-      # secrets.NARDUK_PLATFORM_GH_PACKAGES_READ (org Actions, same value as
-      # nvault GH_PACKAGES_READ). Legacy caller-owned installers may explicitly
-      # map secrets.NVAULT_TOKEN into this input; that is a service-token contract.
-      # Local installs use GH_PACKAGES_READ. Do not mint a per-app PAT.
+      # CI alias for the single estate packages-read PAT. This is the only
+      # credential foundation checks and legacy direct installs may consume.
+      # Callers pass secrets.NARDUK_PLATFORM_GH_PACKAGES_READ (org Actions,
+      # same value as nvault GH_PACKAGES_READ). Local installs use
+      # GH_PACKAGES_READ. Do not mint a per-app PAT.
       NARDUK_PLATFORM_GH_PACKAGES_READ:
+        required: false
+      # Caller-owned install wrappers may receive only this service token,
+      # never the package PAT. It is separate so one invocation can both
+      # install through nVault and run the foundation check with its canonical
+      # PAT. Generic caller-owned installers may omit it.
+      NVAULT_TOKEN:
         required: false
 
 env:
@@ -718,7 +724,7 @@ jobs:
         if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
@@ -1206,7 +1212,7 @@ jobs:
         if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
@@ -1646,7 +1652,7 @@ jobs:
         if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
@@ -1994,7 +2000,7 @@ jobs:
   # treats `skipped` as acceptable for this job.
   e2e-report:
     name: E2E report
-    if: "!cancelled() && inputs.run-e2e && inputs.e2e-shards > 1 && needs.e2e-plan.outputs.skipped != 'true'"
+    if: "!cancelled() && inputs.run-e2e && inputs.e2e-shards > 1 && needs.e2e-plan.result == 'success' && needs.e2e-plan.outputs.skipped != 'true'"
     needs: [e2e-plan, e2e]
     # Merging is pure Node work with no browser — keep it off the scarce
     # isolated browser pool.
@@ -2203,7 +2209,7 @@ jobs:
         if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail

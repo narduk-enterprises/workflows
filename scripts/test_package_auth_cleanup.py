@@ -60,6 +60,10 @@ AUTH_PATH_EXPR = (
 CLEANUP_RM = (
     'rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"'
 )
+CALLER_NVAULT_EXPR = (
+    "${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && "
+    "secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}"
+)
 
 # Patterns that would print auth content or delete more than the exact file.
 FORBIDDEN_CLEANUP = (
@@ -161,18 +165,24 @@ def validate_job(job_id: str, job: dict) -> None:
     caller = caller_install[0]
     assert caller.get("if") == "inputs.install-script != ''"
     caller_env = caller.get("env") or {}
-    assert caller_env.get("NVAULT_TOKEN") == "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}"
+    assert caller_env.get("NVAULT_TOKEN") == CALLER_NVAULT_EXPR
     assert "NARDUK_PLATFORM_GH_PACKAGES_READ" not in caller_env
     caller_run = caller.get("run") or ""
     assert "case \"$INSTALL_SCRIPT\" in" in caller_run
     assert "*[!A-Za-z0-9:_-]*" in caller_run
     assert '"$PM" run "$INSTALL_SCRIPT"' in caller_run
     assert "eval " not in caller_run
-    assert "NVAULT_TOKEN" not in caller_run
+    assert 'if [ -z "$NVAULT_TOKEN" ]; then' not in caller_run
     assert names.index(CALLER_INSTALL_STEP) > cleanup_i
 
 
 def validate(document: dict) -> None:
+    workflow_call = document.get("on", document.get(True))["workflow_call"]
+    secrets = workflow_call["secrets"]
+    assert secrets.get("NARDUK_PLATFORM_GH_PACKAGES_READ") == {"required": False}
+    assert secrets.get("NVAULT_TOKEN") == {"required": False}, (
+        "caller-owned installers need a separate optional nVault service-token secret"
+    )
     found = auth_jobs(document)
     assert set(found) == set(AUTH_JOBS), (
         f"auth-materializing jobs changed: expected {set(AUTH_JOBS)}, got {set(found)}"
@@ -233,6 +243,24 @@ def cleanup_is_safe_when_absent_and_targeted() -> None:
         assert "REDACTED" not in present.stdout + present.stderr
         assert not auth.exists()
         assert sibling.exists()
+
+
+def caller_install_can_omit_nvault_token(document: dict) -> None:
+    """A generic caller-owned install script remains usable without nVault."""
+    for job_id in AUTH_JOBS:
+        step = named_steps(document["jobs"][job_id], CALLER_INSTALL_STEP)[0]
+        run = step["run"]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(
+                json.dumps({"scripts": {"ci:install": "node -e 'process.exit(0)'"}})
+            )
+            env = dict(os.environ)
+            env.update({"INSTALL_SCRIPT": "ci:install", "PM": "npm", "NVAULT_TOKEN": ""})
+            result = subprocess.run(
+                ["bash", "-c", run], cwd=root, env=env, capture_output=True, text=True, timeout=30
+            )
+            assert result.returncode == 0, (job_id, result.stdout, result.stderr)
 
 
 def validate_registry_mapping(document: dict, workflow: str) -> set[str]:
@@ -341,6 +369,7 @@ def main() -> None:
     validate(document)
     registry_auth_behavior()
     cleanup_is_safe_when_absent_and_targeted()
+    caller_install_can_omit_nvault_token(document)
 
     # Seeded-red: dropping cleanup from any single auth job must fail the contract.
     for job_id in AUTH_JOBS:
@@ -382,7 +411,7 @@ def main() -> None:
     else:
         raise AssertionError("broad-delete cleanup mutation did not fail the contract")
 
-    # Seeded-red: mapping the service token as a direct package token must fail.
+    # Seeded-red: mapping the canonical package secret into an installer must fail.
     candidate = deepcopy(document)
     step = named_steps(candidate["jobs"]["build"], CALLER_INSTALL_STEP)[0]
     step["env"] = {
@@ -396,6 +425,18 @@ def main() -> None:
         pass
     else:
         raise AssertionError("direct-package-token mapping mutation did not fail the contract")
+
+    # Seeded-red: the caller-owned install contract cannot silently collapse
+    # its service-token secret back into the foundation/package PAT channel.
+    candidate = deepcopy(document)
+    workflow_call = candidate.get("on", candidate.get(True))["workflow_call"]
+    workflow_call["secrets"].pop("NVAULT_TOKEN")
+    try:
+        validate(candidate)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("missing separate nVault secret did not fail the contract")
 
     # Seeded-red: bypassing script-name validation must fail.
     candidate = deepcopy(document)
