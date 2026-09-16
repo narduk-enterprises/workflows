@@ -148,6 +148,15 @@ on:
         required: false
         type: string
         default: '"ubuntu-latest"'
+      lightweight-runner:
+        description: >-
+          Optional JSON runsOn for E2E planning, report merge, and Required.
+          Overrides CI_LIGHTWEIGHT_RUNNER; unset preserves the build route.
+          Resolve private self-hosted routes from fleet. Public callers always
+          use ubuntu-latest for these jobs, regardless of this override.
+        required: false
+        type: string
+        default: ""
       working-directory:
         description: "Directory containing the root package.json / lockfile"
         required: false
@@ -1236,8 +1245,8 @@ jobs:
     name: E2E plan
     if: inputs.run-e2e
     needs: build
-    # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
+    # CI lightweight route (company-hq CI policy); caller override takes precedence.
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
     # `contents: read` and nothing else, deliberately. A job in a CALLED
@@ -1991,8 +2000,8 @@ jobs:
     needs: [e2e-plan, e2e]
     # Merging is pure Node work with no browser — keep it off the scarce
     # isolated browser pool.
-    # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
+    # CI lightweight route (company-hq CI policy); caller override takes precedence.
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -2233,7 +2242,7 @@ jobs:
     if: always()
     needs: [build, extra-gate, e2e-plan, e2e, e2e-report, deploy-dry-run]
     # Organization-wide lightweight route; unset preserves the caller fallback.
-    runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
     timeout-minutes: 20
     permissions:
       contents: read
