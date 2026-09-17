@@ -738,7 +738,11 @@ foundation checks use it by default. `NVAULT_TOKEN` carries the caller's
 service token when an explicitly selected `install-script` needs nVault; that
 installer resolves `GH_PACKAGES_READ` from nVault before starting npm/pnpm.
 Generic caller-owned install scripts may omit it and validate their own
-credentials. Raw PAT consumers omit `install-script` and pass only
+credentials. When `NVAULT_TOKEN` is empty (Dependabot runs see only
+Dependabot-store secrets, and `NVAULT_TOKEN` is Actions-only) and
+`foundation-check-auth` is not `nvault`, the caller script instead receives
+the org package-read secret as `GH_PACKAGES_READ`, so it can install without
+an nVault exchange. It never receives both (workflows#98). Raw PAT consumers omit `install-script` and pass only
 `secrets.NARDUK_PLATFORM_GH_PACKAGES_READ`.
 
 `foundation-check-auth: nvault` remains a compatibility mode for callers that
