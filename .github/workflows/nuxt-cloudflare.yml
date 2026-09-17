@@ -2814,6 +2814,9 @@ jobs:
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
           NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
+          # org package-read secret to GH_PACKAGES_READ (workflows#98).
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
