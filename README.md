@@ -987,6 +987,17 @@ registered), shared by roughly ten repositories, so a pull request waits on
 only lever a caller has over that from inside this callable — the pool's
 capacity itself belongs to `narduk-enterprises/fleet`.
 
+**Fewer lanes is not by itself faster — it is fewer slots.** Measured on gonogo
+with `e2e-pr-shards: 1` and no `e2e-pr-args`: the same suite ran 527 / 407 /
+292 s in three lanes plus a 32 s report (a 559 s critical path), and 913 s in
+one. Aggregate pool occupancy dropped 27% (1258 runner-seconds over four jobs
+to 913 over one) and the run held **one** isolated slot instead of three, which
+is the part that shortens every other repository's queue — but the pull
+request's own wall clock got *longer*, because the tests were redistributed
+rather than reduced. `e2e-pr-shards` alone is a courtesy to the pool. To make
+your own pull request faster, pair it with an `e2e-pr-args` subset that runs
+genuinely fewer tests.
+
 The rules, all of which fail toward running **more**:
 
 - **Unset is today's behaviour.** `e2e-pr-shards: 0` and `e2e-pr-args: ""` are
