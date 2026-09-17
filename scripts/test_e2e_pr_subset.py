@@ -353,6 +353,7 @@ def run_required(**env_overrides) -> subprocess.CompletedProcess:
         {
             "BUILD_RESULT": "success",
             "EXTRA_GATE_RESULT": "skipped",
+            "CALLER_LINT_RESULT": "success",
             "E2E_PLAN_RESULT": "success",
             "E2E_PLAN_SKIPPED": "false",
             "E2E_RESULT": "success",

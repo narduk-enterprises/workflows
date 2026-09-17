@@ -755,6 +755,55 @@ workflow's job — that stays a separate `nuxt-cloudflare-deploy.yml` sibling
 (deferred, not built in this pass), matching hydrogen's existing two-job
 `ci` / `deploy` split rather than folding deploy secrets into the CI gate.
 
+#### `node-version-file`: single-sourcing the Node version
+
+| Input | Type | Default | Purpose |
+|---|---|---|---|
+| `node-version` | string | `"24"` | Node.js version passed straight to `actions/setup-node` |
+| `node-version-file` | string | `""` | Optional path (relative to `working-directory`) to a file declaring the Node version, e.g. `.node-version` or `.nvmrc` |
+
+Empty (the default) preserves prior behaviour exactly: every `setup-node`
+step in this callable uses `node-version`. Setting `node-version-file`
+lets a caller single-source its Node version from a file it already
+maintains — `.node-version`, `.nvmrc`, `package.json`'s `engines` via a
+generated file, etc. — instead of ALSO pinning it as this input's own value,
+which is how a caller's Node pin and its CI pin drift apart.
+
+`actions/setup-node` rejects `node-version` and `node-version-file` together,
+so every `setup-node` step here resolves them as two mutually exclusive
+expressions rather than passing both: `node-version-file` is passed through
+unchanged, and `node-version` resolves to an empty string whenever
+`node-version-file` is set (an empty string is `setup-node`'s own "not
+provided" sentinel for either input). A caller that sets both gets
+`node-version-file`; `node-version` is silently ignored in that case, exactly
+as if the caller had left it unset.
+
+#### `caller-lint`: hygiene gate over the caller's OWN workflows
+
+Every `nuxt-cloudflare.yml` adopter now gets a `caller-lint` job as part of
+`Required` (Logan, 2026-09-17 askme round, "Caller lint + job timeouts in
+workflows (Recommended)"; company-hq#745). It checks out the CALLING
+repository (not this one), runs pinned `actionlint` over the caller's own
+`.github/workflows/*.yml`, and runs a small inline Python audit that fails
+the job when a caller workflow:
+
+- has no workflow-level `concurrency:` block (skipped for a file whose only
+  trigger is `workflow_call` — a callable must NOT declare one; see
+  "Concurrency is the caller's job" above);
+- has a job that does not `uses:` a reusable workflow and has no
+  `timeout-minutes` (a job that DOES `uses:` one is reported as an
+  informational `::notice::` naming the called workflow instead — that job
+  cannot declare `timeout-minutes` at all, because the called workflow's own
+  jobs own it, and flagging it as a finding was a false positive this repo
+  used to ship in `agent-infrastructure`'s own `audit_workflows.py`);
+- has any `uses:` step or job not pinned to a full 40-character commit SHA;
+- is missing `permissions:` at the workflow level or on any job.
+
+This is a caller-side hygiene check, distinct from what `actionlint` alone
+proves (schema/expression validity) and distinct from what `lint_callables.py`
+proves about THIS repo's own callables — `caller-lint` proves the same class
+of thing about the repository that adopted one.
+
 #### The unit-test lane and `extra-scripts`
 
 ```yaml

@@ -113,6 +113,20 @@ on:
         required: false
         type: string
         default: "24"
+      node-version-file:
+        description: >-
+          Optional path (relative to working-directory) to a file declaring
+          the Node.js version, e.g. .node-version or .nvmrc, passed straight
+          through to actions/setup-node. Empty (the default) preserves prior
+          behaviour: every setup-node step uses `node-version` instead.
+          setup-node rejects node-version and node-version-file together, so
+          when this is set every setup-node step in this workflow resolves
+          node-version to an empty string rather than passing both. Lets a
+          caller single-source its Node version instead of also pinning it
+          as this input's own value.
+        required: false
+        type: string
+        default: ""
       package-manager:
         description: "Package manager: pnpm or npm (hydrogen currently runs npm)"
         required: false
@@ -535,7 +549,12 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: ${{ inputs.node-version }}
+          # node-version and node-version-file are mutually exclusive on
+          # setup-node (passing both is rejected), so resolve them as two
+          # exclusive expressions: node-version-file wins when the caller
+          # sets it, and node-version otherwise reproduces prior behaviour.
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
           # v7 caches the package manager BY DEFAULT (`package-manager-cache`
           # defaults to true) — dropping the `cache:` input does NOT turn it
           # off. Without this line the explicit restore/save below is a SECOND
@@ -1212,7 +1231,12 @@ jobs:
         if: inputs.package-manager == 'pnpm'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: ${{ inputs.node-version }}
+          # node-version and node-version-file are mutually exclusive on
+          # setup-node (passing both is rejected), so resolve them as two
+          # exclusive expressions: node-version-file wins when the caller
+          # sets it, and node-version otherwise reproduces prior behaviour.
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
           package-manager-cache: false
       - name: Configure package registry auth
         if: inputs.install-script == ''
@@ -1646,7 +1670,12 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: ${{ inputs.node-version }}
+          # node-version and node-version-file are mutually exclusive on
+          # setup-node (passing both is rejected), so resolve them as two
+          # exclusive expressions: node-version-file wins when the caller
+          # sets it, and node-version otherwise reproduces prior behaviour.
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
           # v7 caches the package manager BY DEFAULT (`package-manager-cache`
           # defaults to true) — dropping the `cache:` input does NOT turn it
           # off. Without this line the explicit restore/save below is a SECOND
@@ -2146,7 +2175,12 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: ${{ inputs.node-version }}
+          # node-version and node-version-file are mutually exclusive on
+          # setup-node (passing both is rejected), so resolve them as two
+          # exclusive expressions: node-version-file wins when the caller
+          # sets it, and node-version otherwise reproduces prior behaviour.
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
 
       - name: Resolve pinned @playwright/test version
         id: playwright-version
@@ -2228,7 +2262,12 @@ jobs:
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: ${{ inputs.node-version }}
+          # node-version and node-version-file are mutually exclusive on
+          # setup-node (passing both is rejected), so resolve them as two
+          # exclusive expressions: node-version-file wins when the caller
+          # sets it, and node-version otherwise reproduces prior behaviour.
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
           # v7 caches the package manager BY DEFAULT (`package-manager-cache`
           # defaults to true) — dropping the `cache:` input does NOT turn it
           # off. Without this line the explicit restore/save below is a SECOND
@@ -2361,10 +2400,184 @@ jobs:
             npx wrangler "${ARGS[@]}"
           fi
 
+  caller-lint:
+    name: Caller lint
+    # Audits the CALLING repository's OWN .github/workflows -- not this
+    # callable -- for the same baseline hygiene this repo's ci.yml enforces
+    # on itself: workflow-level concurrency, per-job timeouts, SHA-pinned
+    # actions, and permissions blocks (Logan, 2026-09-17 askme round,
+    # "Caller lint + job timeouts in workflows (Recommended)";
+    # company-hq#745). A job whose only step is `uses:` a reusable workflow
+    # cannot declare a job-level timeout-minutes at all -- the called
+    # workflow's own jobs own that -- so the inline audit below treats that
+    # case as informational, not a finding (the same fix landed in
+    # agent-infrastructure skills/ci-workflow-author/scripts/audit_workflows.py
+    # for its own missing-timeout rule, which used to flag it as a false
+    # positive).
+    #
+    # Same lightweight route as E2E plan/report and Required (company-hq CI
+    # policy) -- this job does no build work, only lint over the caller's own
+    # checkout.
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # This step imports PyYAML. Hosted images currently include it, but
+      # keep the checked fallback so a runner-image update cannot silently
+      # remove a required parser (mirrors ci.yml's own "Ensure PyYAML is
+      # available" step).
+      - name: Ensure PyYAML is available
+        run: |
+          set -euo pipefail
+          if python3 -c "import yaml" 2>/dev/null; then
+            echo "PyYAML already available"
+          else
+            echo "PyYAML missing on this guest; installing into user site-packages"
+            python3 -m pip install --user --quiet pyyaml
+            python3 -c "import yaml" || { echo "::error::PyYAML still unavailable after install"; exit 1; }
+          fi
+
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          # Pinned version + checksum rather than `curl | bash` from the
+          # project's install script (same pin ci.yml uses for its own
+          # actionlint install -- keep both in sync on a bump).
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL --retry 3 -o "$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" actionlint
+          ./actionlint -version
+
+      - name: actionlint (caller's own workflows)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(.github/workflows/*.yml .github/workflows/*.yaml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no workflow files found under .github/workflows; nothing to lint"
+            exit 0
+          fi
+          ./actionlint -no-color "${files[@]}"
+
+      - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF_AUDIT'
+          import glob
+          import re
+          import sys
+
+          import yaml
+
+          SHA_PIN = re.compile(r"^[0-9a-f]{40}$")
+          USES_LINE = re.compile(r"^\s*(?:-\s*)?uses:\s*(\S+)\s*(#.*)?$")
+          LOCAL_USES = ("./", "docker://")
+
+          files = sorted(
+              glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml")
+          )
+          if not files:
+              print("no caller workflow files found under .github/workflows; nothing to audit")
+              sys.exit(0)
+
+          findings = []
+
+          for path in files:
+              text = open(path, encoding="utf-8").read()
+              try:
+                  doc = yaml.safe_load(text)
+              except yaml.YAMLError as exc:
+                  findings.append(f"{path}: does not parse as YAML ({exc})")
+                  continue
+              if not isinstance(doc, dict):
+                  findings.append(f"{path}: does not parse as a YAML mapping")
+                  continue
+
+              # PyYAML parses the bare key `on:` as the boolean True.
+              on = doc.get("on", doc.get(True))
+              if isinstance(on, str):
+                  on_keys = {on}
+              elif isinstance(on, list):
+                  on_keys = set(on)
+              elif isinstance(on, dict):
+                  on_keys = set(on.keys())
+              else:
+                  on_keys = set()
+              # A workflow_call-only file is a callable, not a caller: its concurrency
+              # group would be evaluated in ITS OWN caller's context and could cancel
+              # that caller's run, so it must not declare one (the reason this repo's
+              # own callables never do -- see README "Concurrency is the caller's job").
+              is_callable_only = bool(on_keys) and on_keys.issubset({"workflow_call"})
+
+              if not is_callable_only and doc.get("concurrency") is None:
+                  findings.append(
+                      f"{path}: no workflow-level concurrency: block (repeated "
+                      "pushes/PR updates queue redundant runs instead of superseding "
+                      "them)"
+                  )
+
+              if doc.get("permissions") is None:
+                  findings.append(f"{path}: no top-level permissions: block")
+
+              for job_id, job in (doc.get("jobs") or {}).items():
+                  if not isinstance(job, dict):
+                      continue
+                  # A job whose only step is `uses:` a reusable workflow cannot
+                  # declare timeout-minutes at all -- the called workflow's own jobs
+                  # own that. Report it as information, not a finding.
+                  if "uses" in job:
+                      print(
+                          f"::notice::{path}: job '{job_id}' uses {job['uses']!r} -- "
+                          "its timeout lives in the called workflow, not here"
+                      )
+                  elif job.get("timeout-minutes") is None:
+                      findings.append(
+                          f"{path}: job '{job_id}' has no timeout-minutes (would "
+                          "inherit GitHub's 6-hour default)"
+                      )
+                  if job.get("permissions") is None:
+                      findings.append(
+                          f"{path}: job '{job_id}' has no permissions: block (job "
+                          "level replaces, never merges, the workflow level)"
+                      )
+
+              for lineno, line in enumerate(text.splitlines(), start=1):
+                  m = USES_LINE.match(line)
+                  if not m:
+                      continue
+                  ref = m.group(1)
+                  if ref.startswith(LOCAL_USES):
+                      continue
+                  if "@" not in ref:
+                      findings.append(f"{path}:{lineno}: `uses: {ref}` has no ref at all")
+                      continue
+                  pin = ref.rsplit("@", 1)[1]
+                  if not SHA_PIN.match(pin):
+                      findings.append(
+                          f"{path}:{lineno}: `uses: {ref}` is not pinned to a full "
+                          "40-character commit SHA"
+                      )
+
+          for item in findings:
+              print(f"::error::{item}")
+
+          print(f"\ncaller-lint: {len(files)} file(s) checked, {len(findings)} finding(s)")
+          sys.exit(1 if findings else 0)
+          PYEOF_AUDIT
   required:
     name: Required
     if: always()
-    needs: [build, extra-gate, e2e-plan, e2e, e2e-report, deploy-dry-run]
+    needs: [build, extra-gate, e2e-plan, e2e, e2e-report, deploy-dry-run, caller-lint]
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
     timeout-minutes: 20
@@ -2379,6 +2592,7 @@ jobs:
           E2E_REPORT_RESULT: ${{ needs.e2e-report.result }}
           DEPLOY_DRY_RUN_RESULT: ${{ needs.deploy-dry-run.result }}
           EXTRA_GATE_RESULT: ${{ needs.extra-gate.result }}
+          CALLER_LINT_RESULT: ${{ needs.caller-lint.result }}
           RUN_E2E: ${{ inputs.run-e2e }}
           # The plan job's EFFECTIVE shard count, falling back to the input
           # when the plan produced no output at all (it was skipped, or it
@@ -2407,6 +2621,8 @@ jobs:
             fi
           }
           require_success build "$BUILD_RESULT"
+          # caller-lint has no `if:` -- it always runs, same as build.
+          require_success caller-lint "$CALLER_LINT_RESULT"
           if [ -n "${{ inputs.extra-gate-scripts }}" ]; then
             require_success extra-gate "$EXTRA_GATE_RESULT"
           elif [ "$EXTRA_GATE_RESULT" != "skipped" ]; then
