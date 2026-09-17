@@ -70,17 +70,56 @@ def check_e2e_plan_is_contents_only() -> None:
 
 
 def check_seeded_escalation_is_rejected() -> None:
-    """Re-introduce workflows#59's escalation and require the linter to catch it."""
-    path = WORKFLOWS / "nuxt-cloudflare.yml"
+    """Re-introduce workflows#59's escalation and require the linter to catch it.
+
+    The historical escalation was `pull-requests: read` on nuxt-cloudflare's
+    `E2E plan`. That exact key is no longer outside nuxt-cloudflare.yml's grant
+    — the `preview` job's sticky comment widened it to `pull-requests: write`,
+    a migration every adopter had to make first — so the original seed would now
+    be legal there and this test would quietly stop testing anything. It is
+    therefore seeded on `node-library.yml`, whose grant is still
+    `{contents, packages}` and where the shape of the defect is identical, and
+    a second seed keeps nuxt-cloudflare.yml itself covered with a key nothing
+    grants.
+    """
+    path = WORKFLOWS / "node-library.yml"
     doc = copy.deepcopy(yaml.safe_load(path.read_text()))
-    doc["jobs"]["e2e-plan"]["permissions"]["pull-requests"] = "read"
+    job_id = next(iter(doc["jobs"]))
+    doc["jobs"][job_id].setdefault("permissions", {})["pull-requests"] = "read"
     items = findings_for(path, doc)
-    if not any("pull-requests" in item and "e2e-plan" in item for item in items):
+    if not any("pull-requests" in item and job_id in item for item in items):
         raise SystemExit(
-            "FAIL  seeded `pull-requests: read` on E2E plan was NOT rejected — "
+            "FAIL  seeded `pull-requests: read` on node-library.yml was NOT rejected — "
             f"findings: {items}"
         )
     print("PASS  seeded workflows#59 escalation (`pull-requests: read`) is rejected")
+
+    path = WORKFLOWS / "nuxt-cloudflare.yml"
+    doc = copy.deepcopy(yaml.safe_load(path.read_text()))
+    doc["jobs"]["e2e-plan"]["permissions"]["deployments"] = "read"
+    items = findings_for(path, doc)
+    if not any("deployments" in item and "e2e-plan" in item for item in items):
+        raise SystemExit(
+            "FAIL  seeded `deployments: read` on E2E plan was NOT rejected — "
+            f"findings: {items}"
+        )
+    print("PASS  seeded out-of-grant escalation on nuxt-cloudflare.yml is rejected")
+
+
+def check_preview_is_the_only_pull_requests_job() -> None:
+    """`pull-requests: write` is the sticky comment's grant, and only its."""
+    doc = yaml.safe_load((WORKFLOWS / "nuxt-cloudflare.yml").read_text())
+    holders = {
+        job_id
+        for job_id, job in doc["jobs"].items()
+        if isinstance(job, dict) and "pull-requests" in (job.get("permissions") or {})
+    }
+    assert holders == {"preview"}, (
+        "only the `preview` job may hold the widened `pull-requests` grant; "
+        f"found {sorted(holders)}"
+    )
+    assert doc["jobs"]["preview"]["permissions"]["pull-requests"] == "write"
+    print("PASS  only nuxt-cloudflare.yml's `preview` job holds `pull-requests: write`")
 
 
 def check_undeclared_callable_is_rejected() -> None:
@@ -105,6 +144,7 @@ def main() -> None:
     check_shipped_callables_pass()
     check_e2e_plan_is_contents_only()
     check_seeded_escalation_is_rejected()
+    check_preview_is_the_only_pull_requests_job()
     check_undeclared_callable_is_rejected()
     check_shorthand_permissions_are_rejected()
     print("\ncallable permission-ceiling contract passed")

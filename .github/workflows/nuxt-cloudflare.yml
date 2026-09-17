@@ -470,6 +470,99 @@ on:
         required: false
         type: string
         default: ""
+      preview-checks:
+        description: >-
+          Comma-separated checks to run against the pull request's Cloudflare
+          preview deployment: `none`, `og`, `e2e-subset`, or `og,e2e-subset`.
+          Default `og` (Logan, askme round 2026-09-17: "Post URL + run the PR
+          subset on it"). The job runs on `pull_request` /
+          `pull_request_target` events ONLY — a push to the default branch has
+          no PR preview to check, and `Required` expects the job `skipped`
+          there.
+
+          A CALLER WHOSE REPOSITORY HAS NO WORKERS BUILDS PREVIEW MUST PASS
+          `preview-checks: none`. This gate is fail-closed on purpose: a
+          preview that never appears inside `preview-timeout-minutes` is a
+          FAILURE, not a skip, because "the preview URL never showed up" is
+          the single most common way a Workers Builds connection silently
+          breaks, and a gate that treats it as a pass is the gate that lets a
+          repo ship for weeks with no preview at all.
+
+          `og` runs `narduk-app og:check --live --base-url <preview>` from the
+          caller's own installed `@narduk-enterprises/narduk-app-tools`.
+          `e2e-subset` additionally runs `e2e-script` with `e2e-pr-args`
+          against the preview with `PLAYWRIGHT_BASE_URL` set — the caller's
+          Playwright config must honour that variable and must NOT start its
+          own `webServer`, or the suite will test localhost and report green.
+        required: false
+        type: string
+        default: "og"
+      preview-url-source:
+        description: >-
+          How this workflow learns the preview URL.
+
+          `pr-comment` (default) reads the pull request's comments and takes
+          the first `*.workers.dev` URL posted by Cloudflare's GitHub App.
+          That is the surface Cloudflare actually documents for Workers Builds:
+          the integration creates check runs, commit statuses and a pull
+          request comment, and "a preview URL will be provided for any builds
+          which perform `wrangler versions upload`"
+          (developers.cloudflare.com/workers/ci-cd/builds/git-integration/github-integration/).
+
+          `url-template` derives the URL from `preview-url-template` and makes
+          no GitHub API read at all.
+
+          THERE IS DELIBERATELY NO `deployment` / `environment_url` SOURCE.
+          Cloudflare's *Pages* integration creates GitHub Deployments; the
+          Workers Builds integration documents check runs, statuses and a
+          comment, and no deployment object. A source keyed on
+          `environment_url` would be dead code for this callable's class and
+          would cost every adopter a `deployments: read` grant to carry it.
+        required: false
+        type: string
+        default: "pr-comment"
+      preview-url-template:
+        description: >-
+          Preview URL template, used only when `preview-url-source:
+          url-template`. Placeholders: `{branch}` (the PR head ref verbatim),
+          `{branch-alias}` (the head ref lowercased with every character
+          outside `[a-z0-9]` replaced by `-`, runs collapsed and the ends
+          trimmed) and `{sha}` (the PR head SHA, short form, 12 characters).
+
+          Cloudflare's aliased preview URLs take the shape
+          `<ALIAS>-<WORKER_NAME>.<SUBDOMAIN>.workers.dev`, so a typical value is
+          `https://{branch-alias}-myworker.myaccount.workers.dev`.
+
+          `{branch-alias}` reproduces the transform this estate has OBSERVED
+          (buoys: branch `codex/buoys-complete` ->
+          `codex-buoys-complete-buoys.narduk-enterprises.workers.dev`).
+          Cloudflare does not publish the truncation rule it applies to long
+          branch names, so a repository with long branch names should stay on
+          `pr-comment`, which reads the URL Cloudflare actually minted instead
+          of predicting it.
+        required: false
+        type: string
+        default: ""
+      preview-timeout-minutes:
+        description: >-
+          Whole-job budget for the preview lane, including the bounded wait for
+          the preview deployment to appear and report the PR head's build. The
+          wait itself is this budget minus five minutes, so the selected checks
+          still have room to run and the sticky comment still gets posted;
+          below a six-minute budget the whole budget becomes the wait. Keep it
+          at or above 10.
+        required: false
+        type: number
+        default: 20
+      preview-working-directory:
+        description: >-
+          Directory to run the preview checks from; empty (the default) uses
+          `working-directory`. Mirrors `wrangler-working-directory`. Set it
+          when the app that owns `og:check` and the Playwright suite is a
+          workspace package rather than the repository root (buoys: `apps/web`).
+        required: false
+        type: string
+        default: ""
       wrangler-dry-run:
         description: "Run an opt-in `wrangler deploy --dry-run` validation gate"
         required: false
@@ -1913,7 +2006,9 @@ jobs:
           BROWSERS_OVERRIDE: ${{ inputs.e2e-browsers-path }}
           INSTALL_BROWSERS: ${{ inputs.e2e-install-browsers }}
           ROUTE: ${{ inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner }}
-        run: |
+        # Anchored so the `preview` job's browser lane runs the IDENTICAL
+        # route guard rather than a second copy that can drift (workflows#V1).
+        run: &guard_isolated_playwright_route |
           set -euo pipefail
           node <<'NODE'
           const route = process.env.ROUTE || ''
@@ -2124,7 +2219,8 @@ jobs:
           PLAYWRIGHT_TOOLCHAIN_OWNER_UID: "0"
           PLAYWRIGHT_TOOLCHAIN_ROOT: /opt/playwright-ci
           REQUIRED_BROWSERS: ${{ inputs.e2e-browsers }}
-        run: |
+        # Anchored for the `preview` job's browser lane -- same text, not a copy.
+        run: &assert_isolated_playwright_toolchain |
           set -euo pipefail
           node --input-type=module <<'NODE'
           import {
@@ -2316,7 +2412,8 @@ jobs:
           inputs.e2e-install-browsers
           && !contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'playwright-isolated')
           && !contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'proxmox-playwright-x64')
-        run: |
+        # Anchored for the `preview` job's browser lane -- same text, not a copy.
+        run: &install_playwright_browsers |
           set -euo pipefail
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
             pnpm exec playwright install --with-deps ${{ inputs.e2e-browsers }}
@@ -2530,6 +2627,574 @@ jobs:
           path: ${{ inputs.working-directory }}/playwright-report
           if-no-files-found: ignore
           retention-days: 7
+
+  # PREVIEW (V1; Logan, askme round 2026-09-17, "Post URL + run the PR subset
+  # on it (Recommended)"; company-hq#745, company-hq D-ORG-1 (g), 2026-09-02).
+  #
+  # WHAT CLOUDFLARE ACTUALLY EXPOSES. Workers Builds' GitHub App creates check
+  # runs, commit statuses and a pull request comment, and "a preview URL will
+  # be provided for any builds which perform `wrangler versions upload`"
+  # (developers.cloudflare.com/workers/ci-cd/builds/git-integration/github-integration/).
+  # It does NOT create a GitHub Deployment -- that is the Pages integration's
+  # shape -- so there is no `environment_url` to read and this job does not
+  # pretend there is. The two sources it offers are the comment Cloudflare
+  # posts, and a caller-supplied URL template that needs no GitHub read at all.
+  #
+  # THE URL IS NOT THE PROOF. A preview URL appearing in a comment says a build
+  # was attempted, not that the PR's head commit is what is actually serving.
+  # So the wait below is not satisfied until the URL itself answers and its
+  # `x-build-version` header is a prefix of the PR head SHA. That header is the
+  # estate's existing live-proof convention (buoys docs/workers-builds.md, which
+  # records `x-build-version: a84fa2163903` for commit a84fa216390321...), and it
+  # is compared BY PREFIX because Cloudflare emits a 12-character short SHA
+  # while `git rev-parse --short` defaults to 7 -- a fixed-width comparison
+  # would be a gate that never passes or, worse, one somebody "fixes" by
+  # deleting it.
+  #
+  # FAIL CLOSED. A preview that never appears inside the bound is a FAILURE,
+  # not a skip. "The preview never showed up" is the single most common way a
+  # Workers Builds connection silently breaks, and it is indistinguishable from
+  # "this repo does not use previews" only if you refuse to make the caller say
+  # which it is -- which is what `preview-checks: none` is for.
+  #
+  # RUNNER CLASS. Lightweight (the `caller-lint` / `E2E plan` route) unless the
+  # caller selected `e2e-subset`, which needs a browser guest and therefore the
+  # `e2e-runner` route. The isolated-pool preflight it runs there is the SAME
+  # YAML node as the `e2e` job's, via anchors, not a second copy: an
+  # image-equality gate that exists twice is an image-equality gate that drifts.
+  # Callers should note that with `e2e-subset` selected the bounded wait holds a
+  # `playwright-isolated` slot (three effective slots across ~ten repos), which
+  # is why `preview-timeout-minutes` is a caller input and why `og` is the
+  # default.
+  preview:
+    name: Preview
+    if: >-
+      inputs.preview-checks != 'none'
+      && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
+    needs: build
+    runs-on: ${{ fromJSON(contains(inputs.preview-checks, 'e2e-subset') && (inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner) || (github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner))) }}
+    timeout-minutes: ${{ inputs.preview-timeout-minutes }}
+    # `pull-requests: write` is a WIDENING of this callable's caller grant and
+    # is the reason this change cannot ship onto a moving `v1` until every
+    # adopter has granted it -- see README "Preview checks". A called workflow
+    # asking for a permission its caller did not grant kills the caller's whole
+    # run at startup with no logs (workflows#59). Write, not read, because the
+    # same grant both reads Cloudflare's comment and updates the sticky one.
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: write
+    env:
+      # Dependency installation must never acquire a browser as a side effect;
+      # the anchored installer below stays the only download path, and it is
+      # unreachable on the isolated route.
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Rejects a mistyped selection BEFORE spending a runner on it. `og` and
+      # `e2e-subset` are the only checks; `none` is exclusive; and
+      # `url-template` without a template is a configuration error, not an
+      # empty URL to wait for.
+      - name: Validate preview configuration
+        env:
+          CHECKS: ${{ inputs.preview-checks }}
+          SOURCE: ${{ inputs.preview-url-source }}
+          TEMPLATE: ${{ inputs.preview-url-template }}
+        run: |
+          set -euo pipefail
+          known="og e2e-subset"
+          selected=""
+          IFS=','
+          for raw in $CHECKS; do
+            check="$(printf '%s' "$raw" | tr -d '[:space:]')"
+            [ -z "$check" ] && continue
+            if [ "$check" = "none" ]; then
+              # Reached only when the job's own `inputs.preview-checks != 'none'`
+              # condition already let the lane start, i.e. 'none' was not the
+              # exact whole value -- either it has company, or it has padding.
+              echo "::error::preview-checks must be exactly 'none' to turn the lane off, with no other values and no surrounding whitespace (got '$CHECKS')"
+              exit 1
+            fi
+            case " $known " in
+              *" $check "*) selected="$selected $check" ;;
+              *)
+                echo "::error::preview-checks contains unknown check '$check' (known: none, og, e2e-subset)"
+                exit 1
+                ;;
+            esac
+          done
+          unset IFS
+          if [ -z "$selected" ]; then
+            echo "::error::preview-checks resolved to no checks at all ('$CHECKS') -- pass 'none' to turn the preview lane off"
+            exit 1
+          fi
+          case "$SOURCE" in
+            pr-comment) ;;
+            url-template)
+              if [ -z "$TEMPLATE" ]; then
+                echo "::error::preview-url-source is 'url-template' but preview-url-template is empty"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::preview-url-source must be 'pr-comment' or 'url-template' (got '$SOURCE')"
+              exit 1
+              ;;
+          esac
+          echo "preview checks:$selected; url source: $SOURCE"
+
+      # BEFORE dependency installation, exactly as in the e2e job: once an
+      # install has run, a browser could already have been acquired and the
+      # guard would be auditing state it no longer controls. Same anchored text.
+      - name: Guard isolated Playwright route
+        if: contains(inputs.preview-checks, 'e2e-subset')
+        env:
+          BROWSERS_OVERRIDE: ${{ inputs.e2e-browsers-path }}
+          INSTALL_BROWSERS: ${{ inputs.e2e-install-browsers }}
+          ROUTE: ${{ inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner }}
+        run: *guard_isolated_playwright_route
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          package-manager-cache: false
+
+      - name: Configure package registry auth
+        if: inputs.install-script == ''
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: *configure_package_registry_auth
+
+      - name: Point pnpm at a workspace-local store (self-hosted)
+        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
+        run: |
+          set -euo pipefail
+          mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
+          if [ "$mount_point" != "/" ] && [ -d "$mount_point/pnpm-store" ] && [ -w "$mount_point/pnpm-store" ]; then
+            echo "npm_config_store_dir=$mount_point/pnpm-store" >> "$GITHUB_ENV"
+          fi
+
+      # The preview lane installs because both checks run the CALLER's own
+      # toolchain: `og:check` comes from the caller's pinned
+      # @narduk-enterprises/narduk-app-tools, and the e2e subset is the caller's
+      # own Playwright suite. Resolving the tool a second way here would be a
+      # second credential path and a second version to keep in step.
+      - name: Install dependencies (pnpm)
+        if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      - name: Install dependencies (npm)
+        if: inputs.install-script == '' && inputs.package-manager == 'npm'
+        run: npm ci
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      - name: Remove package auth materialization
+        if: always() && inputs.install-script == ''
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
+      - name: Install dependencies (caller script)
+        if: inputs.install-script != ''
+        env:
+          INSTALL_SCRIPT: ${{ inputs.install-script }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          PM: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$INSTALL_SCRIPT" in
+            ''|*[!A-Za-z0-9:_-]*)
+              echo "::error::install-script must be one package.json script name"
+              exit 1
+              ;;
+          esac
+          raw=$(npm pkg get "scripts.$INSTALL_SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            echo "::error::install-script names \"$INSTALL_SCRIPT\" but no such script exists"
+            exit 1
+          fi
+          "$PM" run "$INSTALL_SCRIPT"
+
+      # Same anchored image-equality assertion the e2e job runs, on the same
+      # isolated-route condition, and before anything launches a browser.
+      - name: Assert isolated Playwright toolchain
+        if: >-
+          contains(inputs.preview-checks, 'e2e-subset')
+          && (contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'playwright-isolated')
+          || contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'proxmox-playwright-x64'))
+        env:
+          PLAYWRIGHT_ALLOWED_BROWSER_PREFIX: /opt
+          PLAYWRIGHT_TOOLCHAIN_OWNER_UID: "0"
+          PLAYWRIGHT_TOOLCHAIN_ROOT: /opt/playwright-ci
+          REQUIRED_BROWSERS: ${{ inputs.e2e-browsers }}
+        run: *assert_isolated_playwright_toolchain
+
+      - name: Resolve and verify preview deployment
+        id: preview
+        env:
+          SOURCE: ${{ inputs.preview-url-source }}
+          TEMPLATE: ${{ inputs.preview-url-template }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BUDGET_MINUTES: ${{ inputs.preview-timeout-minutes }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF_PREVIEW'
+          import json
+          import os
+          import re
+          import subprocess
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+
+          WORKERS_DEV = re.compile(
+              r"https://[A-Za-z0-9][A-Za-z0-9.-]*\.workers\.dev(?:/[^\s)\]<>\"']*)?"
+          )
+
+          head_sha = (os.environ.get("HEAD_SHA") or "").strip().lower()
+          if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
+              print(
+                  "::error::this job resolved no pull-request head SHA -- it runs on "
+                  "pull_request/pull_request_target events only"
+              )
+              raise SystemExit(1)
+          short_sha = head_sha[:12]
+
+          # The wait is the JOB budget minus five minutes, so the selected
+          # checks and the sticky comment still have room after it. Below a
+          # six-minute budget the whole budget is the wait -- a caller that
+          # small has said it wants the wait and nothing else.
+          budget = int(float(os.environ.get("BUDGET_MINUTES") or 20) * 60)
+          wait_seconds = max(1, budget - 300) if budget > 300 else max(1, budget)
+          # Derived, not configurable: a small budget must still get several
+          # reads, and a large one must not hammer the API.
+          poll_seconds = min(15, max(1, wait_seconds // 10))
+
+          def branch_alias(ref: str) -> str:
+              alias = re.sub(r"[^a-z0-9]+", "-", ref.lower()).strip("-")
+              return alias
+
+          def templated_url() -> str:
+              template = os.environ.get("TEMPLATE") or ""
+              return (
+                  template.replace("{branch-alias}", branch_alias(os.environ.get("HEAD_REF") or ""))
+                  .replace("{branch}", os.environ.get("HEAD_REF") or "")
+                  .replace("{sha}", short_sha)
+              )
+
+          seen_authors: set[str] = set()
+
+          def commented_url() -> str:
+              """One read of the PR's comments; the Cloudflare app's URL or ''."""
+              try:
+                  raw = subprocess.run(
+                      [
+                          "gh", "api", "--paginate",
+                          f"repos/{os.environ['REPO']}/issues/{os.environ['PR_NUMBER']}/comments",
+                          "--jq", ".[] | {login: .user.login, body: .body}",
+                      ],
+                      capture_output=True, text=True, timeout=60, check=True,
+                  ).stdout
+              except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                  stderr = getattr(exc, "stderr", "") or ""
+                  print(f"::warning::could not read pull-request comments this round: {stderr.strip()[:200]}")
+                  return ""
+              for line in raw.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      comment = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  login = str(comment.get("login") or "")
+                  seen_authors.add(login)
+                  if "cloudflare" not in login.lower():
+                      continue
+                  match = WORKERS_DEV.search(str(comment.get("body") or ""))
+                  if match:
+                      return match.group(0)
+              return ""
+
+          def probe(url: str):
+              """One HTTP read: (status, x-build-version) or (None, reason)."""
+              request = urllib.request.Request(url, method="GET", headers={"user-agent": "narduk-ci-preview"})
+              try:
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return response.status, (response.headers.get("x-build-version") or "").strip()
+              except urllib.error.HTTPError as exc:
+                  return exc.code, (exc.headers.get("x-build-version") or "").strip() if exc.headers else ""
+              except Exception as exc:  # noqa: BLE001 -- any transport failure is "not ready yet"
+                  return None, str(exc)
+
+          source = os.environ.get("SOURCE") or "pr-comment"
+          if source == "url-template" and not templated_url().lower().startswith("https://"):
+              print("::warning::preview-url-template does not resolve to an https URL")
+
+          deadline = time.monotonic() + wait_seconds
+          url = ""
+          last = "no attempt completed"
+          attempts = 0
+          while True:
+              attempts += 1
+              url = templated_url() if source == "url-template" else commented_url()
+              if not url:
+                  last = "no preview URL has been published for this pull request yet"
+              else:
+                  status, version = probe(url)
+                  if status is None:
+                      last = f"{url} is not answering yet ({version})"
+                  elif status >= 400:
+                      last = f"{url} returned HTTP {status}"
+                  elif not version:
+                      last = f"{url} returned HTTP {status} but no x-build-version header"
+                  elif len(version) < 7 or not head_sha.startswith(version.lower()):
+                      last = (
+                          f"{url} is serving build {version}, not this pull request's head "
+                          f"{short_sha} -- the preview build for this commit has not finished"
+                      )
+                  else:
+                      with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+                          handle.write(f"url={url}\n")
+                          handle.write(f"build-version={version}\n")
+                          handle.write(f"head-sha={short_sha}\n")
+                      print(f"preview {url} is serving x-build-version {version} (head {short_sha}) after {attempts} read(s)")
+                      raise SystemExit(0)
+              remaining = deadline - time.monotonic()
+              if remaining <= 0:
+                  break
+              print(f"waiting for preview ({attempts}): {last}")
+              time.sleep(min(poll_seconds, remaining))
+
+          print(f"::error::preview deployment did not become ready within {wait_seconds}s: {last}")
+          if source == "pr-comment" and not url:
+              print(
+                  "::error::no comment from Cloudflare's GitHub App carried a "
+                  f"*.workers.dev URL (comment authors seen: {sorted(seen_authors) or 'none'}). "
+                  "A repository without Workers Builds previews must pass "
+                  "`preview-checks: none` rather than leave this failing."
+              )
+          sys.exit(1)
+          PYEOF_PREVIEW
+
+      - name: Install Playwright browsers
+        if: >-
+          contains(inputs.preview-checks, 'e2e-subset')
+          && inputs.e2e-install-browsers
+          && !contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'playwright-isolated')
+          && !contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'proxmox-playwright-x64')
+        run: *install_playwright_browsers
+
+      # `!cancelled()` rather than the implicit `success()`: when og:check fails
+      # the e2e subset must still run and the sticky comment must still report
+      # both, otherwise the first red check hides the second one for the whole
+      # review. Both are still gated on a resolved URL, so neither runs against
+      # nothing.
+      - name: Check preview social previews (og:check --live)
+        id: og-check
+        if: ${{ !cancelled() && contains(inputs.preview-checks, 'og') && steps.preview.outputs.url != '' }}
+        working-directory: ${{ inputs.preview-working-directory != '' && inputs.preview-working-directory || inputs.working-directory }}
+        env:
+          PM: ${{ inputs.package-manager }}
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+        run: |
+          set -euo pipefail
+          # The caller's OWN pinned @narduk-enterprises/narduk-app-tools, run
+          # out of the install this job just did. No second version pin and no
+          # second credential path: `foundation-check`'s dlx fallback exists
+          # because that gate must work for callers who have not adopted the
+          # package at all, which is not true here -- `preview-checks: og` is a
+          # caller asserting it has the tool.
+          if [ "$PM" = "pnpm" ]; then
+            pnpm exec narduk-app og:check --live --base-url "$PREVIEW_URL"
+          else
+            npx --no-install narduk-app og:check --live --base-url "$PREVIEW_URL"
+          fi
+
+      - name: Run preview e2e subset
+        id: preview-e2e
+        if: ${{ !cancelled() && contains(inputs.preview-checks, 'e2e-subset') && steps.preview.outputs.url != '' }}
+        working-directory: ${{ inputs.preview-working-directory != '' && inputs.preview-working-directory || inputs.working-directory }}
+        env:
+          GATE: Run preview e2e subset
+          SCRIPT: ${{ inputs.e2e-script }}
+          PM: ${{ inputs.package-manager }}
+          # The PULL-REQUEST argument set (workflows#83, buoys#116): the caller
+          # owns what "the subset" means through its own Playwright project
+          # selection, and this workflow never guesses. Empty is a hard failure
+          # rather than a silent full-suite run against a shared preview.
+          EXTRA_ARGS: ${{ inputs.e2e-pr-args }}
+          PLAYWRIGHT_BASE_URL: ${{ steps.preview.outputs.url }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SCRIPT" ]; then
+            echo "::error::$GATE is enabled but e2e-script is empty"
+            exit 1
+          fi
+          if [ -z "$EXTRA_ARGS" ]; then
+            echo "::error::$GATE is enabled but e2e-pr-args is empty -- name the pull-request project (e.g. --project=pr) rather than running the whole suite against a shared preview"
+            exit 1
+          fi
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :x: $msg" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$msg"
+            exit 1
+          fi
+          echo "running against PLAYWRIGHT_BASE_URL=$PLAYWRIGHT_BASE_URL"
+          ARGS=()
+          # Deliberate word splitting: e2e-pr-args is a caller-supplied argument
+          # list, not a single argument.
+          # shellcheck disable=SC2206
+          ARGS+=(${EXTRA_ARGS})
+          if [ "$PM" = "pnpm" ]; then
+            pnpm run "$SCRIPT" "${ARGS[@]}"
+          else
+            npm run "$SCRIPT" -- "${ARGS[@]}"
+          fi
+
+      # ONE comment, edited in place. `always()` because the most valuable
+      # comment is the one on a run where the preview never appeared: a lane
+      # that only reports when it is green is a lane nobody notices going away.
+      - name: Post or update the sticky preview comment
+        if: always()
+        env:
+          MARKER: "<!-- narduk-ci:preview -->"
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PREVIEW_URL: ${{ steps.preview.outputs.url }}
+          BUILD_VERSION: ${{ steps.preview.outputs.build-version }}
+          HEAD_SHORT: ${{ steps.preview.outputs.head-sha }}
+          RESOLVE_OUTCOME: ${{ steps.preview.outcome }}
+          OG_OUTCOME: ${{ steps.og-check.outcome }}
+          E2E_OUTCOME: ${{ steps.preview-e2e.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF_COMMENT'
+          import json
+          import os
+          import subprocess
+          import sys
+          import tempfile
+
+          marker = os.environ["MARKER"]
+          icons = {
+              "success": ":white_check_mark: pass",
+              "failure": ":x: FAIL",
+              "cancelled": ":grey_question: cancelled",
+              "skipped": ":heavy_minus_sign: not selected",
+              "": ":heavy_minus_sign: not run",
+          }
+
+          def row(label: str, outcome: str) -> str:
+              return f"| {label} | {icons.get(outcome, outcome)} |"
+
+          url = os.environ.get("PREVIEW_URL") or ""
+          version = os.environ.get("BUILD_VERSION") or ""
+          head = os.environ.get("HEAD_SHORT") or ""
+          lines = [marker, "", "### Cloudflare preview", ""]
+          if url:
+              lines += [
+                  f"**URL:** {url}",
+                  "",
+                  f"**Serving build:** `{version}` (pull-request head `{head}`)",
+                  "",
+              ]
+          else:
+              lines += [
+                  ":x: **No preview deployment became ready for this commit inside the "
+                  "configured wait.** A repository without Workers Builds previews should "
+                  "pass `preview-checks: none`.",
+                  "",
+              ]
+          lines += [
+              "| Check | Result |",
+              "|---|---|",
+              row("preview ready + `x-build-version`", os.environ.get("RESOLVE_OUTCOME", "")),
+              row("`og:check --live`", os.environ.get("OG_OUTCOME", "")),
+              row("e2e subset against the preview", os.environ.get("E2E_OUTCOME", "")),
+              "",
+              f"[Workflow run]({os.environ['RUN_URL']})",
+              "",
+          ]
+          body = "\n".join(lines)
+
+          # The same table also goes to the job summary, so the URL and the
+          # verdicts survive even when the comment API call does not.
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write("\n".join(lines[2:]) + "\n")
+
+          repo = os.environ["REPO"]
+          pr = os.environ["PR_NUMBER"]
+
+          def gh(args, check=True):
+              return subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60, check=check)
+
+          # FIND BY MARKER, then EDIT. Appending a new comment every run is how
+          # a PR ends up with fourteen preview comments and reviewers reading
+          # the wrong one.
+          existing = ""
+          try:
+              listed = gh(["api", "--paginate", f"repos/{repo}/issues/{pr}/comments",
+                           "--jq", ".[] | {id: .id, body: .body}"]).stdout
+              for line in listed.splitlines():
+                  line = line.strip()
+                  if not line:
+                      continue
+                  try:
+                      comment = json.loads(line)
+                  except json.JSONDecodeError:
+                      continue
+                  if marker in str(comment.get("body") or ""):
+                      existing = str(comment.get("id"))
+                      break
+          except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+              print(f"::warning::could not list pull-request comments: {(getattr(exc, 'stderr', '') or '').strip()[:200]}")
+
+          with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as handle:
+              handle.write(body)
+              body_file = handle.name
+
+          if existing:
+              args = ["api", "-X", "PATCH", f"repos/{repo}/issues/comments/{existing}", "-F", f"body=@{body_file}"]
+              action = f"updated comment {existing}"
+          else:
+              args = ["api", "-X", "POST", f"repos/{repo}/issues/{pr}/comments", "-F", f"body=@{body_file}"]
+              action = "posted a new comment"
+          result = gh(args, check=False)
+          if result.returncode != 0:
+              print(f"::warning::could not post the preview comment: {result.stderr.strip()[:300]}")
+              sys.exit(0)
+          print(f"preview comment {action}")
+          PYEOF_COMMENT
 
   deploy-dry-run:
     name: Deploy dry run
@@ -2872,7 +3537,7 @@ jobs:
   required:
     name: Required
     if: always()
-    needs: [build, extra-gate, e2e-plan, e2e, e2e-report, deploy-dry-run, caller-lint]
+    needs: [build, extra-gate, e2e-plan, e2e, e2e-report, preview, deploy-dry-run, caller-lint]
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
     timeout-minutes: 20
@@ -2888,6 +3553,10 @@ jobs:
           DEPLOY_DRY_RUN_RESULT: ${{ needs.deploy-dry-run.result }}
           EXTRA_GATE_RESULT: ${{ needs.extra-gate.result }}
           CALLER_LINT_RESULT: ${{ needs.caller-lint.result }}
+          PREVIEW_RESULT: ${{ needs.preview.result }}
+          PREVIEW_CHECKS: ${{ inputs.preview-checks }}
+          # The preview lane exists only where a pull-request preview does.
+          EVENT_NAME: ${{ github.event_name }}
           RUN_E2E: ${{ inputs.run-e2e }}
           # The plan job's EFFECTIVE shard count, falling back to the input
           # when the plan produced no output at all (it was skipped, or it
@@ -2961,6 +3630,21 @@ jobs:
             require_skipped e2e-plan "$E2E_PLAN_RESULT"
             require_skipped e2e "$E2E_RESULT"
             require_skipped e2e-report "$E2E_REPORT_RESULT"
+          fi
+          # PREVIEW (V1). Three states, and the middle one is the point:
+          #   preview-checks: none              -> must be skipped
+          #   selected, on a pull request       -> must SUCCEED (a preview that
+          #                                        never appeared is a failure,
+          #                                        not a skip -- fail closed)
+          #   selected, on any other event      -> must be skipped; a push to
+          #                                        the default branch has no PR
+          #                                        preview to check.
+          if [ "$PREVIEW_CHECKS" = "none" ]; then
+            require_skipped preview "$PREVIEW_RESULT"
+          elif [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
+            require_success preview "$PREVIEW_RESULT"
+          else
+            require_skipped preview "$PREVIEW_RESULT"
           fi
           if [ "$RUN_DEPLOY_DRY_RUN" = "true" ]; then
             require_success deploy-dry-run "$DEPLOY_DRY_RUN_RESULT"

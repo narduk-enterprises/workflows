@@ -250,6 +250,16 @@ jobs:
       - name: Dependency audit gate tests
         run: python3 scripts/test_dependency_audit.py
 
+      # V1 (company-hq#745). The preview lane's whole value is that it fails
+      # when the preview is absent, stale or serving a different commit -- the
+      # three states a human reviewer cannot tell apart from a working preview
+      # by looking at a URL. These cases run the shipped resolver against a real
+      # local origin with controlled `x-build-version` headers, prove the sticky
+      # comment is EDITED rather than appended, and prove `Required` still goes
+      # red when a selected preview check is skipped.
+      - name: Preview lane contract tests
+        run: python3 scripts/test_preview_gate.py
+
       # Cheap belt-and-braces: actionlint parses YAML itself, but a file it
       # cannot classify as a workflow is skipped rather than failed, so an
       # unparseable stray .yml would slip past both checks above.

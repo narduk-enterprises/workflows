@@ -362,6 +362,12 @@ def run_required(**env_overrides) -> subprocess.CompletedProcess:
             "RUN_E2E": "true",
             "RUN_DEPLOY_DRY_RUN": "false",
             "DEPLOY_DRY_RUN_RESULT": "skipped",
+            # The preview lane (V1) is off in these cases: they are about the
+            # E2E subset's aggregation, and `preview-checks: none` is the state
+            # that must leave `Required` reading exactly as it did before.
+            "PREVIEW_CHECKS": "none",
+            "PREVIEW_RESULT": "skipped",
+            "EVENT_NAME": "pull_request",
         }
     )
     env.update({k: str(v) for k, v in env_overrides.items()})

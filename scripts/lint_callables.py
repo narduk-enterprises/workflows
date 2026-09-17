@@ -114,7 +114,13 @@ CALLER_GRANTS: dict[str, set[str]] = {
     "code-review.yml": {"contents"},
     "docs-governance.yml": {"contents"},
     "node-library.yml": {"contents"},
-    "nuxt-cloudflare.yml": {"contents", "packages"},
+    # WIDENED for the `preview` job's sticky pull-request comment (V1). This
+    # is a BREAKING interface change, not a tidy-up: every adopter's `ci:` job
+    # must add `pull-requests: write` BEFORE the `v1` tag moves onto the commit
+    # that carries it, or its whole run dies at startup exactly the way
+    # workflows#59 did. `write`, not `read`: the same grant both reads
+    # Cloudflare's preview comment and updates the sticky one.
+    "nuxt-cloudflare.yml": {"contents", "packages", "pull-requests"},
     "python-data.yml": {"contents"},
     "reusable-browser-tests.yml": {"contents", "packages", "actions"},
     "reusable-node-ci.yml": {"contents", "packages"},
@@ -368,6 +374,55 @@ def check_fail_closed_playwright(path: Path, doc: dict, f: Findings) -> None:
                     f"R11 job '{job_id}' step '{step.get('name') or step.get('uses') or '(unnamed)'}' "
                     "declares continue-on-error — a required gate may not soften failure",
                 )
+
+    # Any OTHER job routed to the browser pool is held to the same fail-closed
+    # preflight as `e2e`. Without this, adding a second browser-capable job
+    # (the `preview` job's `e2e-subset` lane) would silently escape R11
+    # entirely: the pool's image-equality gate would be enforced on one lane
+    # and absent on the other, which is the same false green company-hq#343 is
+    # about.
+    for job_id, job in jobs.items():
+        if job_id == "e2e" or not isinstance(job, dict):
+            continue
+        if "e2e-runner" not in str(job.get("runs-on", "")):
+            continue
+        steps = [step for step in (job.get("steps") or []) if isinstance(step, dict)]
+        names = [step.get("name") for step in steps]
+        for required_name in ("Guard isolated Playwright route", "Assert isolated Playwright toolchain"):
+            if required_name not in names:
+                f.add(
+                    path,
+                    f"R11 job '{job_id}' is routed to the browser pool but has no "
+                    f"'{required_name}' step",
+                )
+        installs = [
+            names.index(name)
+            for name in ("Install dependencies (pnpm)", "Install dependencies (npm)")
+            if name in names
+        ]
+        if "Guard isolated Playwright route" in names and installs:
+            if names.index("Guard isolated Playwright route") > min(installs):
+                f.add(
+                    path,
+                    f"R11 job '{job_id}' runs its isolated-route guard after dependency "
+                    "installation — browser acquisition could already occur",
+                )
+        if "Install Playwright browsers" in names:
+            installer_condition = " ".join(
+                str(steps[names.index("Install Playwright browsers")].get("if", "")).split()
+            )
+            for fragment in (
+                "inputs.e2e-install-browsers",
+                "!contains",
+                "playwright-isolated",
+                "proxmox-playwright-x64",
+            ):
+                if fragment not in installer_condition:
+                    f.add(
+                        path,
+                        f"R11 job '{job_id}' browser installer is not proven unreachable on "
+                        f"the isolated route (missing {fragment!r})",
+                    )
 
     e2e = jobs.get("e2e")
     if not isinstance(e2e, dict) or "e2e-runner" not in str(e2e.get("runs-on", "")):
