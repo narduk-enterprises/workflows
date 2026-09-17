@@ -808,6 +808,88 @@ proves (schema/expression validity) and distinct from what `lint_callables.py`
 proves about THIS repo's own callables — `caller-lint` proves the same class
 of thing about the repository that adopted one.
 
+#### Dependency audit (`dependency-audit`, `audit-ignore`)
+
+| Input | Type | Default | Purpose |
+|---|---|---|---|
+| `dependency-audit` | boolean | `true` | Fail the build on a high/critical advisory **that has a published fix** |
+| `audit-ignore` | string | `""` | Comma-separated `GHSA-xxxx-xxxx-xxxx=reason` suppressions; the reason is required |
+
+The estate security bar (company-hq#745; Logan, askme round 2026-09-17, "Fail on
+fixable high/critical (Recommended)"; company-hq D-ORG-1 (g), 2026-09-02) is
+*alerts on, and no **fixable** high or critical advisory in the tree*. That is
+deliberately not what `pnpm audit --audit-level=high` reports on its own: its
+exit status goes non-zero for **any** high/critical finding, including ones
+upstream has published no patch for. A gate that cannot tell "you have not
+upgraded" from "there is nothing to upgrade to" is a gate whose only
+sustainable reaction is `|| true`, and once that lands the fixable advisories
+stop being caught too.
+
+So the audit command's exit status is discarded on purpose and the JSON report
+is what decides:
+
+| Finding | Result |
+|---|---|
+| high/critical **with** a published fix | `::error::` — the `build` job fails |
+| high/critical with **no** published fix | `::warning::` — the build passes |
+| moderate / low / info | counted in the job summary, never blocking |
+| report missing, empty, unparseable, or in an unrecognised shape | `::error::` — hard failure |
+
+That last row is the same fail-closed rule `require-scripts` exists for: "the
+audit did not run" must never be indistinguishable from "the audit found
+nothing".
+
+Both report shapes are parsed, and the `package-manager` input selects the
+*command*, never the parser — npm changed this format once already, and a
+parser keyed on the input would silently read zero advisories the next time it
+changes:
+
+- **pnpm / npm 6** — the `advisories` map. Fixable means `patched_versions` is a
+  real range rather than the `"<0.0.0"` no-patch sentinel.
+- **npm 7+** (`auditReportVersion: 2`) — the `vulnerabilities` map. Fixable
+  means `fixAvailable` is `true` or a `{name, version, isSemVerMajor}` object;
+  a fix that needs a major bump still counts as a fix.
+
+Estate contract pins are not advisories and do not count here — only what the
+package manager's own audit reports does.
+
+##### `audit-ignore`: a suppression must carry its reason
+
+```yaml
+audit-ignore: >-
+  GHSA-aaaa-bbbb-cccc=no upstream release yet, tracked in company-hq#812, review 2026-12-01,
+  GHSA-dddd-eeee-ffff=unreachable code path behind a disabled flag, review 2026-11-01
+```
+
+Each entry is `<id>=<reason>`, entries separated by commas. **The reason is
+required**: an entry with no `=reason` fails the gate rather than silently
+muting an advisory, which mirrors the written-reason convention a Dependabot
+`ignore:` block carries. Every suppression is echoed as a `::warning::` with its
+reason attached, so a muted advisory cannot become invisible tribal knowledge,
+and an entry that matches nothing in the current report is reported as a stale
+suppression so it gets removed instead of accumulating. Advisories the report
+carries no GHSA id for are matched by `NPM-<numeric-id>`.
+
+##### Why a step in `build` and not its own job
+
+The tree it audits is the one `build` just installed. A standalone lightweight
+job on the `caller-lint` runner class would cost a second checkout, a second
+`setup-node` and a second full install — 60–120s and a second runner slot on
+this repo's adopters — to re-derive state that already exists in `build`, for
+the ~5–10s the audit command itself takes. It never touches the browser pool.
+`Required` covers it through `build`, which it already demands success from;
+there is no separate result to aggregate.
+
+##### Turning it off
+
+`dependency-audit: false` is a bounded remediation, not a setting — the same
+status `require-scripts: false` has. Unlike `run-tests` and `foundation-check`,
+this input defaults to **`true`**: those two run a caller-specific script that
+may not exist, while this one reads the lockfile every adopter already has, and
+it is a security bar rather than an optional lane. It is still a new gate that
+can turn an existing adopter red, so the `v1` tag must not move onto it until
+the adopters have been checked — see [Versioning policy](#versioning-policy).
+
 #### The unit-test lane and `extra-scripts`
 
 ```yaml
