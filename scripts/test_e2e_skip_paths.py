@@ -382,12 +382,24 @@ def check_shard_list_empties_on_skip() -> None:
             env = dict(os.environ)
             env["TOTAL"] = "3"
             env["SKIPPED"] = skipped
+            # The step also resolves the effective pull-request shard/args
+            # override (workflows#83). This case is about the skip path only,
+            # so both overrides are UNSET and the event is a push — the
+            # combination that must leave `e2e-shards` in force.
+            env["PR_TOTAL"] = "0"
+            env["ARGS"] = ""
+            env["PR_ARGS"] = ""
+            env["EVENT_NAME"] = "push"
             env["GITHUB_OUTPUT"] = str(output_path)
             result = subprocess.run(
                 ["bash", "-c", script], capture_output=True, text=True, env=env
             )
             written = output_path.read_text().strip()
-            ok = result.returncode == 0 and written == expect
+            # Assert the `shards=` assignment specifically rather than the
+            # whole file: this step writes the effective shard total and args
+            # alongside it, and those belong to test_e2e_pr_subset.py.
+            lines = [line for line in written.splitlines() if line.startswith("shards=")]
+            ok = result.returncode == 0 and lines == [expect]
             label = f"Compute shard list with SKIPPED={skipped}"
             if ok:
                 print(f"PASS  {label} -> {expect}")

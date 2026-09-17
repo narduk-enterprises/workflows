@@ -950,13 +950,83 @@ Never include a CSS pattern here — a CSS-only diff is expected to run E2E in
 full, on purpose (overflow and mobile-layout specs exist specifically to
 catch CSS regressions).
 
-The decision is made by calling `gh api repos/<repo>/pulls/<n>/files
+The decision is made by calling `gh api repos/<repo>/compare/<base>...<head>
 --paginate` from the `E2E plan` job, so it needs no repository checkout of
-its own. `gh` is standard on GitHub-hosted runners but self-hosted runners
-provision their own toolchains — its absence degrades to "run the full
-suite" (a warning, not a failure), same as zero reported changed files or a
-missing PR number. An empty `e2e-skip-paths` (the default) never skips and
+its own. The **compare** endpoint, not `pulls/<n>/files`: comparing two commits
+is a Contents read that works under the `contents: read` every caller already
+grants, where `pulls/<n>/files` needs `pull-requests: read` — and a called
+workflow requesting a permission its caller did not grant kills the caller's
+entire run at startup, on every adopter at once (workflows#59). `gh` is
+standard on GitHub-hosted runners but self-hosted runners provision their own
+toolchains — its absence degrades to "run the full suite" (a warning, not a
+failure), same as zero reported changed files or a diff at the compare API's
+silent 300-file cap. An empty `e2e-skip-paths` (the default) never skips and
 adds no behavior for existing callers.
+
+#### A smaller suite on pull requests (`e2e-pr-shards`, `e2e-pr-args`)
+
+(workflows#83) `e2e-skip-paths` above is all-or-nothing: it either runs the
+whole matrix or none of it. These two inputs are the middle setting — a
+**caller-defined** subset on pull requests, the full suite on the default
+branch.
+
+```yaml
+      run-e2e: true
+      e2e-shards: 3                  # push / default branch: unchanged
+      e2e-args: ""
+      e2e-pr-shards: 1               # pull request: one lane
+      e2e-pr-args: "--project=smoke" # pull request: the caller's own project
+```
+
+Why this exists: the `playwright-isolated` pool is **three effective slots
+against a declared seven** (the fleet-owned on-prem guests 343-346 have never
+registered), shared by roughly ten repositories, so a pull request waits on
+**queue**, not on compute. Measured on buoys: push run `35165183477` queued
+1 s and ran its shard in 128 s, while pull-request run `35165732448` queued
+**295 s** to run the identical 128 s shard. Reducing pull-request lanes is the
+only lever a caller has over that from inside this callable — the pool's
+capacity itself belongs to `narduk-enterprises/fleet`.
+
+**Fewer lanes is not by itself faster — it is fewer slots.** Measured on gonogo
+with `e2e-pr-shards: 1` and no `e2e-pr-args`: the same suite ran 527 / 407 /
+292 s in three lanes plus a 32 s report (a 559 s critical path), and 913 s in
+one. Aggregate pool occupancy dropped 27% (1258 runner-seconds over four jobs
+to 913 over one) and the run held **one** isolated slot instead of three, which
+is the part that shortens every other repository's queue — but the pull
+request's own wall clock got *longer*, because the tests were redistributed
+rather than reduced. `e2e-pr-shards` alone is a courtesy to the pool. To make
+your own pull request faster, pair it with an `e2e-pr-args` subset that runs
+genuinely fewer tests.
+
+The rules, all of which fail toward running **more**:
+
+- **Unset is today's behaviour.** `e2e-pr-shards: 0` and `e2e-pr-args: ""` are
+  the defaults and mean "no override". Every current adopter passes neither,
+  so they see no change whatsoever.
+- **Pull-request events only.** `push`, `schedule`, `workflow_dispatch` and
+  anything unrecognised run `e2e-shards`/`e2e-args` even when an override is
+  configured — the same confinement `e2e-skip-paths` has, and for the same
+  reason: the default branch is the canonical validation, and neither input
+  may weaken it.
+- **`e2e-pr-args` replaces, it does not append.** A pull-request subset cannot
+  silently inherit a conflicting `--project` from `e2e-args`.
+- **Empty means inherit.** A caller that wants arguments on a push and *none*
+  on a pull request cannot express that here; put a `github.event_name`
+  expression in the caller's own `with:` block instead. A sentinel for
+  "explicitly empty" would be a second, weaker way to say the same thing.
+- **The subset is the caller's to define.** This workflow never guesses what
+  "smoke" means — it passes your arguments to your `e2e-script`. Tag the
+  subset in your own `playwright.config` (a project) or with `--grep`.
+
+`Required` is unaffected as a gate: it still demands `E2E` succeed, and it
+derives "was there more than one shard, so must `E2E report` have run?" from
+the same single resolved value `E2E` sharded on, so a one-lane pull request
+correctly expects `E2E report` to be `skipped` rather than absent.
+
+**A subset is a smaller gate, not a weaker one.** Whatever a pull request
+stops running, the default-branch push still runs — but it runs it *after* the
+merge. Choose the subset so a failure it cannot catch is one you are willing
+to find on `main`.
 
 #### The isolated Playwright toolchain gate
 
@@ -1207,6 +1277,13 @@ executed here.
   breaking change here specifically because the composed context comes from
   the caller's job id and this workflow's `Required` job** — neither of which
   moved. `v1` moved again rather than a `v2` being cut.
+- `nuxt-cloudflare.yml`'s pull-request subset inputs (`e2e-pr-shards`,
+  `e2e-pr-args`, workflows#83) are within-major for the same reason: both are
+  optional, both default to an UNSET sentinel (`0` / `""`), and with them
+  unset every event resolves the shard count and argument list exactly as
+  before. No job, check name, or `Required` expectation changed — the effective
+  shard count simply moved from `inputs.e2e-shards` to an `E2E plan` output
+  that equals it whenever no override is supplied.
 - `reusable-browser-tests.yml` is a new callable, so its required route,
   artifact, and exact-version inputs do not break an existing caller.
   `python-data.yml`'s `run-pyright`, exact `pyright-version`, and
