@@ -2427,10 +2427,15 @@ jobs:
               require_skipped e2e-report "$E2E_REPORT_RESULT"
             else
               require_success e2e "$E2E_RESULT"
-              # Fail closed on a shard count that is not a count: `-gt` on a
-              # non-numeric value aborts this script under `set -e`, which
-              # ends the job as a FAILURE rather than a false green, but with
-              # no message anyone can act on. Say what happened instead.
+              # Fail closed on a shard count that is not a count. `set -e`
+              # does NOT rescue this: it is disabled inside an `if`
+              # condition, so `[ "" -gt 1 ]` prints "integer expected" to
+              # stderr, returns 2, and takes the `else` branch -- which
+              # expects `e2e-report` to be SKIPPED, finds it skipped, and
+              # exits 0. Proven by deleting these four lines: the empty,
+              # '0' and 'abc' cases in scripts/test_e2e_pr_subset.py all
+              # go rc=0. That is a false GREEN on an unresolved shard
+              # count, not a noisy abort.
               if ! [ "$E2E_SHARDS" -ge 1 ] 2>/dev/null; then
                 echo "::error::effective e2e shard count is not a positive integer (got '$E2E_SHARDS')"
                 exit 1

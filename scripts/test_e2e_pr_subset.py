@@ -330,10 +330,145 @@ def check_behaviour() -> None:
         raise SystemExit(f"{failures} case(s) failed")
 
 
+
+def required_step_script(*, extra_gate_scripts: str = "") -> str:
+    """The shipped `Required` aggregation, with its one inline expression bound.
+
+    The step interpolates `${{ inputs.extra-gate-scripts }}` directly into the
+    script text rather than passing it through `env:`, so executing the shipped
+    text means substituting it the way Actions would.
+    """
+    script = named_step(
+        load()["jobs"]["required"],
+        "Require enabled gates to succeed and disabled gates to skip",
+    )["run"]
+    token = "${{ inputs.extra-gate-scripts }}"
+    assert token in script, "Required step no longer interpolates extra-gate-scripts"
+    return script.replace(token, extra_gate_scripts)
+
+
+def run_required(**env_overrides) -> subprocess.CompletedProcess:
+    env = dict(os.environ)
+    env.update(
+        {
+            "BUILD_RESULT": "success",
+            "EXTRA_GATE_RESULT": "skipped",
+            "E2E_PLAN_RESULT": "success",
+            "E2E_PLAN_SKIPPED": "false",
+            "E2E_RESULT": "success",
+            "E2E_REPORT_RESULT": "skipped",
+            "E2E_SHARDS": "1",
+            "RUN_E2E": "true",
+            "RUN_DEPLOY_DRY_RUN": "false",
+            "DEPLOY_DRY_RUN_RESULT": "skipped",
+        }
+    )
+    env.update({k: str(v) for k, v in env_overrides.items()})
+    return subprocess.run(
+        ["bash", "-c", required_step_script()],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+
+def check_required_still_gates() -> None:
+    """A subset is a SMALLER gate, not a disabled one.
+
+    The whole risk of shipping a pull-request subset is that it quietly stops
+    gating: fewer lanes must still mean a red `Required` when a test in the
+    surviving lane fails. These execute the shipped aggregation with the
+    subset active (one effective shard) rather than asserting its text.
+    """
+    failures = 0
+
+    def case(label: str, *, expect_rc: int, expect_text: str | None = None, **env):
+        nonlocal failures
+        result = run_required(**env)
+        ok = result.returncode == expect_rc
+        if ok and expect_text is not None:
+            ok = expect_text in (result.stdout + result.stderr)
+        if ok:
+            print(f"PASS  {label}")
+        else:
+            failures += 1
+            print(
+                f"FAIL  {label}: rc={result.returncode} (want {expect_rc}) "
+                f"out={result.stdout!r} err={result.stderr!r}"
+            )
+
+    # The negative proof: one lane, and that lane fails.
+    case(
+        "subset active + e2e failed -> Required RED",
+        expect_rc=1,
+        expect_text="e2e job reported 'failure'",
+        E2E_SHARDS="1",
+        E2E_RESULT="failure",
+    )
+    case(
+        "subset active + e2e cancelled -> Required RED",
+        expect_rc=1,
+        E2E_SHARDS="1",
+        E2E_RESULT="cancelled",
+    )
+    # A skipped e2e is never a success substitute: an expression mistake that
+    # skipped the only lane must not report green.
+    case(
+        "subset active + e2e skipped while enabled -> Required RED",
+        expect_rc=1,
+        expect_text="e2e job reported 'skipped'",
+        E2E_SHARDS="1",
+        E2E_RESULT="skipped",
+    )
+    # The green shape the gonogo canary actually produced.
+    case(
+        "subset active + e2e green + report skipped -> Required GREEN",
+        expect_rc=0,
+        E2E_SHARDS="1",
+        E2E_RESULT="success",
+        E2E_REPORT_RESULT="skipped",
+    )
+    # One lane must NOT expect a merged report; if one ran, the plan and the
+    # matrix disagreed and that disagreement is the bug this PR exists to stop.
+    case(
+        "subset active + report ran anyway -> Required RED",
+        expect_rc=1,
+        E2E_SHARDS="1",
+        E2E_RESULT="success",
+        E2E_REPORT_RESULT="success",
+    )
+    # Unset overrides: the full-suite shape still demands the report.
+    case(
+        "no override (3 shards) + report skipped -> Required RED",
+        expect_rc=1,
+        E2E_SHARDS="3",
+        E2E_REPORT_RESULT="skipped",
+    )
+    case(
+        "no override (3 shards) + report green -> Required GREEN",
+        expect_rc=0,
+        E2E_SHARDS="3",
+        E2E_REPORT_RESULT="success",
+    )
+    # The numeric guard: a non-count must name itself rather than aborting
+    # wordlessly on `-gt` under `set -e`.
+    for bad in ("", "0", "abc"):
+        case(
+            f"effective shard count {bad!r} -> actionable ::error::",
+            expect_rc=1,
+            expect_text="effective e2e shard count is not a positive integer",
+            E2E_SHARDS=bad,
+        )
+
+    if failures:
+        raise SystemExit(f"{failures} Required case(s) failed")
+
+
 def main() -> None:
     check_inputs_declared()
     check_single_resolution_point()
     check_behaviour()
+    check_required_still_gates()
     print("\ne2e pull-request subset contract passed")
 
 
