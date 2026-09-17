@@ -48,10 +48,15 @@ INSTALL_STEPS = (
 # `e2e-report` is deliberately absent (workflows#49): it no longer installs
 # the caller's dependency tree at all, so it never runs the auth bootstrap or
 # needs the paired cleanup — see scripts/test_e2e_report_minimal_install.py.
+# `preview` (V1) joins them: its checks run the CALLER's own toolchain -- the
+# caller's pinned narduk-app-tools for `og:check` and the caller's Playwright
+# suite for the subset -- so it installs the dependency tree and is bound by the
+# same materialize-then-remove-on-every-outcome contract as the other four.
 AUTH_JOBS = (
     "build",
     "extra-gate",
     "e2e",
+    "preview",
     "deploy-dry-run",
 )
 

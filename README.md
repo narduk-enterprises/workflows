@@ -708,6 +708,14 @@ existing package-read-secret contract for private callers.
 jobs:
   ci:
     uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v1
+    # A called workflow's jobs may only request permissions the caller granted;
+    # asking for one it did not kills the whole run at startup (workflows#59).
+    # `pull-requests: write` is required by the `preview` lane's sticky comment
+    # -- see "Preview checks" below before pinning a ref that carries it.
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: write
     with:
       node-version: "24"
       package-manager: npm # hydrogen's current package manager; pnpm is the default
@@ -1162,6 +1170,136 @@ correctly expects `E2E report` to be `skipped` rather than absent.
 stops running, the default-branch push still runs — but it runs it *after* the
 merge. Choose the subset so a failure it cannot catch is one you are willing
 to find on `main`.
+
+#### Preview checks (`preview-checks`, `preview-url-source`)
+
+| Input | Type | Default | Purpose |
+|---|---|---|---|
+| `preview-checks` | string | `og` | `none`, `og`, `e2e-subset`, or `og,e2e-subset` |
+| `preview-url-source` | string | `pr-comment` | `pr-comment` or `url-template` |
+| `preview-url-template` | string | `""` | URL template for `url-template`; `{branch}`, `{branch-alias}`, `{sha}` |
+| `preview-timeout-minutes` | number | `20` | Whole-job budget; the bounded wait is this minus five minutes |
+| `preview-working-directory` | string | `""` | Directory the preview checks run from; empty uses `working-directory` |
+
+> **This is a BREAKING interface change.** The `preview` job requests
+> `pull-requests: write`, and a called workflow asking for a permission its
+> caller did not grant kills the caller's **entire** run at startup —
+> `startup_failure`, zero jobs, no logs, no annotation (workflows#59, which took
+> down every `@v1` adopter on 2026-09-04). **Every adopter must add
+> `pull-requests: write` to its `ci:` job before the `v1` tag moves onto this
+> commit**, and an adopter whose repository has no Workers Builds preview must
+> also pass `preview-checks: none` in the same change:
+>
+> ```yaml
+> jobs:
+>   ci:
+>     uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v1
+>     permissions:
+>       contents: read
+>       packages: read
+>       pull-requests: write # sticky preview comment
+> ```
+
+##### What Cloudflare actually exposes, and what this workflow therefore reads
+
+Workers Builds' GitHub App creates **check runs**, **commit statuses** and a
+**pull request comment**, and "a preview URL will be provided for any builds
+which perform `wrangler versions upload`"
+([Cloudflare: Workers Builds GitHub integration](https://developers.cloudflare.com/workers/ci-cd/builds/git-integration/github-integration/)).
+It does **not** create a GitHub Deployment — that is the *Pages* integration's
+shape — so there is no `environment_url` to read, and this workflow does not
+offer a source that pretends there is. Adding one would also have cost every
+adopter a `deployments: read` grant to carry dead code.
+
+That leaves two honest sources:
+
+- **`pr-comment` (default)** — read the pull request's comments and take the
+  first `*.workers.dev` URL posted by an author whose login contains
+  `cloudflare`. A `workers.dev` link posted by anyone else is ignored.
+- **`url-template`** — derive the URL locally, with no GitHub read at all.
+  Cloudflare's aliased preview URLs are
+  `<ALIAS>-<WORKER_NAME>.<SUBDOMAIN>.workers.dev`, so a typical template is
+  `https://{branch-alias}-myworker.myaccount.workers.dev`. `{branch-alias}` is
+  the head ref lowercased with every character outside `[a-z0-9]` replaced by
+  `-`. That reproduces the transform this estate has **observed** (buoys'
+  branch `codex/buoys-complete` →
+  `codex-buoys-complete-buoys.narduk-enterprises.workers.dev`); Cloudflare does
+  not publish the truncation rule it applies to long branch names, so a
+  repository with long branch names should stay on `pr-comment`, which reads
+  the URL Cloudflare actually minted rather than predicting it.
+
+##### The URL is not the proof — `x-build-version` is
+
+A preview link in a comment says a build was *attempted*. The wait is not
+satisfied until the URL itself answers and its `x-build-version` header is a
+prefix of the pull request's head SHA. That header is the estate's existing
+live-proof convention (buoys `docs/workers-builds.md` records
+`x-build-version: a84fa2163903` for commit `a84fa216390321…`), and it is
+compared **by prefix** because Cloudflare emits a 12-character short SHA while
+`git rev-parse --short` defaults to 7. A fixed-width comparison would be a gate
+that never passes, and a gate that never passes is a gate somebody deletes.
+
+Each round of the bounded wait is one comment read and one HTTP read — no sleep
+loop that can outlive the job, and the wait is `preview-timeout-minutes` minus
+five so the checks and the comment still have room after it.
+
+##### Fail closed
+
+A preview that never becomes ready inside the bound is a **FAILURE, not a
+skip**, and so is one that answers 4xx/5xx, carries no `x-build-version`, or
+serves a different commit. "The preview never showed up" is the single most
+common way a Workers Builds connection silently breaks, and it is
+indistinguishable from "this repository does not use previews" only if you
+refuse to make the caller say which it is. That is what `preview-checks: none`
+is for.
+
+The lane runs on `pull_request` / `pull_request_target` events only. A push to
+the default branch has no pull-request preview to check, and `Required` expects
+the job `skipped` there — a `preview` job that *runs* on a push is a failure
+too.
+
+##### The checks
+
+- **`og`** — `narduk-app og:check --live --base-url <preview>`, run from the
+  caller's **own** installed `@narduk-enterprises/narduk-app-tools`. Unlike
+  `foundation-check`, there is no pinned `dlx` fallback here: `preview-checks:
+  og` is a caller asserting it has the tool, and a second resolution path would
+  mean a second credential path and a second version to keep in step.
+- **`e2e-subset`** — runs `e2e-script` with `e2e-pr-args` (the same
+  pull-request argument set `e2e-pr-shards`/`e2e-pr-args` introduced in
+  workflows#83) against the preview with `PLAYWRIGHT_BASE_URL` set. An empty
+  `e2e-pr-args` is a hard failure rather than a silent full-suite run against a
+  shared preview.
+
+  **The caller's Playwright config must honour `PLAYWRIGHT_BASE_URL` and must
+  not start its own `webServer`**, or the suite will test localhost and report
+  green. buoys cannot use this yet for exactly that reason — its
+  `playwright.config.ts` has only dev-server and prebuilt-Worker modes and "no
+  fixture accepts an override base URL" (`docs/e2e-testing.md`).
+
+##### Runner class
+
+Lightweight (the same route as `caller-lint` and `E2E plan`) **unless**
+`e2e-subset` is selected, which needs a browser guest and therefore the
+`e2e-runner` route. On that route the lane runs the **same YAML nodes** as the
+`e2e` job's isolated-route guard, image-equality assertion and browser
+installer — shared by anchor, not copied, because an image-equality gate that
+exists twice is an image-equality gate that drifts. `lint_callables.py` R11 now
+holds *every* job routed to `e2e-runner` to that preflight, not just `e2e`.
+
+Note that with `e2e-subset` selected the bounded wait holds a
+`playwright-isolated` slot (three effective slots across roughly ten repos —
+see "A smaller suite on pull requests"). That is why `preview-timeout-minutes`
+is a caller input and why `og` is the default.
+
+##### One sticky comment
+
+The lane posts a single comment carrying the URL, the build version, the head
+SHA and each check's result, marked with `<!-- narduk-ci:preview -->`. Later
+runs **find it by marker and edit it**; they never append. The same table also
+goes to the job summary, so the URL survives even when the comment API call
+does not — and a failure to post warns rather than turning an otherwise passing
+lane red.
 
 #### The isolated Playwright toolchain gate
 
