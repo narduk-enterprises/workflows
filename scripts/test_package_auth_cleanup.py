@@ -8,7 +8,8 @@ after the install consumers so success, failed install, and cancelled jobs
 cannot leave registry credentials on the guest.
 
 Callers can instead opt into an app-owned install wrapper. In that path the
-workflow must expose the service credential only as `NVAULT_TOKEN`, suppress
+workflow must expose the service credential only as `NVAULT_TOKEN` (with the
+package-read secret as `GH_PACKAGES_READ` only when that token is empty), suppress
 the legacy direct-materialization path, validate the package.json script name,
 and invoke it without eval.
 
@@ -63,6 +64,14 @@ CLEANUP_RM = (
 CALLER_NVAULT_EXPR = (
     "${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && "
     "secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}"
+)
+# Dependabot runs cannot see the Actions-only NVAULT_TOKEN. The caller script
+# receives the org package-read secret as GH_PACKAGES_READ only when no
+# service token is present and the legacy nvault foundation mode is off
+# (workflows#98), so it never sees both credentials.
+CALLER_PACKAGE_READ_FALLBACK_EXPR = (
+    "${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && "
+    "secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}"
 )
 
 # Patterns that would print auth content or delete more than the exact file.
@@ -167,6 +176,10 @@ def validate_job(job_id: str, job: dict) -> None:
     caller_env = caller.get("env") or {}
     assert caller_env.get("NVAULT_TOKEN") == CALLER_NVAULT_EXPR
     assert "NARDUK_PLATFORM_GH_PACKAGES_READ" not in caller_env
+    assert caller_env.get("GH_PACKAGES_READ") == CALLER_PACKAGE_READ_FALLBACK_EXPR, (
+        f"{job_id}: caller install must map the package-read secret only as a "
+        "fallback when NVAULT_TOKEN is empty"
+    )
     caller_run = caller.get("run") or ""
     assert "case \"$INSTALL_SCRIPT\" in" in caller_run
     assert "*[!A-Za-z0-9:_-]*" in caller_run
@@ -425,6 +438,29 @@ def main() -> None:
         pass
     else:
         raise AssertionError("direct-package-token mapping mutation did not fail the contract")
+
+    # Seeded-red: an unconditional package-read mapping (both credentials
+    # visible to the caller script) must fail.
+    candidate = deepcopy(document)
+    step = named_steps(candidate["jobs"]["extra-gate"], CALLER_INSTALL_STEP)[0]
+    step["env"]["GH_PACKAGES_READ"] = "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}"
+    try:
+        validate(candidate)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("unconditional package-read fallback mutation did not fail the contract")
+
+    # Seeded-red: dropping the Dependabot fallback must fail.
+    candidate = deepcopy(document)
+    step = named_steps(candidate["jobs"]["deploy-dry-run"], CALLER_INSTALL_STEP)[0]
+    step["env"].pop("GH_PACKAGES_READ")
+    try:
+        validate(candidate)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("missing package-read fallback mutation did not fail the contract")
 
     # Seeded-red: the caller-owned install contract cannot silently collapse
     # its service-token secret back into the foundation/package PAT channel.
