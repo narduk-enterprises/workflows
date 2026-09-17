@@ -336,6 +336,48 @@ on:
         required: false
         type: string
         default: ""
+      e2e-pr-shards:
+        description: >-
+          Shard count for `pull_request`/`pull_request_target` events only.
+          0 (the default) means UNSET: pull requests use `e2e-shards`, which
+          is exactly today's behaviour. Any value >= 1 replaces `e2e-shards`
+          on pull-request events while a push (default branch, schedule,
+          workflow_dispatch) keeps running `e2e-shards`.
+
+          This exists because the estate's `playwright-isolated` pool is three
+          effective slots against a declared seven, shared by roughly ten
+          repositories, and queue — not compute — is what a pull request
+          actually waits on (p90 294s; buoys PR run 35165732448 queued 295s to
+          run a 128s shard). Fewer pull-request lanes is the only lever a
+          caller has over that from here. workflows#83.
+        required: false
+        type: number
+        default: 0
+      e2e-pr-args:
+        description: >-
+          `e2e-args` replacement for `pull_request`/`pull_request_target`
+          events only. Empty (the default) means UNSET: pull requests use
+          `e2e-args`, which is exactly today's behaviour.
+
+          The intended shape is a Playwright PROJECT selection, so the caller
+          owns what "the pull-request subset" means in its own
+          `playwright.config`, and this workflow never guesses:
+          `e2e-pr-args: "--project=smoke"` with `e2e-args: ""`. A `--grep`
+          tag selection works the same way.
+
+          Because empty means "inherit", a caller that wants arguments on a
+          push but NONE on a pull request cannot express that here — pass the
+          push-only arguments through a `github.event_name` expression in the
+          caller's own workflow instead. Deliberate: a
+          sentinel for "explicitly empty" would be a second, weaker way to say
+          the same thing.
+
+          This REPLACES rather than appends, so a pull-request subset cannot
+          silently inherit a conflicting `--project` from `e2e-args`.
+          workflows#83.
+        required: false
+        type: string
+        default: ""
       e2e-install-browsers:
         description: >-
           Run `playwright install --with-deps` on a non-isolated runner.
@@ -1267,6 +1309,16 @@ jobs:
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       skipped: ${{ steps.skip.outputs.skipped }}
+      # The EFFECTIVE shard count and e2e arguments for this event, resolved
+      # exactly once here (workflows#83). `e2e`, `e2e-report` and `required`
+      # all read these rather than re-deriving the pull-request/push split
+      # from `inputs.*` — three copies of one conditional is how the shard
+      # total in `--shard=<n>/<total>`, the `E2E report` gate and the
+      # `Required` aggregation drift apart, and a `Required` that expects a
+      # report job the plan never fanned out for is a red gate on a correct
+      # run.
+      shard-total: ${{ steps.plan.outputs.shard-total }}
+      e2e-args: ${{ steps.plan.outputs.e2e-args }}
     steps:
       # Decides BEFORE the shard list is computed, so "skipped" can force
       # shards to `[]` below. Only a pull_request(_target) event is eligible:
@@ -1418,17 +1470,73 @@ jobs:
         id: plan
         env:
           TOTAL: ${{ inputs.e2e-shards }}
+          PR_TOTAL: ${{ inputs.e2e-pr-shards }}
+          ARGS: ${{ inputs.e2e-args }}
+          PR_ARGS: ${{ inputs.e2e-pr-args }}
+          EVENT_NAME: ${{ github.event_name }}
           SKIPPED: ${{ steps.skip.outputs.skipped }}
         run: |
           set -euo pipefail
+          # `e2e-shards`/`e2e-args` are validated FIRST and unconditionally,
+          # so a malformed push-path value is still caught on a pull request
+          # rather than surfacing weeks later on the merge to the default
+          # branch, where it fails the branch every other lane builds on.
           if ! [ "$TOTAL" -ge 1 ] 2>/dev/null; then
             echo "::error::e2e-shards must be an integer >= 1 (got '$TOTAL')"
             exit 1
           fi
+          if ! [ "$PR_TOTAL" -ge 0 ] 2>/dev/null; then
+            echo "::error::e2e-pr-shards must be an integer >= 0 (got '$PR_TOTAL')"
+            exit 1
+          fi
+          # These two travel through $GITHUB_OUTPUT to reach `e2e`, and
+          # $GITHUB_OUTPUT is a line-oriented `name=value` file: an embedded
+          # newline would silently truncate the value AND let the remainder be
+          # read as a further output assignment. A Playwright argument list
+          # has no legitimate newline in it, so reject rather than invent an
+          # escaping convention or a heredoc delimiter a caller could also
+          # supply.
+          for candidate in "$ARGS" "$PR_ARGS"; do
+            case "$candidate" in
+              *$'\n'*|*$'\r'*)
+                echo "::error::e2e-args and e2e-pr-args must be a single line (no newlines)"
+                exit 1
+                ;;
+            esac
+          done
+          # 0 means UNSET, and only a pull-request event may take the
+          # override at all: a push to the default branch is the canonical
+          # validation this input must not weaken, exactly as `e2e-skip-paths`
+          # is confined to pull requests one step above. Any unexpected event
+          # name therefore falls through to the FULL configuration — the
+          # fail-closed direction, since the cost of running too much is
+          # runner time and the cost of running too little is an unproven
+          # merge. workflows#83.
+          effective_total="$TOTAL"
+          effective_args="$ARGS"
+          case "$EVENT_NAME" in
+            pull_request|pull_request_target)
+              if [ "$PR_TOTAL" -ge 1 ]; then
+                effective_total="$PR_TOTAL"
+              fi
+              if [ -n "$PR_ARGS" ]; then
+                effective_args="$PR_ARGS"
+              fi
+              ;;
+          esac
+          {
+            echo "shard-total=$effective_total"
+            echo "e2e-args=$effective_args"
+          } >> "$GITHUB_OUTPUT"
           if [ "$SKIPPED" = "true" ]; then
             echo "shards=[]" >> "$GITHUB_OUTPUT"
           else
-            echo "shards=[$(seq 1 "$TOTAL" | paste -sd, -)]" >> "$GITHUB_OUTPUT"
+            echo "shards=[$(seq 1 "$effective_total" | paste -sd, -)]" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### E2E plan\n\nevent %s: %s shard(s), args: %s\n\n' \
+              "$EVENT_NAME" "$effective_total" "${effective_args:-(none)}" \
+              >> "$GITHUB_STEP_SUMMARY"
           fi
 
   e2e:
@@ -1901,8 +2009,13 @@ jobs:
           SCRIPT: ${{ inputs.e2e-script }}
           PM: ${{ inputs.package-manager }}
           SHARD: ${{ matrix.shard }}
-          TOTAL: ${{ inputs.e2e-shards }}
-          EXTRA_ARGS: ${{ inputs.e2e-args }}
+          # The plan job's EFFECTIVE values, not `inputs.*` — the matrix this
+          # job runs was fanned out from `shard-total`, so `--shard=<n>/<total>`
+          # must use the same number or Playwright is told it is shard 1 of 3
+          # while only one lane exists, and two thirds of the suite never runs
+          # while the gate reports success (workflows#83).
+          TOTAL: ${{ needs.e2e-plan.outputs.shard-total }}
+          EXTRA_ARGS: ${{ needs.e2e-plan.outputs.e2e-args }}
           E2E_PREBUILT_ARTIFACT: ${{ needs.build.outputs.e2e-build-path != '' && '1' || '' }}
           E2E_BUILD_ARTIFACT_PATH: ${{ needs.build.outputs.e2e-build-path }}
         run: |
@@ -2000,7 +2113,14 @@ jobs:
   # treats `skipped` as acceptable for this job.
   e2e-report:
     name: E2E report
-    if: "!cancelled() && inputs.run-e2e && inputs.e2e-shards > 1 && needs.e2e-plan.result == 'success' && needs.e2e-plan.outputs.skipped != 'true'"
+    # `shard-total`, not `inputs.e2e-shards`: with a pull-request shard
+    # override there may be exactly one lane and therefore nothing to merge,
+    # and `Required` below reads the same output, so the two agree by
+    # construction rather than by two conditionals staying in step
+    # (workflows#83). An unset/skipped plan leaves this empty, and an empty
+    # string compares false against 1 — report skipped, which is what
+    # `Required` then demands.
+    if: "!cancelled() && inputs.run-e2e && needs.e2e-plan.outputs.shard-total > 1 && needs.e2e-plan.result == 'success' && needs.e2e-plan.outputs.skipped != 'true'"
     needs: [e2e-plan, e2e]
     # Merging is pure Node work with no browser — keep it off the scarce
     # isolated browser pool.
@@ -2260,7 +2380,14 @@ jobs:
           DEPLOY_DRY_RUN_RESULT: ${{ needs.deploy-dry-run.result }}
           EXTRA_GATE_RESULT: ${{ needs.extra-gate.result }}
           RUN_E2E: ${{ inputs.run-e2e }}
-          E2E_SHARDS: ${{ inputs.e2e-shards }}
+          # The plan job's EFFECTIVE shard count, falling back to the input
+          # when the plan produced no output at all (it was skipped, or it
+          # failed before writing one). The fallback keeps this aggregation
+          # readable in exactly the states where it must still be able to go
+          # red, and the numeric guard below rejects anything that is not a
+          # count rather than letting `-gt` abort the whole gate under
+          # `set -e` (workflows#83).
+          E2E_SHARDS: ${{ needs.e2e-plan.outputs.shard-total || inputs.e2e-shards }}
           E2E_PLAN_SKIPPED: ${{ needs.e2e-plan.outputs.skipped }}
           RUN_DEPLOY_DRY_RUN: ${{ inputs.wrangler-dry-run }}
         run: |
@@ -2300,6 +2427,14 @@ jobs:
               require_skipped e2e-report "$E2E_REPORT_RESULT"
             else
               require_success e2e "$E2E_RESULT"
+              # Fail closed on a shard count that is not a count: `-gt` on a
+              # non-numeric value aborts this script under `set -e`, which
+              # ends the job as a FAILURE rather than a false green, but with
+              # no message anyone can act on. Say what happened instead.
+              if ! [ "$E2E_SHARDS" -ge 1 ] 2>/dev/null; then
+                echo "::error::effective e2e shard count is not a positive integer (got '$E2E_SHARDS')"
+                exit 1
+              fi
               if [ "$E2E_SHARDS" -gt 1 ]; then
                 require_success e2e-report "$E2E_REPORT_RESULT"
               else

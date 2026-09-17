@@ -223,6 +223,16 @@ jobs:
       - name: E2E report minimal-install tests
         run: python3 scripts/test_e2e_report_minimal_install.py
 
+      # The pull-request E2E subset (`e2e-pr-shards`/`e2e-pr-args`). Two
+      # halves: that leaving both unset is byte-for-byte today's behaviour on
+      # every event — every pinned adopter passes neither — and that `e2e`,
+      # `e2e-report` and `Required` all resolve the effective shard count from
+      # the ONE place that computes it. Three copies of that conditional is
+      # how `--shard=<n>/<total>` and the `Required` aggregation drift into a
+      # suite that silently runs a third of its tests and reports success.
+      - name: E2E pull-request subset contract tests
+        run: python3 scripts/test_e2e_pr_subset.py
+
       # Every nuxt-cloudflare install job must either pair legacy `.npmrc.auth`
       # materialization with exact-path cleanup or delegate to a validated
       # caller-owned wrapper that receives only the nVault service token.
