@@ -273,6 +273,47 @@ on:
         required: false
         type: boolean
         default: true
+      dependency-audit:
+        description: >-
+          Fail the build when the dependency tree carries a high or critical
+          advisory THAT HAS A PUBLISHED FIX. The estate security bar
+          (company-hq#745, Logan askme 2026-09-17 "Fail on fixable
+          high/critical"; company-hq D-ORG-1 (g), 2026-09-02) is alerts-on plus
+          no *fixable* high/critical — an advisory with no upstream patch is
+          reported as a `::warning::` and does NOT block, because a gate that
+          cannot tell "you have not upgraded" from "there is nothing to upgrade
+          to" is a gate that gets turned off.
+
+          DEFAULT IS `true`, unlike `run-tests` and `foundation-check`. Those
+          two default false because they run a caller-specific script that may
+          not exist; this one reads the lockfile every adopter already has, and
+          it is a security bar rather than an optional lane. It is still a new
+          gate that can turn an existing adopter red, so the `v1` tag must not
+          move onto it before the adopters have been checked — see README
+          "Dependency audit".
+
+          Estate contract pins do not count as advisories; only what the
+          package manager's own audit reports does.
+        required: false
+        type: boolean
+        default: true
+      audit-ignore:
+        description: >-
+          Comma-separated `GHSA-xxxx-xxxx-xxxx=reason` entries suppressing
+          specific advisories in the dependency audit. THE REASON IS REQUIRED:
+          an entry with no `=reason` fails the gate rather than silently
+          muting an advisory, and every suppression is echoed as a
+          `::warning::` carrying its reason, so a muted advisory can never
+          become invisible tribal knowledge. This mirrors the written-reason
+          convention Dependabot `ignore:` blocks carry.
+
+          An entry matching nothing in the current report is reported as a
+          stale-suppression `::warning::` so it gets removed rather than
+          accumulating. `NPM-<numeric-id>` is accepted for advisories the
+          report carries no GHSA id for.
+        required: false
+        type: string
+        default: ""
       run-e2e:
         description: "Run the optional Playwright e2e suite (opt-in)"
         required: false
@@ -820,6 +861,248 @@ jobs:
         with:
           path: ${{ steps.dep-cache-dir.outputs.path }}
           key: ${{ steps.dep-cache.outputs.cache-primary-key }}
+
+      # DEPENDENCY AUDIT (DA1; company-hq#745, Logan askme 2026-09-17 "Fail on
+      # fixable high/critical (Recommended)"; company-hq D-ORG-1 (g),
+      # 2026-09-02). The estate security bar is "alerts on, and no FIXABLE
+      # high/critical advisory in the tree" -- so this gate is deliberately
+      # NOT `<pm> audit --audit-level=high` with its own exit status. That
+      # status goes non-zero for ANY high/critical finding, including ones with
+      # no published patch, which makes the only sustainable reaction
+      # `|| true`: a gate that cannot distinguish "you have not upgraded" from
+      # "upstream has shipped no fix" gets switched off within a week, and then
+      # the fixable ones stop being caught too.
+      #
+      # So the exit status of the audit command is discarded on purpose and the
+      # JSON body is what decides:
+      #   fixable high/critical   -> ::error:: and the build fails
+      #   unfixable high/critical -> ::warning:: and the build passes
+      #   moderate/low/info       -> counted in the summary, never blocking
+      # A missing or unparseable report is a HARD FAILURE, not a pass: "the
+      # audit did not run" must never be indistinguishable from "the audit
+      # found nothing" (the same fail-closed rule `require-scripts` exists for).
+      #
+      # BOTH REPORT SHAPES ARE PARSED. pnpm (and npm 6) emit the `advisories`
+      # map, where fixability is `patched_versions` being a real range rather
+      # than the "<0.0.0" no-patch sentinel; npm 7+ emits `auditReportVersion:
+      # 2` with a `vulnerabilities` map, where fixability is `fixAvailable`
+      # being true or a {name,version,isSemVerMajor} object. `package-manager`
+      # selects the command, never the parser -- npm changed this format once
+      # already and a parser keyed on the input would silently read zero
+      # advisories the next time it changes.
+      #
+      # Runs as a STEP IN THIS JOB rather than a separate lightweight job
+      # because the tree it audits is the one this job just installed: a
+      # standalone job costs a second checkout, setup-node and full install
+      # (measured against this repo's adopters: 60-120s and a second runner
+      # slot) to re-derive state that already exists here for the ~5-10s the
+      # audit itself takes. `Required` covers it through `build`, which it
+      # already demands success from.
+      - name: Dependency audit
+        if: inputs.dependency-audit
+        env:
+          PM: ${{ inputs.package-manager }}
+          AUDIT_IGNORE: ${{ inputs.audit-ignore }}
+        run: |
+          set -euo pipefail
+          tmpdir="${RUNNER_TEMP:-/tmp}"
+          report="$tmpdir/dependency-audit.json"
+          errlog="$tmpdir/dependency-audit.err"
+          # `--audit-level=high` (the `=` form: npm parses a bare `--audit-level
+          # high` as a positional) only narrows what the tool considers
+          # blocking; the severity decision below is made from the report.
+          set +e
+          "$PM" audit --json --audit-level=high >"$report" 2>"$errlog"
+          audit_status=$?
+          set -e
+          if [ ! -s "$report" ]; then
+            echo "::error::dependency audit produced no report ($PM audit exited $audit_status) -- the audit did not run, which is a failure, not a pass"
+            sed -n '1,20p' "$errlog" >&2 || true
+            exit 1
+          fi
+          AUDIT_REPORT="$report" AUDIT_STATUS="$audit_status" python3 - <<'PYEOF_AUDIT'
+          import json
+          import os
+          import re
+          import sys
+
+          BLOCKING = ("critical", "high")
+          GHSA = re.compile(r"(GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4})", re.I)
+
+          report_path = os.environ["AUDIT_REPORT"]
+          raw = open(report_path, encoding="utf-8").read()
+          try:
+              doc = json.loads(raw)
+          except json.JSONDecodeError as exc:
+              print(
+                  f"::error::dependency audit report is not JSON ({exc}); "
+                  f"`audit` exited {os.environ.get('AUDIT_STATUS')}"
+              )
+              print(raw[:500], file=sys.stderr)
+              raise SystemExit(1)
+          if not isinstance(doc, dict):
+              print("::error::dependency audit report is not a JSON object")
+              raise SystemExit(1)
+
+          # audit-ignore entries are `GHSA-id=reason`, comma separated. The
+          # reason is REQUIRED and is printed next to every suppression, so a
+          # muted advisory can never become invisible tribal knowledge -- the
+          # same contract Dependabot's `ignore:` blocks carry in writing.
+          ignores: dict[str, str] = {}
+          bad_ignores: list[str] = []
+          for entry in os.environ.get("AUDIT_IGNORE", "").split(","):
+              entry = entry.strip()
+              if not entry:
+                  continue
+              ident, sep, reason = entry.partition("=")
+              ident = ident.strip()
+              reason = reason.strip()
+              if not sep or not reason or not ident:
+                  bad_ignores.append(entry)
+                  continue
+              ignores[ident.upper()] = reason
+
+          records: list[dict] = []
+
+          def ghsa_ids(*candidates) -> list[str]:
+              """Every GHSA id embedded in the candidate strings, in order."""
+              out: list[str] = []
+              for candidate in candidates:
+                  if candidate in (None, "", False):
+                      continue
+                  out.extend(m.group(1).upper() for m in GHSA.finditer(str(candidate)))
+              return out
+
+          # npm 7+ / `auditReportVersion: 2`
+          vulnerabilities = doc.get("vulnerabilities")
+          advisories = doc.get("advisories")
+          if isinstance(vulnerabilities, dict) and not isinstance(advisories, dict):
+              for name, vuln in vulnerabilities.items():
+                  if not isinstance(vuln, dict):
+                      continue
+                  severity = str(vuln.get("severity", "")).lower()
+                  fix = vuln.get("fixAvailable", False)
+                  ids: list[str] = []
+                  titles: list[str] = []
+                  for via in vuln.get("via") or []:
+                      if isinstance(via, dict):
+                          ids.extend(ghsa_ids(via.get("url")))
+                          source = via.get("source")
+                          if source not in (None, ""):
+                              ids.append(f"NPM-{source}")
+                          if via.get("title"):
+                              titles.append(str(via["title"]))
+                  records.append(
+                      {
+                          "package": str(vuln.get("name", name)),
+                          "severity": severity,
+                          "fixable": bool(fix),
+                          "ids": list(dict.fromkeys(ids)),
+                          "title": titles[0] if titles else "(no title)",
+                          "fix": (
+                              f"{fix.get('name')}@{fix.get('version')}"
+                              if isinstance(fix, dict)
+                              else ("upgrade available" if fix else "no fix published")
+                          ),
+                      }
+                  )
+          elif isinstance(advisories, dict):
+              # pnpm / npm 6 `advisories` map. "<0.0.0" is this format's
+              # explicit "no patched version exists" sentinel.
+              for key, adv in advisories.items():
+                  if not isinstance(adv, dict):
+                      continue
+                  patched = str(adv.get("patched_versions", "") or "").strip()
+                  fixable = bool(patched) and patched != "<0.0.0"
+                  records.append(
+                      {
+                          "package": str(adv.get("module_name", "(unknown)")),
+                          "severity": str(adv.get("severity", "")).lower(),
+                          "fixable": fixable,
+                          "ids": list(
+                              dict.fromkeys(
+                                  ghsa_ids(adv.get("github_advisory_id"), adv.get("url"))
+                                  + [f"NPM-{adv.get('id', key)}"]
+                              )
+                          ),
+                          "title": str(adv.get("title", "(no title)")),
+                          "fix": patched if fixable else "no fix published",
+                      }
+                  )
+          else:
+              print(
+                  "::error::dependency audit report has neither a "
+                  "`vulnerabilities` nor an `advisories` section -- the report "
+                  "format changed and this gate would have read zero advisories"
+              )
+              raise SystemExit(1)
+
+          blocking = [r for r in records if r["severity"] in BLOCKING]
+          matched_ignores: set[str] = set()
+
+          def ignored_by(record) -> str:
+              for ident in record["ids"]:
+                  if ident in ignores:
+                      matched_ignores.add(ident)
+                      return ident
+              return ""
+
+          failures, warnings, suppressed = [], [], []
+          for record in sorted(blocking, key=lambda r: (r["severity"], r["package"])):
+              label = "/".join(record["ids"]) or "(no advisory id)"
+              line = f"{record['severity']} in {record['package']} [{label}]: {record['title']}"
+              ident = ignored_by(record)
+              if ident:
+                  suppressed.append(f"{line} -- suppressed by audit-ignore {ident}: {ignores[ident]}")
+              elif record["fixable"]:
+                  failures.append(f"{line} -- FIX AVAILABLE ({record['fix']})")
+              else:
+                  warnings.append(f"{line} -- no fix published upstream")
+
+          for entry in bad_ignores:
+              print(
+                  f"::error::audit-ignore entry {entry!r} has no reason -- the "
+                  "required form is `GHSA-xxxx-xxxx-xxxx=why, and when it is "
+                  "reviewed`"
+              )
+          for ident in sorted(set(ignores) - matched_ignores):
+              print(
+                  f"::warning::audit-ignore lists {ident}, which no current "
+                  "high/critical advisory matches -- remove the stale suppression"
+              )
+          for line in warnings:
+              print(f"::warning::{line}")
+          for line in suppressed:
+              print(f"::warning::{line}")
+          for line in failures:
+              print(f"::error::{line}")
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          headline = (
+              f"dependency-audit: {len(failures)} fixable, {len(warnings)} unfixable, "
+              f"{len(suppressed)} suppressed high/critical advisories "
+              f"({len(records)} total advisories parsed)"
+          )
+          print(headline)
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write(f"### Dependency audit\n\n{headline}\n\n")
+                  for line in failures:
+                      handle.write(f"- :x: {line}\n")
+                  for line in warnings + suppressed:
+                      handle.write(f"- :warning: {line}\n")
+                  handle.write("\n")
+
+          if bad_ignores:
+              raise SystemExit(1)
+          if failures:
+              print(
+                  "::error::dependency audit failed: a high/critical advisory "
+                  "has a published fix. Upgrade it, or add "
+                  "`audit-ignore: <GHSA-id>=<reason>` with a reason and a review date."
+              )
+              raise SystemExit(1)
+          PYEOF_AUDIT
 
       # OPT-IN web-foundation conformance gate (company-hq
       # docs/WEB-FOUNDATION-CHECK.md §4/§5, D-WEBFOUND-2 Q5/Q9 (a), D-WEBFOUND-3).

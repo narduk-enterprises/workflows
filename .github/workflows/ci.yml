@@ -240,6 +240,16 @@ jobs:
       - name: package-auth install-scope contract tests
         run: python3 scripts/test_package_auth_cleanup.py
 
+      # DA1 (company-hq#745). The dependency audit is the one gate here whose
+      # correct answer is "fail on SOME high/critical advisories and pass on
+      # others", so its parser is where a silent fail-open is easiest to write:
+      # a report shape it does not recognise reads as zero advisories and every
+      # caller goes green with a fixable critical in the tree. These cases
+      # execute the shipped step text against both report formats and prove the
+      # missing/unparseable/unknown-shape paths exit non-zero.
+      - name: Dependency audit gate tests
+        run: python3 scripts/test_dependency_audit.py
+
       # Cheap belt-and-braces: actionlint parses YAML itself, but a file it
       # cannot classify as a workflow is skipped rather than failed, so an
       # unparseable stray .yml would slip past both checks above.
