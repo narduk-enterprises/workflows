@@ -1385,103 +1385,6 @@ jobs:
       # The inputs moved into `env:` in the same change. They used to be
       # interpolated straight into the shell text, which made every script
       # name a command-injection surface from the caller's `with:` block.
-      - name: Typecheck Worker
-        env:
-          GATE: Typecheck Worker
-          SCRIPT: ${{ inputs.typecheck-worker-script }}
-          PM: ${{ inputs.package-manager }}
-          REQUIRE: ${{ inputs.require-scripts }}
-        run: |
-          set -euo pipefail
-          if [ -z "$SCRIPT" ]; then
-            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
-            exit 0
-          fi
-          # `npm pkg get` yields `{}` for a missing script and the bare JSON
-          # value for a present one, so test the VALUE's type — never the
-          # presence of a quote. Verified against real fixtures, including
-          # colon-bearing names like `web:typecheck`, by
-          # scripts/test_script_gates.py.
-          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
-          present=$(printf '%s' "$raw" | node -e \
-            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
-          if [ "$present" != "yes" ]; then
-            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
-            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
-            if [ "$REQUIRE" = "true" ]; then
-              echo "::error::$msg (require-scripts is on)"
-              exit 1
-            fi
-            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
-            exit 0
-          fi
-          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
-
-      - name: Typecheck Nuxt
-        env:
-          GATE: Typecheck Nuxt
-          SCRIPT: ${{ inputs.typecheck-web-script }}
-          PM: ${{ inputs.package-manager }}
-          REQUIRE: ${{ inputs.require-scripts }}
-        run: |
-          set -euo pipefail
-          if [ -z "$SCRIPT" ]; then
-            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
-            exit 0
-          fi
-          # `npm pkg get` yields `{}` for a missing script and the bare JSON
-          # value for a present one, so test the VALUE's type — never the
-          # presence of a quote. Verified against real fixtures, including
-          # colon-bearing names like `web:typecheck`, by
-          # scripts/test_script_gates.py.
-          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
-          present=$(printf '%s' "$raw" | node -e \
-            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
-          if [ "$present" != "yes" ]; then
-            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
-            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
-            if [ "$REQUIRE" = "true" ]; then
-              echo "::error::$msg (require-scripts is on)"
-              exit 1
-            fi
-            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
-            exit 0
-          fi
-          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
-
-      - name: Unit tests
-        if: inputs.run-tests
-        env:
-          GATE: Unit tests
-          SCRIPT: ${{ inputs.test-script }}
-          PM: ${{ inputs.package-manager }}
-          REQUIRE: ${{ inputs.require-scripts }}
-        run: |
-          set -euo pipefail
-          if [ -z "$SCRIPT" ]; then
-            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
-            exit 0
-          fi
-          # `npm pkg get` yields `{}` for a missing script and the bare JSON
-          # value for a present one, so test the VALUE's type — never the
-          # presence of a quote. Verified against real fixtures, including
-          # colon-bearing names like `web:typecheck`, by
-          # scripts/test_script_gates.py.
-          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
-          present=$(printf '%s' "$raw" | node -e \
-            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
-          if [ "$present" != "yes" ]; then
-            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
-            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
-            if [ "$REQUIRE" = "true" ]; then
-              echo "::error::$msg (require-scripts is on)"
-              exit 1
-            fi
-            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
-            exit 0
-          fi
-          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
-
       - name: Build
         env:
           GATE: Build
@@ -1594,10 +1497,227 @@ jobs:
           include-hidden-files: true
           retention-days: 1
 
-  # The shard list cannot be built in an expression — there is no range() in
-  # the workflow expression language — so it is computed here and consumed by
-  # the e2e matrix. Skipped entirely when the caller left e2e off, which
-  # `Required` treats as an intentional skip.
+  # Typecheck and unit tests run beside `build`, not inside it (workflows row 19,
+  # CI critical path). Nothing downstream consumes their output, but while they
+  # ran in `build` every E2E shard, the preview and the deploy dry run waited
+  # for them before the prebuilt application was released: measured 15 s
+  # typecheck + 6 s unit on buoys `Build`, 11 s + 6 s on riverstatus. The cost
+  # is one more checkout, setup-node and install on the same runner class,
+  # paid in parallel. `extra-scripts` stays in `build` because its contract
+  # is "after build-script, same lane"; scripts that do not need build output
+  # belong in `extra-gate-scripts`, which already runs in parallel.
+  checks:
+    name: Checks
+    # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # node-version and node-version-file are mutually exclusive on
+          # setup-node (passing both is rejected), so resolve them as two
+          # exclusive expressions: node-version-file wins when the caller
+          # sets it, and node-version otherwise reproduces prior behaviour.
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          package-manager-cache: false
+      # Restore-only dependency cache: same key and guard as `build` (see the
+      # SELF-HOSTED RUNNERS DO NOT CACHE DEPENDENCIES block there). `build` owns
+      # the default-branch save; a second writer here would only race it.
+      - name: Resolve dependency cache directory
+        id: dep-cache-dir
+        if: runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm config set store-dir "$GITHUB_WORKSPACE/.cache/pnpm-store"
+            echo "path=.cache/pnpm-store" >> "$GITHUB_OUTPUT"
+          else
+            npm config set cache "$GITHUB_WORKSPACE/.cache/npm"
+            echo "path=.cache/npm" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: dep-cache
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.dep-cache-dir.outputs.path }}
+          key: node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ hashFiles(format('{0}/pnpm-lock.yaml', inputs.working-directory), format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
+
+      - name: Configure package registry auth
+        if: inputs.install-script == ''
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: *configure_package_registry_auth
+
+      - name: Point pnpm at a workspace-local store (self-hosted)
+        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
+        run: |
+          set -euo pipefail
+          mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
+          if [ "$mount_point" != "/" ] && [ -d "$mount_point/pnpm-store" ] && [ -w "$mount_point/pnpm-store" ]; then
+            echo "npm_config_store_dir=$mount_point/pnpm-store" >> "$GITHUB_ENV"
+          fi
+      - name: Install dependencies (pnpm)
+        if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      - name: Install dependencies (npm)
+        if: inputs.install-script == '' && inputs.package-manager == 'npm'
+        run: npm ci
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      # Exact-path cleanup only: persistent self-hosted workspaces must not keep
+      # registry credentials after install (success, failure, or cancel).
+      - name: Remove package auth materialization
+        if: always() && inputs.install-script == ''
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
+      - name: Install dependencies (caller script)
+        if: inputs.install-script != ''
+        env:
+          INSTALL_SCRIPT: ${{ inputs.install-script }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
+          # org package-read secret to GH_PACKAGES_READ (workflows#98).
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          PM: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$INSTALL_SCRIPT" in
+            ''|*[!A-Za-z0-9:_-]*)
+              echo "::error::install-script must be one package.json script name"
+              exit 1
+              ;;
+          esac
+          raw=$(npm pkg get "scripts.$INSTALL_SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            echo "::error::install-script names \"$INSTALL_SCRIPT\" but no such script exists"
+            exit 1
+          fi
+          "$PM" run "$INSTALL_SCRIPT"
+
+      # Every gate probes before it runs; see the EVERY GATE BELOW PROBES
+      # comment in `build` for the contract.
+      - name: Typecheck Worker
+        env:
+          GATE: Typecheck Worker
+          SCRIPT: ${{ inputs.typecheck-worker-script }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SCRIPT" ]; then
+            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
+            exit 0
+          fi
+          # `npm pkg get` yields `{}` for a missing script and the bare JSON
+          # value for a present one, so test the VALUE's type — never the
+          # presence of a quote. Verified against real fixtures, including
+          # colon-bearing names like `web:typecheck`, by
+          # scripts/test_script_gates.py.
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+
+      - name: Typecheck Nuxt
+        env:
+          GATE: Typecheck Nuxt
+          SCRIPT: ${{ inputs.typecheck-web-script }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SCRIPT" ]; then
+            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
+            exit 0
+          fi
+          # `npm pkg get` yields `{}` for a missing script and the bare JSON
+          # value for a present one, so test the VALUE's type — never the
+          # presence of a quote. Verified against real fixtures, including
+          # colon-bearing names like `web:typecheck`, by
+          # scripts/test_script_gates.py.
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+
+      - name: Unit tests
+        if: inputs.run-tests
+        env:
+          GATE: Unit tests
+          SCRIPT: ${{ inputs.test-script }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SCRIPT" ]; then
+            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
+            exit 0
+          fi
+          # `npm pkg get` yields `{}` for a missing script and the bare JSON
+          # value for a present one, so test the VALUE's type — never the
+          # presence of a quote. Verified against real fixtures, including
+          # colon-bearing names like `web:typecheck`, by
+          # scripts/test_script_gates.py.
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+
   extra-gate:
     name: Extra gate
     if: inputs.extra-gate-scripts != ''
@@ -1701,10 +1821,20 @@ jobs:
             if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
           done
 
+  # The shard list cannot be built in an expression — there is no range() in
+  # the workflow expression language — so it is computed here and consumed by
+  # the e2e matrix. Skipped entirely when the caller left e2e off, which
+  # `Required` treats as an intentional skip.
+  #
+  # No `needs: build`: this job reads nothing from `build` (the skip decision
+  # and the shard list come from inputs and the PR diff), so it runs beside
+  # the build instead of after it. That took its queue wait and runtime off
+  # the E2E critical path (~13 s + 5 s p50 on buoys). `e2e` still needs
+  # `build` for the prebuilt application, and Required still fails a run
+  # whose build failed.
   e2e-plan:
     name: E2E plan
     if: inputs.run-e2e
-    needs: build
     # CI lightweight route (company-hq CI policy); caller override takes precedence.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
@@ -3548,7 +3678,7 @@ jobs:
   required:
     name: Required
     if: always()
-    needs: [build, extra-gate, e2e-plan, e2e, e2e-report, preview, deploy-dry-run, caller-lint]
+    needs: [build, checks, extra-gate, e2e-plan, e2e, e2e-report, preview, deploy-dry-run, caller-lint]
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner)) }}
     timeout-minutes: 20
@@ -3558,6 +3688,7 @@ jobs:
       - name: Require enabled gates to succeed and disabled gates to skip
         env:
           BUILD_RESULT: ${{ needs.build.result }}
+          CHECKS_RESULT: ${{ needs.checks.result }}
           E2E_PLAN_RESULT: ${{ needs.e2e-plan.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
           E2E_REPORT_RESULT: ${{ needs.e2e-report.result }}
@@ -3596,6 +3727,7 @@ jobs:
             fi
           }
           require_success build "$BUILD_RESULT"
+          require_success checks "$CHECKS_RESULT"
           # caller-lint has no `if:` -- it always runs, same as build.
           require_success caller-lint "$CALLER_LINT_RESULT"
           if [ -n "${{ inputs.extra-gate-scripts }}" ]; then

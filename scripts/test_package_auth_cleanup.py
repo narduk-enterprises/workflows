@@ -54,6 +54,7 @@ INSTALL_STEPS = (
 # same materialize-then-remove-on-every-outcome contract as the other four.
 AUTH_JOBS = (
     "build",
+    "checks",
     "extra-gate",
     "e2e",
     "preview",
