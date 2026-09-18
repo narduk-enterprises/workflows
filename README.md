@@ -70,6 +70,7 @@ in their app-class workflow.
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional web-foundation conformance check, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: script-probed lint, typecheck, test, build (pnpm or npm), fail-closed by default through `require-scripts`. Zero live callers as of 2026-07-27 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
 | `code-review.yml` | **Advisory, default-off, not a CI gate.** Requests one containerized read-only agent review of a PR head from the estate's ephemeral pool, by firing a single `repository_dispatch` at `agent-infrastructure`. No `Required` job, never part of `ci / Required`, and every refusal path (opted out, fork, no secret, dispatch failure) exits SUCCESS. `enabled` defaults to `false`, so adopting the tag that carries it changes nothing until a repo opts in. See [Advisory code review](#advisory-code-review) |
+| `cursor-review.yml` | **Default-off PR reviewer, not a CI gate.** Reviews a pull request with one Cursor Cloud agent (`grok-4.6`, effort `xhigh`, fast) that has the caller checked out at the PR head plus read-only context repos (estate manual, coding standards, decisions), then posts a REAL pull-request review on the reviewed head — APPROVE / COMMENT / REQUEST_CHANGES with inline comments — using the job's own `GITHUB_TOKEN`. Skips (draft, fork, `no-ai-review`, no secret) exit SUCCESS; a reviewer error fails the job. A REQUEST_CHANGES review blocks merge under the repo's pull-request rule. See [Cursor review](#cursor-review) (agent-infrastructure#1564) |
 | `closing-syntax-check.yml` | PR-closing-syntax gate (agent-infrastructure#837, #1085): rejects a PR body whose closing keyword is ambiguous (a bare comma-separated list) or sits outside a canonical closing line/list item, and rejects any commit in the PR's own commit range that carries a closing keyword at all — GitHub's squash-merge auto-close scan reads the landed commit message independently of the curated PR body. **Fully self-contained**: the checker's source (canonically `narduk-enterprises/agent-infrastructure`'s `scripts/check_pr_closing_syntax.py`) is vendored directly inside this callable, so an adopting repo needs no local copy at all — see the workflow file's own header for the sync procedure |
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 
@@ -323,6 +324,56 @@ so a private caller that passes nothing is Blacksmith-eligible (it is on the
   a new job that copies `${{ fromJSON(inputs.runner) }}` verbatim does *not*
   get Blacksmith overflow automatically — use the expression above, or it
   silently stays off the overflow route.
+
+## Cursor review
+
+`cursor-review.yml` is the estate's pull-request reviewer (design and decisions:
+[agent-infrastructure#1564](https://github.com/narduk-enterprises/agent-infrastructure/issues/1564)).
+It is default-off and never part of `ci / Required`. A caller adds a second job
+beside `ci` — the job id is free, `cursor-review` is the convention — and grants
+it exactly `contents: read` + `pull-requests: write`:
+
+```yaml
+jobs:
+  ci:
+    uses: narduk-enterprises/workflows/.github/workflows/<workflow>.yml@<sha-of-v2> # v2
+    # ...
+
+  cursor-review:
+    if: ${{ github.event_name == 'pull_request' }}
+    uses: narduk-enterprises/workflows/.github/workflows/cursor-review.yml@<sha-of-v2> # v2
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      enabled: true
+    secrets:
+      CURSOR_CLOUD_AGENTS_API_KEY: ${{ secrets.CURSOR_CLOUD_AGENTS_API_KEY }}
+```
+
+What happens per pull request head:
+
+1. The job launches one Cursor Cloud agent with the caller repository at the PR
+   head branch and the `context-repos` (default `narduk-enterprises/agent-infrastructure`
+   and `narduk-enterprises/company-hq`) attached read-only. The brief lives in
+   `scripts/cursor_review_brief.md`; the agent reads the target repo's own
+   `AGENTS.md`, the estate coding standards, may run the repo's cheap checks, and
+   answers with one fenced JSON block (`verdict`, `summary`, `findings[]`).
+2. The job polls the run (30 s) up to `wait-minutes` (default 30), reads the run's
+   `result`, and posts a formal review on the reviewed head. Any `blocking`
+   finding requests changes. Each finding whose `path:line` is inside the PR
+   diff becomes an inline comment; the rest are listed in the review body.
+3. A push to the PR cancels the in-flight job and the previous agent run, and the
+   new head is reviewed again. A non-blocking review dismisses the bot's own stale
+   REQUEST_CHANGES; enable `dismiss_stale_reviews_on_push` and
+   `required_review_thread_resolution` on the repo's ruleset to make lanes answer
+   every thread.
+
+The only secret is `CURSOR_CLOUD_AGENTS_API_KEY`, a GitHub Actions repository
+secret delivered from nvault at a workstation (company-hq D-CLOUD-SECRETS-1). No
+GitHub credential enters the Cursor VM. Public callers (`narduk-libs`, this repo)
+wait on `ubuntu-latest`; private callers on the manifest's `linux-ci` route via
+the `runner` default, a near-idle poll.
 
 ## How to consume
 
