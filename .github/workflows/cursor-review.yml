@@ -1,0 +1,169 @@
+name: Reusable Cursor Review
+
+# Reviews a pull request with ONE Cursor Cloud agent (grok-4.6, effort xhigh,
+# fast) and posts a real GitHub pull-request review on the reviewed head:
+# APPROVE / COMMENT / REQUEST_CHANGES with one inline comment per finding.
+# Design and decisions: narduk-enterprises/agent-infrastructure#1564.
+#
+# The agent gets the caller repository checked out at the PR head branch plus
+# read-only context repositories (estate operating manual, coding standards,
+# decisions), reviews with full repository context, may run the repository's
+# cheap checks, and answers with one fenced JSON block. This job reads that
+# answer back from the Cursor run record and posts the review with the job's
+# own GITHUB_TOKEN. No GitHub credential ever enters the Cursor VM; the only
+# secret is the Cursor API key, an approved GitHub Actions secret under
+# company-hq D-CLOUD-SECRETS-1.
+#
+# `enabled` defaults to FALSE, so the tag carrying this file changes nothing
+# for a caller that has not opted in.
+#
+# SKIPS exit 0 with a `::notice::`: no pull request on this event, a draft PR,
+# the `no-ai-review` label, a FORK head (same-repo heads only: a fork must not
+# steer estate Cursor capacity, and a public caller's fork PR has no secret
+# anyway), or a caller that was never given the secret. A reviewer error or a
+# run that exceeds `wait-minutes` FAILS the job so the check is visibly red;
+# this job is never part of `ci / Required`, so red here blocks nothing by
+# itself. What blocks a merge is the REQUEST_CHANGES review under the
+# repository's pull-request rule, which GitHub and verify-pr-gate both honour.
+#
+# A push to the PR cancels the in-flight job (job-level concurrency keyed by
+# PR number) and the script also cancels the previous head's agent run through
+# the Cursor API before launching the new one.
+#
+# RUNNER ROUTING: same shape as code-review.yml. The default resolves from the
+# caller's own visibility: a PRIVATE caller lands on the fleet manifest's
+# linux-ci organization-group route, anything else on GitHub-hosted
+# ubuntu-latest. The job is a near-idle poller (30-second GET every cycle), so
+# a self-hosted slot it holds costs almost nothing but the slot itself. A
+# PUBLIC caller must never pass a self-hosted label.
+
+# Least privilege at the top; R12 lets a job request only what is granted here.
+permissions:
+  contents: read
+  pull-requests: write
+
+on:
+  workflow_call:
+    inputs:
+      enabled:
+        description: >-
+          Master switch. FALSE by default: a caller that does not pass
+          `enabled: true` gets a skipped job and no launch at all.
+        required: false
+        type: boolean
+        default: false
+      model:
+        description: Cursor model id. `GET https://api.cursor.com/v1/models` lists valid ids.
+        required: false
+        type: string
+        default: grok-4.6
+      effort:
+        description: Model `effort` parameter (grok-4.6 accepts low..xhigh).
+        required: false
+        type: string
+        default: xhigh
+      fast:
+        description: Model `fast` parameter.
+        required: false
+        type: boolean
+        default: true
+      context-repos:
+        description: >-
+          Comma-separated `owner/name` repositories attached read-only beside
+          the caller so the reviewer can read the estate operating manual,
+          coding standards, skills, and decisions. The caller repository is
+          never repeated here.
+        required: false
+        type: string
+        default: narduk-enterprises/agent-infrastructure,narduk-enterprises/company-hq
+      wait-minutes:
+        description: >-
+          Wall-clock budget for the agent run before the job fails. Keep it
+          under the job's own timeout-minutes.
+        required: false
+        type: number
+        default: 30
+      approve-on-clean:
+        description: >-
+          Submit APPROVE when the reviewer's verdict is approve. FALSE submits
+          COMMENT instead, for a repository that wants no bot approvals.
+        required: false
+        type: boolean
+        default: true
+      runner:
+        description: >-
+          JSON-encoded runner for this job: a plain string ("ubuntu-latest"),
+          a JSON array, or a JSON object ({"group":"linux-ci","labels":[...]})
+          matching the runner-fleet manifest's `runsOn` shape. Decoded with
+          fromJSON(), so the value must be valid JSON. Empty (the default)
+          routes a PRIVATE caller to the fleet manifest's linux-ci
+          organization-group route and a public or visibility-unknown caller to
+          GitHub-hosted ubuntu-latest; an explicit value always wins. A PUBLIC
+          (or possibly-future-public) CALLER MUST NEVER PASS A SELF-HOSTED LABEL.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      CURSOR_CLOUD_AGENTS_API_KEY:
+        description: >-
+          Cursor API key used to launch and read the review agent. OPTIONAL on
+          purpose (R7): a caller that has not been given it gets a `::notice::`
+          and a green skipped job, never a hard failure.
+        required: false
+
+jobs:
+  cursor-review:
+    name: Cursor review
+    if: ${{ inputs.enabled }}
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+    # One review per pull request at a time; a new head cancels the old wait.
+    # Job-level on purpose: R6 forbids workflow-level concurrency in a callable.
+    concurrency:
+      group: cursor-review-${{ github.repository }}-${{ github.event.pull_request.number || github.run_id }}
+      cancel-in-progress: true
+    steps:
+      # This callable's own script and brief, at exactly the commit the caller
+      # pinned. `github.job_workflow_sha` is the reusable workflow's commit,
+      # which is what keeps the YAML and the script it runs in lock-step. It is
+      # read through toJSON/fromJSON because actionlint 1.7.12's github-context
+      # schema predates the field and would reject the direct reference.
+      - name: Check out the reviewer script at this callable's pinned commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: narduk-enterprises/workflows
+          ref: ${{ fromJSON(toJSON(github)).job_workflow_sha }}
+          path: .narduk-workflows
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/cursor_review.py
+            scripts/cursor_review_brief.md
+          sparse-checkout-cone-mode: false
+
+      - name: Review this pull request with a Cursor Cloud agent
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          CURSOR_CLOUD_AGENTS_API_KEY: ${{ secrets.CURSOR_CLOUD_AGENTS_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_OPTED_OUT: ${{ contains(github.event.pull_request.labels.*.name, 'no-ai-review') }}
+          CURSOR_MODEL: ${{ inputs.model }}
+          CURSOR_EFFORT: ${{ inputs.effort }}
+          CURSOR_FAST: ${{ inputs.fast }}
+          CONTEXT_REPOS: ${{ inputs.context-repos }}
+          WAIT_MINUTES: ${{ inputs.wait-minutes }}
+          APPROVE_ON_CLEAN: ${{ inputs.approve-on-clean }}
+          BRIEF_PATH: .narduk-workflows/scripts/cursor_review_brief.md
+        run: |
+          set -euo pipefail
+          python3 .narduk-workflows/scripts/cursor_review.py
