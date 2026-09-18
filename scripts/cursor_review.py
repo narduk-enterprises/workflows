@@ -60,6 +60,10 @@ Transport = Callable[[str, str, dict[str, str], Optional[bytes], int], tuple[int
 class ReviewError(RuntimeError):
     """A failure that must make the job red: the review did not happen."""
 
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
+
 
 class Skip(Exception):
     """A deliberate no-op: the job stays green and says why."""
@@ -113,7 +117,7 @@ class GitHub:
         status, value = self.transport(method, url, headers, body, 60)
         if status not in ok:
             detail = value.get("message") if isinstance(value, dict) else str(value)
-            raise ReviewError(f"GitHub {method} {path} returned HTTP {status}: {str(detail)[:300]}")
+            raise ReviewError(f"GitHub {method} {path} returned HTTP {status}: {str(detail)[:300]}", status=status)
         return value
 
     def pages(self, path: str, *, limit: int = 5) -> list[Any]:
@@ -144,7 +148,7 @@ class Cursor:
         status, value = self.transport(method, f"{self.api}{path}", headers, body, 60)
         if status not in ok:
             detail = value.get("message") if isinstance(value, dict) else str(value)
-            raise ReviewError(f"Cursor {method} {path} returned HTTP {status}: {str(detail)[:300]}")
+            raise ReviewError(f"Cursor {method} {path} returned HTTP {status}: {str(detail)[:300]}", status=status)
         return value
 
 
@@ -420,10 +424,17 @@ def wait_for_run(cursor: Cursor, agent_id: str, *, deadline: float, sleep: Calla
         sleep(POLL_SECONDS)
 
 
+def is_own_review(review: dict[str, Any]) -> bool:
+    """A review THIS workflow posted: the shared `github-actions[bot]` login is
+    not enough, because every Actions job in the estate posts under it, and a
+    blocking review from another workflow must never be dismissed here."""
+    return (review.get("user") or {}).get("login") == BOT_LOGIN and f"<!-- {REVIEW_MARKER} " in (review.get("body") or "")
+
+
 def dismiss_stale_request_changes(github: GitHub, number: str, head_sha: str) -> int:
     dismissed = 0
     for review in github.pages(f"pulls/{number}/reviews"):
-        if (review.get("user") or {}).get("login") == BOT_LOGIN and review.get("state") == "CHANGES_REQUESTED":
+        if is_own_review(review) and review.get("state") == "CHANGES_REQUESTED":
             github.call("PUT", f"pulls/{number}/reviews/{review['id']}/dismissals", {"message": f"Superseded by the Cursor review of {head_sha[:12]}.", "event": "DISMISS"}, ok=(200,))
             dismissed += 1
     return dismissed
@@ -447,7 +458,7 @@ def post_review(github: GitHub, env: dict[str, str], result: dict[str, Any], con
     try:
         review = github.call("POST", f"pulls/{number}/reviews", payload)
     except ReviewError as exc:
-        if placed and "422" in str(exc):
+        if placed and exc.status == 422:
             # One rejected anchor sinks the whole review; fall back to body-only.
             notice(f"inline comments were refused ({exc}); posting the findings in the review body instead")
             payload["comments"] = []

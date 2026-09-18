@@ -20,7 +20,7 @@ Properties worth this machinery (agent-infrastructure#1564):
   * The callable itself passes the repository's structural rules and wires
     every value the script reads.
 
-Run: python3 scripts/test_cursor_review.py
+Run: python3 scripts/test_cursor_review.py  (needs PyYAML, as every test here does)
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ import json
 import re
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 from typing import Any
 
@@ -117,7 +118,7 @@ class FakeTransport:
         if method == "POST" and path.endswith("/pulls/7/reviews"):
             if self.review_status != 200:
                 status, self.review_status = self.review_status, 200
-                return status, {"message": "Unprocessable Entity: line could not be resolved"}
+                return status, {"message": "Unprocessable Entity: line could not be resolved" if status == 422 else "Forbidden"}
             return 200, {"id": 900, "html_url": "https://github.com/x/pull/7#pullrequestreview-900", "state": payload["event"]}
         if method == "PUT" and "/dismissals" in path:
             return 200, {"state": "DISMISSED"}
@@ -227,17 +228,20 @@ class ReviewFlowTests(unittest.TestCase):
         self.assertFalse(any(c["method"] == "PUT" for c in transport.calls), "a blocking review dismisses nothing")
 
     def test_a_clean_verdict_approves_and_dismisses_the_bots_stale_request_changes(self):
+        own = f"<!-- {cr.REVIEW_MARKER} " + json.dumps({"agentId": "bc-x", "headSha": "c" * 40, "verdict": "request_changes", "event": "REQUEST_CHANGES"}) + " -->"
         prior = [
-            {"id": 1, "state": "CHANGES_REQUESTED", "user": {"login": cr.BOT_LOGIN}},
-            {"id": 2, "state": "CHANGES_REQUESTED", "user": {"login": "loganrenz"}},
-            {"id": 3, "state": "COMMENTED", "user": {"login": cr.BOT_LOGIN}},
+            {"id": 1, "state": "CHANGES_REQUESTED", "user": {"login": cr.BOT_LOGIN}, "body": "**Cursor review**\n" + own},
+            {"id": 2, "state": "CHANGES_REQUESTED", "user": {"login": "loganrenz"}, "body": "no"},
+            {"id": 3, "state": "COMMENTED", "user": {"login": cr.BOT_LOGIN}, "body": own},
+            # Another workflow's blocking review under the SAME shared bot login.
+            {"id": 4, "state": "CHANGES_REQUESTED", "user": {"login": cr.BOT_LOGIN}, "body": "<!-- agent-review-disposition {} -->\nBlocking concerns"},
         ]
         transport = FakeTransport(result=review_json(verdict="approve", findings=[]), prior_reviews=prior)
         run(transport)
         self.assertEqual("APPROVE", posted_review(transport)["event"])
         dismissals = [c for c in transport.calls if c["method"] == "PUT"]
         self.assertEqual(1, len(dismissals))
-        self.assertTrue(dismissals[0]["url"].endswith("/pulls/7/reviews/1/dismissals"), "only this bot's own request-changes review is dismissed")
+        self.assertTrue(dismissals[0]["url"].endswith("/pulls/7/reviews/1/dismissals"), "only this workflow's own request-changes review is dismissed; a human's and another workflow's stay")
 
     def test_approve_on_clean_false_downgrades_to_comment(self):
         transport = FakeTransport(result=review_json(verdict="approve", findings=[]))
@@ -294,19 +298,22 @@ class ReviewFlowTests(unittest.TestCase):
             run(transport)
 
     def test_main_maps_a_review_error_to_exit_1(self):
-        with contextlib.redirect_stdout(io.StringIO()):
-            code = cr.run(env(PR_HEAD_SHA="nope"), FakeTransport()) if False else None
-        self.assertIsNone(code)
-        transport = FakeTransport(result="no block")
         out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            try:
-                cr.run(env(), transport, sleep=lambda _s: None, clock=lambda: 0.0)
-            except cr.ReviewError as exc:
-                print(f"::error::{exc}")
-                code = 1
+        with (
+            mock.patch.dict(cr.os.environ, env(PR_HEAD_SHA="nope"), clear=True),
+            mock.patch.object(cr, "urllib_transport", FakeTransport()),
+            contextlib.redirect_stdout(out),
+        ):
+            code = cr.main()
         self.assertEqual(1, code)
-        self.assertIn("::error::", out.getvalue())
+        self.assertIn("::error::PR_HEAD_SHA is not a full commit sha", out.getvalue())
+
+    def test_a_non_anchor_error_does_not_take_the_body_only_fallback(self):
+        transport = FakeTransport(review_status=403)
+        with self.assertRaisesRegex(cr.ReviewError, "HTTP 403"):
+            run(transport)
+        posts = [c for c in transport.calls if c["method"] == "POST" and c["url"].endswith("/pulls/7/reviews")]
+        self.assertEqual(1, len(posts), "a 403 is a real failure, not a bad inline anchor")
 
 
 class ParserTests(unittest.TestCase):
