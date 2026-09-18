@@ -28,7 +28,12 @@ name: Reusable Cursor Review
 #
 # A push to the PR cancels the in-flight job (job-level concurrency keyed by
 # PR number) and the script also cancels the previous head's agent run through
-# the Cursor API before launching the new one.
+# the Cursor API before launching the new one. A CALLER that declares its own
+# workflow-level concurrency (some caller lints require one) MUST use a group
+# name different from this job's `cursor-review-<repo>-<pr>`: with the same
+# name the workflow run holds the group, this job then fails at scheduling
+# with no steps and no annotation (five private callers, 2026-09-18). Use
+# `cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}`.
 #
 # RUNNER ROUTING: same shape as code-review.yml. The default resolves from the
 # caller's own visibility: a PRIVATE caller lands on the fleet manifest's
