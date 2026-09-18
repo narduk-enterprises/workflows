@@ -26,8 +26,8 @@ They prove:
      (parity, derived by substituting the old bare `inputs.<name>` back in);
   4. Blacksmith overflow and CI_LIGHTWEIGHT_RUNNER keep working.
 
-nuxt-cloudflare.yml is owned by a separate lane (row 19) and is deliberately
-not in CALLABLES yet; adding it here is the whole change needed to cover it.
+nuxt-cloudflare.yml joined CALLABLES after workflows#110 added its `checks`
+job, so all ten of its runner-reading `runs-on:` lines are covered.
 """
 
 from __future__ import annotations
@@ -57,6 +57,7 @@ CALLABLES = {
     "docs-governance.yml": "runner",
     "node-library.yml": "runner",
     "python-data.yml": "runner",
+    "nuxt-cloudflare.yml": "runner",
 }
 BLACKSMITH_LABEL = "blacksmith-2vcpu-ubuntu-2404"
 
