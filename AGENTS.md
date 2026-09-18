@@ -7,7 +7,7 @@ one place, not in a hundred repos. Ten callables live in
 (`apple.yml`, `closing-syntax-check.yml`, `code-review.yml`, `cursor-review.yml`,
 `docs-governance.yml`, `node-library.yml`, `nuxt-cloudflare.yml`,
 `python-data.yml`, `reusable-browser-tests.yml`, `reusable-node-ci.yml`);
-`ci.yml` is the one non-callable, and it is this repo's own gate. The repo is
+`ci.yml` and `cursor-review-self.yml` are the two non-callables: this repo's own gate, and this repo's own use of the Cursor reviewer. The repo is
 public; its own CI and every public caller must use GitHub-hosted runners.
 Private callers retain their existing reusable-workflow access and may use
 manifest-routed self-hosted capacity where their repository policy permits it.

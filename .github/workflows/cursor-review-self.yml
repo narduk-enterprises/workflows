@@ -1,0 +1,28 @@
+# Pull-request reviewer (agent-infrastructure#1564). One Cursor Cloud agent
+# (grok-4.6, effort xhigh, fast) reviews every same-repo, non-draft PR head
+# with this repo plus agent-infrastructure and company-hq attached, and the
+# callable posts a real GitHub review from this run. Any blocking finding is
+# REQUEST_CHANGES, which the branch rules honour. Never part of the required
+# check; skips exit green, a reviewer error shows red on this job only. The
+# only secret is CURSOR_CLOUD_AGENTS_API_KEY (company-hq D-CLOUD-SECRETS-1).
+# Public repository: the job stays on GitHub-hosted ubuntu-latest.
+name: Cursor review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  cursor-review:
+    uses: narduk-enterprises/workflows/.github/workflows/cursor-review.yml@852e0f0ce79860dc5fce0b998bf90712ba6a6bf4 # workflows#120; the moving v2 tag predates this callable, keep the SHA
+    permissions:
+      contents: read
+      pull-requests: write
+    with:
+      enabled: true
+      runner: '"ubuntu-latest"'
+    secrets:
+      CURSOR_CLOUD_AGENTS_API_KEY: ${{ secrets.CURSOR_CLOUD_AGENTS_API_KEY }}
