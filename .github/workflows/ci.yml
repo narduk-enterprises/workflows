@@ -260,6 +260,14 @@ jobs:
       - name: Preview lane contract tests
         run: python3 scripts/test_preview_gate.py
 
+      # Evaluates every `runs-on:` that reads a caller runner input across
+      # caller visibility x input x org variables: an empty input routes a
+      # private caller to the linux-ci group route and a public or
+      # visibility-unknown one to ubuntu-latest, and an explicit input
+      # resolves exactly as it did before the default flipped (row 18 Q3).
+      - name: Default runner route tests
+        run: python3 scripts/test_runner_default.py
+
       # Cheap belt-and-braces: actionlint parses YAML itself, but a file it
       # cannot classify as a workflow is skipped rather than failed, so an
       # unparseable stray .yml would slip past both checks above.

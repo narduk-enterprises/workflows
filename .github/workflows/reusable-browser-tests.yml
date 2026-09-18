@@ -159,10 +159,13 @@ jobs:
   contract:
     name: Validate routes and browser contract
     # This must run before any caller-controlled self-hosted route is evaluated.
-    # A labels-only or wrong-group route therefore fails on a credential-free
-    # hosted runner instead of scheduling the validation itself on the wrong
-    # organization host.
-    runs-on: ubuntu-latest
+    # A labels-only or wrong-group route therefore fails on a runner this file
+    # chooses, never on one the caller chose: private callers get the fixed
+    # linux-ci organization-group route (group AND labels, from fleet
+    # Config/github-runner-fleet.json; CI-RUNNER-POLICY.md Sec 1/Sec 4), and a
+    # public or visibility-unknown context keeps GitHub-hosted ubuntu-latest
+    # (Sec 3). Neither value reads an input, so the fail-closed property holds.
+    runs-on: ${{ fromJSON(github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -883,7 +886,7 @@ jobs:
     needs: [contract, validate, chromium, webkit, report]
     # The organization lightweight route is independent of browser inputs.
     # Invalid browser inputs must still produce a visible Required failure.
-    runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
     timeout-minutes: 5
     permissions:
       contents: read

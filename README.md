@@ -17,9 +17,12 @@ Shared reusable GitHub Actions workflows for the narduk-enterprises estate (CI-5
 > runner label.** That warning is still correct, but it rests on the *caller*,
 > not on this repo: `runner` is a free-form caller-supplied value, a repo can
 > go public later, and a fork PR on a public caller can run
-> attacker-controlled code on estate infrastructure. Reusable jobs default to
-> GitHub-hosted `ubuntu-latest`; `apple.yml`'s Mac route is the one input with
-> no default, deliberately.
+> attacker-controlled code on estate infrastructure. A reusable job whose
+> runner input is left empty resolves it per run from the caller's own
+> visibility: a private caller gets the fleet manifest's `linux-ci`
+> organization-group route, a public (or visibility-unknown) caller gets
+> GitHub-hosted `ubuntu-latest` — see [Default route](#default-route-empty-runner).
+> `apple.yml`'s Mac route is the one input with no default, deliberately.
 
 Fix CI in one place, not 100. Application repos call these workflows via
 `workflow_call` instead of blob-copying YAML. This repo replaces the broken
@@ -197,7 +200,7 @@ same encoding but splits it into **two** inputs — `lint-runner` and
 whole reason that file exists. It accepts three shapes:
 
 ```yaml
-runner: '"ubuntu-latest"'                                              # plain string (the default)
+runner: '"ubuntu-latest"'                                              # plain string
 runner: '["self-hosted","Linux","X64","proxmox","linux-ci"]'           # JSON array
 runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'  # JSON object
 ```
@@ -205,8 +208,48 @@ runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","li
 The object form matches `Config/github-runner-fleet.json`'s `runsOn` shape
 exactly, so a private manifest-routed caller can paste that value verbatim.
 The value must be **valid JSON** — a bare string still needs its own quotes,
-which is why the default is the four-character JSON string `"ubuntu-latest"`,
-not the bare word.
+which is why the explicit hosted value is the four-character JSON string
+`"ubuntu-latest"`, not the bare word.
+
+### Default route (empty `runner`)
+
+The `runner` inputs of `closing-syntax-check.yml`, `code-review.yml`,
+`docs-governance.yml`, `node-library.yml`, `python-data.yml` and
+`reusable-node-ci.yml`, and `apple.yml`'s `lint-runner`, default to the empty
+string (row 18 Q3, Logan 2026-09-18, "Flip the default (Recommended)"). Every
+`runs-on:` resolves the **effective route** as:
+
+```
+inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'
+```
+
+| Caller | Before | After |
+|---|---|---|
+| private, passes nothing | GitHub-hosted `ubuntu-latest` (policy drift, company-hq `CI-RUNNER-POLICY.md` §1) | `linux-ci` organization group, group **and** labels (§4) |
+| public, or an event with no `repository` payload, passes nothing | `ubuntu-latest` | `ubuntu-latest` (§3) |
+| any caller, explicit value | that value | that value — unchanged, proven by `scripts/test_runner_default.py` |
+
+The comparison is `== true`, so an unknown visibility falls to hosted, the safe
+direction. Because visibility is read at run time, a caller that goes public
+lands on hosted on its next run with no edit. Blacksmith overflow and
+`CI_LIGHTWEIGHT_RUNNER` apply to the effective route exactly as they applied to
+`inputs.runner` before; an effective `"ubuntu-latest"` is never sent to
+Blacksmith. `reusable-browser-tests.yml`'s `contract` job and its `Required`
+fallback use the same visibility gate with no caller input at all, so the
+route contract is still validated on a runner this file chose.
+
+The route literal is the fleet manifest's `linux-ci` class
+(`fleet/Config/github-runner-fleet.json`, organization group `linux-ci`). It is
+one string repeated at each site; `test_runner_default.py` fails if any copy
+diverges, but nothing here re-reads the manifest, so a manifest label change
+must be mirrored here.
+
+**The `linux-ci` group is `selected`-visibility.** A private caller the
+manifest does not list in that group gets a job that queues with no eligible
+runner when it passes nothing. Such a repo must be added to the manifest group
+(the policy fix) or pass `'"ubuntu-latest"'` explicitly, and a repo holding a
+§2 hosted exception (for example `package-delivery`, exception 5) must pass
+`'"ubuntu-latest"'` explicitly. See the versioning note on this change below.
 
 **A PUBLIC CALLER MUST NEVER PASS A SELF-HOSTED LABEL.** A fork PR on a public
 caller can run attacker-controlled code, so a self-hosted `runner` value hands
@@ -220,9 +263,9 @@ in this repo repeats this rule in a loud top-of-file comment; don't rely on
 this README alone when adding the next one.
 
 `reusable-node-ci.yml`'s existing `runner` input is a **plain string only**
-(`runs-on: ${{ inputs.runner }}`, no `fromJSON`) — it predates this
-convention and is left as-is. Don't pass a JSON-encoded value to it; it isn't
-decoded.
+(no `fromJSON` on the caller's value) — it predates this convention. Don't pass
+a JSON-encoded value to it; it isn't decoded. Its empty default follows the same
+visibility-gated route as above.
 
 ### Blacksmith overflow (`BLACKSMITH_RUNNERS_ENABLED`)
 
@@ -238,6 +281,11 @@ with zero Cloudflare secrets in scope) resolves as:
 ```
 runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
 ```
+
+In the callables with an empty `runner` default, each `inputs.runner` above is
+the parenthesised effective route from [Default route](#default-route-empty-runner),
+so a private caller that passes nothing is Blacksmith-eligible (it is on the
+`linux-ci` class this overflow serves) and a public one never is.
 
 - **Switch**: the org Actions variable `BLACKSMITH_RUNNERS_ENABLED`
   (default `false`, visibility restricted to private repos). Only the exact
@@ -446,9 +494,10 @@ slot and `AGENTS.md` requires that only work needing Xcode/macOS occupy it:
   and plist checks via `python3` `plistlib` (not PlistBuddy/`plutil`, which are
   macOS-only). SwiftLint does not compile the project, but its official Linux
   binary still dynamically loads `libsourcekitdInProc.so`; self-hosted
-  `linux-ci` runners provide the pinned Swift SourceKit runtime layer. Defaults
-  to `"ubuntu-latest"`; a repo approved for the `linux-ci` organization group
-  should pass that route's `runsOn` object instead:
+  `linux-ci` runners provide the pinned Swift SourceKit runtime layer. Empty
+  by default: a private caller gets the `linux-ci` organization-group route
+  and a public one `"ubuntu-latest"` (see [Default route](#default-route-empty-runner)).
+  Passing the route explicitly still works and still wins:
 
 ```yaml
       lint-runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
@@ -1538,6 +1587,18 @@ executed here.
   find at least one adopter run on the new commit and confirm it resolves and
   succeeds, per Logan, 2026-09-04: "Fan-out canary before the tag advances
   (Recommended)" (Refs company-hq#536).
+- **The empty-`runner` default flip (row 18 Q3) must not reach `v1` until its
+  unlisted private callers are fixed.** It changes no input name, job, check
+  context or permission, so it stays within `v1`, but it moves every private
+  caller that passes nothing onto the `selected`-visibility `linux-ci` group.
+  At the flip, the `@v1` callers passing nothing were `coding-standards`
+  (`docs-governance.yml`) and `x-event-recap` (`node-library.yml`) — both
+  outside that group — and `package-delivery` and `software-delivery` on
+  `nuxt-cloudflare.yml` (whose flip ships separately). Before `v1` advances
+  over this change: add each such repo to the fleet manifest's `linux-ci`
+  group, or have it pass `'"ubuntu-latest"'` explicitly (mandatory for a §2
+  hosted exception such as `package-delivery`); then run the fan-out canary.
+  SHA-pinned callers pick the change up only when they bump their pin.
 - Adding a workflow, or adding an **optional** input with a default, is
   within-major. Renaming or newly requiring an input, removing a job, renaming
   a job (which renames the composed check context and silently orphans every
@@ -1705,8 +1766,9 @@ per job, never extrapolated from a run count.
   and may use manifest-routed self-hosted runners only where policy permits.
 - New reusable workflows follow both estate-wide conventions added by CI-5
   phase 2: the workflow's last job is named exactly `Required` and `needs:`
-  everything else (see above), and `runs-on:` is `${{ fromJSON(inputs.runner) }}`
-  fed by a JSON-encoded `runner` input defaulting to `'"ubuntu-latest"'` (see
-  "Runner routing" above).
+  everything else (see above), and `runs-on:` decodes the effective route
+  (`inputs.runner`, else the visibility-gated default) from a JSON-encoded
+  `runner` input defaulting to `''` (see "Default route" above; add the new
+  callable to `scripts/test_runner_default.py`).
 - Estate conventions live in the `ci-workflow-author` skill
   (agent-infrastructure repo); consult it before adding workflows here.

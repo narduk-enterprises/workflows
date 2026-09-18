@@ -324,9 +324,12 @@ def main() -> None:
     call = document.get("on", document.get(True))["workflow_call"]
     assert call["secrets"] == {"DEPENDENCY_SSH_KEY": {"description": "Optional read-only GitHub deploy key for a private SwiftPM dependency in the caller's organization.", "required": False}}
     assert call["inputs"]["apple-runner"]["required"] is True
-    assert document["jobs"]["lint"]["runs-on"] == "${{ fromJSON(inputs.lint-runner) }}"
+    # Empty lint-runner resolves by caller visibility (row 18 Q3); behaviour is
+    # evaluated in scripts/test_runner_default.py.
+    lint_default = 'inputs.lint-runner || github.event.repository.private == true && \'{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}\' || \'"ubuntu-latest"\''
+    assert document["jobs"]["lint"]["runs-on"] == "${{ fromJSON(" + lint_default + ") }}"
     assert document["jobs"]["xcode"]["runs-on"] == "${{ fromJSON(inputs.apple-runner) }}"
-    assert document["jobs"]["required"]["runs-on"] == "${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || (inputs.lint-runner)) }}"
+    assert document["jobs"]["required"]["runs-on"] == "${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || (" + lint_default + ")) }}"
     assert document["jobs"]["required"]["needs"] == ["lint", "xcode"]
     install_swiftlint = next(
         item

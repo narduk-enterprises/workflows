@@ -30,12 +30,15 @@ name: Reusable Advisory Code Review
 #
 # RUNNER ROUTING: `runner` is a caller-controlled, JSON-encoded string input,
 # decoded with fromJSON() at `runs-on:` — the same shape every other callable in
-# this repository uses. It defaults to GitHub-hosted `ubuntu-latest`, and that
-# default is deliberately NOT the self-hosted linux-ci route even though every
-# realistic caller is a private estate repo that should pass it: this repository
-# never defaults a caller onto estate infrastructure, because `runner` is
-# free-form and a caller can go public later (README, workflows#2, D-VIS-1).
-# Private org callers pass their manifest route verbatim, group included:
+# this repository uses. Its default is EMPTY, resolved per run from the
+# caller's own visibility (workflows row 18 Q3, Logan 2026-09-18 "Flip the
+# default"): `github.event.repository.private == true` selects the linux-ci
+# organization-group route below, anything else selects GitHub-hosted
+# `ubuntu-latest`. The earlier hosted-only default guarded against a caller
+# going public later (README, workflows#2, D-VIS-1); reading visibility at run
+# time covers that case directly, so a public caller still never lands on
+# estate infrastructure. Private org callers may still pass their manifest
+# route verbatim, group included, and an explicit value always wins:
 #
 #   runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
 #
@@ -76,15 +79,20 @@ on:
       runner:
         description: >-
           JSON-encoded runner for this job: a plain string ("ubuntu-latest"),
-          a JSON array, or a JSON object
-          ({"group":"linux-ci","labels":[...]}) matching the runner-fleet
-          manifest's `runsOn` shape. Decoded with fromJSON(), so the value must
-          be valid JSON — a bare string needs its own quotes. Defaults to
-          GitHub-hosted ubuntu-latest. A PUBLIC (or possibly-future-public)
-          CALLER MUST NEVER PASS A SELF-HOSTED LABEL.
+          a JSON array, or a JSON object ({"group":"linux-ci","labels":[...]})
+          matching the runner-fleet manifest's `runsOn` shape. Decoded with
+          fromJSON(), so the value must be valid JSON — a bare string needs
+          its own quotes. Empty (the default) routes a PRIVATE caller to the
+          fleet manifest's linux-ci organization-group route (group AND
+          labels) and a public or visibility-unknown caller to GitHub-hosted
+          ubuntu-latest; an explicit value always wins. A private caller
+          outside the manifest's linux-ci group must be added to it (or pass
+          '"ubuntu-latest"' explicitly), or its jobs queue with no eligible
+          runner. A PUBLIC (or possibly-future-public) CALLER MUST NEVER PASS
+          A SELF-HOSTED LABEL.
         required: false
         type: string
-        default: '"ubuntu-latest"'
+        default: ''
     secrets:
       AGENT_REVIEW_DISPATCH_TOKEN:
         description: >-
@@ -117,9 +125,11 @@ jobs:
     # documented `blacksmith-2vcpu-ubuntu-2404` label (override via
     # `vars.BLACKSMITH_LINUX_LABEL`) -- a label-only route, per D-BLACKSMITH-4:
     # provider-created runner groups are not a stable contract and are never
-    # pinned here. Any other value, and any caller still on the public
-    # `"ubuntu-latest"` default, keeps the caller's own `inputs.runner` route
-    # unchanged -- this never touches a public repo's runner. This is a
+    # pinned here. The route compared and used is the EFFECTIVE one: an
+    # explicit `inputs.runner`, else (empty default) the linux-ci group route
+    # for a private caller and `"ubuntu-latest"` for a public or
+    # visibility-unknown one. Any effective `"ubuntu-latest"` keeps that
+    # hosted route -- this never touches a public repo's runner. This is a
     # MANUAL switch, not automatic provider fallback: GitHub does not move an
     # already-queued job to another runs-on target, so the fallback is
     # flipping the variable back to false (or deleting the repo override) and
@@ -131,7 +141,7 @@ jobs:
     # expanded by D-CI-CAP-1 (c)): a job landing on Blacksmith here is
     # exercising that named exception, not drift.
     # ---------------------------------------------------------------------
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
     permissions:
