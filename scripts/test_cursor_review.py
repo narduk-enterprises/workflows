@@ -332,6 +332,14 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(2, len(result["findings"]))
         self.assertEqual("src/a.ts", result["findings"][0]["path"])
 
+    def test_parse_result_keeps_dotfile_paths_and_drops_only_a_dot_slash_prefix(self):
+        text = review_json(findings=[
+            {"severity": "nit", "path": "./.github/workflows/ci.yml", "line": 3, "title": "a", "body": "b"},
+            {"severity": "nit", "path": "/src/x.ts", "line": 1, "title": "a", "body": "b"},
+        ])
+        paths = [f["path"] for f in cr.parse_result(text)["findings"]]
+        self.assertEqual([".github/workflows/ci.yml", "src/x.ts"], paths)
+
     def test_parse_result_rejects_bad_vocabulary(self):
         for bad in (review_json(verdict="lgtm"), review_json(findings=[{"severity": "high", "title": "x"}]), review_json(summary=""), "```json\n[1]\n```"):
             with self.subTest(bad[:40]), self.assertRaises(cr.ReviewError):
