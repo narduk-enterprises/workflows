@@ -89,7 +89,8 @@ class FakeTransport:
 
     def cursor(self, method: str, path: str, payload: Any) -> tuple[int, Any]:
         if method == "POST" and path.endswith("/v1/agents"):
-            return 200, {"id": "bc-new", "url": "https://cursor.com/agents?id=bc-new", "status": "CREATING"}
+            # The real API (verified 2026-09-18) answers 201 with the agent WRAPPED.
+            return 201, {"agent": {"id": "bc-new", "url": "https://cursor.com/agents/bc-new", "status": "CREATING"}}
         if method == "GET" and path.endswith("/v1/agents/bc-old"):
             return 200, {"id": "bc-old", "status": "RUNNING", "latestRunId": "run-old"}
         if method == "POST" and path.endswith("/runs/run-old/cancel"):
@@ -291,6 +292,13 @@ class ReviewFlowTests(unittest.TestCase):
         transport = FakeTransport(run_statuses=["RUNNING"])
         with self.assertRaisesRegex(cr.ReviewError, "wait budget"):
             run(transport, WAIT_MINUTES="1")
+
+    def test_a_launch_response_without_an_agent_is_an_error_that_shows_the_shape(self):
+        transport = FakeTransport()
+        real = transport.cursor
+        transport.cursor = lambda m, p, b: (201, {"ok": True}) if m == "POST" and p.endswith("/v1/agents") else real(m, p, b)
+        with self.assertRaisesRegex(cr.ReviewError, r'no agent id \(response: \{"ok": true\}\)'):
+            run(transport)
 
     def test_an_answer_without_the_json_block_is_an_error(self):
         transport = FakeTransport(result="I approve this.")
