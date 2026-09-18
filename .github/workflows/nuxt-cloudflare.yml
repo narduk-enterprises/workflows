@@ -475,6 +475,24 @@ on:
         required: false
         type: string
         default: ""
+      e2e-full-paths:
+        description: >-
+          Space-separated glob patterns (same `*`/`**` syntax as
+          `e2e-skip-paths`). On a pull request event, when at least one
+          changed path matches, E2E runs the FULL configuration
+          (`e2e-args`, `e2e-shards`) instead of the pull-request tier
+          (`e2e-pr-args`, `e2e-pr-shards`). This way a PR that touches app
+          or test code proves the whole suite before merge, and a
+          docs/CI/config PR keeps the fast subset. Logan 2026-09-18: "lets do
+          the path scoped full run ... wall clock more important than
+          occasional red main". When the changed-file list cannot be
+          determined (no `gh`, a failed compare, the 300-file compare cap),
+          a caller that set this input gets the full suite. Empty (the
+          default) leaves the tiers exactly as they were. Pushes always run
+          the full configuration regardless.
+        required: false
+        type: string
+        default: ""
       preview-checks:
         description: >-
           Comma-separated checks to run against the pull request's Cloudflare
@@ -1860,6 +1878,9 @@ jobs:
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       skipped: ${{ steps.skip.outputs.skipped }}
+      # `true` when `e2e-full-paths` promoted this pull request to the full
+      # configuration; consumed only by the shard-list step below.
+      full: ${{ steps.skip.outputs.full }}
       # The EFFECTIVE shard count and e2e arguments for this event, resolved
       # exactly once here (workflows#83). `e2e`, `e2e-report` and `required`
       # all read these rather than re-deriving the pull-request/push split
@@ -1885,10 +1906,20 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           SKIP_PATTERNS: ${{ inputs.e2e-skip-paths }}
+          FULL_PATTERNS: ${{ inputs.e2e-full-paths }}
         run: |
           set -euo pipefail
-          if [ -z "$SKIP_PATTERNS" ]; then
+          # One changed-file read serves both path inputs. `full` answers
+          # "does this PR need the full configuration?" (e2e-full-paths). When
+          # the files cannot be determined it is `true` for a caller that
+          # opted in (they asked for full-on-risk), and `false` otherwise,
+          # which leaves the pre-existing tiers untouched.
+          FULL_PATTERNS="${FULL_PATTERNS:-}"
+          unknown_full=false
+          if [ -n "$FULL_PATTERNS" ]; then unknown_full=true; fi
+          if [ -z "$SKIP_PATTERNS" ] && [ -z "$FULL_PATTERNS" ]; then
             echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "full=false" >> "$GITHUB_OUTPUT"
             echo "e2e-skip-paths is empty: E2E always runs"
             exit 0
           fi
@@ -1896,12 +1927,14 @@ jobs:
             pull_request|pull_request_target) ;;
             *)
               echo "skipped=false" >> "$GITHUB_OUTPUT"
+              echo "full=false" >> "$GITHUB_OUTPUT"
               echo "event '$EVENT_NAME' is not a pull request: e2e-skip-paths never applies outside PR events"
               exit 0
               ;;
           esac
           if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
             echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "full=$unknown_full" >> "$GITHUB_OUTPUT"
             echo "no pull request base/head sha in context; running the full suite"
             exit 0
           fi
@@ -1912,6 +1945,7 @@ jobs:
           # suite", never to a hard failure of the whole E2E plan.
           if ! command -v gh >/dev/null 2>&1; then
             echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "full=$unknown_full" >> "$GITHUB_OUTPUT"
             echo "::warning::gh CLI not found on this runner; e2e-skip-paths cannot be evaluated, running the full suite"
             exit 0
           fi
@@ -1924,11 +1958,13 @@ jobs:
           if ! files=$(gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA" \
               --paginate --jq '.files[]?.filename'); then
             echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "full=$unknown_full" >> "$GITHUB_OUTPUT"
             echo "::warning::could not compare $BASE_SHA...$HEAD_SHA; running the full suite"
             exit 0
           fi
           if [ -z "$files" ]; then
             echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "full=$unknown_full" >> "$GITHUB_OUTPUT"
             echo "no changed files reported for $BASE_SHA...$HEAD_SHA; running the full suite"
             exit 0
           fi
@@ -1943,6 +1979,7 @@ jobs:
           file_count=$(printf '%s\n' "$files" | grep -c . || true)
           if [ "$file_count" -ge 300 ]; then
             echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "full=$unknown_full" >> "$GITHUB_OUTPUT"
             echo "::warning::changed-file list hit the compare API's 300-file cap (silently truncated); running the full suite"
             exit 0
           fi
@@ -1981,6 +2018,8 @@ jobs:
           unmatched=0
           total=0
           unmatched_list=""
+          full=false
+          full_list=""
           bq='`'
           while IFS= read -r file; do
             [ -z "$file" ] && continue
@@ -1997,15 +2036,27 @@ jobs:
               unmatched=$((unmatched + 1))
               unmatched_list="${unmatched_list}- ${bq}${file}${bq}\n"
             fi
+            for pattern in $FULL_PATTERNS; do
+              regex=$(glob_to_regex "$pattern")
+              if printf '%s' "$file" | grep -Eq -- "$regex"; then
+                full=true
+                full_list="${full_list}- ${bq}${file}${bq}\n"
+                break
+              fi
+            done
           done <<< "$files"
-          if [ "$unmatched" -eq 0 ]; then
+          # A full-path match vetoes the skip: those files need the whole suite.
+          if [ -n "$SKIP_PATTERNS" ] && [ "$unmatched" -eq 0 ] && [ "$full" = false ]; then
             skipped=true
             reason="every changed file matches e2e-skip-paths: skipping E2E"
+          elif [ "$full" = true ]; then
+            skipped=false
+            reason="a changed file matches e2e-full-paths: running the full E2E suite"
           else
             skipped=false
             reason="at least one changed file does not match e2e-skip-paths: running E2E"
           fi
-          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -n "$SKIP_PATTERNS" ]; then
             {
               printf '### E2E skip-path plan\n\n%s changed file(s), %s unmatched.\n\n' "$total" "$unmatched"
               if [ "$unmatched" -gt 0 ]; then
@@ -2014,8 +2065,23 @@ jobs:
               fi
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -n "$FULL_PATTERNS" ]; then
+            {
+              printf '### E2E full-path plan\n\n'
+              if [ "$full" = true ]; then
+                printf 'Full configuration: these changed files match e2e-full-paths:\n'
+                printf '%b' "$full_list"
+              else
+                printf 'Pull-request tier: no changed file matches e2e-full-paths.\n'
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
           echo "skipped=$skipped" >> "$GITHUB_OUTPUT"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
           echo "$reason"
+          if [ -n "$FULL_PATTERNS" ]; then
+            echo "e2e-full-paths matched: $full"
+          fi
         shell: bash
       - name: Compute shard list
         id: plan
@@ -2026,6 +2092,7 @@ jobs:
           PR_ARGS: ${{ inputs.e2e-pr-args }}
           EVENT_NAME: ${{ github.event_name }}
           SKIPPED: ${{ steps.skip.outputs.skipped }}
+          FULL: ${{ steps.skip.outputs.full }}
         run: |
           set -euo pipefail
           # `e2e-shards`/`e2e-args` are validated FIRST and unconditionally,
@@ -2065,8 +2132,12 @@ jobs:
           # merge. workflows#83.
           effective_total="$TOTAL"
           effective_args="$ARGS"
-          case "$EVENT_NAME" in
-            pull_request|pull_request_target)
+          FULL="${FULL:-}"
+          # `FULL=true` means e2e-full-paths matched a changed file: this PR
+          # keeps the full configuration like a push does.
+          case "$EVENT_NAME:$FULL" in
+            pull_request:true|pull_request_target:true) ;;
+            pull_request:*|pull_request_target:*)
               if [ "$PR_TOTAL" -ge 1 ]; then
                 effective_total="$PR_TOTAL"
               fi

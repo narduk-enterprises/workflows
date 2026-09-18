@@ -49,6 +49,11 @@ def check_input_declared() -> None:
     assert inp["type"] == "string"
     assert inp["default"] == ""
     print("PASS  e2e-skip-paths input declared, optional, default empty")
+    inp = trigger["workflow_call"]["inputs"]["e2e-full-paths"]
+    assert inp["required"] is False
+    assert inp["type"] == "string"
+    assert inp["default"] == ""
+    print("PASS  e2e-full-paths input declared, optional, default empty")
 
 
 def check_job_wiring() -> None:
@@ -57,6 +62,9 @@ def check_job_wiring() -> None:
 
     plan = jobs["e2e-plan"]
     assert plan["outputs"]["skipped"] == "${{ steps.skip.outputs.skipped }}"
+    assert plan["outputs"]["full"] == "${{ steps.skip.outputs.full }}"
+    plan_step = named_step(plan, "Compute shard list")
+    assert plan_step["env"]["FULL"] == "${{ steps.skip.outputs.full }}", plan_step["env"]
     # workflows#59: this job must never request a permission its callers do
     # not grant. `pull-requests: read` here fails EVERY caller's run at
     # startup with zero jobs and no annotation.
@@ -125,6 +133,7 @@ def run_skip_step(
     head_sha: str,
     skip_patterns: str,
     files: list[str],
+    full_patterns: str = "",
 ) -> tuple[subprocess.CompletedProcess, str]:
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
@@ -143,6 +152,7 @@ def run_skip_step(
         env["BASE_SHA"] = base_sha
         env["HEAD_SHA"] = head_sha
         env["SKIP_PATTERNS"] = skip_patterns
+        env["FULL_PATTERNS"] = full_patterns
         env["GITHUB_OUTPUT"] = str(output_path)
         env["GITHUB_STEP_SUMMARY"] = str(summary_path)
         result = subprocess.run(
@@ -236,6 +246,7 @@ def check_behavior() -> None:
         ),
     ]
     cases += _compare_cap_cases()
+    cases += _full_paths_cases()
     failures = _run_cases(cases)
     failures += _check_missing_gh_degrades_safely()
     failures += _check_failing_gh_degrades_safely()
@@ -279,11 +290,71 @@ def _compare_cap_cases() -> list:
     ]
 
 
+def _full_paths_cases() -> list:
+    """`e2e-full-paths`: a pull request touching any listed glob runs the
+    full suite (`full=true`) instead of the pull-request tier. When the
+    changed files cannot be determined, an opted-in caller gets the full
+    suite; a caller that did not opt in keeps today's behavior."""
+    base, head = "a" * 40, "b" * 40
+    pr = dict(event_name="pull_request", base_sha=base, head_sha=head)
+    return [
+        (
+            "full-paths match on a PR -> full=true",
+            dict(pr, skip_patterns="", full_patterns="server/database/** drizzle/**",
+                 files=["app/pages/index.vue", "server/database/schema.ts"]),
+            {"skipped": "false", "full": "true"},
+        ),
+        (
+            "full-paths no match on a PR -> full=false (pull-request tier)",
+            dict(pr, skip_patterns="", full_patterns="server/database/**",
+                 files=["app/pages/index.vue"]),
+            {"skipped": "false", "full": "false"},
+        ),
+        (
+            "full-paths and skip-paths together: docs-only PR still skips",
+            dict(pr, skip_patterns="**/*.md", full_patterns="server/database/**",
+                 files=["README.md"]),
+            {"skipped": "true", "full": "false"},
+        ),
+        (
+            "full-paths match beats skip-paths: no skip, full=true",
+            dict(pr, skip_patterns="**/*.md server/**", full_patterns="server/database/**",
+                 files=["server/database/schema.ts"]),
+            {"skipped": "false", "full": "true"},
+        ),
+        (
+            "full-paths opted in, changed files unknown (empty list) -> full=true",
+            dict(pr, skip_patterns="", full_patterns="server/database/**", files=[]),
+            {"skipped": "false", "full": "true"},
+        ),
+        (
+            "full-paths opted in, missing head sha -> full=true",
+            dict(event_name="pull_request", base_sha=base, head_sha="",
+                 skip_patterns="", full_patterns="server/database/**", files=["x"]),
+            {"skipped": "false", "full": "true"},
+        ),
+        (
+            "full-paths on a push -> unaffected, full=false",
+            dict(event_name="push", base_sha=base, head_sha=head, skip_patterns="",
+                 full_patterns="server/database/**", files=["server/database/schema.ts"]),
+            {"skipped": "false", "full": "false"},
+        ),
+    ]
+
+
+def parse_outputs(text: str) -> dict:
+    """The step writes one `key=value` line per output (`skipped`, `full`)."""
+    return dict(line.split("=", 1) for line in text.strip().splitlines() if "=" in line)
+
+
 def _run_cases(cases: list) -> int:
+    """`expected` is the `skipped` value alone (then `full` must be "false"),
+    or a dict of every output the case asserts."""
     failures = 0
     for label, kwargs, expected in cases:
         result, output = run_skip_step(**kwargs)
-        ok = result.returncode == 0 and output.strip() == f"skipped={expected}"
+        want = expected if isinstance(expected, dict) else {"skipped": expected, "full": "false"}
+        ok = result.returncode == 0 and parse_outputs(output) == want
         if not ok:
             failures += 1
             print(
@@ -328,7 +399,7 @@ def _check_missing_gh_degrades_safely() -> int:
             env=env,
         )
         output = output_path.read_text().strip()
-        ok = result.returncode == 0 and output == "skipped=false"
+        ok = result.returncode == 0 and parse_outputs(output) == {"skipped": "false", "full": "false"}
         label = "gh CLI absent -> degrades to running the full suite, never fails"
         if ok:
             print(f"PASS  {label}")
@@ -366,7 +437,7 @@ def _check_failing_gh_degrades_safely() -> int:
         )
         output = output_path.read_text().strip()
         label = "compare API failure -> degrades to running the full suite, never fails"
-        if result.returncode == 0 and output == "skipped=false":
+        if result.returncode == 0 and parse_outputs(output) == {"skipped": "false", "full": "false"}:
             print(f"PASS  {label}")
             return 0
         print(f"FAIL  {label}: rc={result.returncode} output={output!r} stderr={result.stderr!r}")

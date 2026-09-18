@@ -143,6 +143,7 @@ def run_plan(
     args: str,
     pr_args: str,
     skipped: str = "false",
+    full: str = "",
 ) -> tuple[subprocess.CompletedProcess, dict[str, str]]:
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
@@ -159,6 +160,7 @@ def run_plan(
                 "ARGS": args,
                 "PR_ARGS": pr_args,
                 "SKIPPED": skipped,
+                "FULL": full,
                 "GITHUB_OUTPUT": str(output_path),
                 "GITHUB_STEP_SUMMARY": str(summary_path),
             }
@@ -230,6 +232,30 @@ def check_behaviour() -> None:
             args="--workers=1",
             pr_args="--project=smoke",
             expect={"shard-total": "3", "e2e-args": "--workers=1", "shards": "[1,2,3]"},
+        )
+
+    # -- 3b. e2e-full-paths: a PR whose files matched (FULL=true) runs the
+    #        full e2e-args/e2e-shards; FULL=false keeps the PR tier. --
+    for event in PR_EVENTS:
+        case(
+            f"{event}: FULL=true -> override ignored, full suite",
+            event_name=event,
+            total="3",
+            pr_total="1",
+            args="--workers=1",
+            pr_args="--project=smoke",
+            full="true",
+            expect={"shard-total": "3", "e2e-args": "--workers=1", "shards": "[1,2,3]"},
+        )
+        case(
+            f"{event}: FULL=false -> pull-request tier",
+            event_name=event,
+            total="3",
+            pr_total="1",
+            args="--workers=1",
+            pr_args="--project=smoke",
+            full="false",
+            expect={"shard-total": "1", "e2e-args": "--project=smoke", "shards": "[1]"},
         )
 
     # -- 4. An unrecognised event falls through to the FULL configuration.
