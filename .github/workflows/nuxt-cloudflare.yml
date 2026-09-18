@@ -641,7 +641,7 @@ on:
           to its own action SHAs.
         required: false
         type: string
-        default: "0.2.0"
+        default: "0.10.0"
       foundation-check-auth:
         description: >-
           Type of the credential used for foundation checks. package-token is
@@ -1282,7 +1282,23 @@ jobs:
           # A failed credential resolve still leaves an artifact for the
           # always-upload/evaluate steps. Never reuse a prior run's output.
           : > foundation-check.json
-          if ! GH_PACKAGES_READ=$(node --input-type=module <<'NODE'
+          # workflows#109: a caller whose committed project .npmrc routes the
+          # @narduk-enterprises scope to the anonymous npm.nard.uk mirror
+          # (company-hq D-PKG-6; the same last-route rule as "Configure
+          # package registry auth", workflows#106) needs no credential here
+          # either. narduk-app-tools >= 0.10.0 (narduk-libs#499) follows that
+          # .npmrc scope route for its live registry lookup, so the check runs
+          # with no token at all, whether or not the caller forwards one.
+          mirrored=$(node -e '
+            const fs=require("fs")
+            const npmrc=fs.existsSync(".npmrc")?fs.readFileSync(".npmrc","utf8"):""
+            const routes=[...npmrc.matchAll(/^[ \t]*@narduk-enterprises:registry[ \t]*=[ \t]*"?([^"\s]*)"?[ \t]*$/gm)].map(m=>m[1])
+            process.stdout.write(routes.length>0&&/^https:\/\/npm\.nard\.uk\/?$/.test(routes.at(-1))?"yes":"no")
+          ' 2>/dev/null || echo no)
+          if [ "$mirrored" = "yes" ]; then
+            echo "@narduk-enterprises routes to https://npm.nard.uk; running foundation:check with no package-read credential"
+            unset NARDUK_PLATFORM_GH_PACKAGES_READ GH_PACKAGES_READ NODE_AUTH_TOKEN
+          elif ! GH_PACKAGES_READ=$(node --input-type=module <<'NODE'
           const secret = process.env.NARDUK_PLATFORM_GH_PACKAGES_READ;
           const valid = value => typeof value === 'string' && value.length > 0 && value === value.trim() && !/[\0\r\n]/.test(value);
           try {
@@ -1313,24 +1329,25 @@ jobs:
           ); then
             echo "::error::foundation-check registry authentication is unavailable"
             exit 0
+          else
+            echo "::add-mask::$GH_PACKAGES_READ"
+            export GH_PACKAGES_READ
+            # workflows#85: #79 renamed this step's exported credential from
+            # NODE_AUTH_TOKEN to GH_PACKAGES_READ, but narduk-app-tools's own
+            # item-2.3 live registry lookup (both the installed-binary branch
+            # below, which writes no npmrc at all, and the pinned-dlx branch)
+            # reads NODE_AUTH_TOKEN directly rather than going through either
+            # npmrc's ${GH_PACKAGES_READ} templating. That silently broke
+            # package-token-mode foundation-check for every v1 adopter refreshing
+            # past afbaa6051e (buoys#39 reproduced it deterministically). This
+            # repo's own README (`nuxt-cloudflare.yml` catalog entry) never
+            # stopped documenting "supplies NODE_AUTH_TOKEN to both the
+            # installed checker and the optional pinned download" -- #79 changed
+            # the code without updating that contract. Export both names, same
+            # value, until narduk-app-tools reads GH_PACKAGES_READ instead.
+            export NODE_AUTH_TOKEN="$GH_PACKAGES_READ"
+            unset NARDUK_PLATFORM_GH_PACKAGES_READ
           fi
-          echo "::add-mask::$GH_PACKAGES_READ"
-          export GH_PACKAGES_READ
-          # workflows#85: #79 renamed this step's exported credential from
-          # NODE_AUTH_TOKEN to GH_PACKAGES_READ, but narduk-app-tools's own
-          # item-2.3 live registry lookup (both the installed-binary branch
-          # below, which writes no npmrc at all, and the pinned-dlx branch)
-          # reads NODE_AUTH_TOKEN directly rather than going through either
-          # npmrc's ${GH_PACKAGES_READ} templating. That silently broke
-          # package-token-mode foundation-check for every v1 adopter refreshing
-          # past afbaa6051e (buoys#39 reproduced it deterministically). This
-          # repo's own README (`nuxt-cloudflare.yml` catalog entry) never
-          # stopped documenting "supplies NODE_AUTH_TOKEN to both the
-          # installed checker and the optional pinned download" -- #79 changed
-          # the code without updating that contract. Export both names, same
-          # value, until narduk-app-tools reads GH_PACKAGES_READ instead.
-          export NODE_AUTH_TOKEN="$GH_PACKAGES_READ"
-          unset NARDUK_PLATFORM_GH_PACKAGES_READ
           has_dep=$(node -e '
             let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
               let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}
@@ -1349,10 +1366,14 @@ jobs:
             echo "@narduk-enterprises/narduk-app-tools is not a dependency; running the pinned $TOOL_VERSION release via dlx"
             npmrc_file="$(mktemp)"
             trap 'rm -f "$npmrc_file"' EXIT
-            {
-              echo "@narduk-enterprises:registry=https://npm.pkg.github.com"
-              echo "//npm.pkg.github.com/:_authToken=\${GH_PACKAGES_READ}"
-            } > "$npmrc_file"
+            if [ "$mirrored" = "yes" ]; then
+              echo "@narduk-enterprises:registry=https://npm.nard.uk" > "$npmrc_file"
+            else
+              {
+                echo "@narduk-enterprises:registry=https://npm.pkg.github.com"
+                echo "//npm.pkg.github.com/:_authToken=\${GH_PACKAGES_READ}"
+              } > "$npmrc_file"
+            fi
             if [ "$PM" = "pnpm" ]; then
               NPM_CONFIG_USERCONFIG="$npmrc_file" NPM_CONFIG_GLOBALCONFIG=/dev/null \
                 pnpm dlx --package "@narduk-enterprises/narduk-app-tools@${TOOL_VERSION}" \

@@ -738,8 +738,13 @@ project `.npmrc` routes `@narduk-enterprises` to the anonymous
 `https://npm.nard.uk` mirror (company-hq `D-PKG-6`) counts as public for that
 scope and can drop the secret, unless it also depends on `@narduk-geo` (not
 mirrored) or its lockfile still names `npm.pkg.github.com` (workflows#106).
-The web-foundation check (`foundation-check: true`) still reads the secret on
-its own path, so a caller running it keeps forwarding it for now.
+The web-foundation check (`foundation-check: true`) follows the same route
+(workflows#109): a mirror-routed caller runs it with no credential at all,
+and the pinned dlx download fetches from `https://npm.nard.uk`. That needs
+narduk-app-tools 0.10.0 or later (the `foundation-check-tool-version` default),
+because older releases hard-code GitHub Packages for their live registry
+lookup. A caller that has adopted the tool as a dependency must depend on
+0.10.0 or later too.
 Without a caller bootstrap,
 the callable writes a temporary user config containing a literal variable
 reference, then removes it after the install.
@@ -1740,7 +1745,9 @@ executed here.
   The callable resolves the existing package-read grant for that legacy one
   step and supplies `NODE_AUTH_TOKEN` to both the installed checker and the
   optional pinned download. The checker needs this credential for its live N-1
-  registry lookup even when dependencies are already installed. Neither the
+  registry lookup even when dependencies are already installed, unless the
+  caller's project `.npmrc` routes `@narduk-enterprises` to `npm.nard.uk`
+  (workflows#109): then no credential is resolved or exported. Neither the
   service token nor the resolved package token is exported to later steps;
   temporary npm configuration contains only an environment-variable reference.
   Missing or rejected credentials leave a blocking UNKNOWN artifact rather

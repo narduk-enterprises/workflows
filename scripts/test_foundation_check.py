@@ -118,15 +118,18 @@ globalThis.fetch = async (url, options) => {
 
 def run_check_step(
     *, has_dep: bool, pm: str, auth_source: str = "package-token",
-    resolve: str = "ok", credential: str | None = None,
+    resolve: str = "ok", credential: str | None = None, npmrc: str | None = None,
+    expected_token: str | None = None, captured: list[str] | None = None,
 ) -> tuple[int, str, str | None, str]:
     """Execute the "Run..." step; returns (rc, stdout+stderr, produced JSON, stub log)."""
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = pathlib.Path(tmp)
         pkg: dict[str, object] = {"name": "f"}
         if has_dep:
-            pkg["dependencies"] = {"@narduk-enterprises/narduk-app-tools": "0.2.0"}
+            pkg["dependencies"] = {"@narduk-enterprises/narduk-app-tools": "0.10.0"}
         (tmp_path / "package.json").write_text(json.dumps(pkg))
+        if npmrc is not None:
+            (tmp_path / ".npmrc").write_text(npmrc)
 
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
@@ -152,12 +155,12 @@ def run_check_step(
             **os.environ,
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "PM": pm,
-            "TOOL_VERSION": "0.2.0",
+            "TOOL_VERSION": "0.10.0",
             "AUTH_SOURCE": auth_source,
             "NARDUK_PLATFORM_GH_PACKAGES_READ": credential if credential is not None else (
                 "test-service-token" if auth_source == "nvault" else "test-secret-token"
             ),
-            "EXPECTED_PACKAGE_TOKEN": (
+            "EXPECTED_PACKAGE_TOKEN": expected_token if expected_token is not None else (
                 "resolved-test-package-token" if auth_source == "nvault" else "test-secret-token"
             ),
             "STUB_RESOLVE": resolve,
@@ -172,6 +175,8 @@ def run_check_step(
         out_file = tmp_path / "foundation-check.json"
         if out_file.exists():
             produced = out_file.read_text()
+        if captured is not None and captured_npmrc.exists():
+            captured.append(captured_npmrc.read_text())
         leftover = list(mktemp_dir.iterdir())
         return p.returncode, p.stdout + p.stderr, produced, str(leftover)
 
@@ -204,8 +209,8 @@ def main() -> int:
     failures += 0 if check("foundation-check input defaults to false (opt-in)", ok) else 1
 
     total += 1
-    ok = input_default("foundation-check-tool-version") == "0.2.0"
-    failures += 0 if check("foundation-check-tool-version pins 0.2.0", ok) else 1
+    ok = input_default("foundation-check-tool-version") == "0.10.0"
+    failures += 0 if check("foundation-check-tool-version pins 0.10.0", ok) else 1
 
     total += 1
     ok = input_default("foundation-check-auth") == "package-token"
@@ -250,7 +255,7 @@ def main() -> int:
             **os.environ,
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "PM": "pnpm",
-            "TOOL_VERSION": "0.2.0",
+            "TOOL_VERSION": "0.10.0",
             "AUTH_SOURCE": "package-token",
             "NARDUK_PLATFORM_GH_PACKAGES_READ": "test-secret-token",
             "EXPECTED_PACKAGE_TOKEN": "test-secret-token",
@@ -279,6 +284,53 @@ def main() -> int:
                 f"[{pm}] nvault dependency={has_dep}: resolves once, isolates credential, supports registry lookup",
                 ok, f"rc={rc} produced={produced!r} leftover={leftover}\n{out}",
             ) else 1
+
+    # --- workflows#109: npm.nard.uk mirror callers need no credential ---
+
+    mirror_rc = "@narduk-enterprises:registry=https://npm.nard.uk\n"
+    for pm in ("pnpm", "npm"):
+        for has_dep in (True, False):
+            for credential, what in (("", "no secret"), ("test-secret-token", "secret forwarded")):
+                total += 1
+                captured: list[str] = []
+                rc, out, produced, leftover = run_check_step(
+                    has_dep=has_dep, pm=pm, npmrc=mirror_rc, credential=credential,
+                    expected_token="", captured=captured,
+                )
+                npmrc_ok = has_dep or captured == ["@narduk-enterprises:registry=https://npm.nard.uk\n"]
+                ok = (
+                    rc == 0 and produced == FIXTURE_ARTEFACT and leftover == "[]" and npmrc_ok
+                    and "::error::" not in out and "test-secret-token" not in out
+                )
+                failures += 0 if check(
+                    f"[{pm}] mirror dependency={has_dep}, {what}: runs with no token, dlx routes to npm.nard.uk",
+                    ok, f"rc={rc} produced={produced!r} captured={captured!r}\n{out}",
+                ) else 1
+
+    total += 1
+    # Last route wins, as in "Configure package registry auth" (#106): an
+    # .npmrc pointed back at GitHub Packages after the mirror line is the
+    # break-glass path and must use the credential again.
+    captured = []
+    rc, out, produced, leftover = run_check_step(
+        has_dep=False, pm="pnpm", captured=captured,
+        npmrc=mirror_rc + "@narduk-enterprises:registry=https://npm.pkg.github.com\n",
+    )
+    ok = rc == 0 and produced == FIXTURE_ARTEFACT and any("npm.pkg.github.com" in c for c in captured)
+    failures += 0 if check(
+        "break-glass: a later GitHub Packages route restores the credential path",
+        ok, f"rc={rc} produced={produced!r} captured={captured!r}\n{out}",
+    ) else 1
+
+    total += 1
+    rc, out, produced, leftover = run_check_step(
+        has_dep=True, pm="pnpm", credential="", npmrc="@narduk-enterprises:registry=https://npm.pkg.github.com\n",
+    )
+    ok = rc == 0 and produced == "" and "registry authentication is unavailable" in out
+    failures += 0 if check(
+        "a GitHub-Packages-routed caller with no secret still reports missing auth",
+        ok, f"rc={rc} produced={produced!r}\n{out}",
+    ) else 1
 
     for label, kwargs in (
         ("nVault denial", {"auth_source": "nvault", "resolve": "denied"}),
@@ -312,7 +364,7 @@ def main() -> int:
             **os.environ,
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "PM": "pnpm",
-            "TOOL_VERSION": "0.2.0",
+            "TOOL_VERSION": "0.10.0",
             "AUTH_SOURCE": "package-token",
             "NARDUK_PLATFORM_GH_PACKAGES_READ": "test-secret-token",
         }
