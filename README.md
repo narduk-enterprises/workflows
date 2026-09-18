@@ -1234,6 +1234,35 @@ stops running, the default-branch push still runs — but it runs it *after* the
 merge. Choose the subset so a failure it cannot catch is one you are willing
 to find on `main`.
 
+#### The full suite for risky paths (`e2e-full-paths`)
+
+`e2e-full-paths` is the escape hatch from the pull-request subset: a
+space-separated list of globs (the same syntax as `e2e-skip-paths`). When any
+file a pull request changes matches one, that pull request runs the full
+`e2e-shards`/`e2e-args` instead of `e2e-pr-shards`/`e2e-pr-args`.
+
+```yaml
+    with:
+      e2e-pr-shards: 1
+      e2e-pr-args: "--project=smoke"
+      e2e-full-paths: "server/database/** drizzle/** playwright.config.ts"
+```
+
+The use is a fast pull-request smoke by default, with the whole suite reserved
+for the paths whose breakage the smoke tier cannot see — schema, auth,
+routing, the Playwright config itself. The rules:
+
+- **Unset is today's behaviour.** An empty `e2e-full-paths` (the default)
+  never forces the full suite.
+- **It beats `e2e-skip-paths`.** A file matching both lists runs the full
+  suite; it is never skipped.
+- **Unknown means full, for an opted-in caller.** When the changed files
+  cannot be listed (no base/head SHA, no `gh`, a compare API error, an empty
+  list, or the 300-file compare cap), a caller that set `e2e-full-paths` gets
+  the full suite. A caller that did not keeps its pull-request tier.
+- **Pull-request events only.** A push always runs the full suite anyway.
+- The `E2E plan` job summary lists which changed files forced the full run.
+
 #### Preview checks (`preview-checks`, `preview-url-source`)
 
 | Input | Type | Default | Purpose |
@@ -1632,6 +1661,8 @@ executed here.
   before. No job, check name, or `Required` expectation changed — the effective
   shard count simply moved from `inputs.e2e-shards` to an `E2E plan` output
   that equals it whenever no override is supplied.
+  `e2e-full-paths` is within-major on the same rule: optional, default `""`,
+  and with it unset every event plans exactly as before.
 - `reusable-browser-tests.yml` is a new callable, so its required route,
   artifact, and exact-version inputs do not break an existing caller.
   `python-data.yml`'s `run-pyright`, exact `pyright-version`, and
