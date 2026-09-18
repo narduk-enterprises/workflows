@@ -155,11 +155,20 @@ def run_skip_step(
         env["FULL_PATTERNS"] = full_patterns
         env["GITHUB_OUTPUT"] = str(output_path)
         env["GITHUB_STEP_SUMMARY"] = str(summary_path)
+        # The step runs inside the CALLER'S checkout. Seed decoy files that the
+        # test patterns would pathname-expand to if the shell were allowed to
+        # glob them (`**/*.md` -> `docs/decoy.md`, `design/**` -> `design/x`):
+        # a matcher that only works in an empty directory is not a matcher.
+        workspace = root / "workspace"
+        for decoy in ("docs/decoy.md", "design/x/decoy.png", "server/database/decoy.ts", "README.md"):
+            (workspace / decoy).parent.mkdir(parents=True, exist_ok=True)
+            (workspace / decoy).write_text("")
         result = subprocess.run(
             ["bash", "-c", skip_step_script()],
             capture_output=True,
             text=True,
             env=env,
+            cwd=workspace,
         )
         return result, output_path.read_text()
 

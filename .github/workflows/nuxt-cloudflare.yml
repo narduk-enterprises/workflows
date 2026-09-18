@@ -1944,6 +1944,12 @@ jobs:
           FULL_PATTERNS: ${{ inputs.e2e-full-paths }}
         run: |
           set -euo pipefail
+          # `set -f`: the pattern lists below are split with unquoted `$SKIP_PATTERNS`
+          # / `$FULL_PATTERNS`, and without this the shell pathname-expands each
+          # glob against the CALLER'S CHECKOUT before the matcher ever sees it.
+          # `**/*.md` in a workspace holding `docs/readme.md` silently became that
+          # one file, and a docs-only PR stopped skipping (workflows#118).
+          set -f
           # One changed-file read serves both path inputs. `full` answers
           # "does this PR need the full configuration?" (e2e-full-paths). When
           # the files cannot be determined it is `true` for a caller that
