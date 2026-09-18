@@ -12,7 +12,9 @@ Shared reusable GitHub Actions workflows for the narduk-enterprises estate (CI-5
 > one optional secret (`NARDUK_PLATFORM_GH_PACKAGES_READ`) that falls back to
 > the ephemeral `github.token` when a caller passes nothing.
 >
-> **Callers must pin `@v1` or a full commit SHA — never `@main` — and a
+> **Callers must pin `@v2` (new work; `@v1` is frozen, see
+> [v1 is frozen; adopt v2 when touched](#v1-is-frozen-adopt-v2-when-touched))
+> or a full commit SHA — never `@main` — and a
 > public (or possibly-future-public) caller must never pass a self-hosted
 > runner label.** That warning is still correct, but it rests on the *caller*,
 > not on this repo: `runner` is a free-form caller-supplied value, a repo can
@@ -348,7 +350,7 @@ concurrency:
 
 jobs:
   ci: # <-- must be named `ci`; GitHub composes "ci / Required" from this + the reusable workflow's job name
-    uses: narduk-enterprises/workflows/.github/workflows/<workflow>.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/<workflow>.yml@v2
     with:
       # ...per-workflow inputs, see below
     secrets:
@@ -420,7 +422,7 @@ jobs:
 
   ci: # still named `ci`; still composes `ci / Required`
     needs: changes
-    uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v2
     with:
       run-e2e: ${{ needs.changes.outputs.code == 'true' }}
       wrangler-dry-run: ${{ needs.changes.outputs.code == 'true' }}
@@ -475,7 +477,7 @@ back to the ephemeral `github.token`.
 ```yaml
 jobs:
   ci:
-    uses: narduk-enterprises/workflows/.github/workflows/apple.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/apple.yml@v2
     with:
       # Repo-scoped Mac from Config/github-runner-fleet.json `appleRepositories`.
       # REQUIRED — there is no default, on purpose.
@@ -533,7 +535,7 @@ release credentials behind a PR-triggered gate. That stays the
 ```yaml
 jobs:
   ci:
-    uses: narduk-enterprises/workflows/.github/workflows/python-data.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/python-data.yml@v2
     with:
       runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
       working-directory: services/my-pipeline
@@ -671,7 +673,7 @@ setup cost and capacity, and retain the caller's final integration aggregate.
 ```yaml
 jobs:
   ci:
-    uses: narduk-enterprises/workflows/.github/workflows/node-library.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/node-library.yml@v2
     with:
       node-version: "22"
       package-manager: pnpm
@@ -700,7 +702,7 @@ With a per-package matrix (generalizes narduk-libs' `package-gates`):
 ```yaml
 jobs:
   ci:
-    uses: narduk-enterprises/workflows/.github/workflows/node-library.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/node-library.yml@v2
     with:
       package-matrix: |
         [
@@ -747,7 +749,7 @@ can opt out of that automatic name-based detection without forwarding a token:
 ```yaml
 jobs:
   ci:
-    uses: narduk-enterprises/workflows/.github/workflows/node-library.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/node-library.yml@v2
     with:
       runner: '"ubuntu-latest"'
       required-runner: '"ubuntu-latest"'
@@ -763,7 +765,7 @@ existing package-read-secret contract for private callers.
 ```yaml
 jobs:
   ci:
-    uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v2
     # A called workflow's jobs may only request permissions the caller granted;
     # asking for one it did not kills the whole run at startup (workflows#59).
     # `pull-requests: write` is required by the `preview` lane's sticky comment
@@ -1045,7 +1047,7 @@ browser callable consumes it without rebuilding:
 ```yaml
 jobs:
   ci:
-    uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v2
     with:
       runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
       working-directory: apps/web
@@ -1054,7 +1056,7 @@ jobs:
 
   browser:
     needs: ci
-    uses: narduk-enterprises/workflows/.github/workflows/reusable-browser-tests.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/reusable-browser-tests.yml@v2
     with:
       linux-runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
       browser-runner: '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}'
@@ -1318,7 +1320,7 @@ hide a flake. Empty (the default) adds no job.
 > ```yaml
 > jobs:
 >   ci:
->     uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v1
+>     uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@v2
 >     permissions:
 >       contents: read
 >       packages: read
@@ -1481,7 +1483,7 @@ concurrency:
 
 jobs:
   ci:
-    uses: narduk-enterprises/workflows/.github/workflows/docs-governance.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/docs-governance.yml@v2
     with:
       command: python3 scripts/check-handbook-spine.py
       fetch-depth: 1
@@ -1511,7 +1513,7 @@ were not runtime callers.
 ```yaml
 jobs:
   ci:
-    uses: narduk-enterprises/workflows/.github/workflows/reusable-node-ci.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/reusable-node-ci.yml@v2
     with:
       node-version: "22"
       run-lint: true
@@ -1560,7 +1562,7 @@ a `::notice::` naming which one fired:
 
 ```yaml
   code-review:
-    uses: narduk-enterprises/workflows/.github/workflows/code-review.yml@v1
+    uses: narduk-enterprises/workflows/.github/workflows/code-review.yml@v2
     with:
       enabled: true
       review-tier: cheapest-capable
@@ -1645,6 +1647,7 @@ executed here.
   backward-compatible additions to the same major, so `v1` moves again rather
   than a `v2` being cut. An adopter merged before the tag moves must pin the
   exact commit SHA and switch to `@v1` once the tag covers it.
+- **`v1` is frozen; adopt `v2` when touched.** See the section below.
 - **A fan-out canary precedes an advance**: before moving the tag, trigger or
   find at least one adopter run on the new commit and confirm it resolves and
   succeeds, per Logan, 2026-09-04: "Fan-out canary before the tag advances
@@ -1743,6 +1746,38 @@ executed here.
   undeclared) reproduces every existing adopter's behavior byte-for-byte.
   `v1` moves again rather than a `v2` being cut, behind the usual fan-out
   canary.
+
+### v1 is frozen; adopt v2 when touched
+
+Logan, 2026-09-18 (askme, 13:41 CT): "Moving v2 tag; repos move when touched
+(Recommended)".
+
+- **`v1` stays at f8e3cc6 and does not move again.** Everything after it is
+  on the `v2` line. `v2.0.0` (a29cd16, the pull-request preview gate) is a
+  breaking change for `nuxt-cloudflare.yml`: its `preview` job requests
+  `pull-requests: write`, and a caller that does not grant it hits
+  `startup_failure` on its **whole** run (workflows#59). Moving `v1` over it
+  would have broken every `@v1` nuxt-cloudflare caller at once. On
+  2026-09-18 none of the seven (hydrogen, marketing-web, my-farm,
+  narduk-nvr, package-delivery, software-delivery, vtraceroute) granted it.
+- **`v2` is the moving major tag**, advanced by hand behind the fan-out
+  canary, the same way `v1` was.
+- **A repo moves to `@v2` in the next PR that works on it**, not in a sweep.
+  Make these changes in that same PR:
+  1. every `uses: …/<workflow>.yml@v1` becomes `@v2`;
+  2. a `nuxt-cloudflare.yml` caller adds `pull-requests: write` to its `ci:`
+     job's `permissions:`, and passes `preview-checks: none` if the repo has
+     no Workers Builds preview (see [the preview gate](#nuxt-cloudflareyml));
+  3. a **private** caller that passes no `runner` now lands on the
+     `linux-ci` organization group ([Default route](#default-route-empty-runner)).
+     Confirm the repo is in that group. If it is not, it queues forever
+     rather than failing. Otherwise pass `runner:` explicitly (for example
+     `'"ubuntu-latest"'` for a named CI-RUNNER-POLICY §2 hosted exception);
+  4. `nuxt-cloudflare.yml`'s `dependency-audit` defaults to `true` on `v2`
+     and fails on fixable high/critical advisories. Fix them, or pass
+     `dependency-audit: false` with its written reason.
+
+  The PR's own CI run on `@v2` is the proof it moved cleanly.
 
 ## Maintainer conventions
 
