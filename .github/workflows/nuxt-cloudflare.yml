@@ -493,6 +493,20 @@ on:
         required: false
         type: string
         default: ""
+      e2e-quarantine-args:
+        description: >-
+          Arguments that select the caller's quarantined tests (for example
+          `--project=quarantine --retries=0`). When set, a separate,
+          NON-BLOCKING `E2E (quarantine)` job runs `e2e-script` with exactly
+          these arguments on every event E2E runs on. The job's
+          prebuilt artifact, runner and setup are the same as E2E's. It is
+          `continue-on-error` and `Required` never lists it, so a quarantined
+          test can fail or flake without affecting the gate. Its history is
+          the evidence a test needs to leave quarantine. Unsharded. Empty
+          (the default) adds no job.
+        required: false
+        type: string
+        default: ""
       preview-checks:
         description: >-
           Comma-separated checks to run against the pull request's Cloudflare
@@ -2191,7 +2205,11 @@ jobs:
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
-    steps:
+    # Anchored: `e2e-quarantine` below runs these exact steps as its one
+    # `quarantine` leg, so the non-blocking lane can never drift from the
+    # gate's setup. Steps branch on `matrix.shard == 'quarantine'` only for
+    # the arguments, the artifact name and the summary line.
+    steps: &e2e_steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -2650,6 +2668,7 @@ jobs:
           # while the gate reports success (workflows#83).
           TOTAL: ${{ needs.e2e-plan.outputs.shard-total }}
           EXTRA_ARGS: ${{ needs.e2e-plan.outputs.e2e-args }}
+          QUARANTINE_ARGS: ${{ inputs.e2e-quarantine-args }}
           E2E_PREBUILT_ARTIFACT: ${{ needs.build.outputs.e2e-build-path != '' && '1' || '' }}
           E2E_BUILD_ARTIFACT_PATH: ${{ needs.build.outputs.e2e-build-path }}
         run: |
@@ -2670,6 +2689,12 @@ jobs:
             echo "- :x: $msg" >> "$GITHUB_STEP_SUMMARY"
             echo "::error::$msg"
             exit 1
+          fi
+          # The quarantine leg (`e2e-quarantine`) runs only the caller's
+          # quarantine selection, unsharded, and never the gate's arguments.
+          if [ "$SHARD" = quarantine ]; then
+            TOTAL=1
+            EXTRA_ARGS="$QUARANTINE_ARGS"
           fi
           ARGS=()
           # A single lane runs the suite exactly as before — no --shard, no
@@ -2717,14 +2742,60 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           # Per-shard name: upload-artifact v4+ rejects a duplicate artifact
-          # name, so a fixed name would fail the moment a caller shards.
-          name: playwright-evidence-${{ matrix.shard }}
+          # name, so a fixed name would fail the moment a caller shards. The
+          # quarantine leg's name must NOT match `E2E report`'s
+          # `playwright-evidence-*` pattern, or its results would be merged
+          # into the gate's report.
+          name: ${{ matrix.shard == 'quarantine' && 'playwright-quarantine' || format('playwright-evidence-{0}', matrix.shard) }}
           path: |
             ${{ inputs.working-directory }}/blob-report
             ${{ inputs.working-directory }}/playwright-report
             ${{ inputs.working-directory }}/test-results
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Record quarantine result
+        if: always() && matrix.shard == 'quarantine'
+        env:
+          STATUS: ${{ job.status }}
+          ARGS: ${{ inputs.e2e-quarantine-args }}
+        run: |
+          {
+            echo "### E2E quarantine (non-blocking)"
+            echo
+            echo "Result: **${STATUS}**, running \`${ARGS}\`. This lane never affects \`Required\`;"
+            echo "the \`playwright-quarantine\` artifact holds the report."
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$STATUS" != success ]; then
+            echo "::warning::E2E quarantine lane: ${STATUS} (non-blocking)"
+          fi
+
+  # The non-blocking quarantine lane (`e2e-quarantine-args`). A separate job,
+  # not a leg of `e2e`'s matrix: `Required` reads `needs.e2e.result`, and
+  # only a job `Required` does not list can fail without any way of reaching
+  # the gate. `continue-on-error` keeps a red leg from failing the caller's
+  # run. The matrix exists only so the shared steps see
+  # `matrix.shard == 'quarantine'`; GitHub renders the name `E2E (quarantine)`.
+  e2e-quarantine:
+    name: E2E
+    if: inputs.run-e2e && inputs.e2e-quarantine-args != '' && needs.e2e-plan.outputs.skipped != 'true'
+    needs: [build, e2e-plan]
+    runs-on: ${{ fromJSON(inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+    timeout-minutes: 30
+    continue-on-error: true
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [quarantine]
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps: *e2e_steps
 
   # Sharded runs produce N partial blob reports and no readable result. This
   # job is what turns them back into one HTML report — the merge step

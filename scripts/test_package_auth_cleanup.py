@@ -57,6 +57,8 @@ AUTH_JOBS = (
     "checks",
     "extra-gate",
     "e2e",
+    # Runs `e2e`'s own anchored steps (`*e2e_steps`), cleanup included.
+    "e2e-quarantine",
     "preview",
     "deploy-dry-run",
 )
