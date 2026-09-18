@@ -1263,6 +1263,39 @@ routing, the Playwright config itself. The rules:
 - **Pull-request events only.** A push always runs the full suite anyway.
 - The `E2E plan` job summary lists which changed files forced the full run.
 
+#### A non-blocking quarantine lane (`e2e-quarantine-args`)
+
+A flaky test is taken out of the gate by tagging it (for example
+`@quarantine`) and excluding that tag from the caller's gating Playwright
+projects. It still needs somewhere to run, or it can never show it is fixed.
+`e2e-quarantine-args` is that place:
+
+```yaml
+    with:
+      e2e-quarantine-args: "--project=quarantine --retries=0"
+```
+
+When set, an extra `E2E (quarantine)` job runs `e2e-script` with exactly
+these arguments, on every event E2E runs on:
+
+- **It cannot fail the gate.** The job is `continue-on-error: true`,
+  `Required` does not list it, and no job `needs:` it. A red quarantine run
+  shows as a warning and a job-summary line. It never turns `ci / Required`
+  or the caller's run red. `lint_callables.py` enforces this through its
+  `NON_GATING_JOBS` exemption, which is the only job allowed outside R5.
+- **It is the gate's setup.** It runs `E2E`'s own steps through a YAML alias:
+  the same prebuilt artifact, runner route, toolchain checks and auth cleanup.
+  Only the arguments differ. It is unsharded.
+- **Its evidence is separate.** It uploads `playwright-quarantine`, which is
+  outside `E2E report`'s `playwright-evidence-*` merge, so quarantined results
+  never enter the gate's report.
+- **It skips with E2E.** A docs-only PR skipped by `e2e-skip-paths` runs
+  neither.
+
+The job's history on the default branch is the "N consecutive green runs"
+record a test needs to leave quarantine. Pass `--retries=0` so a retry can't
+hide a flake. Empty (the default) adds no job.
+
 #### Preview checks (`preview-checks`, `preview-url-source`)
 
 | Input | Type | Default | Purpose |
@@ -1663,6 +1696,9 @@ executed here.
   that equals it whenever no override is supplied.
   `e2e-full-paths` is within-major on the same rule: optional, default `""`,
   and with it unset every event plans exactly as before.
+  `e2e-quarantine-args` is too: optional, default `""`, and when unset its
+  job is skipped. The job it adds is never `needs:`-ed and never gates, so no
+  check context `Required` reads changes.
 - `reusable-browser-tests.yml` is a new callable, so its required route,
   artifact, and exact-version inputs do not break an existing caller.
   `python-data.yml`'s `run-pyright`, exact `pyright-version`, and

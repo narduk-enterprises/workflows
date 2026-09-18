@@ -82,6 +82,12 @@ Each rule below exists because breaking it has a specific, known blast radius:
                                         grant the new permission BEFORE the
                                         tag carrying it moves
 
+  NON_GATING_JOBS is the one sanctioned exception to R5 and to R11's
+  continue-on-error rule: a named, reviewed job that must NOT reach the gate
+  (the quarantine lane). It is exempt only while it is `continue-on-error:
+  true`, `Required` does not list it, and no other job `needs:` it. Every
+  other R11 rule still applies to it.
+
 Run: python3 scripts/lint_callables.py [paths...]
 Exit 0 clean, 1 on any finding. No third-party imports beyond PyYAML.
 """
@@ -203,6 +209,36 @@ def check_uses_pins(path: Path, f: Findings) -> None:
             )
 
 
+# workflow file name -> job ids that deliberately never reach `Required`.
+# Adding an entry is a gate-shape change; see the module docstring.
+NON_GATING_JOBS: dict[str, frozenset[str]] = {
+    # `e2e-quarantine-args`: quarantined tests run here, non-blocking, so
+    # their pass history can build up without a flake failing the gate.
+    "nuxt-cloudflare.yml": frozenset({"e2e-quarantine"}),
+}
+
+
+def non_gating_jobs(path: Path, doc: dict, f: Findings) -> frozenset[str]:
+    """The declared non-gating jobs present in this file, after checking that each
+    one really cannot reach the gate."""
+    jobs = doc.get("jobs") or {}
+    declared = NON_GATING_JOBS.get(path.name, frozenset()) & set(jobs)
+    for jid in sorted(declared):
+        if jobs[jid].get("continue-on-error") is not True:
+            f.add(path, f"R5 non-gating job '{jid}' must declare `continue-on-error: true`")
+        for other_id, other in jobs.items():
+            needs = other.get("needs") or []
+            if isinstance(needs, str):
+                needs = [needs]
+            if jid in needs:
+                f.add(
+                    path,
+                    f"R5 non-gating job '{jid}' is needed by '{other_id}' — a non-gating job "
+                    "must not feed any job, least of all `Required`",
+                )
+    return declared
+
+
 def check_required_job(path: Path, doc: dict, f: Findings) -> None:
     jobs = doc.get("jobs") or {}
     required = {jid: j for jid, j in jobs.items() if (j.get("name") or jid) == "Required"}
@@ -215,7 +251,7 @@ def check_required_job(path: Path, doc: dict, f: Findings) -> None:
         needs = job.get("needs") or []
         if isinstance(needs, str):
             needs = [needs]
-        missing = sorted(set(jobs) - set(needs) - {jid})
+        missing = sorted(set(jobs) - set(needs) - {jid} - non_gating_jobs(path, doc, f))
         if missing:
             f.add(
                 path,
@@ -365,7 +401,7 @@ def check_fail_closed_playwright(path: Path, doc: dict, f: Findings) -> None:
     for job_id, job in jobs.items():
         if not isinstance(job, dict):
             continue
-        if "continue-on-error" in job:
+        if "continue-on-error" in job and job_id not in NON_GATING_JOBS.get(path.name, frozenset()):
             f.add(path, f"R11 job '{job_id}' declares continue-on-error — a required gate may not soften failure")
         for step in job.get("steps") or []:
             if isinstance(step, dict) and "continue-on-error" in step:

@@ -268,6 +268,12 @@ jobs:
       - name: Default runner route tests
         run: python3 scripts/test_runner_default.py
 
+      # The quarantine lane can never reach the gate: continue-on-error,
+      # needed by no job, e2e's exact steps, and the linter's NON_GATING_JOBS
+      # exemption rejects each way of weakening that.
+      - name: E2E quarantine lane tests
+        run: python3 scripts/test_e2e_quarantine.py
+
       # Cheap belt-and-braces: actionlint parses YAML itself, but a file it
       # cannot classify as a workflow is skipped rather than failed, so an
       # unparseable stray .yml would slip past both checks above.
