@@ -793,9 +793,17 @@ jobs:
           try {
             const pkg = fs.existsSync('package.json') ? JSON.parse(fs.readFileSync('package.json', 'utf8')) : {};
             const dependencies = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies, pkg.peerDependencies);
-            const direct = Object.entries(dependencies).some(([name, spec]) => /@narduk-(enterprises|geo)\//.test(`${name} ${spec}`));
+            const uses = scope => Object.entries(dependencies).some(([name, spec]) => new RegExp(`@narduk-${scope}/`).test(`${name} ${spec}`));
             const locked = ['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock', 'bun.lock'].some(file => fs.existsSync(file) && fs.readFileSync(file, 'utf8').includes('npm.pkg.github.com'));
-            console.log(direct || locked ? 'private' : 'public');
+            // workflows#106: a committed project .npmrc that routes the
+            // @narduk-enterprises scope to the anonymous npm.nard.uk mirror
+            // (company-hq D-PKG-6) needs no credential. The mirror serves only
+            // that scope, so @narduk-geo stays private; a lockfile or .npmrc
+            // pointed back at GitHub Packages is private again (break-glass).
+            const npmrc = fs.existsSync('.npmrc') ? fs.readFileSync('.npmrc', 'utf8') : '';
+            const routes = [...npmrc.matchAll(/^[ \t]*@narduk-enterprises:registry[ \t]*=[ \t]*"?([^"\s]*)"?[ \t]*$/gm)].map(match => match[1]);
+            const mirrored = routes.length > 0 && /^https:\/\/npm\.nard\.uk\/?$/.test(routes.at(-1));
+            console.log(locked || uses('geo') || (uses('enterprises') && !mirrored) ? 'private' : 'public');
           } catch {
             console.error('Cannot determine package registry requirements from repository metadata.');
             process.exitCode = 1;
@@ -808,7 +816,7 @@ jobs:
               echo '::error::Private packages require the org NARDUK_PLATFORM_GH_PACKAGES_READ secret forwarded to this workflow. It maps to GH_PACKAGES_READ; do not substitute a GitHub App or write token.'
               exit 1
             fi
-            echo 'No private package dependencies and no package-read secret; skipping registry auth.'
+            echo 'No GitHub Packages dependencies (none, or @narduk-enterprises via npm.nard.uk) and no package-read secret; skipping registry auth.'
             exit 0
           fi
           if [[ "$NARDUK_PLATFORM_GH_PACKAGES_READ" == *[[:space:]]* ]]; then

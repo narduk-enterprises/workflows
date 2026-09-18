@@ -681,7 +681,14 @@ The org Actions secret `NARDUK_PLATFORM_GH_PACKAGES_READ` maps into
 also supplied for existing caller bootstrap scripts; it is an interface
 compatibility detail, not another secret to create. There is no implicit
 `github.token` fallback. Missing credentials fail before private-package
-installs; public-only installs need no credential. Without a caller bootstrap,
+installs; public-only installs need no credential. A caller whose committed
+project `.npmrc` routes `@narduk-enterprises` to the anonymous
+`https://npm.nard.uk` mirror (company-hq `D-PKG-6`) counts as public for that
+scope and can drop the secret, unless it also depends on `@narduk-geo` (not
+mirrored) or its lockfile still names `npm.pkg.github.com` (workflows#106).
+The web-foundation check (`foundation-check: true`) still reads the secret on
+its own path, so a caller running it keeps forwarding it for now.
+Without a caller bootstrap,
 the callable writes a temporary user config containing a literal variable
 reference, then removes it after the install.
 

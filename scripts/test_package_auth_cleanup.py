@@ -334,6 +334,36 @@ def registry_auth_behavior() -> None:
                     assert sentinel not in config.read_text()
                 else:
                     assert not config.exists()
+        # workflows#106: @narduk-enterprises routed to the anonymous
+        # npm.nard.uk mirror by the committed project .npmrc needs no
+        # credential; everything that still resolves from GitHub Packages
+        # (the @narduk-geo scope, a GitHub Packages lockfile URL, a later
+        # .npmrc line repointing the scope, a lookalike host or a
+        # commented-out route) keeps failing closed without one.
+        mirror = "@narduk-enterprises:registry=https://npm.nard.uk/\n"
+        enterprises = {"@narduk-enterprises/core": "1.0.0"}
+        for case, npmrc, deps, lock, expected in (
+            ("mirrored", mirror, enterprises, None, 0),
+            ("mirrored-no-slash", '@narduk-enterprises:registry = "https://npm.nard.uk"\n', enterprises, None, 0),
+            ("mirrored-geo", mirror, {**enterprises, "@narduk-geo/grid": "1.0.0"}, None, 1),
+            ("mirrored-locked", mirror, enterprises, "resolution: https://npm.pkg.github.com/example.tgz", 1),
+            ("repointed", mirror + "@narduk-enterprises:registry=https://npm.pkg.github.com\n", enterprises, None, 1),
+            ("lookalike", "@narduk-enterprises:registry=https://npm.nard.uk.example.com/\n", enterprises, None, 1),
+            ("commented", "# " + mirror, enterprises, None, 1),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "package.json").write_text(json.dumps({"dependencies": deps}))
+                (root / ".npmrc").write_text(npmrc)
+                if lock:
+                    (root / "pnpm-lock.yaml").write_text(lock)
+                result = subprocess.run(["bash", "-c", script], cwd=root, env={
+                    "PATH": node_dir + os.pathsep + os.environ["PATH"], "HOME": tmp,
+                    "NARDUK_PLATFORM_GH_PACKAGES_READ": "", "GH_PACKAGES_READ": "",
+                    "PACKAGE_REGISTRY_AUTH": "auto",
+                }, capture_output=True, text=True, timeout=20)
+                assert result.returncode == expected, (workflow, case, result.stderr)
+                assert not (root / ".npmrc.auth").exists(), (workflow, case)
         if workflow == "node-library.yml":
             # Public monorepos may carry workspace names under estate scopes
             # even though no dependency is fetched from the private registry.
@@ -379,7 +409,7 @@ def registry_auth_behavior() -> None:
             pass
         else:
             raise AssertionError("missing cleanup did not fail the contract")
-    print("registry-auth behavior passed (4 callables; private/transitive/public/malformed/missing/invalid credentials)")
+    print("registry-auth behavior passed (4 callables; private/transitive/public/malformed/missing/invalid credentials; npm.nard.uk mirror routing)")
 
 
 def main() -> None:
