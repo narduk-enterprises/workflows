@@ -399,10 +399,14 @@ def launch(cursor: Cursor, env: dict[str, str], brief: str, repository: str, rep
         "name": f"review {repository}#{env['PR_NUMBER']} @{env['PR_HEAD_SHA'][:7]}",
         "workOnCurrentBranch": True,
     }
-    agent = cursor.call("POST", "/v1/agents", body)
+    value = cursor.call("POST", "/v1/agents", body)
+    # Verified live 2026-09-18: POST /v1/agents answers 201 with the agent
+    # wrapped as {"agent": {...}}, while GET /v1/agents/{id} returns it bare.
+    agent = value.get("agent") if isinstance(value, dict) and isinstance(value.get("agent"), dict) else value
     agent_id = agent.get("id") if isinstance(agent, dict) else None
     if not isinstance(agent_id, str) or not agent_id.startswith("bc-"):
-        raise ReviewError("Cursor launch returned no agent id")
+        shape = json.dumps(value)[:300] if not isinstance(value, str) else value[:300]
+        raise ReviewError(f"Cursor launch returned no agent id (response: {shape})")
     return agent
 
 
@@ -515,7 +519,7 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
     started = clock()
     agent = launch(cursor, env, brief, repository, repos)
     agent_id = agent["id"]
-    agent_url = agent.get("url") or f"https://cursor.com/agents?id={agent_id}"
+    agent_url = agent.get("url") or f"https://cursor.com/agents/{agent_id}"
     print(f"launched Cursor agent {agent_id} for {repository}#{number} @ {env['PR_HEAD_SHA'][:12]}")
     marker = upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` in progress: agent [{agent_id}]({agent_url}).")
 
