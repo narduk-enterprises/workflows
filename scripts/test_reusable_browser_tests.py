@@ -71,12 +71,15 @@ def validate_structure(document: dict) -> None:
     }
 
     jobs = document["jobs"]
-    assert jobs["contract"]["runs-on"] == "ubuntu-latest"
+    # Route chosen by this file, never by a caller input: private -> linux-ci
+    # group route, public/unknown -> hosted (row 18 Q3; test_runner_default.py).
+    visibility_route = 'github.event.repository.private == true && \'{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}\' || \'"ubuntu-latest"\''
+    assert jobs["contract"]["runs-on"] == "${{ fromJSON(" + visibility_route + ") }}"
     assert jobs["chromium"]["runs-on"] == "${{ fromJSON(inputs.browser-runner) }}"
     assert jobs["webkit"]["runs-on"] == "${{ fromJSON(inputs.browser-runner) }}"
     assert jobs["validate"]["runs-on"] == "${{ fromJSON(inputs.linux-runner) }}"
     assert jobs["report"]["runs-on"] == "${{ fromJSON(inputs.linux-runner) }}"
-    assert jobs["required"]["runs-on"] == "${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '\"ubuntu-latest\"') }}"
+    assert jobs["required"]["runs-on"] == "${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || " + visibility_route + ") }}"
     assert jobs["validate"]["needs"] == "contract"
     assert jobs["chromium"]["needs"] == ["contract", "validate"]
     assert jobs["webkit"]["needs"] == ["contract", "validate", "chromium"]

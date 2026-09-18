@@ -17,13 +17,16 @@ name: Reusable Apple CI
 # stay on Linux so they never occupy the Mac slot. Hence two separately-routed
 # jobs:
 #
-#   lint  -> `lint-runner`  (Linux; defaults to GitHub-hosted ubuntu-latest)
+#   lint  -> `lint-runner`  (Linux; empty default = linux-ci group if the
+#                            caller is private, else hosted ubuntu-latest)
 #   xcode -> `apple-runner` (the repo-scoped Mac; REQUIRED, no default)
 #
 # `apple-runner` deliberately has NO default. A reusable workflow that
 # defaults to a self-hosted label hands estate infrastructure to whichever
 # caller forgets to think about it; making it required forces every adopter to
-# resolve its route from Config/github-runner-fleet.json first.
+# resolve its route from Config/github-runner-fleet.json first. (`lint-runner`'s
+# visibility-gated default is not that hazard: it can only select the
+# credential-free linux-ci class for a caller GitHub reports as private.)
 #
 # RELEASE/SIGNING IS OUT OF SCOPE, like node-library.yml's publish job.
 # Archive, codesign, notarize, TestFlight and Sparkle need temporary
@@ -55,6 +58,18 @@ name: Reusable Apple CI
 # infrastructure. This repository is public, so public callers use hosted
 # capacity; `runner` is a free-form
 # caller-supplied value and this workflow cannot police it.
+#
+# DEFAULT ROUTE (workflows row 18 Q3, Logan 2026-09-18 "Flip the default"):
+# an EMPTY runner input (the default) resolves per run from the caller's own
+# visibility. `github.event.repository.private == true` selects the fleet
+# manifest's linux-ci organization-group route, group AND labels (fleet
+# Config/github-runner-fleet.json; company-hq CI-RUNNER-POLICY.md Sec 1 and
+# Sec 4); anything else (public, or an event with no repository payload)
+# selects GitHub-hosted "ubuntu-latest" (Sec 3). An explicit caller value
+# always wins. Because visibility is read at run time, a caller that goes
+# public falls back to hosted on its next run without editing anything. A
+# private caller the manifest does not admit to the linux-ci group must be
+# added there, or pass '"ubuntu-latest"' explicitly, or its jobs queue.
 
 # Least-privilege baseline for every job in this workflow. A called workflow's
 # token is capped by the caller's grant and can only be narrowed from here,
@@ -95,13 +110,16 @@ on:
           ("ubuntu-latest"), a JSON array, or a JSON object
           ({"group":"linux-ci","labels":[...]}) matching the runner-fleet
           manifest's `runsOn` shape. Private repos approved for the `linux-ci`
-          organization group should pass that route's `runsOn` object verbatim;
-          repos not in that group stay on GitHub-hosted ubuntu-latest (this
-          job holds no secrets). Never pass a self-hosted value from a public
-          or potentially-public caller.
+          organization group should pass that route's `runsOn` object
+          verbatim; empty (the default) sends a PRIVATE caller to that same
+          route and a public or visibility-unknown caller to GitHub-hosted
+          ubuntu-latest; an explicit value always wins. A private repo outside
+          the linux-ci group must be added to it (or pass '"ubuntu-latest"'
+          explicitly), or this job queues with no eligible runner. Never pass
+          a self-hosted value from a public or potentially-public caller.
         required: false
         type: string
-        default: '"ubuntu-latest"'
+        default: ''
       working-directory:
         description: "Directory containing Package.swift / the Xcode project"
         required: false
@@ -196,7 +214,7 @@ jobs:
     # Skipped entirely when the caller opted out of both Linux gates, which
     # `Required` below treats as an intentional skip rather than a pass.
     if: inputs.run-swiftlint || inputs.linux-checks != ''
-    runs-on: ${{ fromJSON(inputs.lint-runner) }}
+    runs-on: ${{ fromJSON(inputs.lint-runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
     timeout-minutes: ${{ inputs.lint-timeout-minutes }}
     permissions:
       contents: read
@@ -431,7 +449,7 @@ jobs:
     if: always()
     needs: [lint, xcode]
     # Aggregation is pure shell; use the organization lightweight route first.
-    runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || (inputs.lint-runner)) }}
+    runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || (inputs.lint-runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
     permissions:

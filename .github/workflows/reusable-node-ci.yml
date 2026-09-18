@@ -37,10 +37,15 @@ on:
         type: string
         default: "pnpm"
       runner:
-        description: "Runner label. Default ubuntu-latest; a public (or possibly-future-public) caller must never pass a self-hosted label."
+        description: >-
+          Runner label (plain string, not JSON). Empty (the default) routes a
+          PRIVATE caller to the fleet manifest's linux-ci organization group
+          and a public or visibility-unknown caller to GitHub-hosted
+          ubuntu-latest. An explicit value always wins. A public (or
+          possibly-future-public) caller must never pass a self-hosted label.
         required: false
         type: string
-        default: "ubuntu-latest"
+        default: ""
       run-lint:
         description: "Run the lint script"
         required: false
@@ -86,7 +91,9 @@ env:
 jobs:
   ci:
     name: Node CI
-    runs-on: ${{ inputs.runner }}
+    # Empty runner: private -> linux-ci group route (group AND labels, fleet
+    # Config/github-runner-fleet.json); public/unknown -> ubuntu-latest.
+    runs-on: ${{ inputs.runner || github.event.repository.private == true && fromJSON('{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || 'ubuntu-latest' }}
     timeout-minutes: 20
     permissions:
       contents: read
