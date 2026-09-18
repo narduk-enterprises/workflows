@@ -352,6 +352,7 @@ def run_required(**env_overrides) -> subprocess.CompletedProcess:
     env.update(
         {
             "BUILD_RESULT": "success",
+            "CHECKS_RESULT": "success",
             "EXTRA_GATE_RESULT": "skipped",
             "CALLER_LINT_RESULT": "success",
             "E2E_PLAN_RESULT": "success",
@@ -403,6 +404,20 @@ def check_required_still_gates() -> None:
                 f"FAIL  {label}: rc={result.returncode} (want {expect_rc}) "
                 f"out={result.stdout!r} err={result.stderr!r}"
             )
+
+    # Typecheck and unit tests moved out of `build` into `checks` (row 19):
+    # a red `checks` must still turn Required red.
+    case(
+        "checks failed -> Required RED",
+        expect_rc=1,
+        expect_text="checks job reported 'failure'",
+        CHECKS_RESULT="failure",
+    )
+    case(
+        "checks skipped -> Required RED",
+        expect_rc=1,
+        CHECKS_RESULT="skipped",
+    )
 
     # The negative proof: one lane, and that lane fails.
     case(

@@ -420,6 +420,7 @@ def check_required(doc: dict) -> None:
     baseline = {
         "PATH": "/usr/bin:/bin",
         "BUILD_RESULT": "success",
+        "CHECKS_RESULT": "success",
         "EXTRA_GATE_RESULT": "skipped",
         "CALLER_LINT_RESULT": "success",
         "E2E_PLAN_RESULT": "skipped",

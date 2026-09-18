@@ -382,7 +382,7 @@ Which gates each callable exposes this way:
 
 | Callable | Caller-gatable | Always runs |
 |---|---|---|
-| `nuxt-cloudflare.yml` | `run-e2e` (`e2e`, `e2e-plan`, `e2e-report`), `wrangler-dry-run`, `run-tests` | `build` |
+| `nuxt-cloudflare.yml` | `run-e2e` (`e2e`, `e2e-plan`, `e2e-report`), `wrangler-dry-run`, `run-tests` | `build`, `checks` |
 | `apple.yml` | `run-swiftlint` / `linux-checks` (`lint`), `run-build`, `run-tests` | `xcode` |
 | `python-data.yml` | `run-ruff` (`lint`), `run-tests`, `run-pyright` | `test` |
 | `reusable-browser-tests.yml` | `run-webkit` (`webkit`) | `validate`, `chromium`, `report` |
@@ -932,6 +932,13 @@ is labelled. Existing callers opt in when they mean to.
 after `build-script` in the same lane, so a gate needing build output doesn't
 pay for a second install. earthdata-viewer's vendored-package pin check is the
 first case.
+
+Everything in `build` delays the prebuilt E2E application, and so every E2E
+shard, the preview and the deploy dry run. The typecheck and unit-test lanes
+therefore run in their own parallel `checks` job, and `e2e-plan` no longer
+waits for `build`. An extra script that does **not** need build output belongs
+in `extra-gate-scripts`, which also runs in parallel. On riverstatus, two
+migration-proof scripts in `extra-scripts` held its E2E back by about 8 minutes.
 
 #### `require-scripts`: a lane that matched no script is not a passing lane
 

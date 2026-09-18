@@ -50,9 +50,9 @@ NODE_LIB_GATES = [
 # report every colon-bearing script as missing, which under `require-scripts`
 # is a hard failure for most of the class.
 NUXT_CF_GATES = [
-    (NUXT_CF, "build", "Typecheck Worker", "typecheck"),
-    (NUXT_CF, "build", "Typecheck Nuxt", "web:typecheck"),
-    (NUXT_CF, "build", "Unit tests", "test"),
+    (NUXT_CF, "checks", "Typecheck Worker", "typecheck"),
+    (NUXT_CF, "checks", "Typecheck Nuxt", "web:typecheck"),
+    (NUXT_CF, "checks", "Unit tests", "test"),
     (NUXT_CF, "build", "Build", "build"),
 ]
 
