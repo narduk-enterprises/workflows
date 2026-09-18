@@ -190,7 +190,12 @@ def parse_result(text: str) -> dict[str, Any]:
         severity = str(row.get("severity", "")).strip().lower()
         if severity not in SEVERITIES:
             raise ReviewError(f"finding {index} severity {severity!r} is not one of {SEVERITIES}")
-        path = str(row.get("path") or "").strip().lstrip("./")
+        path = str(row.get("path") or "").strip()
+        # Only a literal "./" prefix goes; lstrip("./") would eat the dot of
+        # ".github/..." and no finding there could ever anchor inline.
+        while path.startswith("./"):
+            path = path[2:]
+        path = path.lstrip("/")
         line = row.get("line")
         line = int(line) if isinstance(line, (int, str)) and str(line).strip().isdigit() else None
         title = str(row.get("title") or "").strip()
