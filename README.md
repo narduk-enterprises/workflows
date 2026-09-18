@@ -329,24 +329,38 @@ so a private caller that passes nothing is Blacksmith-eligible (it is on the
 
 `cursor-review.yml` is the estate's pull-request reviewer (design and decisions:
 [agent-infrastructure#1564](https://github.com/narduk-enterprises/agent-infrastructure/issues/1564)).
-It is default-off and never part of `ci / Required`. A caller adds a second job
-beside `ci` — the job id is free, `cursor-review` is the convention — and grants
-it exactly `contents: read` + `pull-requests: write`:
+It is default-off and never part of `ci / Required`. Every enrolled repository
+calls it from its own workflow file (`.github/workflows/cursor-review.yml`, the
+shape below) rather than from inside `ci.yml`: the trigger set includes
+`ready_for_review`, which most `ci.yml` files do not carry, and a `ci.yml`
+change in some repos re-runs the full gate. The caller grants exactly
+`contents: read` + `pull-requests: write`. Its workflow-level concurrency group
+MUST NOT reuse the callable's job group name (`cursor-review-<repo>-<pr>`); the
+same name deadlocks the job at scheduling.
 
 ```yaml
-jobs:
-  ci:
-    uses: narduk-enterprises/workflows/.github/workflows/<workflow>.yml@<sha-of-v2> # v2
-    # ...
+name: Cursor review
 
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
   cursor-review:
-    if: ${{ github.event_name == 'pull_request' }}
-    uses: narduk-enterprises/workflows/.github/workflows/cursor-review.yml@<sha-of-v2> # v2
+    uses: narduk-enterprises/workflows/.github/workflows/cursor-review.yml@<full-sha> # workflows#<pr>; the moving v2 tag predates this callable, keep the SHA
     permissions:
       contents: read
       pull-requests: write
     with:
       enabled: true
+      # runner: '"ubuntu-latest"'   # a PUBLIC caller pins GitHub-hosted explicitly
     secrets:
       CURSOR_CLOUD_AGENTS_API_KEY: ${{ secrets.CURSOR_CLOUD_AGENTS_API_KEY }}
 ```
