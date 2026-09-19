@@ -1267,7 +1267,11 @@ guests (343, 345 and 346), three 4 GiB `pve-hetzner` fallback guests (340–342)
 and CT 344 is a configured dormant guest rather than an active slot. The old
 three-effective-slots/seven-declared queue measurements are historical; heavy
 jobs request `memory-8g`, while not every browser guest is 8 GiB. Capacity and
-tiering belong to `narduk-enterprises/fleet`, not to this callable.
+tiering belong to `narduk-enterprises/fleet`, not to this callable. See the
+[canonical host inventory](https://github.com/narduk-enterprises/fleet/blob/main/docs/host-inventory.md) for names and placement.
+The primary/fallback flags do not establish GitHub scheduling priority: normal
+browser jobs can land on all six active guests; `memory-8g` matches the three
+active on-prem guests.
 
 **Fewer lanes is not by itself faster — it is fewer slots.** Measured on gonogo
 with `e2e-pr-shards: 1` and no `e2e-pr-args`: the same suite ran 527 / 407 /
