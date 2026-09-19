@@ -324,6 +324,99 @@ class ReviewFlowTests(unittest.TestCase):
         self.assertEqual(1, len(posts), "a 403 is a real failure, not a bad inline anchor")
 
 
+
+class RetryTests(unittest.TestCase):
+    """A single transient 5xx on an idempotent read must not fail the job
+    (agent-infrastructure#1569: `GitHub GET pulls/1569 returned HTTP 504`),
+    and no write may ever be sent twice."""
+
+    def github(self, replies, slept):
+        calls = []
+
+        def transport(method, url, headers, body, timeout):
+            calls.append((method, url))
+            reply = replies[min(len(calls) - 1, len(replies) - 1)]
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        return cr.GitHub("t", REPO, transport, sleep=slept.append), calls
+
+    def test_a_get_recovers_after_two_gateway_failures_and_backs_off(self):
+        slept = []
+        replies = [(504, {"message": "gateway"}), (504, {"message": "gateway"}), (200, {"number": 1569})]
+        github, calls = self.github(replies, slept)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual({"number": 1569}, github.call("GET", "pulls/1569"))
+        self.assertEqual(3, len(calls))
+        self.assertEqual([2, 4], slept)
+
+    def test_a_transport_failure_is_retried_the_same_way(self):
+        slept = []
+        replies = [cr.ReviewError("GET transport failed: URLError"), (200, {"ok": True})]
+        github, calls = self.github(replies, slept)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual({"ok": True}, github.call("GET", "pulls/1569"))
+        self.assertEqual(2, len(calls))
+        self.assertEqual([2], slept)
+
+    def test_four_gateway_failures_raise_the_same_review_error(self):
+        slept = []
+        github, calls = self.github([(504, {"message": "gateway"})], slept)
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(cr.ReviewError, "GitHub GET pulls/1569 returned HTTP 504") as caught:
+                github.call("GET", "pulls/1569")
+        self.assertEqual(504, caught.exception.status)
+        self.assertEqual(cr.RETRY_ATTEMPTS, len(calls))
+        self.assertEqual([2, 4, 8], slept)
+
+    def test_a_write_is_never_retried(self):
+        slept = []
+        github, calls = self.github([(503, {"message": "unavailable"})], slept)
+        with self.assertRaisesRegex(cr.ReviewError, "HTTP 503") as caught:
+            github.call("POST", "pulls/7/reviews", {"event": "COMMENT"})
+        self.assertEqual(503, caught.exception.status)
+        self.assertEqual(1, len(calls), "a retried POST could double-post a review")
+        self.assertEqual([], slept)
+
+    def test_a_cursor_refusal_says_why_instead_of_none(self):
+        """agent-infrastructure lanes read `HTTP 400: None` for a whole
+        afternoon on 2026-09-19; the refusal was a billing quota and the body
+        said so."""
+        refusal = {"error": {"code": "usage_limit_exceeded", "message": "Usage-based pricing required. Background Agent requires at least $2 remaining until your hard limit."}}
+        cursor = cr.Cursor("k", lambda *a: (400, refusal), sleep=lambda _s: None)
+        with self.assertRaises(cr.ReviewError) as caught:
+            cursor.call("POST", "/v1/agents", {"prompt": {}})
+        self.assertIn("usage_limit_exceeded", str(caught.exception))
+        self.assertIn("Usage-based pricing required", str(caught.exception))
+        self.assertNotIn("None", str(caught.exception))
+        self.assertEqual(400, caught.exception.status)
+
+    def test_an_empty_error_body_says_it_was_empty(self):
+        cursor = cr.Cursor("k", lambda *a: (400, None), sleep=lambda _s: None)
+        with self.assertRaisesRegex(cr.ReviewError, "HTTP 400: <empty response body>"):
+            cursor.call("POST", "/v1/agents", {"prompt": {}})
+
+    def test_the_cursor_poll_gets_the_same_retries_and_its_launch_does_not(self):
+        slept = []
+        calls = []
+
+        def transport(method, url, headers, body, timeout):
+            calls.append((method, url))
+            if method == "POST":
+                return 502, {"message": "bad gateway"}
+            return (502, {"message": "bad gateway"}) if len(calls) < 3 else (200, {"status": "FINISHED"})
+
+        cursor = cr.Cursor("k", transport, sleep=slept.append)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual({"status": "FINISHED"}, cursor.call("GET", "/v1/agents/bc-1"))
+        self.assertEqual(3, len(calls))
+        self.assertEqual([2, 4], slept)
+        with self.assertRaisesRegex(cr.ReviewError, "HTTP 502"):
+            cursor.call("POST", "/v1/agents", {"prompt": {}})
+        self.assertEqual(4, len(calls), "a retried launch could start a second agent")
+
+
 class ParserTests(unittest.TestCase):
     def test_parse_result_takes_the_last_block_and_normalizes(self):
         text = "```json\n{\"verdict\": \"approve\", \"summary\": \"old\"}\n```\nthen\n" + review_json(verdict="Request_Changes")
