@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Pull-request E2E subset: `e2e-pr-shards` / `e2e-pr-args` (workflows#83).
 
-The estate's `playwright-isolated` pool is three effective slots against a
-declared seven, shared by roughly ten repositories, so a pull request waits on
-QUEUE rather than on compute: buoys PR run 35165732448 queued 295s to run a
-128s shard, against 1s of queue on the same repo's push run 35165183477.
-Fewer pull-request lanes is the only lever a caller has over that from inside
-this callable.
+The current browser class is tiered: three active 8 GiB on-prem primary guests
+(343, 345 and 346), three 4 GiB pve-hetzner fallback guests (340-342), and a
+configured dormant guest (344). The old three-effective-slots/seven-declared
+queue measurement is historical; this callable must not derive capacity from
+it. Fewer pull-request lanes still bound caller fan-out, but fleet owns the
+capacity and memory tier.
 
 Two things have to hold, and only one of them is about speed:
 

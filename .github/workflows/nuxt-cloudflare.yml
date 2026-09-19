@@ -404,12 +404,12 @@ on:
           on pull-request events while a push (default branch, schedule,
           workflow_dispatch) keeps running `e2e-shards`.
 
-          This exists because the estate's `playwright-isolated` pool is three
-          effective slots against a declared seven, shared by roughly ten
-          repositories, and queue — not compute — is what a pull request
-          actually waits on (p90 294s; buoys PR run 35165732448 queued 295s to
-          run a 128s shard). Fewer pull-request lanes is the only lever a
-          caller has over that from here. workflows#83.
+          This input exists because browser capacity is tiered: three active
+          8 GiB on-prem primary guests (343, 345 and 346), three 4 GiB
+          pve-hetzner fallback guests (340-342), and one configured dormant
+          guest (344). The old three-effective-slots/seven-declared queue
+          measurement is historical; heavy jobs request memory-8g and the
+          fleet manifest owns current capacity. workflows#83.
         required: false
         type: number
         default: 0

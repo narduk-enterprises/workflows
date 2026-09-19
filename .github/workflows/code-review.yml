@@ -1,5 +1,9 @@
 name: Reusable Advisory Code Review
 
+# HISTORICAL / RETIRED 2026-09-19. The agent-execution pool is off, its
+# allowlist is empty, and current callers use cursor-review.yml. This source is
+# retained for provenance; deleting or reviving it requires a dated decision.
+
 # Requests ONE containerized advisory code review for a pull request head, from
 # the estate's ephemeral agent pool (agent-infrastructure#333, D-AGENT-POOL-1).
 #
