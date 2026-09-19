@@ -32,8 +32,8 @@ container nothing loads it for you — read it first, then return here.
 
 [`.github/workflows/ci.yml`](./.github/workflows/ci.yml) is the only thing here
 that looks at a callable before its adopters do — a defect in this repo does not
-fail one repo, it fails every repo pinned to the tag carrying it. It runs on the
-self-hosted `linux-ci` runner group and layers two kinds of check:
+fail one repo, it fails every repo pinned to the tag carrying it. It runs on GitHub-hosted capacity for this public repository and layers two
+kinds of check:
 
 - **`actionlint`** — is the workflow *valid*? Schema, expressions, and
   shellcheck over every `run:` block. It needs `shellcheck` on PATH; without it

@@ -93,7 +93,7 @@ branch, read back from the API — not that the caller parses.
 | `node-library.yml` | `narduk-enterprises/narduk-charts` | yes — repo ruleset `require-ci-required` |
 | `nuxt-cloudflare.yml` | `hydrogen` | no — `hydrogen` has no branch protection; it called `@v1` unenforced for months, which is the failure mode this column exists to make visible |
 | `reusable-node-ci.yml` | none | — |
-| `code-review.yml` | none yet — `agent-infrastructure`, `operator-portal`, and `stonx` are the allowlisted launch set | n/a — advisory by design; it must never become a required check |
+| `code-review.yml` | retired 2026-09-19 — source retained, no live pool adopters | n/a — historical advisory callable; current review uses `cursor-review.yml` |
 | `closing-syntax-check.yml` | none yet — a re-home issue is filed on `narduk-enterprises-clients/pacc-trac` (agent-infrastructure#837), the repo the motivating incidents happened in; `narduk-enterprises/agent-infrastructure` stays on its own local, canonical invocation of the same (now commit-scanning) checker rather than adding a redundant cross-repo call to its own required gate | not yet |
 | `reusable-weekly-drift-check.yml` | retired — zero live callers verified across `narduk-enterprises` and `narduk-incubator` | — |
 
@@ -337,6 +337,11 @@ change in some repos re-runs the full gate. The caller grants exactly
 `contents: read` + `pull-requests: write`. Its workflow-level concurrency group
 MUST NOT reuse the callable's job group name (`cursor-review-<repo>-<pr>`); the
 same name deadlocks the job at scheduling.
+
+Provider failure is reported as provider failure. In particular,
+`usage_limit_exceeded` does not fall back to the retired Proxmox pool and does
+not prove that a usage reset, spending change, or other account mutation
+succeeded; the workflow records the review as unavailable until a later run.
 
 ```yaml
 name: Cursor review
@@ -1257,14 +1262,16 @@ branch.
       e2e-pr-args: "--project=smoke" # pull request: the caller's own project
 ```
 
-Why this exists: the `playwright-isolated` pool is **three effective slots
-against a declared seven** (the fleet-owned on-prem guests 343-346 have never
-registered), shared by roughly ten repositories, so a pull request waits on
-**queue**, not on compute. Measured on buoys: push run `35165183477` queued
-1 s and ran its shard in 128 s, while pull-request run `35165732448` queued
-**295 s** to run the identical 128 s shard. Reducing pull-request lanes is the
-only lever a caller has over that from inside this callable — the pool's
-capacity itself belongs to `narduk-enterprises/fleet`.
+Why this exists: the browser class now has three active 8 GiB on-prem primary
+guests (343, 345 and 346), three 4 GiB `pve-hetzner` fallback guests (340–342),
+and CT 344 is a configured dormant guest rather than an active slot. The old
+three-effective-slots/seven-declared queue measurements are historical; heavy
+jobs request `memory-8g`, while not every browser guest is 8 GiB. Capacity and
+tiering belong to `narduk-enterprises/fleet`, not to this callable. See the
+[canonical host inventory](https://github.com/narduk-enterprises/fleet/blob/main/docs/host-inventory.md) for names and placement.
+The primary/fallback flags do not establish GitHub scheduling priority: normal
+browser jobs can land on all six active guests; `memory-8g` matches the three
+active on-prem guests.
 
 **Fewer lanes is not by itself faster — it is fewer slots.** Measured on gonogo
 with `e2e-pr-shards: 1` and no `e2e-pr-args`: the same suite ran 527 / 407 /
@@ -1606,14 +1613,16 @@ Notes:
   would run attacker code on estate infrastructure) — see "Runner routing"
   above.
 
-## Advisory code review
+## Historical advisory code review (retired 2026-09-19)
 
-`code-review.yml` is the odd one out in this repository, and it is worth
-understanding why before adopting it: **it is not a CI gate.** Every other
+`code-review.yml` is retained as a compatibility and provenance surface, not a
+current route. It is worth understanding why it was built: **it is not a CI
+gate.** Every other
 callable here exists to produce `ci / Required`. This one produces nothing a
 branch ruleset can require, has no `Required` job, and cannot fail your build.
-It asks the estate's ephemeral agent pool for one read-only review of a pull
-request head, and the review arrives — or does not — as a comment on the PR.
+It asked the estate's ephemeral agent pool for one read-only review of a pull
+request head. The pool is retired, its allowlist is empty, and no current
+workflow should adopt this callable; current adoption uses `cursor-review.yml`.
 
 That framing is load-bearing. A review request that can redden CI turns an
 optional quality aid into an outage every time the pool is busy, the dispatch
@@ -1627,7 +1636,7 @@ a `::notice::` naming which one fired:
 | PR head is a fork | `review skipped: ... head is a fork` |
 | `AGENT_REVIEW_DISPATCH_TOKEN` not available | `review skipped: ... not available` |
 | the dispatch call fails or returns non-204 | `::warning::`, job still green |
-| the pool is busy (decided downstream) | nothing queues, nothing retries |
+| the retired pool is unavailable | historical behavior: nothing queues, nothing retries |
 
 ### Consuming it
 
