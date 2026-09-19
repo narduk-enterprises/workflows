@@ -3,6 +3,9 @@
 
 Runs inside the `cursor-review.yml` callable. Stdlib only; every network call
 goes through one injectable `transport` so the whole flow is testable offline.
+Idempotent reads (GET) survive a transient gateway failure: `send` retries a
+502/503/504 or a dropped connection up to four attempts with exponential
+backoff. No write is ever retried.
 
 Flow (agent-infrastructure#1564):
 
@@ -49,6 +52,9 @@ MAX_INLINE_COMMENTS = 40
 MAX_COMMENT_CHARS = 6000
 MAX_BODY_CHARS = 60000
 POLL_SECONDS = 30
+RETRY_STATUSES = frozenset({502, 503, 504})
+RETRY_ATTEMPTS = 4
+RETRY_BACKOFF_SECONDS = 2.0
 FENCE = re.compile(r"```json[ \t]*\n(.*?)\n[ \t]*```", re.DOTALL)
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -95,12 +101,75 @@ def urllib_transport(method: str, url: str, headers: dict[str, str], body: bytes
         return status, text
 
 
+def send(
+    transport: Transport,
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    body: bytes | None,
+    timeout: int,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[int, Any]:
+    """One request, with bounded retries for the idempotent half of the API.
+
+    A GET is a read: a single transient 502/503/504 or a dropped connection is
+    the gateway's problem, not the pull request's, and retrying it changes
+    nothing on the server. Everything else goes exactly once — a retried POST
+    could double-post a review or launch a second Cursor agent, and a retried
+    PUT could dismiss a review twice.
+
+    After the last attempt the caller sees exactly what it would have seen
+    without retries: the final status (so `call` raises its own ReviewError
+    carrying that status), or the transport's own ReviewError.
+    """
+    if method.upper() != "GET":
+        return transport(method, url, headers, body, timeout)
+    attempt = 1
+    delay = RETRY_BACKOFF_SECONDS
+    while True:
+        final = attempt >= RETRY_ATTEMPTS
+        try:
+            status, value = transport(method, url, headers, body, timeout)
+            if final or status not in RETRY_STATUSES:
+                return status, value
+            reason = f"HTTP {status}"
+        except ReviewError:
+            if final:
+                raise
+            reason = "transport failure"
+        print(f"::notice::{method} {url.split('?')[0]} hit {reason}; retry {attempt + 1}/{RETRY_ATTEMPTS} in {delay:g}s")
+        sleep(delay)
+        delay *= 2
+        attempt += 1
+
+
+def error_detail(value: Any) -> str:
+    """Up to 300 characters of a response BODY (never a header) for an error.
+
+    Cursor nests its refusal as `{"error": {"code": ..., "message": ...}}`, so
+    the GitHub-shaped `value["message"]` lookup rendered a real answer as the
+    literal `None`: on 2026-09-19 a billing quota (`usage_limit_exceeded`) read
+    only as `Cursor POST /v1/agents returned HTTP 400: None`, and the job log
+    said nothing about why.
+    """
+    if value is None:
+        return "<empty response body>"
+    if isinstance(value, str):
+        return value[:300]
+    try:
+        return json.dumps(value, separators=(",", ":"))[:300]
+    except (TypeError, ValueError):
+        return str(value)[:300]
+
+
 class GitHub:
-    def __init__(self, token: str, repository: str, transport: Transport, api: str = "https://api.github.com") -> None:
+    def __init__(self, token: str, repository: str, transport: Transport, api: str = "https://api.github.com", *, sleep: Callable[[float], None] = time.sleep) -> None:
         self.token = token
         self.repository = repository
         self.transport = transport
         self.api = api.rstrip("/")
+        self.sleep = sleep
 
     def call(self, method: str, path: str, payload: dict[str, Any] | None = None, *, ok: tuple[int, ...] = (200, 201)) -> Any:
         url = path if path.startswith("http") else f"{self.api}/repos/{self.repository}/{path.lstrip('/')}"
@@ -114,7 +183,7 @@ class GitHub:
         if payload is not None:
             headers["Content-Type"] = "application/json"
             body = json.dumps(payload).encode()
-        status, value = self.transport(method, url, headers, body, 60)
+        status, value = send(self.transport, method, url, headers, body, 60, sleep=self.sleep)
         if status not in ok:
             detail = value.get("message") if isinstance(value, dict) else str(value)
             raise ReviewError(f"GitHub {method} {path} returned HTTP {status}: {str(detail)[:300]}", status=status)
@@ -134,10 +203,11 @@ class GitHub:
 
 
 class Cursor:
-    def __init__(self, api_key: str, transport: Transport, api: str = CURSOR_API) -> None:
+    def __init__(self, api_key: str, transport: Transport, api: str = CURSOR_API, *, sleep: Callable[[float], None] = time.sleep) -> None:
         self.api_key = api_key
         self.transport = transport
         self.api = api.rstrip("/")
+        self.sleep = sleep
 
     def call(self, method: str, path: str, payload: dict[str, Any] | None = None, *, ok: tuple[int, ...] = (200, 201)) -> Any:
         headers = {"Authorization": f"Bearer {self.api_key}", "User-Agent": "narduk-cursor-review", "Accept": "application/json"}
@@ -145,10 +215,9 @@ class Cursor:
         if payload is not None:
             headers["Content-Type"] = "application/json"
             body = json.dumps(payload).encode()
-        status, value = self.transport(method, f"{self.api}{path}", headers, body, 60)
+        status, value = send(self.transport, method, f"{self.api}{path}", headers, body, 60, sleep=self.sleep)
         if status not in ok:
-            detail = value.get("message") if isinstance(value, dict) else str(value)
-            raise ReviewError(f"Cursor {method} {path} returned HTTP {status}: {str(detail)[:300]}", status=status)
+            raise ReviewError(f"Cursor {method} {path} returned HTTP {status}: {error_detail(value)}", status=status)
         return value
 
 
@@ -498,8 +567,8 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
         return 0
     repository = env["GITHUB_REPOSITORY"]
     number = env["PR_NUMBER"]
-    github = GitHub(env["GITHUB_TOKEN"], repository, transport, env.get("GITHUB_API_URL") or "https://api.github.com")
-    cursor = Cursor(env["CURSOR_CLOUD_AGENTS_API_KEY"], transport, env.get("CURSOR_API_URL") or CURSOR_API)
+    github = GitHub(env["GITHUB_TOKEN"], repository, transport, env.get("GITHUB_API_URL") or "https://api.github.com", sleep=sleep)
+    cursor = Cursor(env["CURSOR_CLOUD_AGENTS_API_KEY"], transport, env.get("CURSOR_API_URL") or CURSOR_API, sleep=sleep)
     repos = context_repos(env, repository)
     if brief_template is None:
         with open(env["BRIEF_PATH"], encoding="utf-8") as handle:
