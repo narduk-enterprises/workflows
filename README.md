@@ -412,9 +412,10 @@ What happens per pull request head:
    finding requests changes. Each finding whose `path:line` is inside the PR
    diff becomes an inline comment; the rest are listed in the review body.
 3. A push does NOT re-review: `synchronize` is not in the trigger set. A lane
-   that wants the new head reviewed adds `review-now`, which cancels any
-   in-flight job and its agent run, reviews the new head, and is cleared again
-   so the next add is a fresh event. A non-blocking review dismisses the bot's
+   that wants the new head reviewed adds `review-now`, which cancels the
+   in-flight waiter and whatever agent the marker comment still points at —
+   same head or not, because `review-now` is itself the same-head re-request —
+   reviews the new head, and is cleared again so the next add is a fresh event. A non-blocking review dismisses the bot's
    own stale REQUEST_CHANGES itself, on the new head, with the reason recorded.
    Enable `required_review_thread_resolution` on the repo's ruleset to make
    lanes answer every thread. Do **not** enable `dismiss_stale_reviews_on_push`

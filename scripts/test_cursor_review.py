@@ -707,6 +707,40 @@ class ClassRuleTests(unittest.TestCase):
         self.assertFalse(self.launched(transport))
         self.assertEqual(["bc-old"], transport.cancelled, "a skip owes the same cleanup a launch does")
 
+    def test_a_same_head_agent_is_cancelled_too(self):
+        """`review-now` IS the same-head re-request, so a SHA comparison would
+        exempt exactly the run that most needs the cleanup."""
+        marker = {"id": 77, "user": {"login": cr.BOT_LOGIN}, "body": cr.agent_marker("bc-old", HEAD) + "\nin progress"}
+        with self.subTest("skip"):
+            transport = FakeTransport(marker_comment=marker, files=[{"filename": "README.md", "patch": PATCH}])
+            code, _ = run(transport)
+            self.assertEqual(0, code)
+            self.assertFalse(self.launched(transport))
+            self.assertEqual(["bc-old"], transport.cancelled)
+        with self.subTest("review-now relaunch"):
+            transport = FakeTransport(marker_comment=marker)
+            code, _ = run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+            self.assertEqual(0, code)
+            self.assertTrue(self.launched(transport))
+            self.assertEqual(["bc-old"], transport.cancelled)
+
+    def test_a_skip_stays_green_when_the_comments_api_fails(self):
+        """The cleanup is best-effort: a skipped class has nothing to report,
+        so a comments-API failure must not turn a contracted-green job red."""
+
+        class NoComments(FakeTransport):
+            def github(self, method, path, payload):
+                if method == "GET" and "/issues/7/comments" in path:
+                    return 500, {"message": "boom"}
+                return super().github(method, path, payload)
+
+        transport = NoComments(files=[{"filename": "README.md", "patch": PATCH}])
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("could not load the previous agent marker", out)
+        self.assertIn("::notice::review skipped: class P2", out)
+        self.assertFalse(self.launched(transport))
+
     def test_a_rename_out_of_an_always_review_path_is_still_p0(self):
         """`.github/workflows/ci.yml` -> `docs/old-ci.md` reads as metadata-only
         unless the rename's previous_filename is counted."""

@@ -632,14 +632,22 @@ def find_marker_comment(github: GitHub, number: str) -> dict[str, Any] | None:
 
 
 def cancel_previous(cursor: Cursor, marker: dict[str, Any] | None, head_sha: str) -> None:
+    """Cancel whatever agent the marker still points at, same head or not.
+
+    There is no same-SHA exemption. `review-now` IS the same-head re-request
+    that replaced `synchronize`, so the run that most needs this cleanup is
+    exactly the one a SHA comparison would skip: job concurrency has already
+    killed the waiter, leaving an agent nobody is reading. One agent per pull
+    request at a time, and this run is about to be it.
+    """
     record = parse_agent_marker((marker or {}).get("body") or "")
-    if not record or record.get("headSha") == head_sha:
+    if not record:
         return
     try:
         agent = cursor.call("GET", f"/v1/agents/{record['agentId']}")
         if agent.get("status") in ACTIVE_AGENT_STATUSES and agent.get("latestRunId"):
             cursor.call("POST", f"/v1/agents/{record['agentId']}/runs/{agent['latestRunId']}/cancel", {}, ok=(200, 201, 202, 204))
-            notice(f"cancelled the previous head's agent run ({record['agentId']})")
+            notice(f"cancelled the previous agent run ({record['agentId']})")
     except ReviewError as exc:
         notice(f"could not cancel the previous agent run: {exc}")
 
@@ -764,8 +772,14 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
     except Skip as skip:
         # Job concurrency already killed this pull request's in-flight WAITER;
         # the agent it was waiting on keeps burning the pool and posts nothing.
-        # A skip owes the same cleanup a launch does.
-        cancel_previous(cursor, find_marker_comment(github, number), env["PR_HEAD_SHA"])
+        # A skip owes the same cleanup a launch does -- but a skip must stay
+        # green, so a comments-API failure here is a notice, not a red job.
+        try:
+            stale = find_marker_comment(github, number)
+        except ReviewError as exc:
+            notice(f"could not load the previous agent marker: {exc}")
+            stale = None
+        cancel_previous(cursor, stale, env["PR_HEAD_SHA"])
         notice(f"review skipped: {skip}")
         return 0
     notice(f"review class {priority} ({why})")
