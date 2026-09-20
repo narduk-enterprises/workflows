@@ -27,6 +27,7 @@ Run: python3 scripts/test_cursor_review.py  (needs PyYAML, as every test here do
 from __future__ import annotations
 
 import contextlib
+import datetime
 import io
 import json
 import re
@@ -69,7 +70,7 @@ def review_json(**overrides: Any) -> str:
 class FakeTransport:
     """Routes by (method, path) and records everything that was sent."""
 
-    def __init__(self, *, result: str = review_json(), run_statuses: list[str] | None = None, pr_author: str = "loganrenz", head_now: str = HEAD, prior_reviews: list[dict[str, Any]] | None = None, marker_comment: dict[str, Any] | None = None, review_status: int = 200, files: list[dict[str, Any]] | None = None) -> None:
+    def __init__(self, *, result: str = review_json(), run_statuses: list[str] | None = None, pr_author: str = "loganrenz", head_now: str = HEAD, prior_reviews: list[dict[str, Any]] | None = None, marker_comment: dict[str, Any] | None = None, review_status: int = 200, files: list[dict[str, Any]] | None = None, agent_ledger: list[dict[str, Any]] | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
         self.result = result
         self.run_statuses = list(run_statuses or ["RUNNING", "FINISHED"])
@@ -80,7 +81,13 @@ class FakeTransport:
         self.review_status = review_status
         self.cancelled: list[str] = []
         self.labels_removed: list[str] = []
-        self.files = list(files) if files is not None else [{"filename": "src/a.ts", "patch": PATCH}, {"filename": "bin/blob", "patch": None}]
+        self.files = list(files) if files is not None else [{"filename": "src/a.ts", "patch": PATCH, "additions": 40, "deletions": 5}, {"filename": "bin/blob", "patch": None}]
+        # `GET /v1/agents` -- the daily-cap ledger. Empty by default, so the
+        # cap is exercised on every run and never binds unless a test says so.
+        self.agent_ledger = list(agent_ledger or [])
+        # `GET /compare/<old>...<new>` -- the delta gate. None means the
+        # comparison is unreadable, which must fail open.
+        self.compare_files: list[dict[str, Any]] | None = [{"filename": "src/a.ts", "additions": 40, "deletions": 5}]
 
     def __call__(self, method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: int) -> tuple[int, Any]:
         payload = json.loads(body) if body else None
@@ -91,6 +98,8 @@ class FakeTransport:
         return self.github(method, path, payload)
 
     def cursor(self, method: str, path: str, payload: Any) -> tuple[int, Any]:
+        if method == "GET" and path.endswith("/v1/agents"):
+            return 200, {"agents": self.agent_ledger}
         if method == "POST" and path.endswith("/v1/agents"):
             # The real API (verified 2026-09-18) answers 201 with the agent WRAPPED.
             return 201, {"agent": {"id": "bc-new", "url": "https://cursor.com/agents/bc-new", "status": "CREATING"}}
@@ -120,6 +129,10 @@ class FakeTransport:
         if method == "DELETE" and "/issues/7/labels/" in path:
             self.labels_removed.append(path.rsplit("/", 1)[1])
             return 204, None
+        if method == "GET" and "/compare/" in path:
+            if self.compare_files is None:
+                return 500, {"message": "boom"}
+            return 200, {"files": self.compare_files}
         if method == "GET" and path.endswith("/pulls/7/reviews"):
             return 200, self.prior_reviews
         if method == "POST" and path.endswith("/pulls/7/reviews"):
@@ -167,8 +180,21 @@ def run(transport: FakeTransport, **overrides: str) -> tuple[int, str]:
     clock = iter(range(0, 100000, 10))
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
-        code = cr.run(env(**overrides), transport, sleep=lambda _s: None, clock=lambda: float(next(clock)))
+        code = cr.run(env(**overrides), transport, sleep=lambda _s: None, clock=lambda: float(next(clock)), now=lambda: NOW)
     return code, out.getvalue()
+
+
+NOW = 1_790_000_000.0
+
+
+def ledger(count: int, *, repo: str = REPO, age_hours: float = 1.0) -> list[dict[str, Any]]:
+    """`count` review agents for `repo`, all `age_hours` old. Newest-first."""
+    stamp = datetime.datetime.fromtimestamp(NOW - age_hours * 3600, datetime.timezone.utc)
+    return [{"id": f"bc-{i}", "name": f"review {repo}#{i} @abc1234", "createdAt": stamp.isoformat().replace("+00:00", "Z")} for i in range(count)]
+
+
+def marker_comment(rounds: int, *, head: str = HEAD, agent: str = "bc-old") -> dict[str, Any]:
+    return {"id": 1, "user": {"login": cr.BOT_LOGIN}, "body": cr.agent_marker(agent, head, rounds) + "\nprior"}
 
 
 def posted_review(transport: FakeTransport) -> dict[str, Any]:
@@ -464,7 +490,12 @@ class ParserTests(unittest.TestCase):
 
     def test_agent_marker_round_trips_and_ignores_prose(self):
         body = cr.agent_marker("bc-1", HEAD) + "\nprose"
-        self.assertEqual({"agentId": "bc-1", "headSha": HEAD}, cr.parse_agent_marker(body))
+        self.assertEqual({"agentId": "bc-1", "headSha": HEAD, "rounds": 0}, cr.parse_agent_marker(body))
+        self.assertEqual(3, cr.marker_rounds(cr.parse_agent_marker(cr.agent_marker("bc-1", HEAD, 3))))
+        # A marker written before `rounds` existed must parse, and must not
+        # retro-cap a pull request on a number nobody recorded.
+        self.assertEqual(0, cr.marker_rounds({"agentId": "bc-1", "headSha": HEAD}))
+        self.assertEqual(0, cr.marker_rounds({"agentId": "bc-1", "rounds": "seven"}))
         self.assertIsNone(cr.parse_agent_marker("text " + cr.agent_marker("bc-1", HEAD)))
         self.assertIsNone(cr.parse_agent_marker("<!-- cursor-review-agent {not json} -->"))
 
@@ -478,11 +509,25 @@ class WorkflowShapeTests(unittest.TestCase):
     def test_disabled_by_default_and_secret_optional(self):
         inputs = self.doc["on"]["workflow_call"]["inputs"] if "on" in self.doc else self.doc[True]["workflow_call"]["inputs"]
         self.assertIs(inputs["enabled"]["default"], False)
-        self.assertEqual("grok-4.6", inputs["model"]["default"])
-        self.assertEqual("xhigh", inputs["effort"]["default"])
+        # Composer 2.5 is in the SAME first-party pool as Grok 4.6 at about a
+        # third of the cost per review; `review-deep` buys the stronger model.
+        self.assertEqual("composer-2.5", inputs["model"]["default"])
+        # EMPTY, not "xhigh": composer-2.5 defines only `fast` and rejects an
+        # `effort` parameter it does not have, so a non-empty default here
+        # would make every ordinary review fail at launch.
+        self.assertEqual("", inputs["effort"]["default"])
+        self.assertEqual("grok-4.6", inputs["deep-model"]["default"])
+        self.assertEqual("xhigh", inputs["deep-effort"]["default"])
         # fast=false for reviews: the job already budgets wait-minutes and
         # blocks nobody, so the reviewer is never the latency-critical lane.
+        # For composer this is also a COST trap, not just latency: its own
+        # default variant is fast=true, billed at 6x base ($3/$0.50/$15),
+        # which is more expensive than the grok-4.6 it replaced.
         self.assertIs(inputs["fast"]["default"], False)
+        self.assertEqual(4, inputs["max-rounds"]["default"])
+        self.assertEqual(12, inputs["daily-cap"]["default"])
+        self.assertEqual(20, inputs["min-lines"]["default"])
+        self.assertEqual(10, inputs["min-delta-lines"]["default"])
         secrets = (self.doc.get("on") or self.doc.get(True))["workflow_call"]["secrets"]
         self.assertIs(secrets["CURSOR_CLOUD_AGENTS_API_KEY"]["required"], False)
         # `inputs.enabled` alone would let a `bot-inbox` label reach the job,
@@ -756,17 +801,37 @@ class ClassRuleTests(unittest.TestCase):
     def test_policy_markdown_is_never_prose(self):
         """A SKILL.md edit can drop a review-follow-through rule and a
         DECISIONS.md edit can invent an approval; agent-infrastructure is an
-        enrolled caller, so these land here."""
+        enrolled caller, so these land here.
+
+        This is the invariant the 2026-09-20 P0 narrowing had to preserve.
+        `.md` is a metadata suffix, so a policy file that merely stopped being
+        P0 would have fallen through to the all-metadata P2 skip and received
+        NO review at all -- turning "always reviewed" into "never reviewed" in
+        a repository whose product IS its policy prose. Policy paths are P1:
+        reviewed, and subject to the spend limits like any other change.
+        """
         for path in (
             "skills/repo-hygiene-execute/SKILL.md",
-            "scripts/cursor_review_brief.md",
             "harness/claude.md",
             "harness/codex.md",
-            "DECISIONS.md",
             "docs/agents/credentials.md",
             "AGENTS.md",
             "nested/dir/CLAUDE.md",
         ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P1", out)
+                self.assertNotIn("class P2", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_the_two_self_governing_files_stay_p0(self):
+        """Narrowing kept exactly the two that rewrite the rules this reviewer
+        runs by: DECISIONS.md can invent an approval the human-approval
+        citation gate would then honour, and cursor_review_brief.md is the
+        reviewer editing its own brief."""
+        for path in ("DECISIONS.md", "scripts/cursor_review_brief.md"):
             with self.subTest(path):
                 transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
                 code, out = run(transport)
@@ -870,7 +935,7 @@ class ClassRuleTests(unittest.TestCase):
         self.assertTrue(self.launched(transport))
 
     def test_p0_paths_are_reviewed_whatever_the_title_says(self):
-        for path in (".github/workflows/ci.yml", ".github/actions/setup/action.yml", "docs/agents/review-routing.md", "AGENTS.md", "skills/x/CLAUDE.md"):
+        for path in (".github/workflows/ci.yml", ".github/actions/setup/action.yml"):
             with self.subTest(path):
                 transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
                 code, out = run(transport, PR_TITLE="docs: routine wording")
@@ -878,6 +943,19 @@ class ClassRuleTests(unittest.TestCase):
                 self.assertIn("::notice::review class P0", out)
                 self.assertTrue(self.launched(transport))
                 self.assertIn("class P0", posted_review(transport)["body"])
+
+    def test_policy_prose_is_p1_not_p0_so_the_spend_limits_apply(self):
+        """The narrowing itself. These were P0 -- the class no cap may skip --
+        which made the class rule inert in exactly the two repositories with
+        the worst measured multipliers (agent-infrastructure 75% P0 at 3.83
+        launches per pull request; workflows 100% P0 at 4.00)."""
+        for path in ("docs/agents/review-routing.md", "AGENTS.md", "skills/x/CLAUDE.md"):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport, PR_TITLE="docs: routine wording")
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P1", out)
+                self.assertTrue(self.launched(transport))
 
     def test_an_ordinary_code_change_is_p1(self):
         transport = FakeTransport()
@@ -924,6 +1002,246 @@ class ClassRuleTests(unittest.TestCase):
         run(transport)
         self.assertIn("A push no longer re-reviews on its own", posted_review(transport)["body"])
         self.assertIn("review-now", posted_review(transport)["body"])
+
+
+class SpendLimitTests(unittest.TestCase):
+    """The 2026-09-20 cost controls.
+
+    Measured baseline: 199 review launches over 78 pull requests (2.55 each),
+    139 in one Central day, 99 of them between 18:00 and 23:59 -- 13% of the
+    month's pool in one evening. Every gate below is fail-open on purpose:
+    these exist to stop a runaway evening, not to become a new way for a
+    review to vanish quietly.
+    """
+
+    def launched(self, transport: FakeTransport) -> bool:
+        return any(c["method"] == "POST" and c["url"].endswith("/v1/agents") for c in transport.calls)
+
+    # --- size gate -------------------------------------------------------
+    def test_a_tiny_non_p0_diff_is_not_worth_an_agent(self):
+        transport = FakeTransport(files=[{"filename": "src/a.ts", "patch": PATCH, "additions": 3, "deletions": 0}])
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("3 changed line(s)", out)
+        self.assertFalse(self.launched(transport))
+
+    def test_a_tiny_p0_diff_is_still_reviewed(self):
+        """A three-line `.github/workflows/` change is the deleted-`on:`-block
+        hazard. Small is not safe there, so P0 is exempt from the size gate."""
+        transport = FakeTransport(files=[{"filename": ".github/workflows/ci.yml", "patch": PATCH, "additions": 1, "deletions": 2}])
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertTrue(self.launched(transport))
+
+    def test_an_unsized_diff_fails_open(self):
+        """No row carried additions/deletions: that is UNKNOWN, not empty. A
+        zero here would read as a 0-line diff and skip every non-P0 review."""
+        transport = FakeTransport(files=[{"filename": "src/a.ts", "patch": PATCH}])
+        code, _ = run(transport)
+        self.assertEqual(0, code)
+        self.assertTrue(self.launched(transport))
+
+    # --- round cap -------------------------------------------------------
+    def test_the_round_cap_stops_a_fifth_review(self):
+        """No `request_changes` verdict in the measured sample arrived after
+        round 4; rounds 5-13 cost 251 compute minutes for nothing."""
+        transport = FakeTransport(marker_comment=marker_comment(4))
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("already had 4 review(s)", out)
+        self.assertFalse(self.launched(transport))
+
+    def test_the_fourth_review_still_runs(self):
+        transport = FakeTransport(marker_comment=marker_comment(3, head=BASE))
+        code, _ = run(transport)
+        self.assertEqual(0, code)
+        self.assertTrue(self.launched(transport))
+
+    def test_a_re_request_on_the_very_same_head_is_skipped(self):
+        """Nothing moved since the reviewed head, so there is nothing new to
+        read. The marker's headSha IS the last reviewed head."""
+        transport = FakeTransport(marker_comment=marker_comment(1, head=HEAD))
+        code, out = run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+        self.assertEqual(0, code)
+        self.assertIn("only 0 line(s) changed", out)
+        self.assertFalse(self.launched(transport))
+
+    def test_the_round_count_survives_every_later_marker_rewrite(self):
+        """The completion rewrite must carry the count forward. Writing the
+        marker without it resets the ledger to 0 and the cap never binds."""
+        transport = FakeTransport(marker_comment=marker_comment(2, head=BASE))
+        code, _ = run(transport)
+        self.assertEqual(0, code)
+        bodies = [c["body"]["body"] for c in transport.calls if c["method"] in {"POST", "PATCH"} and "/issues/" in c["url"] and "comments" in c["url"]]
+        self.assertTrue(bodies)
+        for body in bodies:
+            self.assertEqual(3, cr.marker_rounds(cr.parse_agent_marker(body)), body[:120])
+
+    # --- delta gate ------------------------------------------------------
+    def test_a_re_request_that_barely_moved_is_skipped(self):
+        transport = FakeTransport(marker_comment=marker_comment(1, head=BASE))
+        transport.compare_files = [{"filename": "src/a.ts", "additions": 1, "deletions": 0}]
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("since the reviewed head", out)
+        self.assertFalse(self.launched(transport))
+
+    def test_a_re_request_with_real_movement_is_reviewed(self):
+        transport = FakeTransport(marker_comment=marker_comment(1, head=BASE))
+        transport.compare_files = [{"filename": "src/a.ts", "additions": 80, "deletions": 20}]
+        code, _ = run(transport)
+        self.assertEqual(0, code)
+        self.assertTrue(self.launched(transport))
+
+    def test_an_unreadable_comparison_fails_open(self):
+        transport = FakeTransport(marker_comment=marker_comment(1, head=BASE))
+        transport.compare_files = None
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("the delta gate is not applied", out)
+        self.assertTrue(self.launched(transport))
+
+    # --- daily cap -------------------------------------------------------
+    def test_the_daily_cap_stops_a_runaway_evening(self):
+        transport = FakeTransport(agent_ledger=ledger(12))
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("launched 12 review(s) in the last 24h", out)
+        self.assertFalse(self.launched(transport))
+
+    def test_under_the_daily_cap_still_reviews(self):
+        transport = FakeTransport(agent_ledger=ledger(11))
+        code, _ = run(transport)
+        self.assertEqual(0, code)
+        self.assertTrue(self.launched(transport))
+
+    def test_the_daily_cap_counts_only_this_repository(self):
+        """It is a PER-REPOSITORY allowance, settable per repository: some
+        need more oversight than others."""
+        transport = FakeTransport(agent_ledger=ledger(30, repo="narduk-enterprises/riverstatus"))
+        code, _ = run(transport)
+        self.assertEqual(0, code)
+        self.assertTrue(self.launched(transport))
+
+    def test_agents_older_than_the_window_do_not_count(self):
+        transport = FakeTransport(agent_ledger=ledger(30, age_hours=48))
+        code, _ = run(transport)
+        self.assertEqual(0, code)
+        self.assertTrue(self.launched(transport))
+
+    def test_a_cursor_ledger_outage_fails_open(self):
+        class Blind(FakeTransport):
+            def cursor(self, method, path, payload):
+                if method == "GET" and path.endswith("/v1/agents"):
+                    return 500, {"message": "boom"}
+                return super().cursor(method, path, payload)
+
+        transport = Blind()
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("the daily cap is not applied", out)
+        self.assertTrue(self.launched(transport))
+
+    def test_a_limit_set_to_zero_is_disabled(self):
+        transport = FakeTransport(agent_ledger=ledger(99), marker_comment=marker_comment(99))
+        code, _ = run(transport, DAILY_CAP="0", MAX_ROUNDS="0", MIN_LINES="0", MIN_DELTA_LINES="0")
+        self.assertEqual(0, code)
+        self.assertTrue(self.launched(transport))
+
+    def test_a_junk_limit_uses_the_default_rather_than_unlimited(self):
+        """A typo must not silently buy unlimited spend."""
+        transport = FakeTransport(agent_ledger=ledger(12))
+        code, out = run(transport, DAILY_CAP="twelve")
+        self.assertEqual(0, code)
+        self.assertIn("is not a whole number", out)
+        self.assertFalse(self.launched(transport))
+
+    # --- review-deep -----------------------------------------------------
+    def test_review_deep_bypasses_every_limit_at_once(self):
+        transport = FakeTransport(
+            agent_ledger=ledger(99),
+            marker_comment=marker_comment(99),
+            files=[{"filename": "src/a.ts", "patch": PATCH, "additions": 1, "deletions": 0}],
+        )
+        code, out = run(transport, PR_LABELS='["review-deep"]')
+        self.assertEqual(0, code)
+        self.assertIn("bypassing every spend limit", out)
+        self.assertTrue(self.launched(transport))
+
+    def test_review_now_does_not_bypass_the_caps(self):
+        """Lanes add `review-now` after every push -- that is what produced
+        2.55 launches per pull request. If it bypassed the caps they would be
+        decorative."""
+        transport = FakeTransport(marker_comment=marker_comment(9))
+        code, out = run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+        self.assertEqual(0, code)
+        self.assertIn("already had 9 review(s)", out)
+        self.assertFalse(self.launched(transport))
+
+    def test_a_gated_head_still_frees_the_review_now_label(self):
+        """A cap that left the label on would strand the lane: adding a label
+        that is already present raises no event."""
+        transport = FakeTransport(marker_comment=marker_comment(9))
+        code, _ = run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+        self.assertEqual(0, code)
+        self.assertEqual([cr.REVIEW_NOW_LABEL], transport.labels_removed)
+
+    def test_a_gated_head_cancels_the_previous_agent(self):
+        """Job concurrency already killed this pull request's waiter, so an
+        agent from the older head would keep burning the pool and post nothing."""
+        transport = FakeTransport(marker_comment=marker_comment(9, head=BASE))
+        code, _ = run(transport)
+        self.assertEqual(0, code)
+        self.assertEqual(["bc-old"], transport.cancelled)
+
+    # --- model routing ---------------------------------------------------
+    def test_the_default_review_sends_composer_and_no_effort_parameter(self):
+        """composer-2.5 defines only `fast`; an `effort` it does not have
+        would be rejected at launch."""
+        model, params, effort, fast = cr.select_model({}, deep=False)
+        self.assertEqual("composer-2.5", model)
+        self.assertEqual("", effort)
+        self.assertIs(fast, False)
+        self.assertEqual([{"id": "fast", "value": "false"}], params)
+        self.assertNotIn("effort", [p["id"] for p in params])
+
+    def test_review_deep_sends_the_strong_model_at_xhigh(self):
+        model, params, effort, _fast = cr.select_model({}, deep=True)
+        self.assertEqual("grok-4.6", model)
+        self.assertEqual("xhigh", effort)
+        self.assertIn({"id": "effort", "value": "xhigh"}, params)
+
+    def test_composer_is_never_launched_in_fast_mode_by_default(self):
+        """Composer's OWN default variant is fast=true at 6x base
+        ($3/$0.50/$15) -- more expensive than the grok-4.6 it replaces."""
+        _m, params, _e, fast = cr.select_model({}, deep=False)
+        self.assertIs(fast, False)
+        self.assertIn({"id": "fast", "value": "false"}, params)
+
+    def test_the_launch_payload_carries_the_selected_model(self):
+        transport = FakeTransport()
+        code, _ = run(transport, CURSOR_MODEL="", CURSOR_EFFORT="")
+        self.assertEqual(0, code)
+        launch = next(c for c in transport.calls if c["method"] == "POST" and c["url"].endswith("/v1/agents"))
+        self.assertEqual("composer-2.5", launch["body"]["model"]["id"])
+        self.assertEqual([{"id": "fast", "value": "false"}], launch["body"]["model"]["params"])
+
+    # --- telemetry -------------------------------------------------------
+    def test_a_completed_review_emits_one_telemetry_line(self):
+        """Cursor exposes no token counts, so this line is the only record of
+        what reviews cost and whether the cheaper model held up."""
+        transport = FakeTransport()
+        code, out = run(transport, CURSOR_MODEL="", CURSOR_EFFORT="")
+        self.assertEqual(0, code)
+        rows = [json.loads(line.split(" ", 1)[1]) for line in out.splitlines() if line.startswith("cursor-review-telemetry ")]
+        self.assertEqual(1, len(rows))
+        row = rows[0]
+        self.assertEqual("composer-2.5", row["model"])
+        self.assertEqual("comment", row["verdict"])
+        self.assertEqual(1, row["round"])
+        self.assertIs(row["deep"], False)
+        self.assertEqual(45, row["diff_lines"])
+
 
 
 if __name__ == "__main__":
