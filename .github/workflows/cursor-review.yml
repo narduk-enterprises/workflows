@@ -57,10 +57,13 @@ name: Reusable Cursor Review
 # from this job's `cursor-review-<repo>-<pr>`: with the same name the workflow
 # run holds the group, this job then fails at scheduling with no steps and no
 # annotation (five private callers, 2026-09-18). The caller's group must ALSO
-# carry the re-request allow-list, because a run-level cancel happens before
-# any job condition is evaluated -- otherwise a `bot-inbox` or `review-p2` add
-# kills a live review and is then skipped by the job `if:`. Use:
-#   cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && !contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name) && 'other-label' || 'review' }}
+# mirror this job's `if:` allow-list, because a run-level cancel happens before
+# any job condition is evaluated -- otherwise a `synchronize`, `bot-inbox` or
+# `review-p2` event kills a live review, is then skipped by the job `if:`, and
+# never reaches `cancel_previous`. A PIN-ONLY bump of an existing caller that
+# still lists `synchronize` is therefore unsafe: drop it in the same commit.
+# Use:
+#   cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name))) && 'review' || 'other' }}
 #
 # RUNNER ROUTING: same shape as code-review.yml. The default resolves from the
 # caller's own visibility: a PRIVATE caller lands on the fleet manifest's

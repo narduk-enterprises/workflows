@@ -345,7 +345,17 @@ seven and a half hours. A lane that wants the new head reviewed adds the
 `review-now` label; the callable clears it again so the next add is a fresh
 event, and every other label addition skips. The callable's job `if:` is an
 allow-list of `opened` / `reopened` / `ready_for_review` / a re-request label,
-so a caller that has not yet dropped `synchronize` spends nothing. `review-p0` and `review-p1` also
+so a caller that has not yet dropped `synchronize` launches nothing here.
+
+**A pin-only bump is not safe.** A caller that keeps `synchronize` and a single
+`cancel-in-progress` concurrency group starts a run on the first push, cancels
+the opened review's waiter *before* any job condition is evaluated, and is then
+skipped by the job `if:` — so `cancel_previous` never runs, the Cursor agent
+keeps burning the pool, and the pull request is left unreviewed. Drop
+`synchronize` in the same commit as the pin, or put every non-review action in
+the `other` concurrency bucket first. The caller group below does the latter:
+it mirrors the job `if:` exactly, so `synchronize`, `edited` and an ignored
+label all share one bucket that no live review is ever in. `review-p0` and `review-p1` also
 wake the reviewer, and because waking it cancels any in-flight waiter they beat
 the inferred P2 signals too. Inside that, Logan's answer of
 2026-09-19 governs volume, in his words: *"No numeric cap, only the P0/P1/P2
@@ -383,7 +393,7 @@ on:
 # review: a run-level cancel happens before any job condition is evaluated, so
 # the discrimination has to be in the GROUP NAME, not only in the callable.
 concurrency:
-  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && !contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name) && 'other-label' || 'review' }}
+  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name))) && 'review' || 'other' }}
   cancel-in-progress: true
 
 permissions:
@@ -426,7 +436,12 @@ What happens per pull request head:
    REQUEST_CHANGES and nothing would launch to replace it, so
    `scripts/verify-pr-gate.py` would print green on a head no reviewer ever
    saw. A repository that keeps `dismiss_stale_reviews_on_push` on must treat
-   `review-now` after every push as mandatory rather than optional.
+   `review-now` after every push as mandatory rather than optional. **With
+   `dismiss_stale_reviews_on_push` off, the duty is the same**: an APPROVE or
+   COMMENT on head N still satisfies GitHub's `reviewDecision` on head N+1, and
+   `verify-pr-gate.py` reads only that decision — it does not bind the review to
+   `headRefOid`. So under company-hq D-AGENT-REVIEW-2 a lane that pushes after a
+   review adds `review-now`, whichever way the ruleset is set.
 
 The only secret is `CURSOR_CLOUD_AGENTS_API_KEY`, a GitHub Actions repository
 secret delivered from nvault at a workstation (company-hq D-CLOUD-SECRETS-1). No
