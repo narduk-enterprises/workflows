@@ -489,6 +489,15 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertIn("inputs.enabled", self.job["if"])
         self.assertIn("github.event.action == 'opened'", self.job["if"])
         self.assertNotIn("synchronize", self.job["if"])
+        self.assertIn("github.event.pull_request.draft == false", self.job["if"])
+        self.assertIn("'no-ai-review'", self.job["if"])
+        # The documented caller group must MIRROR that `if:`, or a run-level
+        # cancel lands on a job the `if:` then skips -- cancel-then-skip.
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        group = [line for line in readme.splitlines() if "cursor-review-caller-" in line and "group:" in line]
+        self.assertTrue(group, "the README caller shape must show its concurrency group")
+        for predicate in ("github.event.pull_request.draft == false", "'no-ai-review'", "'opened'", "'reopened'", "'ready_for_review'", '"review-now","review-p0","review-p1"'):
+            self.assertIn(predicate, group[0], f"caller group is missing {predicate}")
         for label in ("review-now", "review-p0", "review-p1"):
             self.assertIn(label, self.job["if"])
 
@@ -762,10 +771,20 @@ class ClassRuleTests(unittest.TestCase):
                 self.assertIn("::notice::review class P0", out)
                 self.assertTrue(self.launched(transport))
 
+    def test_dependency_and_build_manifests_are_not_prose(self):
+        """`requirements.txt` is installable input, not a README."""
+        for path in ("requirements.txt", "requirements-dev.txt", "constraints.txt", "CMakeLists.txt"):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P1", out)
+                self.assertTrue(self.launched(transport))
+
     def test_ordinary_prose_is_still_p2(self):
         """The policy names are an exception to the `.md` default, not a
         repeal of it."""
-        for path in ("README.md", "docs/architecture.md", "CHANGELOG.md", "LICENSE"):
+        for path in ("README.md", "docs/architecture.md", "CHANGELOG.md", "LICENSE", "NOTICE", "notes.rst"):
             with self.subTest(path):
                 transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
                 code, out = run(transport)

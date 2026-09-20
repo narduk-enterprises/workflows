@@ -393,7 +393,7 @@ on:
 # review: a run-level cancel happens before any job condition is evaluated, so
 # the discrimination has to be in the GROUP NAME, not only in the callable.
 concurrency:
-  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name))) && 'review' || 'other' }}
+  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name)))) && 'review' || 'other' }}
   cancel-in-progress: true
 
 permissions:

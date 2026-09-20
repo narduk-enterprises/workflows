@@ -63,7 +63,7 @@ name: Reusable Cursor Review
 # never reaches `cancel_previous`. A PIN-ONLY bump of an existing caller that
 # still lists `synchronize` is therefore unsafe: drop it in the same commit.
 # Use:
-#   cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name))) && 'review' || 'other' }}
+#   cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name)))) && 'review' || 'other' }}
 #
 # RUNNER ROUTING: same shape as code-review.yml. The default resolves from the
 # caller's own visibility: a PRIVATE caller lands on the fleet manifest's

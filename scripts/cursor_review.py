@@ -81,7 +81,10 @@ ALWAYS_REVIEW_NAMES = ("agents.md", "claude.md", "codex.md", "skill.md", "decisi
 # `CODEOWNERS`, `.gitignore` and `.gitattributes` are deliberately NOT here:
 # a CODEOWNERS edit can drop required reviewers and a `.gitignore` edit can
 # stop ignoring secret material, so they classify as ordinary code.
-METADATA_SUFFIXES = (".md", ".mdx", ".txt", ".rst")
+# `.txt` is NOT here: `requirements.txt`, `constraints.txt` and
+# `CMakeLists.txt` are installable or build input, the same carve-out as
+# CODEOWNERS below.
+METADATA_SUFFIXES = (".md", ".mdx", ".rst")
 METADATA_NAMES = ("LICENSE", "NOTICE")
 CHANGED_FILE_PAGES = 3
 TERMINAL_RUN_STATUSES = frozenset({"FINISHED", "ERROR", "CANCELLED", "EXPIRED"})
