@@ -792,6 +792,22 @@ class ClassRuleTests(unittest.TestCase):
                 self.assertEqual(0, code)
                 self.assertTrue(self.launched(transport))
 
+    def test_review_now_is_cleared_even_when_cursor_refuses(self):
+        """`usage_limit_exceeded` is the failure this change exists to survive.
+        If the label outlived a refused launch, re-adding it would raise no
+        `labeled` event and the lane could never ask again."""
+
+        class Refusing(FakeTransport):
+            def cursor(self, method, url, payload):
+                if method == "POST" and url.endswith("/v1/agents"):
+                    return 400, {"error": "usage_limit_exceeded"}
+                return super().cursor(method, url, payload)
+
+        transport = Refusing()
+        with self.assertRaisesRegex(cr.ReviewError, "usage_limit_exceeded"):
+            run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+        self.assertEqual([cr.REVIEW_NOW_LABEL], transport.labels_removed, "the labeled event must be consumed even when Cursor refuses")
+
     def test_a_rename_out_of_an_always_review_path_is_still_p0(self):
         """`.github/workflows/ci.yml` -> `docs/old-ci.md` reads as metadata-only
         unless the rename's previous_filename is counted."""

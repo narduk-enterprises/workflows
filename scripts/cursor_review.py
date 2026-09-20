@@ -821,13 +821,17 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
 
     marker = find_marker_comment(github, number)
     cancel_previous(cursor, marker, env["PR_HEAD_SHA"])
+    # BEFORE the launch, not after. `usage_limit_exceeded` is the failure this
+    # whole change exists to survive (77 consecutive refusals on 2026-09-19);
+    # if the label outlived a refused launch, re-adding it would raise no
+    # `labeled` event and the lane would have no way to ask again.
+    clear_review_now(github, number, env)
     started = clock()
     agent = launch(cursor, env, brief, repository, repos)
     agent_id = agent["id"]
     agent_url = agent.get("url") or f"https://cursor.com/agents/{agent_id}"
     print(f"launched Cursor agent {agent_id} for {repository}#{number} @ {env['PR_HEAD_SHA'][:12]}")
     marker = upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` (class {priority}) in progress: agent [{agent_id}]({agent_url}).")
-    clear_review_now(github, number, env)
 
     wait_minutes = float(env.get("WAIT_MINUTES") or 30)
     context = {

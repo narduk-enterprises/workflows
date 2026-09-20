@@ -159,11 +159,15 @@ jobs:
     # the in-flight review and only then print its skip. A job whose `if:` is
     # false never enters the group. `synchronize` is refused on purpose: a
     # caller that has not yet dropped it from its own `on:` block spends
-    # nothing here.
+    # nothing here. `draft` and `no-ai-review` are tested here for the same
+    # reason: `preconditions()` refuses both, but a job that reaches the script
+    # to say so has already claimed the group and cancelled a live waiter
+    # without ever running `cancel_previous`. The script keeps both checks --
+    # this `if:` is defence in depth, not the only gate.
     # A caller that declares workflow-level concurrency needs the same
     # discrimination in its GROUP NAME, because a run-level cancel happens
     # before any job condition is evaluated. The README caller shape has it.
-    if: ${{ inputs.enabled && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name))) }}
+    if: ${{ inputs.enabled && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name))) }}
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 45
     permissions:
