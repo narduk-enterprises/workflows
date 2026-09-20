@@ -18,9 +18,11 @@ Flow (agent-infrastructure#1564):
      "No numeric cap, only the P0/P1/P2 class rule". P0 (workflows, the
      operating manual, routed agent docs, or an explicit `review-p0` label)
      always launches; P1 launches once per open/ready/re-request; P2
-     (automation authors, release branches, chore/docs-marked titles,
-     metadata-only diffs, or an explicit `review-p2` label) never launches an
-     agent at all. `review-now` overrides every P2 signal.
+     (automation authors, release branches, metadata-only diffs, or an
+     explicit `review-p2` label) never launches an agent at all. The TITLE is
+     never a signal: it is author-controlled, and `chore:` on a code change
+     would be a free skip of the merge-gating reviewer. `review-now` overrides
+     every P2 signal.
   2. Cancel the agent run a previous head started, if it is still running.
   3. Launch ONE Cursor Cloud agent with the PR repository attached at the head
      branch plus read-only context repositories, and the review brief.
@@ -507,9 +509,9 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
           Never deferred.
       P1  ordinary code work. One review at open / reopen / ready, and another
           only when a lane asks by adding `review-now`.
-      P2  nits: an automation author, a release branch, a chore/docs/nit
-          title, a metadata-only diff, or the `review-p2` label. P2 never
-          launches an agent; the orchestrating session self-reviews it.
+      P2  nits: an automation author, a release branch, a metadata-only
+          diff, or the `review-p2` label. P2 never launches an agent; the
+          orchestrating session self-reviews it. The title is never a signal.
 
     `review-now` is the override: it defeats every inferred P2 signal and the
     explicit `review-p2` label, because a lane adding it has asked for this

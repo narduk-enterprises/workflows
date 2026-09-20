@@ -349,9 +349,10 @@ class rule"*. P0 (`.github/workflows/**`, `.github/actions/**`, `docs/agents/**`
 `AGENTS.md`/`CLAUDE.md`, or the `review-p0` label) is always reviewed; P1 is
 ordinary code, reviewed once per open/reopen/ready; P2 — an automation author
 (`dependabot[bot]`, `github-actions[bot]`, `renovate[bot]`), a
-`changeset-release/*` head, a chore/docs/nit-marked title, a metadata-only
-diff, or the `review-p2` label — never launches an agent, and `review-now`
-overrides every P2 signal. There is no launch counter here on purpose; the
+`changeset-release/*` head, a metadata-only diff, or the `review-p2` label —
+never launches an agent, and `review-now` overrides every P2 signal. The title
+is never a signal: it is author-controlled, and `chore:` on a code change would
+be a free skip of the merge-gating reviewer. There is no launch counter here on purpose; the
 ledger is `gh run list --repo narduk-enterprises/<repo> --workflow cursor-review.yml`.
 
 Provider failure is reported as provider failure. In particular,
