@@ -76,7 +76,7 @@ ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/", "docs/agents
 # Basenames, matched case-insensitively so `harness/claude.md` counts as much
 # as `CLAUDE.md`. These are policy, not prose: a SKILL.md edit can drop a
 # review-follow-through rule and a DECISIONS.md edit can invent an approval.
-ALWAYS_REVIEW_NAMES = ("agents.md", "claude.md", "codex.md", "skill.md", "decisions.md")
+ALWAYS_REVIEW_NAMES = ("agents.md", "claude.md", "codex.md", "skill.md", "decisions.md", "cursor_review_brief.md")
 # Everything here is prose: a diff made only of these launches no agent.
 # `CODEOWNERS`, `.gitignore` and `.gitattributes` are deliberately NOT here:
 # a CODEOWNERS edit can drop required reviewers and a `.gitignore` edit can
@@ -880,7 +880,7 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
         upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` was superseded by a newer head (agent [{agent_id}]({agent_url})). A push no longer re-reviews: add the `{REVIEW_NOW_LABEL}` label to review the new head.")
         return 0
     except ReviewError as exc:
-        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` did not complete: {str(exc)[:500]} (agent [{agent_id}]({agent_url})). The job is red; re-run it or push a new head.")
+        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` did not complete: {str(exc)[:500]} (agent [{agent_id}]({agent_url})). The job is red; re-run it or add the `{REVIEW_NOW_LABEL}` label.")
         raise
     review_url = review.get("html_url") or ""
     upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}`: {event} — {review_url} (agent [{agent_id}]({agent_url}), {duration_text(context.get('elapsed'))}).")

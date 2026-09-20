@@ -296,6 +296,8 @@ class ReviewFlowTests(unittest.TestCase):
             run(transport)
         last_patch = [c for c in transport.calls if c["method"] == "PATCH"][-1]
         self.assertIn("did not complete", last_patch["body"]["body"])
+        self.assertIn("add the `review-now` label", last_patch["body"]["body"])
+        self.assertNotIn("push a new head", last_patch["body"]["body"])
         self.assertFalse(any(c["url"].endswith("/pulls/7/reviews") and c["method"] == "POST" for c in transport.calls))
 
     def test_the_wait_budget_ends_the_run_as_an_error(self):
@@ -757,6 +759,7 @@ class ClassRuleTests(unittest.TestCase):
         enrolled caller, so these land here."""
         for path in (
             "skills/repo-hygiene-execute/SKILL.md",
+            "scripts/cursor_review_brief.md",
             "harness/claude.md",
             "harness/codex.md",
             "DECISIONS.md",
