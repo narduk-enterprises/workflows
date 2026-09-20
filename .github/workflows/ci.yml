@@ -220,6 +220,9 @@ jobs:
       - name: e2e-skip-paths behaviour tests
         run: python3 scripts/test_e2e_skip_paths.py
 
+      - name: E2E proof reuse behavior tests
+        run: python3 scripts/test_e2e_reuse.py
+
       - name: E2E report minimal-install tests
         run: python3 scripts/test_e2e_report_minimal_install.py
 

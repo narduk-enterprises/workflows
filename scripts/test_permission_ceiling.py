@@ -61,12 +61,12 @@ def check_shipped_callables_pass() -> None:
     print("PASS  every shipped callable stays inside its documented caller grant")
 
 
-def check_e2e_plan_is_contents_only() -> None:
-    """The exact regression: `E2E plan` must ask for `contents: read` alone."""
+def check_e2e_plan_is_read_only() -> None:
+    """E2E plan only reads source and prior Actions proof; no write scopes."""
     doc = yaml.safe_load((WORKFLOWS / "nuxt-cloudflare.yml").read_text())
     perms = doc["jobs"]["e2e-plan"]["permissions"]
-    assert perms == {"contents": "read"}, f"E2E plan permissions drifted: {perms}"
-    print("PASS  nuxt-cloudflare.yml `E2E plan` requests contents: read and nothing else")
+    assert perms == {"contents": "read", "actions": "read"}, f"E2E plan permissions drifted: {perms}"
+    print("PASS  nuxt-cloudflare.yml `E2E plan` requests only contents: read and actions: read")
 
 
 def check_seeded_escalation_is_rejected() -> None:
@@ -142,7 +142,7 @@ def check_shorthand_permissions_are_rejected() -> None:
 
 def main() -> None:
     check_shipped_callables_pass()
-    check_e2e_plan_is_contents_only()
+    check_e2e_plan_is_read_only()
     check_seeded_escalation_is_rejected()
     check_preview_is_the_only_pull_requests_job()
     check_undeclared_callable_is_rejected()

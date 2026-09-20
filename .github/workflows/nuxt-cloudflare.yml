@@ -463,18 +463,26 @@ on:
         description: >-
           Space-separated glob patterns (supporting `*` and `**`), relative to
           the repository root. When `run-e2e` is true, every changed path in
-          a pull request event matches at least one pattern, and there is at
+          a pull request or push event matches at least one pattern, and there is at
           least one changed path, the `E2E plan` job emits an empty shard
           list and every browser job (`E2E`, `E2E report`) is skipped —
           `Required` still gates, expecting them `skipped` rather than
-          absent. Empty (the default) never skips. Applies to
-          `pull_request`/`pull_request_target` events only; a push (e.g. to
-          the default branch) always runs the full suite regardless of this
-          input, because that is the canonical-branch validation the skip is
-          not meant to weaken. workflows#49.
+          absent. Defaults to documentation and repository metadata; an
+          explicitly empty value disables path skipping. Unknown or incomplete
+          diffs run E2E. Manual, scheduled and merge-group runs never skip.
         required: false
         type: string
-        default: ""
+        default: "*.md docs/**/*.md apps/*/README.md packages/*/README.md **/AGENTS.md **/CLAUDE.md LICENSE LICENSE.txt .github/ISSUE_TEMPLATE/** .github/PULL_REQUEST_TEMPLATE.md .github/pull_request_template.md .github/CODEOWNERS"
+      e2e-reuse-pr-results:
+        description: >-
+          On a default-branch push, reuse a successful same-repository PR run
+          of the full E2E suite only when its tested Git tree, caller workflow
+          and all callable inputs match. Missing, expired or unreadable proof
+          runs E2E. Requires actions: read on the caller's ci job. Disable for
+          suites whose behavior intentionally differs between PR and push.
+        required: false
+        type: boolean
+        default: true
       e2e-full-paths:
         description: >-
           Space-separated glob patterns (same `*`/`**` syntax as
@@ -488,8 +496,8 @@ on:
           occasional red main". When the changed-file list cannot be
           determined (no `gh`, a failed compare, the 300-file compare cap),
           a caller that set this input gets the full suite. Empty (the
-          default) leaves the tiers exactly as they were. Pushes always run
-          the full configuration regardless.
+          default) leaves the tiers exactly as they were. Pushes use the full
+          configuration whenever E2E is selected.
         required: false
         type: string
         default: ""
@@ -1899,20 +1907,16 @@ jobs:
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
-    # `contents: read` and nothing else, deliberately. A job in a CALLED
-    # workflow may only request permissions the CALLER already granted; ask
-    # for one it did not and the caller's ENTIRE run dies at startup
-    # (`startup_failure`, zero jobs, no logs, no annotation) before any job is
-    # created. Every estate caller grants `contents: read` + `packages: read`,
-    # so the `pull-requests: read` this job briefly carried for
-    # `gh api .../pulls/<n>/files` took down every `@v1` nuxt-cloudflare
-    # adopter at once (workflows#59). The changed-file list below is read
-    # through the COMPARE endpoint instead, which is a Contents read.
+    # Callers adopting this revision must grant actions: read as well as
+    # contents: read. It reads prior PR proof artifacts; it cannot write runs.
+    # Do not advance an existing major tag across this permission migration.
     permissions:
       contents: read
+      actions: read
     outputs:
       shards: ${{ steps.plan.outputs.shards }}
       skipped: ${{ steps.skip.outputs.skipped }}
+      proof-key: ${{ steps.proof.outputs.key }}
       # `true` when `e2e-full-paths` promoted this pull request to the full
       # configuration; consumed only by the shard-list step below.
       full: ${{ steps.skip.outputs.full }}
@@ -1927,19 +1931,61 @@ jobs:
       shard-total: ${{ steps.plan.outputs.shard-total }}
       e2e-args: ${{ steps.plan.outputs.e2e-args }}
     steps:
-      # Decides BEFORE the shard list is computed, so "skipped" can force
-      # shards to `[]` below. Only a pull_request(_target) event is eligible:
-      # a push (main, workflow_dispatch, schedule) always runs the full
-      # suite, because that is the canonical-branch validation this input is
-      # not meant to weaken (workflows#49).
+      - name: Find equivalent successful PR E2E proof
+        id: proof
+        if: inputs.e2e-reuse-pr-results && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)))
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          E2E_INPUTS: ${{ toJSON(inputs) }}
+        with:
+          script: |
+            const { createHash } = require('node:crypto');
+            core.setOutput('reused', 'false');
+            try {
+              const repo = context.repo;
+              const repositoryId = context.payload.repository.id;
+              const workflow = process.env.CALLER_WORKFLOW_REF.split('@')[0];
+              const workflowPath = workflow.slice(`${repo.owner}/${repo.repo}/`.length);
+              const inputs = JSON.parse(process.env.E2E_INPUTS);
+              const canonicalInputs = Object.fromEntries(Object.entries(inputs).sort(([a], [b]) => a.localeCompare(b)));
+              const { data: commit } = await github.rest.repos.getCommit({ ...repo, ref: context.sha, request: { timeout: 10000 } });
+              const tree = commit.commit.tree.sha;
+              if (!/^[a-f0-9]{40}$/.test(tree)) throw new Error('missing tested Git tree');
+              const digest = createHash('sha256').update(JSON.stringify({ tree, workflow, inputs: canonicalInputs })).digest('hex');
+              const key = `e2e-proof-v1-${digest}`;
+              core.setOutput('key', key);
+              if (context.eventName !== 'push') return;
+              // Bound the lookup. An absent proof costs a run, never coverage.
+              const { data } = await github.rest.actions.listArtifactsForRepo({ ...repo, name: key, per_page: 5, request: { timeout: 10000 } });
+              const candidates = data.artifacts.slice(0, 5).filter(artifact => artifact.name === key && !artifact.expired && artifact.workflow_run?.repository_id === repositoryId && artifact.workflow_run?.head_repository_id === repositoryId);
+              const proofs = await Promise.all(candidates.map(async artifact => {
+                const { data: run } = await github.rest.actions.getWorkflowRun({ ...repo, run_id: artifact.workflow_run.id, request: { timeout: 10000 } });
+                return { artifact, run };
+              }));
+              for (const { artifact, run } of proofs) {
+                if (run.event !== 'pull_request' || run.status !== 'completed' || run.conclusion !== 'success' || run.path !== workflowPath || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) continue;
+                // A rerun must publish fresh proof, not inherit an older attempt.
+                if (!(Date.parse(artifact.created_at) >= Date.parse(run.run_started_at))) continue;
+                core.setOutput('reused', 'true');
+                core.notice(`Reusing full E2E proof from ${run.html_url} for Git tree ${tree}`);
+                await core.summary.addRaw(`Full E2E already passed for this Git tree and configuration: ${run.html_url}\n`).write();
+                return;
+              }
+              core.info('No equivalent successful PR E2E proof; evaluating changed paths.');
+            } catch (error) {
+              core.warning(`E2E proof unavailable; running normal E2E selection: ${error.message}`);
+            }
+      # Decide before computing shards so a proven skip schedules no browser.
       - name: Decide whether E2E can be skipped
         id: skip
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.after }}
+          REUSED: ${{ steps.proof.outputs.reused }}
           SKIP_PATTERNS: ${{ inputs.e2e-skip-paths }}
           FULL_PATTERNS: ${{ inputs.e2e-full-paths }}
         run: |
@@ -1950,6 +1996,12 @@ jobs:
           # `**/*.md` in a workspace holding `docs/readme.md` silently became that
           # one file, and a docs-only PR stopped skipping (workflows#118).
           set -f
+          if [ "${REUSED:-false}" = true ]; then
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+            echo "full=false" >> "$GITHUB_OUTPUT"
+            echo "the same Git tree and full E2E configuration already passed on the pull request"
+            exit 0
+          fi
           # One changed-file read serves both path inputs. `full` answers
           # "does this PR need the full configuration?" (e2e-full-paths). When
           # the files cannot be determined it is `true` for a caller that
@@ -1965,18 +2017,20 @@ jobs:
             exit 0
           fi
           case "$EVENT_NAME" in
-            pull_request|pull_request_target) ;;
+            pull_request|pull_request_target|push) ;;
             *)
               echo "skipped=false" >> "$GITHUB_OUTPUT"
               echo "full=false" >> "$GITHUB_OUTPUT"
-              echo "event '$EVENT_NAME' is not a pull request: e2e-skip-paths never applies outside PR events"
+              echo "event '$EVENT_NAME' has no supported diff: running E2E"
               exit 0
               ;;
           esac
-          if [ -z "$BASE_SHA" ] || [ -z "$HEAD_SHA" ]; then
+          if ! [[ "$BASE_SHA" =~ ^[a-f0-9]{40}$ && "$HEAD_SHA" =~ ^[a-f0-9]{40}$ ]] ||
+              [ "$BASE_SHA" = 0000000000000000000000000000000000000000 ] ||
+              [ "$HEAD_SHA" = 0000000000000000000000000000000000000000 ]; then
             echo "skipped=false" >> "$GITHUB_OUTPUT"
             echo "full=$unknown_full" >> "$GITHUB_OUTPUT"
-            echo "no pull request base/head sha in context; running the full suite"
+            echo "no valid base/head sha in context; running the full suite"
             exit 0
           fi
           # Self-hosted runners provision their own toolchains rather than
@@ -1996,8 +2050,12 @@ jobs:
           # `pull-requests: read` and that escalation kills the caller's run
           # at startup (workflows#59, see the permissions comment above).
           # Any read failure degrades to running the full suite.
+          # A divergent push compares from a merge base, not its previous tip.
+          # PRs intentionally use the merge-base diff; pushes must be forward.
+          status_filter='.status == "ahead" or .status == "diverged"'
+          if [ "$EVENT_NAME" = push ]; then status_filter='.status == "ahead"'; fi
           if ! files=$(gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA" \
-              --paginate --jq '.files[]?.filename'); then
+              --jq "if (.files | length) >= 300 or (($status_filter) | not) then error(\"incomplete diff\") else [.files[] | .filename, .previous_filename // empty] | if any(.[]; test(\"[\\\\r\\\\n]\")) then error(\"unsupported filename\") else .[] end end"); then
             echo "skipped=false" >> "$GITHUB_OUTPUT"
             echo "full=$unknown_full" >> "$GITHUB_OUTPUT"
             echo "::warning::could not compare $BASE_SHA...$HEAD_SHA; running the full suite"
@@ -2039,10 +2097,12 @@ jobs:
               if [ "$c" = "*" ]; then
                 nextc="${pattern:$((i + 1)):1}"
                 if [ "$nextc" = "*" ]; then
-                  out+=".*"
                   i=$((i + 2))
                   if [ "${pattern:$i:1}" = "/" ]; then
+                    out+="(.*/)?"
                     i=$((i + 1))
+                  else
+                    out+=".*"
                   fi
                   continue
                 fi
@@ -3971,3 +4031,25 @@ jobs:
             require_skipped deploy-dry-run "$DEPLOY_DRY_RUN_RESULT"
           fi
           exit "$status"
+      # Proof is published only after Required passed and the real full suite
+      # ran. A path skip, PR subset, fork or failed shard cannot mint proof.
+      - name: Write full E2E proof
+        id: e2e-proof
+        if: success() && inputs.e2e-reuse-pr-results && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.e2e.result == 'success' && needs.e2e-plan.outputs.proof-key != '' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards
+        env:
+          PROOF_KEY: ${{ needs.e2e-plan.outputs.proof-key }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof_file=$(mktemp "$RUNNER_TEMP/e2e-proof.XXXXXX")
+          printf '%s\n' "$PROOF_KEY" > "$proof_file"
+          echo "path=$proof_file" >> "$GITHUB_OUTPUT"
+      - name: Publish full E2E proof
+        if: success() && steps.e2e-proof.outputs.path != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ needs.e2e-plan.outputs.proof-key }}
+          path: ${{ steps.e2e-proof.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true

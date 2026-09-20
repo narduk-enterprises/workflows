@@ -19,6 +19,7 @@ Run: python3 scripts/test_e2e_skip_paths.py
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import stat
@@ -47,8 +48,9 @@ def check_input_declared() -> None:
     inp = trigger["workflow_call"]["inputs"]["e2e-skip-paths"]
     assert inp["required"] is False
     assert inp["type"] == "string"
-    assert inp["default"] == ""
-    print("PASS  e2e-skip-paths input declared, optional, default empty")
+    assert "docs/**/*.md" in inp["default"]
+    assert "**/*.md" not in inp["default"].split()
+    print("PASS  e2e-skip-paths defaults to conservative documentation paths")
     inp = trigger["workflow_call"]["inputs"]["e2e-full-paths"]
     assert inp["required"] is False
     assert inp["type"] == "string"
@@ -65,10 +67,8 @@ def check_job_wiring() -> None:
     assert plan["outputs"]["full"] == "${{ steps.skip.outputs.full }}"
     plan_step = named_step(plan, "Compute shard list")
     assert plan_step["env"]["FULL"] == "${{ steps.skip.outputs.full }}", plan_step["env"]
-    # workflows#59: this job must never request a permission its callers do
-    # not grant. `pull-requests: read` here fails EVERY caller's run at
-    # startup with zero jobs and no annotation.
-    assert plan["permissions"] == {"contents": "read"}, plan["permissions"]
+    # The new permission ceiling must be adopted with the callable SHA.
+    assert plan["permissions"] == {"contents": "read", "actions": "read"}, plan["permissions"]
     skip_step = named_step(plan, "Decide whether E2E can be skipped")
     api_calls = [
         line.strip()
@@ -105,20 +105,19 @@ def plan_step_script() -> str:
     return named_step(doc["jobs"]["e2e-plan"], "Compute shard list")["run"]
 
 
-def make_stub_gh(bin_dir: pathlib.Path, files: list[str]) -> None:
-    """A `gh` stub that answers `gh api .../compare/BASE...HEAD --paginate --jq ...`
-    with one filename per line, mirroring the real command's output shape.
-
-    The step reads the changed-file list through the COMPARE endpoint, not
-    `pulls/<n>/files`: comparing two commits is a Contents read and needs only
-    the `contents: read` every caller grants, where `pulls/<n>/files` needs
-    `pull-requests: read` — an escalation that fails the caller's whole run at
-    startup (workflows#59)."""
+def make_stub_gh(bin_dir: pathlib.Path, files: list[str | dict], compare_status: str = "ahead") -> None:
+    """Execute the shipped gh --jq expression against a synthetic API response."""
+    response = {"status": compare_status, "files": [
+        {"filename": item} if isinstance(item, str) else item for item in files
+    ]}
+    fixture = bin_dir / "compare.json"
+    fixture.write_text(json.dumps(response))
     script = bin_dir / "gh"
-    body = "#!/usr/bin/env bash\nset -euo pipefail\n"
-    for f in files:
-        body += f"printf '%s\\n' {shell_quote(f)}\n"
-    script.write_text(body)
+    script.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        '[[ "$1" == api && "$2" == repos/*/compare/* && "$3" == --jq ]]\n'
+        f'exec jq -r "$4" {shell_quote(str(fixture))}\n'
+    )
     script.chmod(script.stat().st_mode | stat.S_IEXEC)
 
 
@@ -132,14 +131,16 @@ def run_skip_step(
     base_sha: str,
     head_sha: str,
     skip_patterns: str,
-    files: list[str],
+    files: list[str | dict],
     full_patterns: str = "",
+    compare_status: str = "ahead",
+    reused: str = "false",
 ) -> tuple[subprocess.CompletedProcess, str]:
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
         bin_dir = root / "bin"
         bin_dir.mkdir()
-        make_stub_gh(bin_dir, files)
+        make_stub_gh(bin_dir, files, compare_status)
         output_path = root / "github_output"
         output_path.write_text("")
         summary_path = root / "github_step_summary"
@@ -149,6 +150,7 @@ def run_skip_step(
         env["GH_TOKEN"] = "fake"
         env["REPO"] = "narduk-enterprises/operator-portal"
         env["EVENT_NAME"] = event_name
+        env["REUSED"] = reused
         env["BASE_SHA"] = base_sha
         env["HEAD_SHA"] = head_sha
         env["SKIP_PATTERNS"] = skip_patterns
@@ -188,7 +190,7 @@ def check_behavior() -> None:
             "false",
         ),
         (
-            "push event never skips even with matching patterns",
+            "push with no diff SHAs cannot skip",
             dict(
                 event_name="push",
                 base_sha="",
@@ -254,6 +256,7 @@ def check_behavior() -> None:
             "false",
         ),
     ]
+    cases += _default_and_push_cases()
     cases += _compare_cap_cases()
     cases += _full_paths_cases()
     failures = _run_cases(cases)
@@ -261,6 +264,41 @@ def check_behavior() -> None:
     failures += _check_failing_gh_degrades_safely()
     if failures:
         raise SystemExit(f"{failures} case(s) failed")
+
+
+def _default_and_push_cases() -> list:
+    doc = load_doc()
+    defaults = doc.get(True, doc.get("on", {}))["workflow_call"]["inputs"]["e2e-skip-paths"]["default"]
+    common = dict(base_sha="a" * 40, head_sha="b" * 40, skip_patterns=defaults)
+    cases = []
+    for event in ("pull_request", "pull_request_target", "push"):
+        for files, expected in (
+            (["README.md", "docs/setup.md", "docs/ci/nested.md", ".github/CODEOWNERS"], "true"),
+            (["content/home.md"], "false"),
+            (["content/README.md"], "false"),
+            (["LICENSE.ts"], "false"),
+            (["apps/web/README.md", "packages/core/README.md"], "true"),
+            (["content/notREADME.md"], "false"),
+            (["docs/check.mjs"], "false"),
+            (["apps/web/app/pages/index.vue"], "false"),
+            (["apps/web/app/assets/main.css"], "false"),
+            (["pnpm-lock.yaml"], "false"),
+            (["playwright.config.ts"], "false"),
+            ([".github/workflows/ci.yml"], "false"),
+            (["unknown.extension"], "false"),
+            ([{"filename": "docs/README.md", "previous_filename": "app/server.ts"}], "false"),
+            ([{"filename": "docs/new.md", "previous_filename": "docs/old.md"}], "true"),
+            (["README.md\nCHANGELOG.md"], "false"),
+        ):
+            cases.append((f"{event}: {files!r}", dict(common, event_name=event, files=files), expected))
+    for event in ("workflow_dispatch", "schedule", "merge_group", "release"):
+        cases.append((f"{event} always runs", dict(common, event_name=event, files=["README.md"]), "false"))
+    cases.extend([
+        ("divergent push runs", dict(common, event_name="push", files=["README.md"], compare_status="diverged"), "false"),
+        ("new branch push runs", dict(common, event_name="push", base_sha="0" * 40, files=["README.md"]), "false"),
+        ("equivalent full PR proof skips even code diff", dict(common, event_name="push", files=["app/server.ts"], reused="true"), "true"),
+    ])
+    return cases
 
 
 def _compare_cap_cases() -> list:
@@ -343,10 +381,10 @@ def _full_paths_cases() -> list:
             {"skipped": "false", "full": "true"},
         ),
         (
-            "full-paths on a push -> unaffected, full=false",
+            "full-paths on a push vetoes path skipping",
             dict(event_name="push", base_sha=base, head_sha=head, skip_patterns="",
                  full_patterns="server/database/**", files=["server/database/schema.ts"]),
-            {"skipped": "false", "full": "false"},
+            {"skipped": "false", "full": "true"},
         ),
     ]
 
