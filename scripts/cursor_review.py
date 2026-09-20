@@ -463,6 +463,11 @@ def label_names(env: dict[str, str]) -> set[str]:
         value = json.loads(raw)
     except ValueError:
         value = raw.replace("\n", ",").split(",")
+    if isinstance(value, str):
+        # `toJSON(labels.*.name)` is an array today, but the splat shape is the
+        # one famous for collapsing, and a silently empty label set would make
+        # `review-now` neither override P2 nor consume its own event.
+        value = [value]
     if not isinstance(value, list):
         return set()
     names = set()
@@ -535,7 +540,7 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
     explicit `review-p2` label, because a lane adding it has asked for this
     exact head to be reviewed.
     """
-    labels = label_names(env)
+    labels = effective_labels(env)
     # `review-now` and `review-p1` both wake the reviewer (RE_REQUEST_LABELS,
     # the job `if:`, the caller group), so both must also beat the INFERRED P2
     # signals -- otherwise adding one cancels the in-flight waiter and then
@@ -582,13 +587,29 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
     return "P1", f"label '{REVIEW_NOW_LABEL}' re-request" if requested else "code change"
 
 
+def effective_labels(env: dict[str, str]) -> set[str]:
+    """`PR_LABELS`, plus the `labeled` event's own label.
+
+    The event's label is on the pull request by definition, so it counts even
+    if the `toJSON(labels.*.name)` splat arrived in a shape `label_names`
+    could not parse. A re-request must not depend on that shape: a silently
+    empty label set would make `review-now` neither override P2 nor consume
+    its own event, and the lane would have no way to ask again.
+    """
+    labels = label_names(env)
+    added = (env.get("PR_EVENT_LABEL") or "").strip().casefold()
+    if (env.get("PR_EVENT_ACTION") or "").strip() == "labeled" and added in RE_REQUEST_LABELS:
+        labels = labels | {added}
+    return labels
+
+
 def clear_review_now(github: GitHub, number: str, env: dict[str, str]) -> None:
     """Remove `review-now` so the next re-request is a fresh `labeled` event.
 
     Adding a label that is already present raises no event, so leaving it on
     would make the second re-request silently do nothing.
     """
-    if REVIEW_NOW_LABEL not in label_names(env):
+    if REVIEW_NOW_LABEL not in effective_labels(env):
         return
     try:
         github.call("DELETE", f"issues/{number}/labels/{REVIEW_NOW_LABEL}", ok=(200, 204, 404))
@@ -822,13 +843,14 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
         },
     )
 
+    # FIRST, before anything that can fail. `usage_limit_exceeded` is the
+    # failure this whole change exists to survive (77 consecutive refusals on
+    # 2026-09-19), and `find_marker_comment` can raise on its own; if the label
+    # outlived either, re-adding it would raise no `labeled` event and the lane
+    # would have no way to ask again.
+    clear_review_now(github, number, env)
     marker = find_marker_comment(github, number)
     cancel_previous(cursor, marker, env["PR_HEAD_SHA"])
-    # BEFORE the launch, not after. `usage_limit_exceeded` is the failure this
-    # whole change exists to survive (77 consecutive refusals on 2026-09-19);
-    # if the label outlived a refused launch, re-adding it would raise no
-    # `labeled` event and the lane would have no way to ask again.
-    clear_review_now(github, number, env)
     started = clock()
     agent = launch(cursor, env, brief, repository, repos)
     agent_id = agent["id"]

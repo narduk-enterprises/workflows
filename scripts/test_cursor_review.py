@@ -781,6 +781,36 @@ class ClassRuleTests(unittest.TestCase):
                 self.assertIn("::notice::review class P1", out)
                 self.assertTrue(self.launched(transport))
 
+    def test_a_single_label_is_read_whatever_shape_the_splat_takes(self):
+        """`PR_LABELS` is a `toJSON` splat. A bare JSON string must read as one
+        label, and the `labeled` event's own label counts regardless."""
+        for label, overrides in (
+            ("json string", {"PR_LABELS": '"review-now"', "PR_AUTHOR": "dependabot[bot]"}),
+            ("empty labels, event label only", {"PR_LABELS": "[]", "PR_AUTHOR": "dependabot[bot]", "PR_EVENT_ACTION": "labeled", "PR_EVENT_LABEL": "review-now"}),
+            ("malformed labels, event label only", {"PR_LABELS": "not json", "PR_AUTHOR": "dependabot[bot]", "PR_EVENT_ACTION": "labeled", "PR_EVENT_LABEL": "review-now"}),
+        ):
+            with self.subTest(label):
+                transport = FakeTransport()
+                code, _ = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertTrue(self.launched(transport), "review-now must override the automation author")
+                self.assertEqual([cr.REVIEW_NOW_LABEL], transport.labels_removed, "and must consume its own event")
+
+    def test_review_now_is_cleared_before_anything_that_can_fail(self):
+        """`find_marker_comment` can raise too; if the label outlived it, the
+        lane could never re-request."""
+
+        class NoComments(FakeTransport):
+            def github(self, method, path, payload):
+                if method == "GET" and "/issues/7/comments" in path:
+                    return 500, {"message": "boom"}
+                return super().github(method, path, payload)
+
+        transport = NoComments()
+        with self.assertRaisesRegex(cr.ReviewError, "HTTP 500"):
+            run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+        self.assertEqual([cr.REVIEW_NOW_LABEL], transport.labels_removed)
+
     def test_ordinary_prose_is_still_p2(self):
         """The policy names are an exception to the `.md` default, not a
         repeal of it."""

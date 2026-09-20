@@ -343,7 +343,10 @@ set deliberately omits `synchronize`: on 2026-09-19 push-driven re-reviews took
 the estate to 165 runs over 80 heads and exhausted the Cursor Models pool for
 seven and a half hours. A lane that wants the new head reviewed adds the
 `review-now` label; the callable clears it again so the next add is a fresh
-event, and every other label addition skips. The callable's job `if:` is an
+event, and every other label addition skips. One ordering matters: the job
+refuses to wake at all while `no-ai-review` is on, and removing that label is
+an `unlabeled` event nothing listens for — so **clear the opt-out first, then
+add `review-now`**, not the other way round. The callable's job `if:` is an
 allow-list of `opened` / `reopened` / `ready_for_review` / a re-request label,
 so a caller that has not yet dropped `synchronize` launches nothing here.
 
