@@ -17,23 +17,53 @@ name: Reusable Cursor Review
 # `enabled` defaults to FALSE, so the tag carrying this file changes nothing
 # for a caller that has not opted in.
 #
+# TRIGGERS AND CLASS RULE (agent-infrastructure, reviewer untangle 2026-09-19).
+# Callers listen on [opened, reopened, ready_for_review, labeled] and NOT on
+# `synchronize`: a push no longer re-reviews on its own. A lane that wants the
+# new head reviewed adds the `review-now` label, which this job clears again so
+# the next add is a fresh event. Every other label addition skips.
+# Within that, Logan's answer of 2026-09-19 governs how much gets reviewed, in
+# his words: "No numeric cap, only the P0/P1/P2 class rule".
+#   P0  `.github/workflows/**`, `.github/actions/**`, `docs/agents/**`,
+#       a policy basename
+#       (`AGENTS.md`, `CLAUDE.md`, `CODEX.md`, `SKILL.md`, `DECISIONS.md`, matched
+#       case-insensitively), or the `review-p0` label. Always reviewed.
+#   P1  ordinary code. Reviewed once per open/reopen/ready, again on request.
+#   P2  an automation author (dependabot, github-actions, renovate), a
+#       `changeset-release/*` head, a metadata-only diff (prose only --
+#       CODEOWNERS and .gitignore are code), or the `review-p2` label. The
+#       TITLE is never a signal: it is author-controlled, and `chore:` on a
+#       code change would be a free skip. An UNKNOWN file list is never P2
+#       either. NEVER launches an agent;
+#       the orchestrating session self-reviews it. `review-now` overrides P2.
+# There is no launch counter and no ledger here on purpose: the ledger is
+# `gh run list --workflow cursor-review.yml` against each enrolled repository.
+#
 # SKIPS exit 0 with a `::notice::`: no pull request on this event, a draft PR,
 # the `no-ai-review` label, a FORK head (same-repo heads only: a fork must not
 # steer estate Cursor capacity, and a public caller's fork PR has no secret
-# anyway), or a caller that was never given the secret. A reviewer error or a
+# anyway), a caller that was never given the secret, a label addition that is
+# not a review re-request, or a P2 pull request. A reviewer error or a
 # run that exceeds `wait-minutes` FAILS the job so the check is visibly red;
 # this job is never part of `ci / Required`, so red here blocks nothing by
 # itself. What blocks a merge is the REQUEST_CHANGES review under the
 # repository's pull-request rule, which GitHub and verify-pr-gate both honour.
 #
-# A push to the PR cancels the in-flight job (job-level concurrency keyed by
-# PR number) and the script also cancels the previous head's agent run through
-# the Cursor API before launching the new one. A CALLER that declares its own
-# workflow-level concurrency (some caller lints require one) MUST use a group
-# name different from this job's `cursor-review-<repo>-<pr>`: with the same
-# name the workflow run holds the group, this job then fails at scheduling
-# with no steps and no annotation (five private callers, 2026-09-18). Use
-# `cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}`.
+# A new review (a `review-now` add, a reopen, ready_for_review) cancels the
+# in-flight job (job-level concurrency keyed by PR number) and the script also
+# cancels the previous head's agent run through the Cursor API, whether it goes
+# on to launch or to skip. A CALLER that declares its own workflow-level
+# concurrency (some caller lints require one) MUST use a group name different
+# from this job's `cursor-review-<repo>-<pr>`: with the same name the workflow
+# run holds the group, this job then fails at scheduling with no steps and no
+# annotation (five private callers, 2026-09-18). The caller's group must ALSO
+# mirror this job's `if:` allow-list, because a run-level cancel happens before
+# any job condition is evaluated -- otherwise a `synchronize`, `bot-inbox` or
+# `review-p2` event kills a live review, is then skipped by the job `if:`, and
+# never reaches `cancel_previous`. A PIN-ONLY bump of an existing caller that
+# still lists `synchronize` is therefore unsafe: drop it in the same commit.
+# Use:
+#   cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name)))) && 'review' || 'other' }}
 #
 # RUNNER ROUTING: same shape as code-review.yml. The default resolves from the
 # caller's own visibility: a PRIVATE caller lands on the fleet manifest's
@@ -68,10 +98,14 @@ on:
         type: string
         default: xhigh
       fast:
-        description: Model `fast` parameter.
+        description: >-
+          Model `fast` parameter. FALSE by default for reviews: `fast` buys
+          wall-clock, and this job already budgets `wait-minutes` and blocks
+          nobody while it waits, so a reviewer is never the latency-critical
+          lane. Implementation lanes keep `fast=true`.
         required: false
         type: boolean
-        default: true
+        default: false
       context-repos:
         description: >-
           Comma-separated `owner/name` repositories attached read-only beside
@@ -119,7 +153,21 @@ on:
 jobs:
   cursor-review:
     name: Cursor review
-    if: ${{ inputs.enabled }}
+    # An ALLOW-list of the actions that start a review, HERE and not only in
+    # the script: job-level concurrency is claimed when a job is queued, so a
+    # `synchronize`, `bot-inbox` or triage event reaching the job would cancel
+    # the in-flight review and only then print its skip. A job whose `if:` is
+    # false never enters the group. `synchronize` is refused on purpose: a
+    # caller that has not yet dropped it from its own `on:` block spends
+    # nothing here. `draft` and `no-ai-review` are tested here for the same
+    # reason: `preconditions()` refuses both, but a job that reaches the script
+    # to say so has already claimed the group and cancelled a live waiter
+    # without ever running `cancel_previous`. The script keeps both checks --
+    # this `if:` is defence in depth, not the only gate.
+    # A caller that declares workflow-level concurrency needs the same
+    # discrimination in its GROUP NAME, because a run-level cancel happens
+    # before any job condition is evaluated. The README caller shape has it.
+    if: ${{ inputs.enabled && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name))) }}
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 45
     permissions:
@@ -162,6 +210,12 @@ jobs:
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_DRAFT: ${{ github.event.pull_request.draft }}
           PR_OPTED_OUT: ${{ contains(github.event.pull_request.labels.*.name, 'no-ai-review') }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          # Empty on every event but `labeled`, which is exactly the test the
+          # script makes: only a review re-request label starts an agent.
+          PR_EVENT_ACTION: ${{ github.event.action }}
+          PR_EVENT_LABEL: ${{ github.event.label.name }}
           CURSOR_MODEL: ${{ inputs.model }}
           CURSOR_EFFORT: ${{ inputs.effort }}
           CURSOR_FAST: ${{ inputs.fast }}

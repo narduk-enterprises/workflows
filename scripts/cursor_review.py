@@ -12,6 +12,17 @@ Flow (agent-infrastructure#1564):
   1. Skip, exit 0, with a `::notice::`, when this event is not a same-repo,
      non-draft pull request, when the PR carries the `no-ai-review` label, or
      when the caller was never given `CURSOR_CLOUD_AGENTS_API_KEY`.
+  1b. Skip when a `labeled` event added a label that is not a review
+     re-request, and skip when the priority class is P2. The class rule is
+     Logan's answer of 2026-09-19 to the reviewer-untangle round, verbatim:
+     "No numeric cap, only the P0/P1/P2 class rule". P0 (workflows, the
+     operating manual, routed agent docs, or an explicit `review-p0` label)
+     always launches; P1 launches once per open/ready/re-request; P2
+     (automation authors, release branches, metadata-only diffs, or an
+     explicit `review-p2` label) never launches an agent at all. The TITLE is
+     never a signal: it is author-controlled, and `chore:` on a code change
+     would be a free skip of the merge-gating reviewer. `review-now` overrides
+     every P2 signal.
   2. Cancel the agent run a previous head started, if it is still running.
   3. Launch ONE Cursor Cloud agent with the PR repository attached at the head
      branch plus read-only context repositories, and the review brief.
@@ -21,6 +32,9 @@ Flow (agent-infrastructure#1564):
      review on the reviewed head: APPROVE / COMMENT / REQUEST_CHANGES with one
      inline comment per finding whose file:line is inside the PR diff.
   6. A non-blocking review dismisses this bot's own stale REQUEST_CHANGES.
+     A head that moved while the agent ran posts nothing and says so: without
+     `synchronize` the new head is reviewed when a lane adds `review-now`, not
+     automatically.
 
 Anything the reviewer reads (the PR, the diff, the agent's answer) is
 untrusted content. Only the contracted JSON shape is trusted, and only its
@@ -42,6 +56,37 @@ from typing import Any, Callable, Optional
 CURSOR_API = "https://api.cursor.com"
 BOT_LOGIN = "github-actions[bot]"
 OPT_OUT_LABEL = "no-ai-review"
+# Priority classes (Logan, 2026-09-19: "No numeric cap, only the P0/P1/P2
+# class rule"). A label is the explicit form; everything else is inferred.
+REVIEW_NOW_LABEL = "review-now"
+CLASS_LABELS = {"review-p0": "P0", "review-p1": "P1", "review-p2": "P2"}
+# Which labels, when ADDED, mean "review the current head now". Any other
+# label addition (`bot-inbox`, `hold merge`, a triage label) must not launch
+# an agent, because the caller now listens for every `labeled` event.
+RE_REQUEST_LABELS = frozenset({REVIEW_NOW_LABEL, "review-p0", "review-p1"})
+# The only `pull_request` actions that start a review. Anything else -- above
+# all `synchronize` -- is refused here and in the callable's job `if:`.
+REVIEW_ACTIONS = frozenset({"opened", "reopened", "ready_for_review", "labeled"})
+# Heads no human is waiting on: the bot opened them and a lane merges them.
+AUTOMATION_AUTHORS = frozenset({"dependabot[bot]", "github-actions[bot]", "renovate[bot]"})
+AUTOMATION_HEAD_REFS = ("changeset-release/",)
+# Always worth a review whatever the title says: a workflow change can delete
+# an `on:` block silently, and the operating manual is estate policy.
+ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/", "docs/agents/")
+# Basenames, matched case-insensitively so `harness/claude.md` counts as much
+# as `CLAUDE.md`. These are policy, not prose: a SKILL.md edit can drop a
+# review-follow-through rule and a DECISIONS.md edit can invent an approval.
+ALWAYS_REVIEW_NAMES = ("agents.md", "claude.md", "codex.md", "skill.md", "decisions.md", "cursor_review_brief.md")
+# Everything here is prose: a diff made only of these launches no agent.
+# `CODEOWNERS`, `.gitignore` and `.gitattributes` are deliberately NOT here:
+# a CODEOWNERS edit can drop required reviewers and a `.gitignore` edit can
+# stop ignoring secret material, so they classify as ordinary code.
+# `.txt` is NOT here: `requirements.txt`, `constraints.txt` and
+# `CMakeLists.txt` are installable or build input, the same carve-out as
+# CODEOWNERS below.
+METADATA_SUFFIXES = (".md", ".mdx", ".rst")
+METADATA_NAMES = ("LICENSE", "NOTICE")
+CHANGED_FILE_PAGES = 3
 TERMINAL_RUN_STATUSES = frozenset({"FINISHED", "ERROR", "CANCELLED", "EXPIRED"})
 ACTIVE_AGENT_STATUSES = frozenset({"CREATING", "RUNNING", "ACTIVE", "PENDING"})
 AGENT_MARKER = "cursor-review-agent"
@@ -345,7 +390,8 @@ def review_body(result: dict[str, Any], event: str, context: dict[str, Any], unp
     counts = {severity: sum(1 for f in result["findings"] if f["severity"] == severity) for severity in SEVERITIES}
     lines = [
         f"**Cursor review** · `{context['model']}` (effort {context['effort']}, fast {str(context['fast']).lower()}) · "
-        f"agent [{context['agent_id']}]({context['agent_url']}) · {duration_text(context.get('elapsed'))} · head `{context['head_sha'][:12]}`",
+        f"class {context.get('priority', 'P1')} · agent [{context['agent_id']}]({context['agent_url']}) · "
+        f"{duration_text(context.get('elapsed'))} · head `{context['head_sha'][:12]}`",
         "",
         result["summary"],
         "",
@@ -360,9 +406,10 @@ def review_body(result: dict[str, Any], event: str, context: dict[str, Any], unp
         lines += ["", "Checks the reviewer ran:", ""] + [f"- {item}" for item in result["checks_run"]]
     lines += [
         "",
-        "How to respond: fix and push (a new head is reviewed again), or reply in the thread with "
-        "`disposition: <accept|reject|defer> - <reason>` and resolve it. A blocking finding requests changes; "
-        "the merge gate honours GitHub's review decision.",
+        "How to respond: fix and push, or reply in the thread with "
+        "`disposition: <accept|reject|defer> - <reason>` and resolve it. A push no longer re-reviews on its own — "
+        f"add the `{REVIEW_NOW_LABEL}` label when the new head needs another review. A blocking finding requests "
+        "changes; the merge gate honours GitHub's review decision.",
         "",
         f"<!-- {REVIEW_MARKER} " + json.dumps({"agentId": context["agent_id"], "headSha": context["head_sha"], "verdict": result["verdict"], "event": event}, sort_keys=True) + " -->",
     ]
@@ -400,6 +447,177 @@ def env_bool(value: str | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def label_names(env: dict[str, str]) -> set[str]:
+    """Case-folded label names from `toJSON(...labels.*.name)`.
+
+    The workflow hands this over as a JSON array of strings. A comma or
+    newline separated string is accepted too so the script stays runnable by
+    hand, and an unparseable value is treated as "no labels" rather than as an
+    error: a label list is an optimisation, never the thing that decides
+    whether the pull request is safe.
+    """
+    raw = (env.get("PR_LABELS") or "").strip()
+    if not raw:
+        return set()
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        value = raw.replace("\n", ",").split(",")
+    if isinstance(value, str):
+        # `toJSON(labels.*.name)` is an array today, but the splat shape is the
+        # one famous for collapsing, and a silently empty label set would make
+        # `review-now` neither override P2 nor consume its own event.
+        value = [value]
+    if not isinstance(value, list):
+        return set()
+    names = set()
+    for item in value:
+        name = item.get("name") if isinstance(item, dict) else item
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip().casefold())
+    return names
+
+
+def is_always_review(path: str) -> bool:
+    return path.startswith(ALWAYS_REVIEW_PREFIXES) or path.rsplit("/", 1)[-1].casefold() in ALWAYS_REVIEW_NAMES
+
+
+def is_metadata(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return path.lower().endswith(METADATA_SUFFIXES) or name in METADATA_NAMES
+
+
+def changed_paths(github: GitHub, number: str) -> list[str] | None:
+    """Every changed file, or None when that cannot be read cheaply.
+
+    None means UNKNOWN, and unknown always reviews: a transport failure, a
+    GitHub error, or a diff past the page bound must never be the reason a
+    pull request silently loses its reviewer.
+    """
+    try:
+        rows = github.pages(f"pulls/{number}/files", limit=CHANGED_FILE_PAGES)
+    except ReviewError as exc:
+        notice(f"could not read the changed files ({exc}); classifying this pull request as reviewable")
+        return None
+    paths: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        # A rename carries its old path in `previous_filename`. Without it,
+        # moving `.github/workflows/ci.yml` to `docs/old-ci.md` reads as a
+        # metadata-only diff -- the deleted-`on:`-block mismatch again, this
+        # time wearing the new name.
+        for key in ("filename", "previous_filename"):
+            value = row.get(key)
+            if value:
+                paths.append(str(value))
+    return paths or None
+
+
+def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str]:
+    """The pull request's priority class: P0, P1, or a `Skip` for P2.
+
+    Logan, 2026-09-19, choosing this over a numeric cap: "No numeric cap, only
+    the P0/P1/P2 class rule". So nothing here counts launches; the class alone
+    decides whether an agent starts.
+
+      P0  merge-blocking work: `.github/workflows/**`, `.github/actions/**`,
+          `docs/agents/**`, a policy basename
+          (`AGENTS.md`, `CLAUDE.md`, `CODEX.md`, `SKILL.md`, `DECISIONS.md`,
+          matched case-insensitively), or the `review-p0` label.
+          Never deferred, so P0 is decided FIRST and outranks every P2 signal:
+          dependabot bumping a pinned action inside `.github/workflows/`, or a
+          `review-p2` label on a workflow change, still gets a review.
+      P1  ordinary code work. One review at open / reopen / ready, and another
+          only when a lane asks by adding `review-now`.
+      P2  nits: an automation author, a release branch, a metadata-only
+          diff, or the `review-p2` label. P2 never launches an agent; the
+          orchestrating session self-reviews it. The title is never a signal,
+          and an UNKNOWN file list is never P2: if the API could not finish
+          listing the diff, the pull request is reviewed.
+
+    `review-now` is the override: it defeats every inferred P2 signal and the
+    explicit `review-p2` label, because a lane adding it has asked for this
+    exact head to be reviewed.
+    """
+    labels = effective_labels(env)
+    # `review-now` and `review-p1` both wake the reviewer (RE_REQUEST_LABELS,
+    # the job `if:`, the caller group), so both must also beat the INFERRED P2
+    # signals -- otherwise adding one cancels the in-flight waiter and then
+    # exits 0, the cancel-then-skip shape this callable already closed for
+    # ignored labels. An explicit class label is a human statement about this
+    # pull request; an author name and a branch prefix are guesses.
+    requested = REVIEW_NOW_LABEL in labels or "review-p1" in labels
+    critical = [path for path in (paths or []) if is_always_review(path)]
+
+    # P0 before every skip. An automation author and a `review-p2` label are
+    # both weaker evidence than the diff itself: dependabot bumping a pinned
+    # action, or anyone labelling a workflow change a nit, is exactly the
+    # deleted-`on:`-block class this reviewer gates (company-hq
+    # D-AGENT-REVIEW-2). Labels may escalate the class, never lower a P0.
+    if "review-p0" in labels:
+        return "P0", "label 'review-p0'"
+    if critical:
+        return "P0", f"touches {critical[0]}"
+    # UNKNOWN never means P2, and that has to hold for the author and head-ref
+    # signals too, not only for the metadata one. A files-API failure, or a
+    # diff past the page bound, hides whether `.github/workflows/ci.yml` is in
+    # there -- and a dependabot pull request with 300 files is exactly the
+    # shape that hides it. Fail open.
+    if paths is None:
+        return "P1", "unknown file list; classifying as reviewable"
+    if "review-p2" in labels and not requested:
+        raise Skip(f"class P2 (label 'review-p2'); add '{REVIEW_NOW_LABEL}' to review this head anyway")
+    if not requested:
+        author = (env.get("PR_AUTHOR") or "").strip()
+        if author.casefold() in AUTOMATION_AUTHORS:
+            raise Skip(f"class P2 (author {author} is an automation account); add '{REVIEW_NOW_LABEL}' to review it anyway")
+        head_ref = env.get("PR_HEAD_REF") or ""
+        if head_ref.startswith(AUTOMATION_HEAD_REFS):
+            raise Skip(f"class P2 (head {head_ref} is a release branch); add '{REVIEW_NOW_LABEL}' to review it anyway")
+    if "review-p1" in labels:
+        return "P1", "label 'review-p1'"
+    # The diff, never the title. A conventional `chore:`/`docs:` prefix on an
+    # ordinary code change would be an author-controlled skip of the
+    # merge-gating reviewer, and estate lanes use those prefixes on code pull
+    # requests every day; `review-p2` is the honest way to say "nit".
+    if not requested:
+        if all(is_metadata(path) for path in paths):
+            raise Skip(f"class P2 (all {len(paths)} changed files are metadata); add '{REVIEW_NOW_LABEL}' to review it anyway")
+    return "P1", f"label '{REVIEW_NOW_LABEL}' re-request" if requested else "code change"
+
+
+def effective_labels(env: dict[str, str]) -> set[str]:
+    """`PR_LABELS`, plus the `labeled` event's own label.
+
+    The event's label is on the pull request by definition, so it counts even
+    if the `toJSON(labels.*.name)` splat arrived in a shape `label_names`
+    could not parse. A re-request must not depend on that shape: a silently
+    empty label set would make `review-now` neither override P2 nor consume
+    its own event, and the lane would have no way to ask again.
+    """
+    labels = label_names(env)
+    added = (env.get("PR_EVENT_LABEL") or "").strip().casefold()
+    if (env.get("PR_EVENT_ACTION") or "").strip() == "labeled" and added in RE_REQUEST_LABELS:
+        labels = labels | {added}
+    return labels
+
+
+def clear_review_now(github: GitHub, number: str, env: dict[str, str]) -> None:
+    """Remove `review-now` so the next re-request is a fresh `labeled` event.
+
+    Adding a label that is already present raises no event, so leaving it on
+    would make the second re-request silently do nothing.
+    """
+    if REVIEW_NOW_LABEL not in effective_labels(env):
+        return
+    try:
+        github.call("DELETE", f"issues/{number}/labels/{REVIEW_NOW_LABEL}", ok=(200, 204, 404))
+        notice(f"cleared the '{REVIEW_NOW_LABEL}' label; add it again to re-request a review")
+    except ReviewError as exc:
+        notice(f"could not clear the '{REVIEW_NOW_LABEL}' label: {exc}")
+
+
 def preconditions(env: dict[str, str]) -> None:
     number = env.get("PR_NUMBER", "").strip()
     if not number.isdigit():
@@ -408,6 +626,19 @@ def preconditions(env: dict[str, str]) -> None:
         raise Skip(f"PR #{number} is a draft; mark it ready for review to get a review")
     if env_bool(env.get("PR_OPTED_OUT")):
         raise Skip(f"opted out (label '{OPT_OUT_LABEL}' on PR #{number})")
+    action = (env.get("PR_EVENT_ACTION") or "").strip()
+    if action == "labeled":
+        added = (env.get("PR_EVENT_LABEL") or "").strip()
+        if added.casefold() not in RE_REQUEST_LABELS:
+            raise Skip(f"label '{added or 'unknown'}' is not a review re-request; add '{REVIEW_NOW_LABEL}' to review the current head")
+    elif action and action not in REVIEW_ACTIONS:
+        # An ALLOW-list, not a deny-list, and it lives here as well as in the
+        # job `if:`. Every enrolled caller still carried `synchronize` when this
+        # landed, and a pin-only follow-up would otherwise recreate the
+        # push-driven storm the whole change exists to stop (165 runs over 80
+        # heads, 2026-09-19). A caller that forgot to drop it now spends
+        # nothing.
+        raise Skip(f"event '{action}' does not request a review; a push no longer re-reviews, add '{REVIEW_NOW_LABEL}' instead")
     if env.get("PR_HEAD_REPOSITORY", "") != env.get("GITHUB_REPOSITORY", ""):
         raise Skip(f"PR #{number} head is a fork ({env.get('PR_HEAD_REPOSITORY') or 'unknown'}); same-repo heads only")
     if not env.get("CURSOR_CLOUD_AGENTS_API_KEY", "").strip():
@@ -442,14 +673,22 @@ def find_marker_comment(github: GitHub, number: str) -> dict[str, Any] | None:
 
 
 def cancel_previous(cursor: Cursor, marker: dict[str, Any] | None, head_sha: str) -> None:
+    """Cancel whatever agent the marker still points at, same head or not.
+
+    There is no same-SHA exemption. `review-now` IS the same-head re-request
+    that replaced `synchronize`, so the run that most needs this cleanup is
+    exactly the one a SHA comparison would skip: job concurrency has already
+    killed the waiter, leaving an agent nobody is reading. One agent per pull
+    request at a time, and this run is about to be it.
+    """
     record = parse_agent_marker((marker or {}).get("body") or "")
-    if not record or record.get("headSha") == head_sha:
+    if not record:
         return
     try:
         agent = cursor.call("GET", f"/v1/agents/{record['agentId']}")
         if agent.get("status") in ACTIVE_AGENT_STATUSES and agent.get("latestRunId"):
             cursor.call("POST", f"/v1/agents/{record['agentId']}/runs/{agent['latestRunId']}/cancel", {}, ok=(200, 201, 202, 204))
-            notice(f"cancelled the previous head's agent run ({record['agentId']})")
+            notice(f"cancelled the previous agent run ({record['agentId']})")
     except ReviewError as exc:
         notice(f"could not cancel the previous agent run: {exc}")
 
@@ -461,7 +700,7 @@ def upsert_marker(github: GitHub, number: str, marker: dict[str, Any] | None, bo
 
 
 def launch(cursor: Cursor, env: dict[str, str], brief: str, repository: str, repos: list[str]) -> dict[str, Any]:
-    fast = env_bool(env.get("CURSOR_FAST", "true"))
+    fast = env_bool(env.get("CURSOR_FAST", "false"))
     body = {
         "prompt": {"text": brief},
         "repos": [{"url": f"https://github.com/{repository}", "startingRef": env["PR_HEAD_REF"]}]
@@ -522,7 +761,7 @@ def post_review(github: GitHub, env: dict[str, str], result: dict[str, Any], con
     number = env["PR_NUMBER"]
     pull = github.call("GET", f"pulls/{number}")
     if pull.get("head", {}).get("sha") != env["PR_HEAD_SHA"]:
-        raise Skip(f"PR #{number} moved to {str(pull.get('head', {}).get('sha'))[:12]} while the review ran; the new head gets its own review")
+        raise Skip(f"PR #{number} moved to {str(pull.get('head', {}).get('sha'))[:12]} while the review ran; a push no longer re-reviews, so add the '{REVIEW_NOW_LABEL}' label to review the new head")
     self_authored = (pull.get("user") or {}).get("login") == BOT_LOGIN
     event = review_event(result, approve_on_clean=env_bool(env.get("APPROVE_ON_CLEAN", "true")), self_authored=self_authored)
     index = diff_index(github.pages(f"pulls/{number}/files"))
@@ -569,6 +808,22 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
     number = env["PR_NUMBER"]
     github = GitHub(env["GITHUB_TOKEN"], repository, transport, env.get("GITHUB_API_URL") or "https://api.github.com", sleep=sleep)
     cursor = Cursor(env["CURSOR_CLOUD_AGENTS_API_KEY"], transport, env.get("CURSOR_API_URL") or CURSOR_API, sleep=sleep)
+    try:
+        priority, why = review_class(env, changed_paths(github, number))
+    except Skip as skip:
+        # Job concurrency already killed this pull request's in-flight WAITER;
+        # the agent it was waiting on keeps burning the pool and posts nothing.
+        # A skip owes the same cleanup a launch does -- but a skip must stay
+        # green, so a comments-API failure here is a notice, not a red job.
+        try:
+            stale = find_marker_comment(github, number)
+        except ReviewError as exc:
+            notice(f"could not load the previous agent marker: {exc}")
+            stale = None
+        cancel_previous(cursor, stale, env["PR_HEAD_SHA"])
+        notice(f"review skipped: {skip}")
+        return 0
+    notice(f"review class {priority} ({why})")
     repos = context_repos(env, repository)
     if brief_template is None:
         with open(env["BRIEF_PATH"], encoding="utf-8") as handle:
@@ -588,6 +843,12 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
         },
     )
 
+    # FIRST, before anything that can fail. `usage_limit_exceeded` is the
+    # failure this whole change exists to survive (77 consecutive refusals on
+    # 2026-09-19), and `find_marker_comment` can raise on its own; if the label
+    # outlived either, re-adding it would raise no `labeled` event and the lane
+    # would have no way to ask again.
+    clear_review_now(github, number, env)
     marker = find_marker_comment(github, number)
     cancel_previous(cursor, marker, env["PR_HEAD_SHA"])
     started = clock()
@@ -595,7 +856,7 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
     agent_id = agent["id"]
     agent_url = agent.get("url") or f"https://cursor.com/agents/{agent_id}"
     print(f"launched Cursor agent {agent_id} for {repository}#{number} @ {env['PR_HEAD_SHA'][:12]}")
-    marker = upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` in progress: agent [{agent_id}]({agent_url}).")
+    marker = upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` (class {priority}) in progress: agent [{agent_id}]({agent_url}).")
 
     wait_minutes = float(env.get("WAIT_MINUTES") or 30)
     context = {
@@ -603,8 +864,9 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
         "agent_url": agent_url,
         "model": env.get("CURSOR_MODEL") or "grok-4.6",
         "effort": env.get("CURSOR_EFFORT") or "xhigh",
-        "fast": env_bool(env.get("CURSOR_FAST", "true")),
+        "fast": env_bool(env.get("CURSOR_FAST", "false")),
         "head_sha": env["PR_HEAD_SHA"],
+        "priority": priority,
     }
     try:
         finished = wait_for_run(cursor, agent_id, deadline=started + wait_minutes * 60, sleep=sleep, clock=clock)
@@ -615,10 +877,10 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
         review, event = post_review(github, env, result, context)
     except Skip as skip:
         notice(f"review skipped: {skip}")
-        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` was superseded by a newer head (agent [{agent_id}]({agent_url})).")
+        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` was superseded by a newer head (agent [{agent_id}]({agent_url})). A push no longer re-reviews: add the `{REVIEW_NOW_LABEL}` label to review the new head.")
         return 0
     except ReviewError as exc:
-        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` did not complete: {str(exc)[:500]} (agent [{agent_id}]({agent_url})). The job is red; re-run it or push a new head.")
+        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` did not complete: {str(exc)[:500]} (agent [{agent_id}]({agent_url})). The job is red; re-run it or add the `{REVIEW_NOW_LABEL}` label.")
         raise
     review_url = review.get("html_url") or ""
     upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}`: {event} — {review_url} (agent [{agent_id}]({agent_url}), {duration_text(context.get('elapsed'))}).")
@@ -629,6 +891,7 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
             "### Cursor review",
             "",
             f"- PR: {repository}#{number} @ `{env['PR_HEAD_SHA'][:12]}`",
+            f"- Class: **{priority}** ({why})",
             f"- Agent: [{agent_id}]({agent_url}) on `{context['model']}` (effort {context['effort']}, fast {str(context['fast']).lower()}), {duration_text(context.get('elapsed'))}",
             f"- Review: **{event}** — {review_url}",
             f"- Findings: {counts['blocking']} blocking, {counts['consider']} consider, {counts['nit']} nit",

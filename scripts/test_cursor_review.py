@@ -15,8 +15,9 @@ Properties worth this machinery (agent-infrastructure#1564):
   * Inline comments anchor only to new-side lines inside the PR diff; the rest
     land in the body, so no bad anchor can 422 the whole review.
   * A non-blocking review dismisses this bot's own stale REQUEST_CHANGES.
-  * A head that moved while the agent ran posts nothing (the new head gets its
-    own review), and a reviewer error makes the job red, never silently green.
+  * A head that moved while the agent ran posts nothing and tells the lane to
+    add `review-now`, and a reviewer error makes the job red, never silently
+    green.
   * The callable itself passes the repository's structural rules and wires
     every value the script reads.
 
@@ -68,7 +69,7 @@ def review_json(**overrides: Any) -> str:
 class FakeTransport:
     """Routes by (method, path) and records everything that was sent."""
 
-    def __init__(self, *, result: str = review_json(), run_statuses: list[str] | None = None, pr_author: str = "loganrenz", head_now: str = HEAD, prior_reviews: list[dict[str, Any]] | None = None, marker_comment: dict[str, Any] | None = None, review_status: int = 200) -> None:
+    def __init__(self, *, result: str = review_json(), run_statuses: list[str] | None = None, pr_author: str = "loganrenz", head_now: str = HEAD, prior_reviews: list[dict[str, Any]] | None = None, marker_comment: dict[str, Any] | None = None, review_status: int = 200, files: list[dict[str, Any]] | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
         self.result = result
         self.run_statuses = list(run_statuses or ["RUNNING", "FINISHED"])
@@ -78,6 +79,8 @@ class FakeTransport:
         self.marker_comment = marker_comment
         self.review_status = review_status
         self.cancelled: list[str] = []
+        self.labels_removed: list[str] = []
+        self.files = list(files) if files is not None else [{"filename": "src/a.ts", "patch": PATCH}, {"filename": "bin/blob", "patch": None}]
 
     def __call__(self, method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: int) -> tuple[int, Any]:
         payload = json.loads(body) if body else None
@@ -113,7 +116,10 @@ class FakeTransport:
         if method == "GET" and path.endswith("/pulls/7"):
             return 200, {"number": 7, "head": {"sha": self.head_now}, "user": {"login": self.pr_author}}
         if method == "GET" and path.endswith("/pulls/7/files"):
-            return 200, [{"filename": "src/a.ts", "patch": PATCH}, {"filename": "bin/blob", "patch": None}]
+            return 200, self.files
+        if method == "DELETE" and "/issues/7/labels/" in path:
+            self.labels_removed.append(path.rsplit("/", 1)[1])
+            return 204, None
         if method == "GET" and path.endswith("/pulls/7/reviews"):
             return 200, self.prior_reviews
         if method == "POST" and path.endswith("/pulls/7/reviews"):
@@ -141,9 +147,13 @@ def env(**overrides: str) -> dict[str, str]:
         "PR_BASE_REF": "main",
         "PR_DRAFT": "false",
         "PR_OPTED_OUT": "false",
+        "PR_AUTHOR": "loganrenz",
+        "PR_LABELS": "[]",
+        "PR_EVENT_ACTION": "opened",
+        "PR_EVENT_LABEL": "",
         "CURSOR_MODEL": "grok-4.6",
         "CURSOR_EFFORT": "xhigh",
-        "CURSOR_FAST": "true",
+        "CURSOR_FAST": "false",
         "CONTEXT_REPOS": "narduk-enterprises/agent-infrastructure,narduk-enterprises/company-hq",
         "WAIT_MINUTES": "30",
         "APPROVE_ON_CLEAN": "true",
@@ -198,7 +208,7 @@ class ReviewFlowTests(unittest.TestCase):
         self.assertEqual({"url": f"https://github.com/{REPO}", "startingRef": "cursor/thing"}, body["repos"][0])
         self.assertEqual([{"url": "https://github.com/narduk-enterprises/agent-infrastructure"}, {"url": "https://github.com/narduk-enterprises/company-hq"}], body["repos"][1:])
         self.assertEqual("grok-4.6", body["model"]["id"])
-        self.assertEqual([{"id": "effort", "value": "xhigh"}, {"id": "fast", "value": "true"}], body["model"]["params"])
+        self.assertEqual([{"id": "effort", "value": "xhigh"}, {"id": "fast", "value": "false"}], body["model"]["params"])
         self.assertTrue(body["workOnCurrentBranch"])
         self.assertNotIn("autoCreatePR", body)
         self.assertIn(f"#7", body["prompt"]["text"])
@@ -286,6 +296,8 @@ class ReviewFlowTests(unittest.TestCase):
             run(transport)
         last_patch = [c for c in transport.calls if c["method"] == "PATCH"][-1]
         self.assertIn("did not complete", last_patch["body"]["body"])
+        self.assertIn("add the `review-now` label", last_patch["body"]["body"])
+        self.assertNotIn("push a new head", last_patch["body"]["body"])
         self.assertFalse(any(c["url"].endswith("/pulls/7/reviews") and c["method"] == "POST" for c in transport.calls))
 
     def test_the_wait_budget_ends_the_run_as_an_error(self):
@@ -468,9 +480,28 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertIs(inputs["enabled"]["default"], False)
         self.assertEqual("grok-4.6", inputs["model"]["default"])
         self.assertEqual("xhigh", inputs["effort"]["default"])
+        # fast=false for reviews: the job already budgets wait-minutes and
+        # blocks nobody, so the reviewer is never the latency-critical lane.
+        self.assertIs(inputs["fast"]["default"], False)
         secrets = (self.doc.get("on") or self.doc.get(True))["workflow_call"]["secrets"]
         self.assertIs(secrets["CURSOR_CLOUD_AGENTS_API_KEY"]["required"], False)
-        self.assertEqual("${{ inputs.enabled }}", self.job["if"])
+        # `inputs.enabled` alone would let a `bot-inbox` label reach the job,
+        # claim its concurrency group, and cancel the in-flight review before
+        # the script could print a skip.
+        self.assertIn("inputs.enabled", self.job["if"])
+        self.assertIn("github.event.action == 'opened'", self.job["if"])
+        self.assertNotIn("synchronize", self.job["if"])
+        self.assertIn("github.event.pull_request.draft == false", self.job["if"])
+        self.assertIn("'no-ai-review'", self.job["if"])
+        # The documented caller group must MIRROR that `if:`, or a run-level
+        # cancel lands on a job the `if:` then skips -- cancel-then-skip.
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        group = [line for line in readme.splitlines() if "cursor-review-caller-" in line and "group:" in line]
+        self.assertTrue(group, "the README caller shape must show its concurrency group")
+        for predicate in ("github.event.pull_request.draft == false", "'no-ai-review'", "'opened'", "'reopened'", "'ready_for_review'", '"review-now","review-p0","review-p1"'):
+            self.assertIn(predicate, group[0], f"caller group is missing {predicate}")
+        for label in ("review-now", "review-p0", "review-p1"):
+            self.assertIn(label, self.job["if"])
 
     def test_permissions_are_exactly_what_posting_a_review_needs(self):
         self.assertEqual({"contents": "read", "pull-requests": "write"}, self.doc["permissions"])
@@ -506,6 +537,393 @@ class WorkflowShapeTests(unittest.TestCase):
         for token in ('"verdict"', '"findings"', '"severity"', '"checks_run"', "approve | comment | request_changes", "{head_sha}", "{base_sha}", "{context_repos}"):
             self.assertIn(token, brief)
         self.assertIn("UNTRUSTED", brief)
+
+
+class ClassRuleTests(unittest.TestCase):
+    """The P0/P1/P2 rule, Logan 2026-09-19: "No numeric cap, only the P0/P1/P2
+    class rule". P2 must never reach `POST /v1/agents`; P0 must always reach
+    it; `review-now` must defeat every inferred P2 signal."""
+
+    def launched(self, transport: FakeTransport) -> bool:
+        return any(c["method"] == "POST" and c["url"].endswith("/v1/agents") for c in transport.calls)
+
+    def test_p2_never_launches_an_agent(self):
+        for label, overrides, files in (
+            ("dependabot author", {"PR_AUTHOR": "dependabot[bot]"}, None),
+            ("actions author", {"PR_AUTHOR": "github-actions[bot]"}, None),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main"}, None),
+            ("explicit label", {"PR_LABELS": '["review-p2"]'}, None),
+            ("metadata-only diff", {}, [{"filename": "README.md", "patch": PATCH}, {"filename": "LICENSE", "patch": None}]),
+        ):
+            with self.subTest(label):
+                transport = FakeTransport(files=files)
+                code, out = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review skipped: class P2", out)
+                self.assertFalse(self.launched(transport), "a P2 pull request must launch no agent")
+
+    def test_review_now_overrides_every_p2_signal(self):
+        for label, overrides, files in (
+            ("dependabot author", {"PR_AUTHOR": "dependabot[bot]"}, None),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main"}, None),
+            ("explicit label", {"PR_LABELS": '["review-p2", "review-now"]'}, None),
+            ("metadata-only diff", {}, [{"filename": "README.md", "patch": PATCH}]),
+        ):
+            with self.subTest(label):
+                overrides.setdefault("PR_LABELS", '["review-now"]')
+                transport = FakeTransport(files=files)
+                code, _ = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertTrue(self.launched(transport), "review-now must defeat the P2 signal")
+
+    def test_a_chore_title_on_a_code_change_is_still_reviewed(self):
+        """The title is author-controlled and estate lanes use `chore:` on code
+        pull requests; only the diff decides the class."""
+        for title in ("chore: bump the lockfile", "docs(readme): typo", "nit: rename a local"):
+            with self.subTest(title):
+                transport = FakeTransport()
+                code, out = run(transport, PR_TITLE=title)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P1", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_p0_outranks_every_p2_skip_signal(self):
+        """A workflow diff is the deleted-`on:`-block class this reviewer gates,
+        so neither an automation author nor a `review-p2` label may skip it."""
+        workflow = [{"filename": ".github/workflows/ci.yml", "patch": PATCH}]
+        for label, overrides in (
+            ("dependabot bumping a pinned action", {"PR_AUTHOR": "dependabot[bot]"}),
+            ("github-actions author", {"PR_AUTHOR": "github-actions[bot]"}),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main"}),
+            ("review-p2 on a workflow change", {"PR_LABELS": '["review-p2"]'}),
+        ):
+            with self.subTest(label):
+                transport = FakeTransport(files=workflow)
+                code, out = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+                self.assertTrue(self.launched(transport), "a P0 diff must launch whatever the P2 signal says")
+
+    def test_the_review_p0_label_outranks_every_p2_skip_signal(self):
+        for label, overrides in (
+            ("dependabot author", {"PR_AUTHOR": "dependabot[bot]", "PR_LABELS": '["review-p0"]'}),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main", "PR_LABELS": '["review-p0"]'}),
+            ("review-p2 alongside", {"PR_LABELS": '["review-p2", "review-p0"]'}),
+            ("metadata-only diff", {"PR_LABELS": '["review-p0"]'}),
+        ):
+            with self.subTest(label):
+                files = [{"filename": "README.md", "patch": PATCH}] if label == "metadata-only diff" else None
+                transport = FakeTransport(files=files)
+                code, out = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_an_unknown_file_list_defeats_every_p2_skip_signal(self):
+        """`changed_paths` returning None means the API could not finish
+        listing the diff, so nothing is known about whether a workflow file is
+        in there. A dependabot pull request with 300 files is exactly that
+        shape, and it is the one that hides a deleted `on:` block."""
+
+        class Broken(FakeTransport):
+            """Only the classification read fails; `post_review` still needs a
+            diff index to place its inline comments."""
+
+            seen = False
+
+            def github(self, method, path, payload):
+                if method == "GET" and path.endswith("/pulls/7/files") and not self.seen:
+                    self.seen = True
+                    return 500, {"message": "boom"}
+                return super().github(method, path, payload)
+
+        for label, overrides in (
+            ("dependabot author", {"PR_AUTHOR": "dependabot[bot]"}),
+            ("actions author", {"PR_AUTHOR": "github-actions[bot]"}),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main"}),
+            ("review-p2 label", {"PR_LABELS": '["review-p2"]'}),
+        ):
+            with self.subTest(label):
+                transport = Broken()
+                code, out = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertIn("classifying this pull request as reviewable", out)
+                self.assertIn("::notice::review class P1 (unknown file list", out)
+                self.assertTrue(self.launched(transport), "an unknown file list must never take a P2 skip")
+
+    def test_a_diff_past_the_page_bound_is_reviewed_not_skipped(self):
+        """`GitHub.pages` gives up after `cr.CHANGED_FILE_PAGES` full pages; the
+        rows already fetched are discarded, so the class must fail open."""
+
+        class Paged(FakeTransport):
+            """Three full pages exhaust the bound; the fourth read is
+            `post_review` building its diff index and may be short."""
+
+            pages_served = 0
+
+            def github(self, method, path, payload):
+                if method == "GET" and path.endswith("/pulls/7/files"):
+                    self.pages_served += 1
+                    if self.pages_served <= cr.CHANGED_FILE_PAGES:
+                        return 200, [{"filename": f"pkg/f{i}.ts", "patch": PATCH} for i in range(100)]
+                    return 200, []
+                return super().github(method, path, payload)
+
+        transport = Paged()
+        code, out = run(transport, PR_AUTHOR="dependabot[bot]")
+        self.assertEqual(0, code)
+        self.assertIn("::notice::review class P1 (unknown file list", out)
+        self.assertTrue(self.launched(transport))
+
+    def test_codeowners_and_ignore_files_are_code_not_prose(self):
+        """A CODEOWNERS edit can drop required reviewers and a `.gitignore`
+        edit can stop ignoring secret material; neither is a README typo."""
+        for path in (".github/CODEOWNERS", "CODEOWNERS", ".gitignore", ".gitattributes"):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P1", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_review_p1_wakes_the_reviewer_it_is_allowed_to_wake(self):
+        """`review-p1` is in RE_REQUEST_LABELS, the job `if:` and the caller
+        concurrency group, so adding it cancels the in-flight waiter. It must
+        therefore beat the inferred P2 signals as well, or the add is a
+        cancel-then-skip."""
+        for label, overrides in (
+            ("dependabot author", {"PR_AUTHOR": "dependabot[bot]", "PR_LABELS": '["review-p1"]'}),
+            ("actions author", {"PR_AUTHOR": "github-actions[bot]", "PR_LABELS": '["review-p1"]'}),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main", "PR_LABELS": '["review-p1"]'}),
+            ("review-p2 alongside", {"PR_LABELS": '["review-p2", "review-p1"]'}),
+            ("metadata-only diff", {"PR_LABELS": '["review-p1"]'}),
+        ):
+            with self.subTest(label):
+                files = [{"filename": "README.md", "patch": PATCH}] if label == "metadata-only diff" else None
+                transport = FakeTransport(files=files)
+                code, out = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P1 (label 'review-p1')", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_a_skipped_class_still_cancels_the_previous_agent(self):
+        """Job concurrency kills this pull request's in-flight waiter before
+        the script runs. If the skip returned without cancelling, the agent
+        that waiter was watching would keep burning the pool and post
+        nothing."""
+        marker = {"id": 77, "user": {"login": cr.BOT_LOGIN}, "body": cr.agent_marker("bc-old", "c" * 40) + "\nin progress"}
+        transport = FakeTransport(marker_comment=marker, files=[{"filename": "README.md", "patch": PATCH}])
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("::notice::review skipped: class P2", out)
+        self.assertFalse(self.launched(transport))
+        self.assertEqual(["bc-old"], transport.cancelled, "a skip owes the same cleanup a launch does")
+
+    def test_a_same_head_agent_is_cancelled_too(self):
+        """`review-now` IS the same-head re-request, so a SHA comparison would
+        exempt exactly the run that most needs the cleanup."""
+        marker = {"id": 77, "user": {"login": cr.BOT_LOGIN}, "body": cr.agent_marker("bc-old", HEAD) + "\nin progress"}
+        with self.subTest("skip"):
+            transport = FakeTransport(marker_comment=marker, files=[{"filename": "README.md", "patch": PATCH}])
+            code, _ = run(transport)
+            self.assertEqual(0, code)
+            self.assertFalse(self.launched(transport))
+            self.assertEqual(["bc-old"], transport.cancelled)
+        with self.subTest("review-now relaunch"):
+            transport = FakeTransport(marker_comment=marker)
+            code, _ = run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+            self.assertEqual(0, code)
+            self.assertTrue(self.launched(transport))
+            self.assertEqual(["bc-old"], transport.cancelled)
+
+    def test_a_skip_stays_green_when_the_comments_api_fails(self):
+        """The cleanup is best-effort: a skipped class has nothing to report,
+        so a comments-API failure must not turn a contracted-green job red."""
+
+        class NoComments(FakeTransport):
+            def github(self, method, path, payload):
+                if method == "GET" and "/issues/7/comments" in path:
+                    return 500, {"message": "boom"}
+                return super().github(method, path, payload)
+
+        transport = NoComments(files=[{"filename": "README.md", "patch": PATCH}])
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("could not load the previous agent marker", out)
+        self.assertIn("::notice::review skipped: class P2", out)
+        self.assertFalse(self.launched(transport))
+
+    def test_policy_markdown_is_never_prose(self):
+        """A SKILL.md edit can drop a review-follow-through rule and a
+        DECISIONS.md edit can invent an approval; agent-infrastructure is an
+        enrolled caller, so these land here."""
+        for path in (
+            "skills/repo-hygiene-execute/SKILL.md",
+            "scripts/cursor_review_brief.md",
+            "harness/claude.md",
+            "harness/codex.md",
+            "DECISIONS.md",
+            "docs/agents/credentials.md",
+            "AGENTS.md",
+            "nested/dir/CLAUDE.md",
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_dependency_and_build_manifests_are_not_prose(self):
+        """`requirements.txt` is installable input, not a README."""
+        for path in ("requirements.txt", "requirements-dev.txt", "constraints.txt", "CMakeLists.txt"):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P1", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_a_single_label_is_read_whatever_shape_the_splat_takes(self):
+        """`PR_LABELS` is a `toJSON` splat. A bare JSON string must read as one
+        label, and the `labeled` event's own label counts regardless."""
+        for label, overrides in (
+            ("json string", {"PR_LABELS": '"review-now"', "PR_AUTHOR": "dependabot[bot]"}),
+            ("empty labels, event label only", {"PR_LABELS": "[]", "PR_AUTHOR": "dependabot[bot]", "PR_EVENT_ACTION": "labeled", "PR_EVENT_LABEL": "review-now"}),
+            ("malformed labels, event label only", {"PR_LABELS": "not json", "PR_AUTHOR": "dependabot[bot]", "PR_EVENT_ACTION": "labeled", "PR_EVENT_LABEL": "review-now"}),
+        ):
+            with self.subTest(label):
+                transport = FakeTransport()
+                code, _ = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertTrue(self.launched(transport), "review-now must override the automation author")
+                self.assertEqual([cr.REVIEW_NOW_LABEL], transport.labels_removed, "and must consume its own event")
+
+    def test_review_now_is_cleared_before_anything_that_can_fail(self):
+        """`find_marker_comment` can raise too; if the label outlived it, the
+        lane could never re-request."""
+
+        class NoComments(FakeTransport):
+            def github(self, method, path, payload):
+                if method == "GET" and "/issues/7/comments" in path:
+                    return 500, {"message": "boom"}
+                return super().github(method, path, payload)
+
+        transport = NoComments()
+        with self.assertRaisesRegex(cr.ReviewError, "HTTP 500"):
+            run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+        self.assertEqual([cr.REVIEW_NOW_LABEL], transport.labels_removed)
+
+    def test_ordinary_prose_is_still_p2(self):
+        """The policy names are an exception to the `.md` default, not a
+        repeal of it."""
+        for path in ("README.md", "docs/architecture.md", "CHANGELOG.md", "LICENSE", "NOTICE", "notes.rst"):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review skipped: class P2", out)
+                self.assertFalse(self.launched(transport))
+
+    def test_synchronize_is_refused_by_the_script_too(self):
+        """Every enrolled caller still carried `synchronize` when this landed.
+        A pin-only follow-up must not recreate the push-driven storm."""
+        for action in ("synchronize", "edited", "assigned"):
+            with self.subTest(action):
+                transport = FakeTransport()
+                code, out = run(transport, PR_EVENT_ACTION=action)
+                self.assertEqual(0, code)
+                self.assertIn("does not request a review", out)
+                self.assertEqual([], transport.calls, "a refused event must cost no network call")
+
+    def test_the_opening_actions_still_review(self):
+        for action in ("opened", "reopened", "ready_for_review", ""):
+            with self.subTest(action or "(no action)"):
+                transport = FakeTransport()
+                code, _ = run(transport, PR_EVENT_ACTION=action)
+                self.assertEqual(0, code)
+                self.assertTrue(self.launched(transport))
+
+    def test_review_now_is_cleared_even_when_cursor_refuses(self):
+        """`usage_limit_exceeded` is the failure this change exists to survive.
+        If the label outlived a refused launch, re-adding it would raise no
+        `labeled` event and the lane could never ask again."""
+
+        class Refusing(FakeTransport):
+            def cursor(self, method, url, payload):
+                if method == "POST" and url.endswith("/v1/agents"):
+                    return 400, {"error": "usage_limit_exceeded"}
+                return super().cursor(method, url, payload)
+
+        transport = Refusing()
+        with self.assertRaisesRegex(cr.ReviewError, "usage_limit_exceeded"):
+            run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+        self.assertEqual([cr.REVIEW_NOW_LABEL], transport.labels_removed, "the labeled event must be consumed even when Cursor refuses")
+
+    def test_a_rename_out_of_an_always_review_path_is_still_p0(self):
+        """`.github/workflows/ci.yml` -> `docs/old-ci.md` reads as metadata-only
+        unless the rename's previous_filename is counted."""
+        transport = FakeTransport(files=[{"filename": "docs/old-ci.md", "previous_filename": ".github/workflows/ci.yml", "patch": PATCH}])
+        code, out = run(transport, PR_TITLE="docs: move the old gate")
+        self.assertEqual(0, code)
+        self.assertIn("::notice::review class P0", out)
+        self.assertTrue(self.launched(transport))
+
+    def test_p0_paths_are_reviewed_whatever_the_title_says(self):
+        for path in (".github/workflows/ci.yml", ".github/actions/setup/action.yml", "docs/agents/review-routing.md", "AGENTS.md", "skills/x/CLAUDE.md"):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport, PR_TITLE="docs: routine wording")
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+                self.assertTrue(self.launched(transport))
+                self.assertIn("class P0", posted_review(transport)["body"])
+
+    def test_an_ordinary_code_change_is_p1(self):
+        transport = FakeTransport()
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("::notice::review class P1", out)
+        self.assertIn("class P1", posted_review(transport)["body"])
+
+    def test_only_a_re_request_label_wakes_the_reviewer(self):
+        for added, launches in (("bot-inbox", False), ("hold merge", False), ("review-now", True), ("review-p0", True)):
+            with self.subTest(added):
+                transport = FakeTransport()
+                labels = json.dumps([added]) if added.startswith("review-") else "[]"
+                code, out = run(transport, PR_EVENT_ACTION="labeled", PR_EVENT_LABEL=added, PR_LABELS=labels)
+                self.assertEqual(0, code)
+                self.assertEqual(launches, self.launched(transport))
+                if not launches:
+                    self.assertIn("is not a review re-request", out)
+                    self.assertEqual([], transport.calls, "a non-review label must cost no network call")
+
+    def test_the_review_now_label_is_cleared_so_the_next_add_is_a_fresh_event(self):
+        transport = FakeTransport()
+        code, _ = run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+        self.assertEqual(0, code)
+        self.assertEqual(["review-now"], transport.labels_removed)
+
+    def test_an_unreadable_file_list_reviews_rather_than_skips(self):
+        class Broken(FakeTransport):
+            def github(self, method, path, payload):
+                if method == "GET" and path.endswith("/pulls/7/files") and not self.seen:
+                    self.seen = True
+                    return 500, {"message": "boom"}
+                return super().github(method, path, payload)
+
+        transport = Broken()
+        transport.seen = False
+        code, out = run(transport, PR_TITLE="chore: something")
+        self.assertEqual(0, code)
+        self.assertIn("classifying this pull request as reviewable", out)
+        self.assertTrue(self.launched(transport))
+
+    def test_the_review_body_tells_the_lane_how_to_re_request(self):
+        transport = FakeTransport()
+        run(transport)
+        self.assertIn("A push no longer re-reviews on its own", posted_review(transport)["body"])
+        self.assertIn("review-now", posted_review(transport)["body"])
 
 
 if __name__ == "__main__":
