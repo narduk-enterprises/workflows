@@ -525,7 +525,13 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
     exact head to be reviewed.
     """
     labels = label_names(env)
-    requested = REVIEW_NOW_LABEL in labels
+    # `review-now` and `review-p1` both wake the reviewer (RE_REQUEST_LABELS,
+    # the job `if:`, the caller group), so both must also beat the INFERRED P2
+    # signals -- otherwise adding one cancels the in-flight waiter and then
+    # exits 0, the cancel-then-skip shape this callable already closed for
+    # ignored labels. An explicit class label is a human statement about this
+    # pull request; an author name and a branch prefix are guesses.
+    requested = REVIEW_NOW_LABEL in labels or "review-p1" in labels
     critical = [path for path in (paths or []) if is_always_review(path)]
 
     # P0 before every skip. An automation author and a `review-p2` label are
@@ -756,6 +762,10 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
     try:
         priority, why = review_class(env, changed_paths(github, number))
     except Skip as skip:
+        # Job concurrency already killed this pull request's in-flight WAITER;
+        # the agent it was waiting on keeps burning the pool and posts nothing.
+        # A skip owes the same cleanup a launch does.
+        cancel_previous(cursor, find_marker_comment(github, number), env["PR_HEAD_SHA"])
         notice(f"review skipped: {skip}")
         return 0
     notice(f"review class {priority} ({why})")

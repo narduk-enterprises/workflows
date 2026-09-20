@@ -47,14 +47,18 @@ name: Reusable Cursor Review
 # itself. What blocks a merge is the REQUEST_CHANGES review under the
 # repository's pull-request rule, which GitHub and verify-pr-gate both honour.
 #
-# A push to the PR cancels the in-flight job (job-level concurrency keyed by
-# PR number) and the script also cancels the previous head's agent run through
-# the Cursor API before launching the new one. A CALLER that declares its own
-# workflow-level concurrency (some caller lints require one) MUST use a group
-# name different from this job's `cursor-review-<repo>-<pr>`: with the same
-# name the workflow run holds the group, this job then fails at scheduling
-# with no steps and no annotation (five private callers, 2026-09-18). Use
-# `cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}`.
+# A new review (a `review-now` add, a reopen, ready_for_review) cancels the
+# in-flight job (job-level concurrency keyed by PR number) and the script also
+# cancels the previous head's agent run through the Cursor API, whether it goes
+# on to launch or to skip. A CALLER that declares its own workflow-level
+# concurrency (some caller lints require one) MUST use a group name different
+# from this job's `cursor-review-<repo>-<pr>`: with the same name the workflow
+# run holds the group, this job then fails at scheduling with no steps and no
+# annotation (five private callers, 2026-09-18). The caller's group must ALSO
+# carry the re-request allow-list, because a run-level cancel happens before
+# any job condition is evaluated -- otherwise a `bot-inbox` or `review-p2` add
+# kills a live review and is then skipped by the job `if:`. Use:
+#   cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && !contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name) && 'other-label' || 'review' }}
 #
 # RUNNER ROUTING: same shape as code-review.yml. The default resolves from the
 # caller's own visibility: a PRIVATE caller lands on the fleet manifest's

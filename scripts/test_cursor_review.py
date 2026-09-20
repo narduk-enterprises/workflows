@@ -674,6 +674,39 @@ class ClassRuleTests(unittest.TestCase):
                 self.assertIn("::notice::review class P1", out)
                 self.assertTrue(self.launched(transport))
 
+    def test_review_p1_wakes_the_reviewer_it_is_allowed_to_wake(self):
+        """`review-p1` is in RE_REQUEST_LABELS, the job `if:` and the caller
+        concurrency group, so adding it cancels the in-flight waiter. It must
+        therefore beat the inferred P2 signals as well, or the add is a
+        cancel-then-skip."""
+        for label, overrides in (
+            ("dependabot author", {"PR_AUTHOR": "dependabot[bot]", "PR_LABELS": '["review-p1"]'}),
+            ("actions author", {"PR_AUTHOR": "github-actions[bot]", "PR_LABELS": '["review-p1"]'}),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main", "PR_LABELS": '["review-p1"]'}),
+            ("review-p2 alongside", {"PR_LABELS": '["review-p2", "review-p1"]'}),
+            ("metadata-only diff", {"PR_LABELS": '["review-p1"]'}),
+        ):
+            with self.subTest(label):
+                files = [{"filename": "README.md", "patch": PATCH}] if label == "metadata-only diff" else None
+                transport = FakeTransport(files=files)
+                code, out = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P1 (label 'review-p1')", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_a_skipped_class_still_cancels_the_previous_agent(self):
+        """Job concurrency kills this pull request's in-flight waiter before
+        the script runs. If the skip returned without cancelling, the agent
+        that waiter was watching would keep burning the pool and post
+        nothing."""
+        marker = {"id": 77, "user": {"login": cr.BOT_LOGIN}, "body": cr.agent_marker("bc-old", "c" * 40) + "\nin progress"}
+        transport = FakeTransport(marker_comment=marker, files=[{"filename": "README.md", "patch": PATCH}])
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("::notice::review skipped: class P2", out)
+        self.assertFalse(self.launched(transport))
+        self.assertEqual(["bc-old"], transport.cancelled, "a skip owes the same cleanup a launch does")
+
     def test_a_rename_out_of_an_always_review_path_is_still_p0(self):
         """`.github/workflows/ci.yml` -> `docs/old-ci.md` reads as metadata-only
         unless the rename's previous_filename is counted."""

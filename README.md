@@ -343,7 +343,9 @@ set deliberately omits `synchronize`: on 2026-09-19 push-driven re-reviews took
 the estate to 165 runs over 80 heads and exhausted the Cursor Models pool for
 seven and a half hours. A lane that wants the new head reviewed adds the
 `review-now` label; the callable clears it again so the next add is a fresh
-event, and every other label addition skips. Inside that, Logan's answer of
+event, and every other label addition skips. `review-p0` and `review-p1` also
+wake the reviewer, and because waking it cancels any in-flight waiter they beat
+the inferred P2 signals too. Inside that, Logan's answer of
 2026-09-19 governs volume, in his words: *"No numeric cap, only the P0/P1/P2
 class rule"*. P0 (`.github/workflows/**`, `.github/actions/**`, `docs/agents/**`,
 `AGENTS.md`/`CLAUDE.md`, or the `review-p0` label) is always reviewed; P1 is
