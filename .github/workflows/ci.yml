@@ -179,6 +179,16 @@ jobs:
       - name: Advisory review callable fail-open tests
         run: python3 scripts/test_code_review_callable.py
 
+      # The reviewer launcher's suite was never wired in here. It shipped
+      # 2026-09-20 with 98 tests -- the four spend limits, the daily-cap
+      # ledger-shape fixture, the YAML-to-Python label allow-list binding --
+      # none of which any gate had ever executed; they ran only when an agent
+      # remembered to run them locally. That is the failure mode the estate
+      # rule "trust the gate, not the worker" names: a suite CI does not run
+      # is a suite that is green by assertion (workflows#132).
+      - name: Cursor reviewer launcher and spend-limit tests
+        run: python3 scripts/test_cursor_review.py
+
       - name: Apple routing and fail-capable gate tests
         run: python3 scripts/test_apple_gate.py
 
