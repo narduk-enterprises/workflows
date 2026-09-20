@@ -506,7 +506,9 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
 
       P0  merge-blocking work: `.github/workflows/**`, `.github/actions/**`,
           `docs/agents/**`, `AGENTS.md`/`CLAUDE.md`, or the `review-p0` label.
-          Never deferred.
+          Never deferred, so P0 is decided FIRST and outranks every P2 signal:
+          dependabot bumping a pinned action inside `.github/workflows/`, or a
+          `review-p2` label on a workflow change, still gets a review.
       P1  ordinary code work. One review at open / reopen / ready, and another
           only when a lane asks by adding `review-now`.
       P2  nits: an automation author, a release branch, a metadata-only
@@ -521,10 +523,17 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
     requested = REVIEW_NOW_LABEL in labels
     critical = [path for path in (paths or []) if is_always_review(path)]
 
-    if "review-p2" in labels and not requested:
-        raise Skip(f"class P2 (label 'review-p2'); add '{REVIEW_NOW_LABEL}' to review this head anyway")
+    # P0 before every skip. An automation author and a `review-p2` label are
+    # both weaker evidence than the diff itself: dependabot bumping a pinned
+    # action, or anyone labelling a workflow change a nit, is exactly the
+    # deleted-`on:`-block class this reviewer gates (company-hq
+    # D-AGENT-REVIEW-2). Labels may escalate the class, never lower a P0.
     if "review-p0" in labels:
         return "P0", "label 'review-p0'"
+    if critical:
+        return "P0", f"touches {critical[0]}"
+    if "review-p2" in labels and not requested:
+        raise Skip(f"class P2 (label 'review-p2'); add '{REVIEW_NOW_LABEL}' to review this head anyway")
     if not requested:
         author = (env.get("PR_AUTHOR") or "").strip()
         if author.casefold() in AUTOMATION_AUTHORS:
@@ -532,8 +541,6 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
         head_ref = env.get("PR_HEAD_REF") or ""
         if head_ref.startswith(AUTOMATION_HEAD_REFS):
             raise Skip(f"class P2 (head {head_ref} is a release branch); add '{REVIEW_NOW_LABEL}' to review it anyway")
-    if critical:
-        return "P0", f"touches {critical[0]}"
     if "review-p1" in labels:
         return "P1", "label 'review-p1'"
     # The diff, never the title. A conventional `chore:`/`docs:` prefix on an

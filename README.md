@@ -373,7 +373,7 @@ on:
 # review: a run-level cancel happens before any job condition is evaluated, so
 # the discrimination has to be in the GROUP NAME, not only in the callable.
 concurrency:
-  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && !startsWith(github.event.label.name, 'review-') && 'other-label' || 'review' }}
+  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && !contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name) && 'other-label' || 'review' }}
   cancel-in-progress: true
 
 permissions:
@@ -404,11 +404,13 @@ What happens per pull request head:
    `result`, and posts a formal review on the reviewed head. Any `blocking`
    finding requests changes. Each finding whose `path:line` is inside the PR
    diff becomes an inline comment; the rest are listed in the review body.
-3. A push to the PR cancels the in-flight job and the previous agent run, and the
-   new head is reviewed again. A non-blocking review dismisses the bot's own stale
-   REQUEST_CHANGES; enable `dismiss_stale_reviews_on_push` and
-   `required_review_thread_resolution` on the repo's ruleset to make lanes answer
-   every thread.
+3. A push does NOT re-review: `synchronize` is not in the trigger set. A lane
+   that wants the new head reviewed adds `review-now`, which cancels any
+   in-flight job and its agent run, reviews the new head, and is cleared again
+   so the next add is a fresh event. A non-blocking review dismisses the bot's
+   own stale REQUEST_CHANGES; enable `dismiss_stale_reviews_on_push` and
+   `required_review_thread_resolution` on the repo's ruleset to make lanes
+   answer every thread.
 
 The only secret is `CURSOR_CLOUD_AGENTS_API_KEY`, a GitHub Actions repository
 secret delivered from nvault at a workstation (company-hq D-CLOUD-SECRETS-1). No

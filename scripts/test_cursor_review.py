@@ -575,6 +575,38 @@ class ClassRuleTests(unittest.TestCase):
                 self.assertIn("::notice::review class P1", out)
                 self.assertTrue(self.launched(transport))
 
+    def test_p0_outranks_every_p2_skip_signal(self):
+        """A workflow diff is the deleted-`on:`-block class this reviewer gates,
+        so neither an automation author nor a `review-p2` label may skip it."""
+        workflow = [{"filename": ".github/workflows/ci.yml", "patch": PATCH}]
+        for label, overrides in (
+            ("dependabot bumping a pinned action", {"PR_AUTHOR": "dependabot[bot]"}),
+            ("github-actions author", {"PR_AUTHOR": "github-actions[bot]"}),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main"}),
+            ("review-p2 on a workflow change", {"PR_LABELS": '["review-p2"]'}),
+        ):
+            with self.subTest(label):
+                transport = FakeTransport(files=workflow)
+                code, out = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+                self.assertTrue(self.launched(transport), "a P0 diff must launch whatever the P2 signal says")
+
+    def test_the_review_p0_label_outranks_every_p2_skip_signal(self):
+        for label, overrides in (
+            ("dependabot author", {"PR_AUTHOR": "dependabot[bot]", "PR_LABELS": '["review-p0"]'}),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main", "PR_LABELS": '["review-p0"]'}),
+            ("review-p2 alongside", {"PR_LABELS": '["review-p2", "review-p0"]'}),
+            ("metadata-only diff", {"PR_LABELS": '["review-p0"]'}),
+        ):
+            with self.subTest(label):
+                files = [{"filename": "README.md", "patch": PATCH}] if label == "metadata-only diff" else None
+                transport = FakeTransport(files=files)
+                code, out = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+                self.assertTrue(self.launched(transport))
+
     def test_a_rename_out_of_an_always_review_path_is_still_p0(self):
         """`.github/workflows/ci.yml` -> `docs/old-ci.md` reads as metadata-only
         unless the rename's previous_filename is counted."""
