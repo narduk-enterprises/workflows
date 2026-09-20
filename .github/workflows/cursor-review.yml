@@ -179,7 +179,11 @@ on:
           A non-P0 diff at or under this many changed lines is skipped; the
           orchestrating session self-reviews it. 0 disables the gate. P0 is
           exempt on purpose -- a three-line workflow change is the
-          deleted-`on:`-block hazard. `review-deep` bypasses it.
+          deleted-`on:`-block hazard. So the CHEAP lever here is `review-p0`,
+          which makes the diff P0 and clears this gate at the ordinary model;
+          `review-deep` also bypasses it but buys the strong reviewer, which a
+          small diff rarely needs. This is the only one of the four limits a
+          class label clears (workflows#132).
         required: false
         type: number
         default: 20
