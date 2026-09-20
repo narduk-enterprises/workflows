@@ -1,5 +1,5 @@
 # Pull-request reviewer (agent-infrastructure#1564). One Cursor Cloud agent
-# (grok-4.6, effort xhigh, fast) reviews every same-repo, non-draft PR head
+# (grok-4.6, effort xhigh, `fast: false`) reviews every same-repo, non-draft PR head
 # with this repo plus agent-infrastructure and company-hq attached, and the
 # callable posts a real GitHub review from this run. Any blocking finding is
 # REQUEST_CHANGES, which the branch rules honour. Never part of the required
@@ -8,20 +8,28 @@
 # Public repository: the job stays on GitHub-hosted ubuntu-latest.
 name: Cursor review
 
-# The trigger set changes with the pin, never before it: `labeled` against the
-# workflows#120 callable would launch a full review on every label add. It
-# moves to [opened, reopened, ready_for_review, labeled] in the caller wave
-# that pins this commit.
+# No `synchronize`: a push does not re-review. A lane that wants the new head
+# reviewed adds the `review-now` label, which the callable clears again so the
+# next add is a fresh event. Every other label addition skips.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review, labeled]
+
+# This group MIRRORS the callable's job `if:`. A run-level cancel happens
+# before any job condition is evaluated, so an event the callable would skip --
+# a stray `labeled`, a draft, a `no-ai-review` pull request -- must not share a
+# bucket with a live review, or it cancels the waiter and is then skipped
+# without cancelling the Cursor agent behind it.
+concurrency:
+  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name)))) && 'review' || 'other' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
   cursor-review:
-    uses: narduk-enterprises/workflows/.github/workflows/cursor-review.yml@852e0f0ce79860dc5fce0b998bf90712ba6a6bf4 # workflows#120; the moving v2 tag predates this callable, keep the SHA
+    uses: narduk-enterprises/workflows/.github/workflows/cursor-review.yml@246013d4284ba0c15040c333e169b90a66334d1f # workflows#125; the moving v2 tag predates this callable, keep the SHA
     permissions:
       contents: read
       pull-requests: write
