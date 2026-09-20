@@ -45,6 +45,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import cursor_review as cr  # noqa: E402
 
 WORKFLOW = ROOT / ".github" / "workflows" / "cursor-review.yml"
+SELF_CALLER = ROOT / ".github" / "workflows" / "cursor-review-self.yml"
 BRIEF = ROOT / "scripts" / "cursor_review_brief.md"
 HEAD = "a" * 40
 BASE = "b" * 40
@@ -99,7 +100,11 @@ class FakeTransport:
 
     def cursor(self, method: str, path: str, payload: Any) -> tuple[int, Any]:
         if method == "GET" and path.endswith("/v1/agents"):
-            return 200, {"agents": self.agent_ledger}
+            # VERIFIED live 2026-09-20: the top-level keys are `items` and
+            # `nextCursor`. This fake previously echoed `agents`, the v0 name
+            # the launcher also guessed, so the daily cap passed its tests
+            # while never binding in production. Keep this key honest.
+            return 200, {"items": self.agent_ledger, "nextCursor": None}
         if method == "POST" and path.endswith("/v1/agents"):
             # The real API (verified 2026-09-18) answers 201 with the agent WRAPPED.
             return 201, {"agent": {"id": "bc-new", "url": "https://cursor.com/agents/bc-new", "status": "CREATING"}}
@@ -582,6 +587,59 @@ class WorkflowShapeTests(unittest.TestCase):
         for token in ('"verdict"', '"findings"', '"severity"', '"checks_run"', "approve | comment | request_changes", "{head_sha}", "{base_sha}", "{context_repos}"):
             self.assertIn(token, brief)
         self.assertIn("UNTRUSTED", brief)
+
+
+class LabelAllowListTests(unittest.TestCase):
+    """The Python label set and every YAML allow-list must not drift apart.
+
+    `review-deep` shipped in RE_REQUEST_LABELS while all three YAML lists still
+    named only three labels, so the escape hatch could never start a review:
+    the job `if:` skipped the event before any Python ran. Nothing failed --
+    the launcher's own tests never read the workflow. This binds them.
+    """
+
+    LIST = re.compile(r"fromJSON\('(\[[^']*\])'\)")
+
+    def allow_lists(self):
+        found = []
+        for path in (WORKFLOW, SELF_CALLER):
+            for raw in self.LIST.findall(path.read_text(encoding="utf-8")):
+                found.append((path.name, frozenset(json.loads(raw))))
+        return found
+
+    def test_every_yaml_allow_list_matches_the_python_label_set(self):
+        found = self.allow_lists()
+        # The job `if:`, the copy-paste caller template beside it, and the
+        # self-caller's own concurrency group.
+        self.assertEqual(3, len(found), f"expected three allow-lists, got {[n for n, _ in found]}")
+        for name, labels in found:
+            self.assertEqual(
+                set(cr.RE_REQUEST_LABELS),
+                set(labels),
+                f"{name} allow-list drifted from RE_REQUEST_LABELS",
+            )
+
+    def test_the_deep_label_can_actually_wake_a_skipped_job(self):
+        # The specific regression: adding `review-deep` must reach the job.
+        self.assertIn(cr.DEEP_LABEL, cr.RE_REQUEST_LABELS)
+        for name, labels in self.allow_lists():
+            self.assertIn(cr.DEEP_LABEL, labels, f"{name} cannot wake a deep review")
+
+    def test_the_caller_group_mirrors_the_job_condition(self):
+        # cancel-in-progress is true and the group splits review from other.
+        # A label the job accepts but the group buckets as 'other' gets its
+        # live run cancelled by the next stray event, before the job `if:` is
+        # evaluated -- which also means `cancel_previous` never runs and the
+        # paid Cursor agent behind it keeps going.
+        caller = SELF_CALLER.read_text(encoding="utf-8")
+        self.assertIn("cancel-in-progress: true", caller)
+        job_if = [l for l in WORKFLOW.read_text(encoding="utf-8").splitlines() if l.strip().startswith("if: ${{ inputs.enabled")]
+        self.assertEqual(1, len(job_if))
+        group = [l for l in caller.splitlines() if l.strip().startswith("group: cursor-review-caller-")]
+        self.assertEqual(1, len(group))
+        for clause in ("github.event.pull_request.draft == false", "no-ai-review", "ready_for_review"):
+            self.assertIn(clause, job_if[0])
+            self.assertIn(clause, group[0], f"the caller group lost the {clause!r} clause")
 
 
 class ClassRuleTests(unittest.TestCase):
@@ -1128,6 +1186,49 @@ class SpendLimitTests(unittest.TestCase):
         code, _ = run(transport)
         self.assertEqual(0, code)
         self.assertTrue(self.launched(transport))
+
+    def test_the_ledger_reads_the_live_items_field(self):
+        # The cap must bind against the shape the API actually returns, with
+        # no `agents` key present anywhere in the payload.
+        class LiveShape(FakeTransport):
+            def cursor(self, method, path, payload):
+                if method == "GET" and path.endswith("/v1/agents"):
+                    return 200, {"items": self.agent_ledger, "nextCursor": None}
+                return super().cursor(method, path, payload)
+
+        transport = LiveShape(agent_ledger=ledger(12))
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("in the last 24h, the cap is 12", out)
+        # The skip advises adding `review-deep`; that advice was a dead end
+        # until the label reached the job `if:` (LabelAllowListTests).
+        self.assertIn(cr.DEEP_LABEL, out)
+        self.assertFalse(self.launched(transport), "the cap binds on the live shape")
+
+    def test_the_v0_agents_key_is_still_tolerated(self):
+        class V0(FakeTransport):
+            def cursor(self, method, path, payload):
+                if method == "GET" and path.endswith("/v1/agents"):
+                    return 200, {"agents": self.agent_ledger}
+                return super().cursor(method, path, payload)
+
+        transport = V0(agent_ledger=ledger(12))
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertFalse(self.launched(transport), "the alias still counts")
+
+    def test_an_unrecognised_ledger_shape_fails_open(self):
+        class Alien(FakeTransport):
+            def cursor(self, method, path, payload):
+                if method == "GET" and path.endswith("/v1/agents"):
+                    return 200, {"data": {"agents": self.agent_ledger}}
+                return super().cursor(method, path, payload)
+
+        transport = Alien(agent_ledger=ledger(99))
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("the daily cap is not applied", out)
+        self.assertTrue(self.launched(transport), "an unknown shape never blocks a review")
 
     def test_a_cursor_ledger_outage_fails_open(self):
         class Blind(FakeTransport):

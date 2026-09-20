@@ -353,8 +353,20 @@ class Cursor:
             except ReviewError as exc:
                 notice(f"could not read the Cursor agent ledger ({exc}); the daily cap is not applied")
                 return None
-            rows = page.get("agents") if isinstance(page, dict) else None
-            if not isinstance(rows, list):
+            # `GET /v1/agents` answers {"items": [...], "nextCursor": ...} --
+            # VERIFIED live 2026-09-20. The v0 list used `agents`, and reading
+            # that key here silently returned None on every call, which made
+            # this cap never bind at all. It was caught in review only because
+            # the live endpoint was re-probed; the unit test had encoded the
+            # same wrong guess in its fake, so it passed. `agents` is kept as a
+            # tolerated alias, never as the primary.
+            rows = None
+            if isinstance(page, dict):
+                for key in ("items", "agents"):
+                    if isinstance(page.get(key), list):
+                        rows = page[key]
+                        break
+            if rows is None:
                 notice("the Cursor agent ledger returned an unexpected shape; the daily cap is not applied")
                 return None
             for row in rows:
