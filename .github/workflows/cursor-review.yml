@@ -22,28 +22,55 @@ name: Reusable Cursor Review
 # `synchronize`: a push no longer re-reviews on its own. A lane that wants the
 # new head reviewed adds the `review-now` label, which this job clears again so
 # the next add is a fresh event. Every other label addition skips.
-# Within that, Logan's answer of 2026-09-19 governs how much gets reviewed, in
-# his words: "No numeric cap, only the P0/P1/P2 class rule".
-#   P0  `.github/workflows/**`, `.github/actions/**`, `docs/agents/**`,
-#       a policy basename
-#       (`AGENTS.md`, `CLAUDE.md`, `CODEX.md`, `SKILL.md`, `DECISIONS.md`, matched
-#       case-insensitively), or the `review-p0` label. Always reviewed.
+# SPEND CONTROLS (2026-09-20). Logan's 2026-09-19 answer was "No numeric cap,
+# only the P0/P1/P2 class rule"; he re-took that decision on 2026-09-20 against
+# the cost evidence, in his words: "Ok numeric cap per repo, and settable at
+# the repo level....some need more oversight than others....or perhaps a label
+# that forces review after the cap?". Measured over 199 launches on 78 pull
+# requests: 2.55 reviews per pull request, 139 in one day, 99 of them in one
+# evening -- 13% of the month's Cursor pool. Four limits, each settable per
+# caller and each disabled by 0, all four bypassed by `review-deep`:
+#   max-rounds (4)       no `request_changes` verdict in the sample arrived
+#                        after round 4; rounds 5-13 cost 251 compute minutes
+#                        and produced no blocking finding.
+#   daily-cap (12)       per repository, per rolling 24h, counted from
+#                        Cursor's own agent ledger so a skipped run is free.
+#   min-lines (20)       a non-P0 diff that small is cheaper to self-review.
+#   min-delta-lines (10) a re-request whose head barely moved is a re-read.
+# Every one fails OPEN: an unknown diff size, an unreadable comparison or a
+# Cursor ledger outage lets the review proceed. `review-now` deliberately does
+# NOT bypass them -- lanes add it after every push, which is what produced the
+# 2.55x, so a `review-now` override would make the caps decorative.
+#   P0  `.github/workflows/**`, `.github/actions/**`, `DECISIONS.md`,
+#       `cursor_review_brief.md`, or the `review-p0` label. Always reviewed
+#       and exempt from the size gate.
+#       NARROWED 2026-09-20: `docs/agents/**` and the `AGENTS.md`/`CLAUDE.md`/
+#       `CODEX.md`/`SKILL.md` basenames used to be P0, which made the class
+#       rule inert in the two repositories with the worst multipliers
+#       (agent-infrastructure 75% P0, this repository 100%). They are P1 now:
+#       still reviewed, but subject to the limits. They are explicitly NOT
+#       metadata, so narrowing did not silently turn "always reviewed" into
+#       "never reviewed" for policy prose.
 #   P1  ordinary code. Reviewed once per open/reopen/ready, again on request.
 #   P2  an automation author (dependabot, github-actions, renovate), a
 #       `changeset-release/*` head, a metadata-only diff (prose only --
 #       CODEOWNERS and .gitignore are code), or the `review-p2` label. The
 #       TITLE is never a signal: it is author-controlled, and `chore:` on a
 #       code change would be a free skip. An UNKNOWN file list is never P2
-#       either. NEVER launches an agent;
+#       either, and neither is an UNKNOWN diff size. NEVER launches an agent;
 #       the orchestrating session self-reviews it. `review-now` overrides P2.
-# There is no launch counter and no ledger here on purpose: the ledger is
-# `gh run list --workflow cursor-review.yml` against each enrolled repository.
+# The launch ledger is Cursor's own `GET /v1/agents`, which is the thing being
+# budgeted: a workflow run that skipped costs nothing and must not consume a
+# repository's daily allowance. Completed reviews also print one greppable
+# `cursor-review-telemetry {...}` JSON line per run, because the Cursor API
+# exposes no token counts and the 2026-09-20 analysis had to model them.
 #
 # SKIPS exit 0 with a `::notice::`: no pull request on this event, a draft PR,
 # the `no-ai-review` label, a FORK head (same-repo heads only: a fork must not
 # steer estate Cursor capacity, and a public caller's fork PR has no secret
 # anyway), a caller that was never given the secret, a label addition that is
-# not a review re-request, or a P2 pull request. A reviewer error or a
+# not a review re-request, a P2 pull request, or any of the four spend limits
+# above. A reviewer error or a
 # run that exceeds `wait-minutes` FAILS the job so the check is visibly red;
 # this job is never part of `ci / Required`, so red here blocks nothing by
 # itself. What blocks a merge is the REQUEST_CHANGES review under the
@@ -57,13 +84,14 @@ name: Reusable Cursor Review
 # from this job's `cursor-review-<repo>-<pr>`: with the same name the workflow
 # run holds the group, this job then fails at scheduling with no steps and no
 # annotation (five private callers, 2026-09-18). The caller's group must ALSO
-# mirror this job's `if:` allow-list, because a run-level cancel happens before
+# mirror this job's `if:` allow-list -- ALL FOUR labels, `review-deep`
+# included -- because a run-level cancel happens before
 # any job condition is evaluated -- otherwise a `synchronize`, `bot-inbox` or
 # `review-p2` event kills a live review, is then skipped by the job `if:`, and
 # never reaches `cancel_previous`. A PIN-ONLY bump of an existing caller that
 # still lists `synchronize` is therefore unsafe: drop it in the same commit.
 # Use:
-#   cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name)))) && 'review' || 'other' }}
+#   cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1","review-deep"]'), github.event.label.name)))) && 'review' || 'other' }}
 #
 # RUNNER ROUTING: same shape as code-review.yml. The default resolves from the
 # caller's own visibility: a PRIVATE caller lands on the fleet manifest's
@@ -88,15 +116,26 @@ on:
         type: boolean
         default: false
       model:
-        description: Cursor model id. `GET https://api.cursor.com/v1/models` lists valid ids.
+        description: >-
+          Cursor model id for an ordinary review. `GET
+          https://api.cursor.com/v1/models` lists valid ids. Composer 2.5 sits
+          in the same first-party "Cursor Models" pool as Grok 4.6 at roughly
+          a third of the cost per review ($0.50/$0.20/$2.50 per Mtok against
+          $2/$0.50/$6). A pull request that needs the stronger reviewer gets
+          the `review-deep` label.
         required: false
         type: string
-        default: grok-4.6
+        default: composer-2.5
       effort:
-        description: Model `effort` parameter (grok-4.6 accepts low..xhigh).
+        description: >-
+          Model `effort` parameter. EMPTY sends no effort parameter at all,
+          which is required for composer-2.5: it defines only `fast` and
+          rejects an `effort` it does not have. grok-4.6 accepts low..xhigh.
+          Note effort is not a rate change -- it buys more thinking tokens at
+          the same price -- so it is a ~10% lever, not a large one.
         required: false
         type: string
-        default: xhigh
+        default: ''
       fast:
         description: >-
           Model `fast` parameter. FALSE by default for reviews: `fast` buys
@@ -106,6 +145,52 @@ on:
         required: false
         type: boolean
         default: false
+      deep-model:
+        description: Model for a `review-deep` pull request.
+        required: false
+        type: string
+        default: grok-4.6
+      deep-effort:
+        description: Effort for a `review-deep` pull request.
+        required: false
+        type: string
+        default: xhigh
+      max-rounds:
+        description: >-
+          Most agent reviews one pull request may consume before further
+          re-requests are skipped. 0 disables the cap. Measured over 199
+          launches on 78 pull requests: every `request_changes` verdict
+          arrived by round 4, while rounds 5-13 cost 251 compute minutes and
+          produced no blocking finding. `review-deep` bypasses it.
+        required: false
+        type: number
+        default: 4
+      daily-cap:
+        description: >-
+          Most reviews this REPOSITORY may launch in a rolling 24 hours,
+          counted from Cursor's own agent ledger so a skipped workflow run
+          costs nothing against it. 0 disables the cap. Set it per repository:
+          some need more oversight than others. `review-deep` bypasses it.
+        required: false
+        type: number
+        default: 12
+      min-lines:
+        description: >-
+          A non-P0 diff at or under this many changed lines is skipped; the
+          orchestrating session self-reviews it. 0 disables the gate. P0 is
+          exempt on purpose -- a three-line workflow change is the
+          deleted-`on:`-block hazard. `review-deep` bypasses it.
+        required: false
+        type: number
+        default: 20
+      min-delta-lines:
+        description: >-
+          A re-request whose head moved this few lines or fewer since the
+          reviewed head is skipped as a re-read of a diff already reviewed.
+          0 disables the gate. `review-deep` bypasses it.
+        required: false
+        type: number
+        default: 10
       context-repos:
         description: >-
           Comma-separated `owner/name` repositories attached read-only beside
@@ -167,7 +252,7 @@ jobs:
     # A caller that declares workflow-level concurrency needs the same
     # discrimination in its GROUP NAME, because a run-level cancel happens
     # before any job condition is evaluated. The README caller shape has it.
-    if: ${{ inputs.enabled && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name))) }}
+    if: ${{ inputs.enabled && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1","review-deep"]'), github.event.label.name))) }}
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 45
     permissions:
@@ -219,6 +304,13 @@ jobs:
           CURSOR_MODEL: ${{ inputs.model }}
           CURSOR_EFFORT: ${{ inputs.effort }}
           CURSOR_FAST: ${{ inputs.fast }}
+          CURSOR_DEEP_MODEL: ${{ inputs.deep-model }}
+          CURSOR_DEEP_EFFORT: ${{ inputs.deep-effort }}
+          CURSOR_DEEP_FAST: 'false'
+          MAX_ROUNDS: ${{ inputs.max-rounds }}
+          DAILY_CAP: ${{ inputs.daily-cap }}
+          MIN_LINES: ${{ inputs.min-lines }}
+          MIN_DELTA_LINES: ${{ inputs.min-delta-lines }}
           CONTEXT_REPOS: ${{ inputs.context-repos }}
           WAIT_MINUTES: ${{ inputs.wait-minutes }}
           APPROVE_ON_CLEAN: ${{ inputs.approve-on-clean }}

@@ -48,8 +48,10 @@ import json
 import os
 import re
 import sys
+import datetime
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable, Optional
 
@@ -63,7 +65,14 @@ CLASS_LABELS = {"review-p0": "P0", "review-p1": "P1", "review-p2": "P2"}
 # Which labels, when ADDED, mean "review the current head now". Any other
 # label addition (`bot-inbox`, `hold merge`, a triage label) must not launch
 # an agent, because the caller now listens for every `labeled` event.
-RE_REQUEST_LABELS = frozenset({REVIEW_NOW_LABEL, "review-p0", "review-p1"})
+# "This one matters": `review-deep` forces the strong model AND bypasses every
+# spend control below (size gate, round cap, delta gate, daily cap). ONE label,
+# one meaning, so a lane never has to reason about which cap it is hitting.
+# `review-now` deliberately does NOT bypass them: lanes add it after every
+# push, which is precisely what produced 2.55 launches per pull request, so a
+# `review-now` override would make the caps decorative.
+DEEP_LABEL = "review-deep"
+RE_REQUEST_LABELS = frozenset({REVIEW_NOW_LABEL, "review-p0", "review-p1", DEEP_LABEL})
 # The only `pull_request` actions that start a review. Anything else -- above
 # all `synchronize` -- is refused here and in the callable's job `if:`.
 REVIEW_ACTIONS = frozenset({"opened", "reopened", "ready_for_review", "labeled"})
@@ -71,12 +80,35 @@ REVIEW_ACTIONS = frozenset({"opened", "reopened", "ready_for_review", "labeled"}
 AUTOMATION_AUTHORS = frozenset({"dependabot[bot]", "github-actions[bot]", "renovate[bot]"})
 AUTOMATION_HEAD_REFS = ("changeset-release/",)
 # Always worth a review whatever the title says: a workflow change can delete
-# an `on:` block silently, and the operating manual is estate policy.
-ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/", "docs/agents/")
-# Basenames, matched case-insensitively so `harness/claude.md` counts as much
-# as `CLAUDE.md`. These are policy, not prose: a SKILL.md edit can drop a
-# review-follow-through rule and a DECISIONS.md edit can invent an approval.
-ALWAYS_REVIEW_NAMES = ("agents.md", "claude.md", "codex.md", "skill.md", "decisions.md", "cursor_review_brief.md")
+# an `on:` block silently.
+#
+# NARROWED 2026-09-20 (cost review). This tuple used to carry `docs/agents/`
+# and the policy basenames `AGENTS.md`/`CLAUDE.md`/`CODEX.md`/`SKILL.md`. That
+# made P0 -- the class no size gate and no cap may skip -- 75% of
+# agent-infrastructure's pull requests and 100% of this repository's, i.e. the
+# class rule filtered nothing in the two repositories with the WORST review
+# multipliers (3.83 and 4.00 launches per pull request, measured over 199
+# launches). Prose about policy is not the deleted-`on:`-block hazard; it is
+# reviewed as ordinary P1 work. Measured effect: agent-infrastructure 75% ->
+# 25% P0, estate-wide 38% -> 27%.
+ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/")
+# Basenames, matched case-insensitively. Only the two that can rewrite the
+# rules this reviewer itself runs by survive the narrowing: a DECISIONS.md edit
+# can invent an approval the human-approval citation gate would then honour,
+# and a `cursor_review_brief.md` edit is the reviewer editing its own brief.
+ALWAYS_REVIEW_NAMES = ("decisions.md", "cursor_review_brief.md")
+# Policy prose: NOT P0 any more (so the size gate, round cap, delta gate and
+# daily cap all apply to it), but explicitly NOT metadata either.
+#
+# Getting this wrong is how narrowing P0 could have silently made things far
+# worse than they were: `.md` is a metadata suffix, so a policy file that
+# merely stops being P0 falls all the way through to the all-metadata P2 skip
+# and is never reviewed at all. In a repository whose product IS its policy
+# prose -- agent-infrastructure, company-hq -- that would have turned "always
+# review" into "never review" in one step. These paths classify P1: reviewed
+# once, and subject to every spend limit like any other code change.
+POLICY_PREFIXES = ("docs/agents/",)
+POLICY_NAMES = ("agents.md", "claude.md", "codex.md", "skill.md")
 # Everything here is prose: a diff made only of these launches no agent.
 # `CODEOWNERS`, `.gitignore` and `.gitattributes` are deliberately NOT here:
 # a CODEOWNERS edit can drop required reviewers and a `.gitignore` edit can
@@ -87,6 +119,37 @@ ALWAYS_REVIEW_NAMES = ("agents.md", "claude.md", "codex.md", "skill.md", "decisi
 METADATA_SUFFIXES = (".md", ".mdx", ".rst")
 METADATA_NAMES = ("LICENSE", "NOTICE")
 CHANGED_FILE_PAGES = 3
+# Cursor bills two separate pools: "Cursor Models" (Grok, Composer) with
+# "significantly more included usage", and "Other Models" at third-party API
+# price. Composer 2.5 is in the SAME generous pool as Grok 4.6 at $0.50/$0.20/
+# $2.50 per Mtok against $2/$0.50/$6 -- about 3x cheaper per review, and 97% of
+# reviews here are advisory rather than blocking.
+DEFAULT_MODEL = "composer-2.5"
+# Composer 2.5 takes no `effort` parameter, only `fast`. An empty effort sends
+# no effort param at all, which is what makes the default model legal.
+DEFAULT_EFFORT = ""
+# WARNING: Composer's own default variant is `fast: true`, billed at 6x its
+# base rate ($3/$0.50/$15) -- MORE than Grok 4.6 standard. Never default it on.
+DEFAULT_FAST = False
+DEFAULT_DEEP_MODEL = "grok-4.6"
+DEFAULT_DEEP_EFFORT = "xhigh"
+# Measured over 199 launches on 78 pull requests: every `request_changes`
+# verdict arrived by round 4. Rounds 5-13 were 31 launches and 251 compute
+# minutes that produced no blocking finding at all.
+DEFAULT_MAX_ROUNDS = 4
+# Per repository, per rolling 24h, counted from Cursor's own agent list. On
+# 2026-09-19 nothing existed to stop 99 launches in six hours; that evening
+# alone spent 13% of the month's pool.
+DEFAULT_DAILY_CAP = 12
+# A non-P0 diff this small is cheaper for the orchestrating session to read
+# than to send: nine reviewed pull requests changed <=20 lines, one of them 3.
+DEFAULT_MIN_LINES = 20
+# A re-request whose head barely moved since the reviewed head is re-reading a
+# diff it already reviewed. This attacks the 2.55x multiplier at its root.
+DEFAULT_MIN_DELTA_LINES = 10
+AGENT_LIST_PAGES = 3
+AGENT_LIST_PAGE_SIZE = 100
+DAILY_WINDOW_SECONDS = 24 * 60 * 60
 TERMINAL_RUN_STATUSES = frozenset({"FINISHED", "ERROR", "CANCELLED", "EXPIRED"})
 ACTIVE_AGENT_STATUSES = frozenset({"CREATING", "RUNNING", "ACTIVE", "PENDING"})
 AGENT_MARKER = "cursor-review-agent"
@@ -265,6 +328,62 @@ class Cursor:
             raise ReviewError(f"Cursor {method} {path} returned HTTP {status}: {error_detail(value)}", status=status)
         return value
 
+    def recent_reviews(self, repository: str, *, since: float, pages: int = AGENT_LIST_PAGES) -> int | None:
+        """Reviews this repository launched in the window, from Cursor's own ledger.
+
+        The thing being budgeted is Cursor agents, so the budget is counted
+        from Cursor, not from GitHub run history: a workflow run that skipped
+        costs nothing and must not consume a repository's daily allowance.
+
+        Returns None when the count cannot be established, and the caller then
+        does NOT apply the cap. This limit exists to stop a runaway evening,
+        not to become a new way for a review to silently vanish; a Cursor list
+        outage should degrade to the old uncapped behaviour, which is safe in
+        the direction that matters for correctness.
+        """
+        prefix = f"review {repository}#".casefold()
+        seen = 0
+        cursor_token = ""
+        for _ in range(max(1, pages)):
+            path = f"/v1/agents?limit={AGENT_LIST_PAGE_SIZE}"
+            if cursor_token:
+                path += f"&cursor={urllib.parse.quote(cursor_token)}"
+            try:
+                page = self.call("GET", path)
+            except ReviewError as exc:
+                notice(f"could not read the Cursor agent ledger ({exc}); the daily cap is not applied")
+                return None
+            # `GET /v1/agents` answers {"items": [...], "nextCursor": ...} --
+            # VERIFIED live 2026-09-20. The v0 list used `agents`, and reading
+            # that key here silently returned None on every call, which made
+            # this cap never bind at all. It was caught in review only because
+            # the live endpoint was re-probed; the unit test had encoded the
+            # same wrong guess in its fake, so it passed. `agents` is kept as a
+            # tolerated alias, never as the primary.
+            rows = None
+            if isinstance(page, dict):
+                for key in ("items", "agents"):
+                    if isinstance(page.get(key), list):
+                        rows = page[key]
+                        break
+            if rows is None:
+                notice("the Cursor agent ledger returned an unexpected shape; the daily cap is not applied")
+                return None
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                created = iso_seconds(row.get("createdAt"))
+                # The list is newest-first, so the first row older than the
+                # window ends the count -- every row after it is older still.
+                if created is not None and created < since:
+                    return seen
+                if str(row.get("name") or "").casefold().startswith(prefix):
+                    seen += 1
+            cursor_token = str((page.get("nextCursor") or "")) if isinstance(page, dict) else ""
+            if not cursor_token:
+                break
+        return seen
+
 
 # ---------------------------------------------------------------------------
 # pure helpers
@@ -423,8 +542,24 @@ def render_brief(template: str, context: dict[str, Any]) -> str:
     return text
 
 
-def agent_marker(agent_id: str, head_sha: str) -> str:
-    return f"<!-- {AGENT_MARKER} " + json.dumps({"agentId": agent_id, "headSha": head_sha}, sort_keys=True) + " -->"
+def agent_marker(agent_id: str, head_sha: str, rounds: int = 0) -> str:
+    """The pull request's own spend ledger, carried in the bot's marker comment.
+
+    `rounds` is how many agents this pull request has consumed. A marker
+    written before this field existed parses with rounds 0, so an in-flight
+    pull request starts counting from the next launch rather than being
+    retro-capped on a number nobody recorded.
+    """
+    payload = {"agentId": agent_id, "headSha": head_sha, "rounds": int(rounds)}
+    return f"<!-- {AGENT_MARKER} " + json.dumps(payload, sort_keys=True) + " -->"
+
+
+def marker_rounds(marker: dict[str, Any] | None) -> int:
+    value = (marker or {}).get("rounds")
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def parse_agent_marker(body: str) -> dict[str, Any] | None:
@@ -440,6 +575,22 @@ def parse_agent_marker(body: str) -> dict[str, Any] | None:
 
 def env_bool(value: str | None) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes"}
+
+
+def env_int(env: dict[str, str], key: str, default: int) -> int:
+    """A spend limit from the caller. 0 disables that limit; junk uses the default.
+
+    Junk must not silently disable a cap -- a caller that typos `daily-cap: twelve`
+    should get the estate default, not unlimited spend.
+    """
+    raw = (env.get(key) or "").strip()
+    if not raw:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        notice(f"{key}={raw!r} is not a whole number; using the default {default}")
+        return default
 
 
 # ---------------------------------------------------------------------------
@@ -482,9 +633,111 @@ def is_always_review(path: str) -> bool:
     return path.startswith(ALWAYS_REVIEW_PREFIXES) or path.rsplit("/", 1)[-1].casefold() in ALWAYS_REVIEW_NAMES
 
 
+def is_policy(path: str) -> bool:
+    return path.startswith(POLICY_PREFIXES) or path.rsplit("/", 1)[-1].casefold() in POLICY_NAMES
+
+
 def is_metadata(path: str) -> bool:
     name = path.rsplit("/", 1)[-1]
+    if is_always_review(path) or is_policy(path):
+        return False
     return path.lower().endswith(METADATA_SUFFIXES) or name in METADATA_NAMES
+
+
+def changed_files(github: GitHub, number: str) -> list[dict[str, Any]] | None:
+    """The diff's file rows, fetched ONCE and shared by the class and size gates.
+
+    None means UNKNOWN, and unknown never skips a review.
+    """
+    try:
+        rows = github.pages(f"pulls/{number}/files", limit=CHANGED_FILE_PAGES)
+    except ReviewError as exc:
+        notice(f"could not read the changed files ({exc}); classifying this pull request as reviewable")
+        return None
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def iso_seconds(value: Any) -> float | None:
+    """Epoch seconds from Cursor's `createdAt`, or None if it is unparseable.
+
+    Cursor stamps fractional seconds (`2026-09-20T12:21:03.252Z`), which
+    `datetime.fromisoformat` accepts but `%Y-%m-%dT%H:%M:%SZ` does not.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def changed_lines(rows: list[dict[str, Any]] | None) -> int | None:
+    """Additions plus deletions across the diff, or None when unknown.
+
+    None is UNKNOWN and never gates: the same fail-open rule the file list
+    already follows. A diff too large to page is a big diff, not a small one.
+    """
+    if rows is None:
+        return None
+    total = 0
+    sized = False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in ("additions", "deletions"):
+            if key not in row:
+                continue
+            try:
+                total += int(row.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            sized = True
+    # No row carried a size at all: that is UNKNOWN, not an empty diff. A
+    # zero returned here would read as "0 changed lines" and skip every
+    # non-P0 review under the size gate -- fail open instead.
+    return total if sized else None
+
+
+def delta_lines(github: GitHub, old_sha: str, head_sha: str) -> int | None:
+    """Lines changed between the reviewed head and this one, or None if unknown.
+
+    None never gates, for the same reason as `changed_lines`.
+    """
+    if not (COMMIT_SHA.fullmatch(old_sha or "") and COMMIT_SHA.fullmatch(head_sha or "")):
+        return None
+    if old_sha == head_sha:
+        return 0
+    try:
+        value = github.call("GET", f"compare/{old_sha}...{head_sha}")
+    except ReviewError as exc:
+        notice(f"could not compare {old_sha[:12]}...{head_sha[:12]} ({exc}); the delta gate is not applied")
+        return None
+    files = value.get("files") if isinstance(value, dict) else None
+    if not isinstance(files, list):
+        return None
+    return changed_lines(files)
+
+
+def select_model(env: dict[str, str], *, deep: bool) -> tuple[str, list[dict[str, str]], str, bool]:
+    """(model id, launch params, effort, fast) for this review.
+
+    `effort` is omitted from the params entirely when empty, because the
+    default model -- Composer 2.5 -- accepts only `fast` and rejects an
+    `effort` parameter it does not define.
+    """
+    if deep:
+        model = (env.get("CURSOR_DEEP_MODEL") or DEFAULT_DEEP_MODEL).strip()
+        effort = (env.get("CURSOR_DEEP_EFFORT") or DEFAULT_DEEP_EFFORT).strip()
+        fast = env_bool(env.get("CURSOR_DEEP_FAST", "false"))
+    else:
+        model = (env.get("CURSOR_MODEL") or DEFAULT_MODEL).strip()
+        effort = (env.get("CURSOR_EFFORT") if env.get("CURSOR_EFFORT") is not None else DEFAULT_EFFORT).strip()
+        fast = env_bool(env.get("CURSOR_FAST", "true" if DEFAULT_FAST else "false"))
+    params = [{"id": "fast", "value": "true" if fast else "false"}]
+    if effort:
+        params.insert(0, {"id": "effort", "value": effort})
+    return model, params, effort, fast
 
 
 def changed_paths(github: GitHub, number: str) -> list[str] | None:
@@ -494,10 +747,12 @@ def changed_paths(github: GitHub, number: str) -> list[str] | None:
     GitHub error, or a diff past the page bound must never be the reason a
     pull request silently loses its reviewer.
     """
-    try:
-        rows = github.pages(f"pulls/{number}/files", limit=CHANGED_FILE_PAGES)
-    except ReviewError as exc:
-        notice(f"could not read the changed files ({exc}); classifying this pull request as reviewable")
+    return paths_from_rows(changed_files(github, number))
+
+
+def paths_from_rows(rows: list[dict[str, Any]] | None) -> list[str] | None:
+    """Changed paths from already-fetched file rows. None stays None (UNKNOWN)."""
+    if rows is None:
         return None
     paths: list[str] = []
     for row in rows:
@@ -665,6 +920,58 @@ def context_repos(env: dict[str, str], repository: str) -> list[str]:
     return repos
 
 
+def spend_gates(
+    env: dict[str, str],
+    github: GitHub,
+    cursor: Cursor,
+    *,
+    repository: str,
+    priority: str,
+    lines: int | None,
+    state: dict[str, Any] | None,
+    now: float,
+) -> None:
+    """Raise `Skip` when this review is not worth its share of the pool.
+
+    Order is cheapest-test-first, and every gate fails OPEN: an unknown diff
+    size, an unreadable comparison, or a Cursor ledger outage lets the review
+    proceed. These limits exist to stop a runaway evening (99 launches in six
+    hours on 2026-09-19, 13% of the month), not to become a new way for a
+    review to disappear quietly.
+
+    `review-deep` bypasses all four, which is checked by the caller.
+    """
+    # 1. Size. P0 is exempt: a three-line `.github/workflows/` change is
+    #    exactly the deleted-`on:`-block hazard, and small is not safe there.
+    min_lines = env_int(env, "MIN_LINES", DEFAULT_MIN_LINES)
+    if min_lines and priority != "P0" and lines is not None and lines <= min_lines:
+        raise Skip(f"class {priority} diff is {lines} changed line(s), at or under the {min_lines}-line floor; add '{DEEP_LABEL}' to review it anyway")
+
+    rounds = marker_rounds(state)
+    # 2. Rounds. Measured over 199 launches: no `request_changes` verdict ever
+    #    arrived after round 4, while rounds 5-13 cost 251 compute minutes.
+    max_rounds = env_int(env, "MAX_ROUNDS", DEFAULT_MAX_ROUNDS)
+    if max_rounds and rounds >= max_rounds:
+        raise Skip(f"this pull request has already had {rounds} review(s), the cap is {max_rounds}; add '{DEEP_LABEL}' to review it again")
+
+    # 3. Delta. A re-request whose head barely moved re-reads a diff already
+    #    reviewed. Only meaningful once something HAS been reviewed.
+    min_delta = env_int(env, "MIN_DELTA_LINES", DEFAULT_MIN_DELTA_LINES)
+    reviewed_sha = str((state or {}).get("headSha") or "")
+    if min_delta and rounds and reviewed_sha:
+        moved = delta_lines(github, reviewed_sha, env["PR_HEAD_SHA"])
+        if moved is not None and moved <= min_delta:
+            raise Skip(f"only {moved} line(s) changed since the reviewed head {reviewed_sha[:12]}, at or under the {min_delta}-line floor; add '{DEEP_LABEL}' to review it anyway")
+
+    # 4. Daily cap, per repository, from Cursor's own ledger. Last because it
+    #    is the only gate that costs a network round trip to Cursor.
+    daily_cap = env_int(env, "DAILY_CAP", DEFAULT_DAILY_CAP)
+    if daily_cap:
+        used = cursor.recent_reviews(repository, since=now - DAILY_WINDOW_SECONDS)
+        if used is not None and used >= daily_cap:
+            raise Skip(f"{repository} has launched {used} review(s) in the last 24h, the cap is {daily_cap}; add '{DEEP_LABEL}' to review this one anyway")
+
+
 def find_marker_comment(github: GitHub, number: str) -> dict[str, Any] | None:
     for comment in github.pages(f"issues/{number}/comments"):
         if (comment.get("user") or {}).get("login") == BOT_LOGIN and parse_agent_marker(comment.get("body") or ""):
@@ -699,16 +1006,13 @@ def upsert_marker(github: GitHub, number: str, marker: dict[str, Any] | None, bo
     return github.call("POST", f"issues/{number}/comments", {"body": body})
 
 
-def launch(cursor: Cursor, env: dict[str, str], brief: str, repository: str, repos: list[str]) -> dict[str, Any]:
-    fast = env_bool(env.get("CURSOR_FAST", "false"))
+def launch(cursor: Cursor, env: dict[str, str], brief: str, repository: str, repos: list[str], *, deep: bool = False) -> dict[str, Any]:
+    model, params, _effort, _fast = select_model(env, deep=deep)
     body = {
         "prompt": {"text": brief},
         "repos": [{"url": f"https://github.com/{repository}", "startingRef": env["PR_HEAD_REF"]}]
         + [{"url": f"https://github.com/{name}"} for name in repos],
-        "model": {
-            "id": env.get("CURSOR_MODEL") or "grok-4.6",
-            "params": [{"id": "effort", "value": env.get("CURSOR_EFFORT") or "xhigh"}, {"id": "fast", "value": "true" if fast else "false"}],
-        },
+        "model": {"id": model, "params": params},
         "name": f"review {repository}#{env['PR_NUMBER']} @{env['PR_HEAD_SHA'][:7]}",
         "workOnCurrentBranch": True,
     }
@@ -790,6 +1094,18 @@ def post_review(github: GitHub, env: dict[str, str], result: dict[str, Any], con
     return review, event
 
 
+def telemetry(row: dict[str, Any]) -> None:
+    """One greppable JSON line per completed review.
+
+    The Cursor API exposes no token counts and no per-agent cost, so the only
+    way to answer "what did reviews actually cost, and did the cheaper model
+    hold up?" is to record it here as the reviews happen. The 2026-09-20 cost
+    analysis had to MODEL the token mix for exactly this reason; the next one
+    should not have to. `gh run view --log | grep cursor-review-telemetry`.
+    """
+    print("cursor-review-telemetry " + json.dumps(row, sort_keys=True, default=str))
+
+
 def step_summary(env: dict[str, str], lines: list[str]) -> None:
     path = env.get("GITHUB_STEP_SUMMARY")
     if not path:
@@ -798,7 +1114,7 @@ def step_summary(env: dict[str, str], lines: list[str]) -> None:
         handle.write("\n".join(lines) + "\n")
 
 
-def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic, brief_template: str | None = None) -> int:
+def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic, brief_template: str | None = None, now: Callable[[], float] = time.time) -> int:
     try:
         preconditions(env)
     except Skip as skip:
@@ -808,8 +1124,10 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
     number = env["PR_NUMBER"]
     github = GitHub(env["GITHUB_TOKEN"], repository, transport, env.get("GITHUB_API_URL") or "https://api.github.com", sleep=sleep)
     cursor = Cursor(env["CURSOR_CLOUD_AGENTS_API_KEY"], transport, env.get("CURSOR_API_URL") or CURSOR_API, sleep=sleep)
+    rows = changed_files(github, number)
+    lines = changed_lines(rows)
     try:
-        priority, why = review_class(env, changed_paths(github, number))
+        priority, why = review_class(env, paths_from_rows(rows))
     except Skip as skip:
         # Job concurrency already killed this pull request's in-flight WAITER;
         # the agent it was waiting on keeps burning the pool and posts nothing.
@@ -850,23 +1168,43 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
     # would have no way to ask again.
     clear_review_now(github, number, env)
     marker = find_marker_comment(github, number)
+    # `find_marker_comment` returns the COMMENT; the ledger is inside its body.
+    state = parse_agent_marker((marker or {}).get("body") or "")
+    deep = DEEP_LABEL in effective_labels(env)
+    if deep:
+        notice(f"'{DEEP_LABEL}': using the deep model and bypassing every spend limit")
+    else:
+        try:
+            spend_gates(env, github, cursor, repository=repository, priority=priority, lines=lines, state=state, now=now())
+        except Skip as skip:
+            # Same cleanup a class skip owes: job concurrency already killed
+            # this pull request's waiter, so an agent from the previous head
+            # would otherwise keep burning the pool and post nothing.
+            cancel_previous(cursor, marker, env["PR_HEAD_SHA"])
+            notice(f"review skipped: {skip}")
+            return 0
     cancel_previous(cursor, marker, env["PR_HEAD_SHA"])
     started = clock()
-    agent = launch(cursor, env, brief, repository, repos)
+    agent = launch(cursor, env, brief, repository, repos, deep=deep)
     agent_id = agent["id"]
     agent_url = agent.get("url") or f"https://cursor.com/agents/{agent_id}"
     print(f"launched Cursor agent {agent_id} for {repository}#{number} @ {env['PR_HEAD_SHA'][:12]}")
-    marker = upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` (class {priority}) in progress: agent [{agent_id}]({agent_url}).")
+    round_number = marker_rounds(state) + 1
+    marker = upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'], round_number)}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` (class {priority}, round {round_number}) in progress: agent [{agent_id}]({agent_url}).")
 
     wait_minutes = float(env.get("WAIT_MINUTES") or 30)
+    model, _params, effort, fast = select_model(env, deep=deep)
     context = {
         "agent_id": agent_id,
         "agent_url": agent_url,
-        "model": env.get("CURSOR_MODEL") or "grok-4.6",
-        "effort": env.get("CURSOR_EFFORT") or "xhigh",
-        "fast": env_bool(env.get("CURSOR_FAST", "false")),
+        "model": model,
+        "effort": effort or "n/a",
+        "fast": fast,
         "head_sha": env["PR_HEAD_SHA"],
         "priority": priority,
+        "round": round_number,
+        "deep": deep,
+        "lines": lines,
     }
     try:
         finished = wait_for_run(cursor, agent_id, deadline=started + wait_minutes * 60, sleep=sleep, clock=clock)
@@ -877,13 +1215,13 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
         review, event = post_review(github, env, result, context)
     except Skip as skip:
         notice(f"review skipped: {skip}")
-        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` was superseded by a newer head (agent [{agent_id}]({agent_url})). A push no longer re-reviews: add the `{REVIEW_NOW_LABEL}` label to review the new head.")
+        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'], round_number)}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` was superseded by a newer head (agent [{agent_id}]({agent_url})). A push no longer re-reviews: add the `{REVIEW_NOW_LABEL}` label to review the new head.")
         return 0
     except ReviewError as exc:
-        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` did not complete: {str(exc)[:500]} (agent [{agent_id}]({agent_url})). The job is red; re-run it or add the `{REVIEW_NOW_LABEL}` label.")
+        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'], round_number)}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` did not complete: {str(exc)[:500]} (agent [{agent_id}]({agent_url})). The job is red; re-run it or add the `{REVIEW_NOW_LABEL}` label.")
         raise
     review_url = review.get("html_url") or ""
-    upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}`: {event} — {review_url} (agent [{agent_id}]({agent_url}), {duration_text(context.get('elapsed'))}).")
+    upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'], round_number)}\nCursor review of `{env['PR_HEAD_SHA'][:12]}`: {event} — {review_url} (agent [{agent_id}]({agent_url}), {duration_text(context.get('elapsed'))}).")
     counts = {severity: sum(1 for f in result["findings"] if f["severity"] == severity) for severity in SEVERITIES}
     step_summary(
         env,
@@ -895,7 +1233,28 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
             f"- Agent: [{agent_id}]({agent_url}) on `{context['model']}` (effort {context['effort']}, fast {str(context['fast']).lower()}), {duration_text(context.get('elapsed'))}",
             f"- Review: **{event}** — {review_url}",
             f"- Findings: {counts['blocking']} blocking, {counts['consider']} consider, {counts['nit']} nit",
+            f"- Round: {round_number}"
+            + (f" of {env_int(env, 'MAX_ROUNDS', DEFAULT_MAX_ROUNDS)}" if env_int(env, "MAX_ROUNDS", DEFAULT_MAX_ROUNDS) else "")
+            + (f" · `{DEEP_LABEL}`" if deep else ""),
         ],
+    )
+    telemetry(
+        {
+            "repo": repository,
+            "pr": int(number),
+            "head": env["PR_HEAD_SHA"][:12],
+            "class": priority,
+            "round": round_number,
+            "deep": deep,
+            "model": context["model"],
+            "effort": context["effort"],
+            "fast": context["fast"],
+            "diff_lines": lines,
+            "elapsed_s": round(float(context.get("elapsed") or 0), 1),
+            "verdict": result.get("verdict"),
+            "event": event,
+            "findings": counts,
+        }
     )
     print(f"posted {event} review {review_url}")
     return 0
