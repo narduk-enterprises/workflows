@@ -8,9 +8,11 @@
 # Public repository: the job stays on GitHub-hosted ubuntu-latest.
 name: Cursor review
 
+# No `synchronize`: a push does not re-review. A lane that wants the new head
+# reviewed adds the `review-now` label, which the callable clears again.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review, labeled]
 
 permissions:
   contents: read

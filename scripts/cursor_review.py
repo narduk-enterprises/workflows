@@ -12,6 +12,15 @@ Flow (agent-infrastructure#1564):
   1. Skip, exit 0, with a `::notice::`, when this event is not a same-repo,
      non-draft pull request, when the PR carries the `no-ai-review` label, or
      when the caller was never given `CURSOR_CLOUD_AGENTS_API_KEY`.
+  1b. Skip when a `labeled` event added a label that is not a review
+     re-request, and skip when the priority class is P2. The class rule is
+     Logan's answer of 2026-09-19 to the reviewer-untangle round, verbatim:
+     "No numeric cap, only the P0/P1/P2 class rule". P0 (workflows, the
+     operating manual, routed agent docs, or an explicit `review-p0` label)
+     always launches; P1 launches once per open/ready/re-request; P2
+     (automation authors, release branches, chore/docs-marked titles,
+     metadata-only diffs, or an explicit `review-p2` label) never launches an
+     agent at all. `review-now` overrides every P2 signal.
   2. Cancel the agent run a previous head started, if it is still running.
   3. Launch ONE Cursor Cloud agent with the PR repository attached at the head
      branch plus read-only context repositories, and the review brief.
@@ -42,6 +51,26 @@ from typing import Any, Callable, Optional
 CURSOR_API = "https://api.cursor.com"
 BOT_LOGIN = "github-actions[bot]"
 OPT_OUT_LABEL = "no-ai-review"
+# Priority classes (Logan, 2026-09-19: "No numeric cap, only the P0/P1/P2
+# class rule"). A label is the explicit form; everything else is inferred.
+REVIEW_NOW_LABEL = "review-now"
+CLASS_LABELS = {"review-p0": "P0", "review-p1": "P1", "review-p2": "P2"}
+# Which labels, when ADDED, mean "review the current head now". Any other
+# label addition (`bot-inbox`, `hold merge`, a triage label) must not launch
+# an agent, because the caller now listens for every `labeled` event.
+RE_REQUEST_LABELS = frozenset({REVIEW_NOW_LABEL, "review-p0", "review-p1"})
+# Heads no human is waiting on: the bot opened them and a lane merges them.
+AUTOMATION_AUTHORS = frozenset({"dependabot[bot]", "github-actions[bot]", "renovate[bot]"})
+AUTOMATION_HEAD_REFS = ("changeset-release/",)
+P2_TITLE = re.compile(r"^\s*(?:nit|chore|docs|deps|style|build|ci\(deps\))(?:\([^)]*\))?!?:", re.IGNORECASE)
+# Always worth a review whatever the title says: a workflow change can delete
+# an `on:` block silently, and the operating manual is estate policy.
+ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/", "docs/agents/")
+ALWAYS_REVIEW_NAMES = ("AGENTS.md", "CLAUDE.md")
+# Everything here is prose: a diff made only of these launches no agent.
+METADATA_SUFFIXES = (".md", ".mdx", ".txt", ".rst")
+METADATA_NAMES = ("LICENSE", "NOTICE", "CODEOWNERS", ".gitignore", ".gitattributes")
+CHANGED_FILE_PAGES = 3
 TERMINAL_RUN_STATUSES = frozenset({"FINISHED", "ERROR", "CANCELLED", "EXPIRED"})
 ACTIVE_AGENT_STATUSES = frozenset({"CREATING", "RUNNING", "ACTIVE", "PENDING"})
 AGENT_MARKER = "cursor-review-agent"
@@ -345,7 +374,8 @@ def review_body(result: dict[str, Any], event: str, context: dict[str, Any], unp
     counts = {severity: sum(1 for f in result["findings"] if f["severity"] == severity) for severity in SEVERITIES}
     lines = [
         f"**Cursor review** · `{context['model']}` (effort {context['effort']}, fast {str(context['fast']).lower()}) · "
-        f"agent [{context['agent_id']}]({context['agent_url']}) · {duration_text(context.get('elapsed'))} · head `{context['head_sha'][:12]}`",
+        f"class {context.get('priority', 'P1')} · agent [{context['agent_id']}]({context['agent_url']}) · "
+        f"{duration_text(context.get('elapsed'))} · head `{context['head_sha'][:12]}`",
         "",
         result["summary"],
         "",
@@ -360,9 +390,10 @@ def review_body(result: dict[str, Any], event: str, context: dict[str, Any], unp
         lines += ["", "Checks the reviewer ran:", ""] + [f"- {item}" for item in result["checks_run"]]
     lines += [
         "",
-        "How to respond: fix and push (a new head is reviewed again), or reply in the thread with "
-        "`disposition: <accept|reject|defer> - <reason>` and resolve it. A blocking finding requests changes; "
-        "the merge gate honours GitHub's review decision.",
+        "How to respond: fix and push, or reply in the thread with "
+        "`disposition: <accept|reject|defer> - <reason>` and resolve it. A push no longer re-reviews on its own — "
+        f"add the `{REVIEW_NOW_LABEL}` label when the new head needs another review. A blocking finding requests "
+        "changes; the merge gate honours GitHub's review decision.",
         "",
         f"<!-- {REVIEW_MARKER} " + json.dumps({"agentId": context["agent_id"], "headSha": context["head_sha"], "verdict": result["verdict"], "event": event}, sort_keys=True) + " -->",
     ]
@@ -400,6 +431,122 @@ def env_bool(value: str | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def label_names(env: dict[str, str]) -> set[str]:
+    """Case-folded label names from `toJSON(...labels.*.name)`.
+
+    The workflow hands this over as a JSON array of strings. A comma or
+    newline separated string is accepted too so the script stays runnable by
+    hand, and an unparseable value is treated as "no labels" rather than as an
+    error: a label list is an optimisation, never the thing that decides
+    whether the pull request is safe.
+    """
+    raw = (env.get("PR_LABELS") or "").strip()
+    if not raw:
+        return set()
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        value = raw.replace("\n", ",").split(",")
+    if not isinstance(value, list):
+        return set()
+    names = set()
+    for item in value:
+        name = item.get("name") if isinstance(item, dict) else item
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip().casefold())
+    return names
+
+
+def is_always_review(path: str) -> bool:
+    return path.startswith(ALWAYS_REVIEW_PREFIXES) or path.rsplit("/", 1)[-1] in ALWAYS_REVIEW_NAMES
+
+
+def is_metadata(path: str) -> bool:
+    name = path.rsplit("/", 1)[-1]
+    return path.lower().endswith(METADATA_SUFFIXES) or name in METADATA_NAMES
+
+
+def changed_paths(github: GitHub, number: str) -> list[str] | None:
+    """Every changed file, or None when that cannot be read cheaply.
+
+    None means UNKNOWN, and unknown always reviews: a transport failure, a
+    GitHub error, or a diff past the page bound must never be the reason a
+    pull request silently loses its reviewer.
+    """
+    try:
+        rows = github.pages(f"pulls/{number}/files", limit=CHANGED_FILE_PAGES)
+    except ReviewError as exc:
+        notice(f"could not read the changed files ({exc}); classifying this pull request as reviewable")
+        return None
+    paths = [str(row.get("filename") or "") for row in rows if isinstance(row, dict) and row.get("filename")]
+    return paths or None
+
+
+def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str]:
+    """The pull request's priority class: P0, P1, or a `Skip` for P2.
+
+    Logan, 2026-09-19, choosing this over a numeric cap: "No numeric cap, only
+    the P0/P1/P2 class rule". So nothing here counts launches; the class alone
+    decides whether an agent starts.
+
+      P0  merge-blocking work: `.github/workflows/**`, `.github/actions/**`,
+          `docs/agents/**`, `AGENTS.md`/`CLAUDE.md`, or the `review-p0` label.
+          Never deferred.
+      P1  ordinary code work. One review at open / reopen / ready, and another
+          only when a lane asks by adding `review-now`.
+      P2  nits: an automation author, a release branch, a chore/docs/nit
+          title, a metadata-only diff, or the `review-p2` label. P2 never
+          launches an agent; the orchestrating session self-reviews it.
+
+    `review-now` is the override: it defeats every inferred P2 signal and the
+    explicit `review-p2` label, because a lane adding it has asked for this
+    exact head to be reviewed.
+    """
+    labels = label_names(env)
+    requested = REVIEW_NOW_LABEL in labels
+    critical = [path for path in (paths or []) if is_always_review(path)]
+
+    if "review-p2" in labels and not requested:
+        raise Skip(f"class P2 (label 'review-p2'); add '{REVIEW_NOW_LABEL}' to review this head anyway")
+    if "review-p0" in labels:
+        return "P0", "label 'review-p0'"
+    if not requested:
+        author = (env.get("PR_AUTHOR") or "").strip()
+        if author.casefold() in AUTOMATION_AUTHORS:
+            raise Skip(f"class P2 (author {author} is an automation account); add '{REVIEW_NOW_LABEL}' to review it anyway")
+        head_ref = env.get("PR_HEAD_REF") or ""
+        if head_ref.startswith(AUTOMATION_HEAD_REFS):
+            raise Skip(f"class P2 (head {head_ref} is a release branch); add '{REVIEW_NOW_LABEL}' to review it anyway")
+    if critical:
+        return "P0", f"touches {critical[0]}"
+    if "review-p1" in labels:
+        return "P1", "label 'review-p1'"
+    # Both remaining signals are weaker than a path, so neither may fire while
+    # the paths are unknown: a "chore:" title on a workflow change is exactly
+    # the mismatch that hides a deleted `on:` block.
+    if not requested and paths is not None:
+        if P2_TITLE.match(env.get("PR_TITLE") or ""):
+            raise Skip(f"class P2 (the title marks this a chore, docs, or nit change); add '{REVIEW_NOW_LABEL}' to review it anyway")
+        if all(is_metadata(path) for path in paths):
+            raise Skip(f"class P2 (all {len(paths)} changed files are metadata); add '{REVIEW_NOW_LABEL}' to review it anyway")
+    return "P1", f"label '{REVIEW_NOW_LABEL}' re-request" if requested else "code change"
+
+
+def clear_review_now(github: GitHub, number: str, env: dict[str, str]) -> None:
+    """Remove `review-now` so the next re-request is a fresh `labeled` event.
+
+    Adding a label that is already present raises no event, so leaving it on
+    would make the second re-request silently do nothing.
+    """
+    if REVIEW_NOW_LABEL not in label_names(env):
+        return
+    try:
+        github.call("DELETE", f"issues/{number}/labels/{REVIEW_NOW_LABEL}", ok=(200, 204, 404))
+        notice(f"cleared the '{REVIEW_NOW_LABEL}' label; add it again to re-request a review")
+    except ReviewError as exc:
+        notice(f"could not clear the '{REVIEW_NOW_LABEL}' label: {exc}")
+
+
 def preconditions(env: dict[str, str]) -> None:
     number = env.get("PR_NUMBER", "").strip()
     if not number.isdigit():
@@ -408,6 +555,10 @@ def preconditions(env: dict[str, str]) -> None:
         raise Skip(f"PR #{number} is a draft; mark it ready for review to get a review")
     if env_bool(env.get("PR_OPTED_OUT")):
         raise Skip(f"opted out (label '{OPT_OUT_LABEL}' on PR #{number})")
+    if (env.get("PR_EVENT_ACTION") or "").strip() == "labeled":
+        added = (env.get("PR_EVENT_LABEL") or "").strip()
+        if added.casefold() not in RE_REQUEST_LABELS:
+            raise Skip(f"label '{added or 'unknown'}' is not a review re-request; add '{REVIEW_NOW_LABEL}' to review the current head")
     if env.get("PR_HEAD_REPOSITORY", "") != env.get("GITHUB_REPOSITORY", ""):
         raise Skip(f"PR #{number} head is a fork ({env.get('PR_HEAD_REPOSITORY') or 'unknown'}); same-repo heads only")
     if not env.get("CURSOR_CLOUD_AGENTS_API_KEY", "").strip():
@@ -461,7 +612,7 @@ def upsert_marker(github: GitHub, number: str, marker: dict[str, Any] | None, bo
 
 
 def launch(cursor: Cursor, env: dict[str, str], brief: str, repository: str, repos: list[str]) -> dict[str, Any]:
-    fast = env_bool(env.get("CURSOR_FAST", "true"))
+    fast = env_bool(env.get("CURSOR_FAST", "false"))
     body = {
         "prompt": {"text": brief},
         "repos": [{"url": f"https://github.com/{repository}", "startingRef": env["PR_HEAD_REF"]}]
@@ -569,6 +720,12 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
     number = env["PR_NUMBER"]
     github = GitHub(env["GITHUB_TOKEN"], repository, transport, env.get("GITHUB_API_URL") or "https://api.github.com", sleep=sleep)
     cursor = Cursor(env["CURSOR_CLOUD_AGENTS_API_KEY"], transport, env.get("CURSOR_API_URL") or CURSOR_API, sleep=sleep)
+    try:
+        priority, why = review_class(env, changed_paths(github, number))
+    except Skip as skip:
+        notice(f"review skipped: {skip}")
+        return 0
+    notice(f"review class {priority} ({why})")
     repos = context_repos(env, repository)
     if brief_template is None:
         with open(env["BRIEF_PATH"], encoding="utf-8") as handle:
@@ -595,7 +752,8 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
     agent_id = agent["id"]
     agent_url = agent.get("url") or f"https://cursor.com/agents/{agent_id}"
     print(f"launched Cursor agent {agent_id} for {repository}#{number} @ {env['PR_HEAD_SHA'][:12]}")
-    marker = upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` in progress: agent [{agent_id}]({agent_url}).")
+    marker = upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` (class {priority}) in progress: agent [{agent_id}]({agent_url}).")
+    clear_review_now(github, number, env)
 
     wait_minutes = float(env.get("WAIT_MINUTES") or 30)
     context = {
@@ -603,8 +761,9 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
         "agent_url": agent_url,
         "model": env.get("CURSOR_MODEL") or "grok-4.6",
         "effort": env.get("CURSOR_EFFORT") or "xhigh",
-        "fast": env_bool(env.get("CURSOR_FAST", "true")),
+        "fast": env_bool(env.get("CURSOR_FAST", "false")),
         "head_sha": env["PR_HEAD_SHA"],
+        "priority": priority,
     }
     try:
         finished = wait_for_run(cursor, agent_id, deadline=started + wait_minutes * 60, sleep=sleep, clock=clock)
@@ -629,6 +788,7 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
             "### Cursor review",
             "",
             f"- PR: {repository}#{number} @ `{env['PR_HEAD_SHA'][:12]}`",
+            f"- Class: **{priority}** ({why})",
             f"- Agent: [{agent_id}]({agent_url}) on `{context['model']}` (effort {context['effort']}, fast {str(context['fast']).lower()}), {duration_text(context.get('elapsed'))}",
             f"- Review: **{event}** — {review_url}",
             f"- Findings: {counts['blocking']} blocking, {counts['consider']} consider, {counts['nit']} nit",

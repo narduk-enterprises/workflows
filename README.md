@@ -70,7 +70,7 @@ in their app-class workflow.
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional web-foundation conformance check, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: script-probed lint, typecheck, test, build (pnpm or npm), fail-closed by default through `require-scripts`. Zero live callers as of 2026-07-27 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
 | `code-review.yml` | **Advisory, default-off, not a CI gate.** Requests one containerized read-only agent review of a PR head from the estate's ephemeral pool, by firing a single `repository_dispatch` at `agent-infrastructure`. No `Required` job, never part of `ci / Required`, and every refusal path (opted out, fork, no secret, dispatch failure) exits SUCCESS. `enabled` defaults to `false`, so adopting the tag that carries it changes nothing until a repo opts in. See [Advisory code review](#advisory-code-review) |
-| `cursor-review.yml` | **Default-off PR reviewer, not a CI gate.** Reviews a pull request with one Cursor Cloud agent (`grok-4.6`, effort `xhigh`, fast) that has the caller checked out at the PR head plus read-only context repos (estate manual, coding standards, decisions), then posts a REAL pull-request review on the reviewed head — APPROVE / COMMENT / REQUEST_CHANGES with inline comments — using the job's own `GITHUB_TOKEN`. Skips (draft, fork, `no-ai-review`, no secret) exit SUCCESS; a reviewer error fails the job. A REQUEST_CHANGES review blocks merge under the repo's pull-request rule. See [Cursor review](#cursor-review) (agent-infrastructure#1564) |
+| `cursor-review.yml` | **Default-off PR reviewer, not a CI gate.** Reviews a pull request with one Cursor Cloud agent (`grok-4.6`, effort `xhigh`, `fast: false`) that has the caller checked out at the PR head plus read-only context repos (estate manual, coding standards, decisions), then posts a REAL pull-request review on the reviewed head — APPROVE / COMMENT / REQUEST_CHANGES with inline comments — using the job's own `GITHUB_TOKEN`. Skips (draft, fork, `no-ai-review`, no secret) exit SUCCESS; a reviewer error fails the job. A REQUEST_CHANGES review blocks merge under the repo's pull-request rule. See [Cursor review](#cursor-review) (agent-infrastructure#1564) |
 | `closing-syntax-check.yml` | PR-closing-syntax gate (agent-infrastructure#837, #1085): rejects a PR body whose closing keyword is ambiguous (a bare comma-separated list) or sits outside a canonical closing line/list item, and rejects any commit in the PR's own commit range that carries a closing keyword at all — GitHub's squash-merge auto-close scan reads the landed commit message independently of the curated PR body. **Fully self-contained**: the checker's source (canonically `narduk-enterprises/agent-infrastructure`'s `scripts/check_pr_closing_syntax.py`) is vendored directly inside this callable, so an adopting repo needs no local copy at all — see the workflow file's own header for the sync procedure |
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 
@@ -338,6 +338,22 @@ change in some repos re-runs the full gate. The caller grants exactly
 MUST NOT reuse the callable's job group name (`cursor-review-<repo>-<pr>`); the
 same name deadlocks the job at scheduling.
 
+**Triggers and the class rule (reviewer untangle, 2026-09-19).** The trigger
+set deliberately omits `synchronize`: on 2026-09-19 push-driven re-reviews took
+the estate to 165 runs over 80 heads and exhausted the Cursor Models pool for
+seven and a half hours. A lane that wants the new head reviewed adds the
+`review-now` label; the callable clears it again so the next add is a fresh
+event, and every other label addition skips. Inside that, Logan's answer of
+2026-09-19 governs volume, in his words: *"No numeric cap, only the P0/P1/P2
+class rule"*. P0 (`.github/workflows/**`, `.github/actions/**`, `docs/agents/**`,
+`AGENTS.md`/`CLAUDE.md`, or the `review-p0` label) is always reviewed; P1 is
+ordinary code, reviewed once per open/reopen/ready; P2 — an automation author
+(`dependabot[bot]`, `github-actions[bot]`, `renovate[bot]`), a
+`changeset-release/*` head, a chore/docs/nit-marked title, a metadata-only
+diff, or the `review-p2` label — never launches an agent, and `review-now`
+overrides every P2 signal. There is no launch counter here on purpose; the
+ledger is `gh run list --repo narduk-enterprises/<repo> --workflow cursor-review.yml`.
+
 Provider failure is reported as provider failure. In particular,
 `usage_limit_exceeded` does not fall back to the retired Proxmox pool and does
 not prove that a usage reset, spending change, or other account mutation
@@ -346,9 +362,11 @@ succeeded; the workflow records the review as unavailable until a later run.
 ```yaml
 name: Cursor review
 
+# No `synchronize`: a push does not re-review. A lane adds `review-now` to ask
+# for the new head, and the callable clears the label again.
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review, labeled]
 
 concurrency:
   group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}

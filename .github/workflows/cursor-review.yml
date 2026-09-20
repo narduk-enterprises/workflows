@@ -17,10 +17,28 @@ name: Reusable Cursor Review
 # `enabled` defaults to FALSE, so the tag carrying this file changes nothing
 # for a caller that has not opted in.
 #
+# TRIGGERS AND CLASS RULE (agent-infrastructure, reviewer untangle 2026-09-19).
+# Callers listen on [opened, reopened, ready_for_review, labeled] and NOT on
+# `synchronize`: a push no longer re-reviews on its own. A lane that wants the
+# new head reviewed adds the `review-now` label, which this job clears again so
+# the next add is a fresh event. Every other label addition skips.
+# Within that, Logan's answer of 2026-09-19 governs how much gets reviewed, in
+# his words: "No numeric cap, only the P0/P1/P2 class rule".
+#   P0  `.github/workflows/**`, `.github/actions/**`, `docs/agents/**`,
+#       `AGENTS.md`/`CLAUDE.md`, or the `review-p0` label. Always reviewed.
+#   P1  ordinary code. Reviewed once per open/reopen/ready, again on request.
+#   P2  an automation author (dependabot, github-actions, renovate), a
+#       `changeset-release/*` head, a chore/docs/nit-marked title, a
+#       metadata-only diff, or the `review-p2` label. NEVER launches an agent;
+#       the orchestrating session self-reviews it. `review-now` overrides P2.
+# There is no launch counter and no ledger here on purpose: the ledger is
+# `gh run list --workflow cursor-review.yml` against each enrolled repository.
+#
 # SKIPS exit 0 with a `::notice::`: no pull request on this event, a draft PR,
 # the `no-ai-review` label, a FORK head (same-repo heads only: a fork must not
 # steer estate Cursor capacity, and a public caller's fork PR has no secret
-# anyway), or a caller that was never given the secret. A reviewer error or a
+# anyway), a caller that was never given the secret, a label addition that is
+# not a review re-request, or a P2 pull request. A reviewer error or a
 # run that exceeds `wait-minutes` FAILS the job so the check is visibly red;
 # this job is never part of `ci / Required`, so red here blocks nothing by
 # itself. What blocks a merge is the REQUEST_CHANGES review under the
@@ -68,10 +86,14 @@ on:
         type: string
         default: xhigh
       fast:
-        description: Model `fast` parameter.
+        description: >-
+          Model `fast` parameter. FALSE by default for reviews: `fast` buys
+          wall-clock, and this job already budgets `wait-minutes` and blocks
+          nobody while it waits, so a reviewer is never the latency-critical
+          lane. Implementation lanes keep `fast=true`.
         required: false
         type: boolean
-        default: true
+        default: false
       context-repos:
         description: >-
           Comma-separated `owner/name` repositories attached read-only beside
@@ -162,6 +184,12 @@ jobs:
           PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
           PR_DRAFT: ${{ github.event.pull_request.draft }}
           PR_OPTED_OUT: ${{ contains(github.event.pull_request.labels.*.name, 'no-ai-review') }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          # Empty on every event but `labeled`, which is exactly the test the
+          # script makes: only a review re-request label starts an agent.
+          PR_EVENT_ACTION: ${{ github.event.action }}
+          PR_EVENT_LABEL: ${{ github.event.label.name }}
           CURSOR_MODEL: ${{ inputs.model }}
           CURSOR_EFFORT: ${{ inputs.effort }}
           CURSOR_FAST: ${{ inputs.fast }}

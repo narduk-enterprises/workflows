@@ -68,7 +68,7 @@ def review_json(**overrides: Any) -> str:
 class FakeTransport:
     """Routes by (method, path) and records everything that was sent."""
 
-    def __init__(self, *, result: str = review_json(), run_statuses: list[str] | None = None, pr_author: str = "loganrenz", head_now: str = HEAD, prior_reviews: list[dict[str, Any]] | None = None, marker_comment: dict[str, Any] | None = None, review_status: int = 200) -> None:
+    def __init__(self, *, result: str = review_json(), run_statuses: list[str] | None = None, pr_author: str = "loganrenz", head_now: str = HEAD, prior_reviews: list[dict[str, Any]] | None = None, marker_comment: dict[str, Any] | None = None, review_status: int = 200, files: list[dict[str, Any]] | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
         self.result = result
         self.run_statuses = list(run_statuses or ["RUNNING", "FINISHED"])
@@ -78,6 +78,8 @@ class FakeTransport:
         self.marker_comment = marker_comment
         self.review_status = review_status
         self.cancelled: list[str] = []
+        self.labels_removed: list[str] = []
+        self.files = list(files) if files is not None else [{"filename": "src/a.ts", "patch": PATCH}, {"filename": "bin/blob", "patch": None}]
 
     def __call__(self, method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: int) -> tuple[int, Any]:
         payload = json.loads(body) if body else None
@@ -113,7 +115,10 @@ class FakeTransport:
         if method == "GET" and path.endswith("/pulls/7"):
             return 200, {"number": 7, "head": {"sha": self.head_now}, "user": {"login": self.pr_author}}
         if method == "GET" and path.endswith("/pulls/7/files"):
-            return 200, [{"filename": "src/a.ts", "patch": PATCH}, {"filename": "bin/blob", "patch": None}]
+            return 200, self.files
+        if method == "DELETE" and "/issues/7/labels/" in path:
+            self.labels_removed.append(path.rsplit("/", 1)[1])
+            return 204, None
         if method == "GET" and path.endswith("/pulls/7/reviews"):
             return 200, self.prior_reviews
         if method == "POST" and path.endswith("/pulls/7/reviews"):
@@ -141,9 +146,13 @@ def env(**overrides: str) -> dict[str, str]:
         "PR_BASE_REF": "main",
         "PR_DRAFT": "false",
         "PR_OPTED_OUT": "false",
+        "PR_AUTHOR": "loganrenz",
+        "PR_LABELS": "[]",
+        "PR_EVENT_ACTION": "opened",
+        "PR_EVENT_LABEL": "",
         "CURSOR_MODEL": "grok-4.6",
         "CURSOR_EFFORT": "xhigh",
-        "CURSOR_FAST": "true",
+        "CURSOR_FAST": "false",
         "CONTEXT_REPOS": "narduk-enterprises/agent-infrastructure,narduk-enterprises/company-hq",
         "WAIT_MINUTES": "30",
         "APPROVE_ON_CLEAN": "true",
@@ -198,7 +207,7 @@ class ReviewFlowTests(unittest.TestCase):
         self.assertEqual({"url": f"https://github.com/{REPO}", "startingRef": "cursor/thing"}, body["repos"][0])
         self.assertEqual([{"url": "https://github.com/narduk-enterprises/agent-infrastructure"}, {"url": "https://github.com/narduk-enterprises/company-hq"}], body["repos"][1:])
         self.assertEqual("grok-4.6", body["model"]["id"])
-        self.assertEqual([{"id": "effort", "value": "xhigh"}, {"id": "fast", "value": "true"}], body["model"]["params"])
+        self.assertEqual([{"id": "effort", "value": "xhigh"}, {"id": "fast", "value": "false"}], body["model"]["params"])
         self.assertTrue(body["workOnCurrentBranch"])
         self.assertNotIn("autoCreatePR", body)
         self.assertIn(f"#7", body["prompt"]["text"])
@@ -468,6 +477,9 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertIs(inputs["enabled"]["default"], False)
         self.assertEqual("grok-4.6", inputs["model"]["default"])
         self.assertEqual("xhigh", inputs["effort"]["default"])
+        # fast=false for reviews: the job already budgets wait-minutes and
+        # blocks nobody, so the reviewer is never the latency-critical lane.
+        self.assertIs(inputs["fast"]["default"], False)
         secrets = (self.doc.get("on") or self.doc.get(True))["workflow_call"]["secrets"]
         self.assertIs(secrets["CURSOR_CLOUD_AGENTS_API_KEY"]["required"], False)
         self.assertEqual("${{ inputs.enabled }}", self.job["if"])
@@ -506,6 +518,104 @@ class WorkflowShapeTests(unittest.TestCase):
         for token in ('"verdict"', '"findings"', '"severity"', '"checks_run"', "approve | comment | request_changes", "{head_sha}", "{base_sha}", "{context_repos}"):
             self.assertIn(token, brief)
         self.assertIn("UNTRUSTED", brief)
+
+
+class ClassRuleTests(unittest.TestCase):
+    """The P0/P1/P2 rule, Logan 2026-09-19: "No numeric cap, only the P0/P1/P2
+    class rule". P2 must never reach `POST /v1/agents`; P0 must always reach
+    it; `review-now` must defeat every inferred P2 signal."""
+
+    def launched(self, transport: FakeTransport) -> bool:
+        return any(c["method"] == "POST" and c["url"].endswith("/v1/agents") for c in transport.calls)
+
+    def test_p2_never_launches_an_agent(self):
+        for label, overrides, files in (
+            ("dependabot author", {"PR_AUTHOR": "dependabot[bot]"}, None),
+            ("actions author", {"PR_AUTHOR": "github-actions[bot]"}, None),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main"}, None),
+            ("chore title", {"PR_TITLE": "chore: bump the lockfile"}, None),
+            ("docs title", {"PR_TITLE": "docs(readme): typo"}, None),
+            ("nit title", {"PR_TITLE": "nit: rename a local"}, None),
+            ("explicit label", {"PR_LABELS": '["review-p2"]'}, None),
+            ("metadata-only diff", {}, [{"filename": "README.md", "patch": PATCH}, {"filename": "LICENSE", "patch": None}]),
+        ):
+            with self.subTest(label):
+                transport = FakeTransport(files=files)
+                code, out = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review skipped: class P2", out)
+                self.assertFalse(self.launched(transport), "a P2 pull request must launch no agent")
+
+    def test_review_now_overrides_every_p2_signal(self):
+        for label, overrides, files in (
+            ("dependabot author", {"PR_AUTHOR": "dependabot[bot]"}, None),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main"}, None),
+            ("chore title", {"PR_TITLE": "chore: bump the lockfile"}, None),
+            ("explicit label", {"PR_LABELS": '["review-p2", "review-now"]'}, None),
+            ("metadata-only diff", {}, [{"filename": "README.md", "patch": PATCH}]),
+        ):
+            with self.subTest(label):
+                overrides.setdefault("PR_LABELS", '["review-now"]')
+                transport = FakeTransport(files=files)
+                code, _ = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertTrue(self.launched(transport), "review-now must defeat the P2 signal")
+
+    def test_p0_paths_are_reviewed_whatever_the_title_says(self):
+        for path in (".github/workflows/ci.yml", ".github/actions/setup/action.yml", "docs/agents/review-routing.md", "AGENTS.md", "skills/x/CLAUDE.md"):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport, PR_TITLE="docs: routine wording")
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+                self.assertTrue(self.launched(transport))
+                self.assertIn("class P0", posted_review(transport)["body"])
+
+    def test_an_ordinary_code_change_is_p1(self):
+        transport = FakeTransport()
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("::notice::review class P1", out)
+        self.assertIn("class P1", posted_review(transport)["body"])
+
+    def test_only_a_re_request_label_wakes_the_reviewer(self):
+        for added, launches in (("bot-inbox", False), ("hold merge", False), ("review-now", True), ("review-p0", True)):
+            with self.subTest(added):
+                transport = FakeTransport()
+                labels = json.dumps([added]) if added.startswith("review-") else "[]"
+                code, out = run(transport, PR_EVENT_ACTION="labeled", PR_EVENT_LABEL=added, PR_LABELS=labels)
+                self.assertEqual(0, code)
+                self.assertEqual(launches, self.launched(transport))
+                if not launches:
+                    self.assertIn("is not a review re-request", out)
+                    self.assertEqual([], transport.calls, "a non-review label must cost no network call")
+
+    def test_the_review_now_label_is_cleared_so_the_next_add_is_a_fresh_event(self):
+        transport = FakeTransport()
+        code, _ = run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+        self.assertEqual(0, code)
+        self.assertEqual(["review-now"], transport.labels_removed)
+
+    def test_an_unreadable_file_list_reviews_rather_than_skips(self):
+        class Broken(FakeTransport):
+            def github(self, method, path, payload):
+                if method == "GET" and path.endswith("/pulls/7/files") and not self.seen:
+                    self.seen = True
+                    return 500, {"message": "boom"}
+                return super().github(method, path, payload)
+
+        transport = Broken()
+        transport.seen = False
+        code, out = run(transport, PR_TITLE="chore: something")
+        self.assertEqual(0, code)
+        self.assertIn("classifying this pull request as reviewable", out)
+        self.assertTrue(self.launched(transport))
+
+    def test_the_review_body_tells_the_lane_how_to_re_request(self):
+        transport = FakeTransport()
+        run(transport)
+        self.assertIn("A push no longer re-reviews on its own", posted_review(transport)["body"])
+        self.assertIn("review-now", posted_review(transport)["body"])
 
 
 if __name__ == "__main__":
