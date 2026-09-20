@@ -908,6 +908,7 @@ jobs:
       contents: read
       packages: read
       pull-requests: write
+      actions: read # E2E proof lookup (required by the new revision)
     with:
       node-version: "24"
       package-manager: npm # hydrogen's current package manager; pnpm is the default
@@ -1271,39 +1272,65 @@ callable. Set an explicitly empty path only for suites that do not test a
 built application. Launchers must honor `E2E_PREBUILT_ARTIFACT=1`: the workflow
 cannot suppress a build hardcoded inside an application script.
 
-#### Skipping E2E on docs-only PRs (`e2e-skip-paths`)
+#### Skipping irrelevant changes (`e2e-skip-paths`)
 
-(workflows#49) `e2e-skip-paths` is a space-separated list of glob patterns
-(`*` and `**` supported), relative to the repository root. When `run-e2e` is
-true, the triggering event is `pull_request`/`pull_request_target`, and
-**every** changed file in that PR matches at least one pattern, `E2E plan`
-emits an empty shard list and `E2E` / `E2E report` both report `skipped` —
-`Required` still gates them, expecting `skipped` rather than an absent check,
-so a workflow-expression mistake cannot silently turn "never checked" green.
-A push event (e.g. the default branch) always runs the full suite regardless
-of this input: the skip is a PR fast path, not a weaker canonical-branch gate.
+E2E now skips by default when **every** changed path is documentation or
+repository metadata: root Markdown, Markdown under `docs/`, nested README and
+agent guidance files, licenses, issue/PR templates, or CODEOWNERS. Runtime
+Markdown under `content/`, executable files under `docs/`, app code, CSS,
+dependencies, configuration, workflows, tests and unknown paths still run.
+
+The same rule applies to pull requests and forward pushes, including the merge
+push. Manual, scheduled and merge-group runs always run E2E. A skipped plan
+emits no shards; `Required` checks that E2E and its report actually skipped.
+
+`e2e-skip-paths` replaces the default with repository-root-relative globs
+(`*` does not cross directories; `**` does). An explicitly empty string disables
+path skipping. Narrow or disable the list if your app renders those documents;
+never add CSS or executable documentation to the list. `e2e-full-paths` takes
+precedence over a matching skip pattern.
+
+The plan reads GitHub's compare endpoint with `contents: read`, including both
+names of renamed files. Empty or failed comparisons, new/deleted branch SHAs,
+force-push divergence, unsupported filenames and the API's 300-file cap all
+run E2E. See [GitHub's compare API](https://docs.github.com/en/rest/commits/commits#compare-two-commits).
+
+#### Reusing full PR E2E after merge (`e2e-reuse-pr-results`)
+
+Default-branch pushes first look for a successful PR run of the **same Git tree,
+caller workflow path and callable inputs**. This handles squash and merge
+commits whose SHA differs but whose tested contents are identical. Other CI
+checks and production delivery still run normally.
+
+`Required` publishes a seven-day proof artifact only after every required gate
+passed and the actual E2E arguments and shard count matched the full suite.
+A PR subset, docs-only skip, failed shard or fork cannot publish proof. Reuse
+requires a completed successful `pull_request` run from the same repository
+and workflow, and a proof from its current run attempt. The lookup checks at
+most five matching artifacts and fails toward running E2E on absent, expired,
+changed or unreadable evidence. Scheduled/manual runs always run; set
+`e2e-reuse-pr-results: false` for tests with intentionally different PR/push
+behavior or external state that must be rechecked after merge.
+
+**Permission migration:** adopting this revision requires `actions: read` on
+all Nuxt callable `ci` jobs, even if E2E is disabled. GitHub validates the
+permission ceiling before evaluating job conditions. The proof lookup needs
+only read access to Actions results; it gains no write permission. Add this
+alongside the existing `contents: read`, `packages: read`, and
+`pull-requests: write` grants before or with the SHA bump. Existing pinned
+callers do not change. This is a breaking permission change: do not advance
+`v2` over it; publish a new major only after an adopter canary is green.
 
 ```yaml
+    permissions:
+      contents: read
+      packages: read
+      pull-requests: write
+      actions: read # read the prior PR's E2E proof
+    with:
       run-e2e: true
-      e2e-skip-paths: "**/*.md design/** docs/** .lane-evidence/** LICENSE"
+      # Defaults: conservative path skipping and full-PR proof reuse.
 ```
-
-Never include a CSS pattern here — a CSS-only diff is expected to run E2E in
-full, on purpose (overflow and mobile-layout specs exist specifically to
-catch CSS regressions).
-
-The decision is made by calling `gh api repos/<repo>/compare/<base>...<head>
---paginate` from the `E2E plan` job, so it needs no repository checkout of
-its own. The **compare** endpoint, not `pulls/<n>/files`: comparing two commits
-is a Contents read that works under the `contents: read` every caller already
-grants, where `pulls/<n>/files` needs `pull-requests: read` — and a called
-workflow requesting a permission its caller did not grant kills the caller's
-entire run at startup, on every adopter at once (workflows#59). `gh` is
-standard on GitHub-hosted runners but self-hosted runners provision their own
-toolchains — its absence degrades to "run the full suite" (a warning, not a
-failure), same as zero reported changed files or a diff at the compare API's
-silent 300-file cap. An empty `e2e-skip-paths` (the default) never skips and
-adds no behavior for existing callers.
 
 #### A smaller suite on pull requests (`e2e-pr-shards`, `e2e-pr-args`)
 
@@ -1398,7 +1425,8 @@ routing, the Playwright config itself. The rules:
   cannot be listed (no base/head SHA, no `gh`, a compare API error, an empty
   list, or the 300-file compare cap), a caller that set `e2e-full-paths` gets
   the full suite. A caller that did not keeps its pull-request tier.
-- **Pull-request events only.** A push always runs the full suite anyway.
+- **Full-tier selection is for pull requests.** Pushes use the full tier when
+  neither path skipping nor equivalent PR proof applies.
 - The `E2E plan` job summary lists which changed files forced the full run.
 
 #### A non-blocking quarantine lane (`e2e-quarantine-args`)

@@ -130,7 +130,9 @@ CALLER_GRANTS: dict[str, set[str]] = {
     # that carries it, or its whole run dies at startup exactly the way
     # workflows#59 did. `write`, not `read`: the same grant both reads
     # Cloudflare's preview comment and updates the sticky one.
-    "nuxt-cloudflare.yml": {"contents", "packages", "pull-requests"},
+    # E2E proof reuse additionally requires actions: read; a new major /
+    # explicit SHA adoption must migrate caller grants before use.
+    "nuxt-cloudflare.yml": {"contents", "packages", "pull-requests", "actions"},
     "python-data.yml": {"contents"},
     "reusable-browser-tests.yml": {"contents", "packages", "actions"},
     "reusable-node-ci.yml": {"contents", "packages"},
