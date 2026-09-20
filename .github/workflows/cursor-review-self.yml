@@ -1,5 +1,7 @@
 # Pull-request reviewer (agent-infrastructure#1564). One Cursor Cloud agent
-# (grok-4.6, effort xhigh, `fast: false`) reviews every same-repo, non-draft PR head
+# (composer-2.5, `fast: false` -- same first-party pool as grok-4.6 at about a
+# third the cost; `review-deep` buys grok-4.6 at effort xhigh and bypasses all
+# four spend limits) reviews every same-repo, non-draft PR head
 # with this repo plus agent-infrastructure and company-hq attached, and the
 # callable posts a real GitHub review from this run. Any blocking finding is
 # REQUEST_CHANGES, which the branch rules honour. Never part of the required
@@ -29,7 +31,7 @@ permissions:
 
 jobs:
   cursor-review:
-    uses: narduk-enterprises/workflows/.github/workflows/cursor-review.yml@246013d4284ba0c15040c333e169b90a66334d1f # workflows#125; the moving v2 tag predates this callable, keep the SHA
+    uses: narduk-enterprises/workflows/.github/workflows/cursor-review.yml@a3557de722b89be5ffef5e45baa4a7eaf6be7269 # workflows#128; the moving v2 tag predates this callable, keep the SHA
     permissions:
       contents: read
       pull-requests: write
