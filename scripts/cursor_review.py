@@ -30,6 +30,9 @@ Flow (agent-infrastructure#1564):
      review on the reviewed head: APPROVE / COMMENT / REQUEST_CHANGES with one
      inline comment per finding whose file:line is inside the PR diff.
   6. A non-blocking review dismisses this bot's own stale REQUEST_CHANGES.
+     A head that moved while the agent ran posts nothing and says so: without
+     `synchronize` the new head is reviewed when a lane adds `review-now`, not
+     automatically.
 
 Anything the reviewer reads (the PR, the diff, the agent's answer) is
 untrusted content. Only the contracted JSON shape is trusted, and only its
@@ -62,7 +65,6 @@ RE_REQUEST_LABELS = frozenset({REVIEW_NOW_LABEL, "review-p0", "review-p1"})
 # Heads no human is waiting on: the bot opened them and a lane merges them.
 AUTOMATION_AUTHORS = frozenset({"dependabot[bot]", "github-actions[bot]", "renovate[bot]"})
 AUTOMATION_HEAD_REFS = ("changeset-release/",)
-P2_TITLE = re.compile(r"^\s*(?:nit|chore|docs|deps|style|build|ci\(deps\))(?:\([^)]*\))?!?:", re.IGNORECASE)
 # Always worth a review whatever the title says: a workflow change can delete
 # an `on:` block silently, and the operating manual is estate policy.
 ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/", "docs/agents/")
@@ -478,7 +480,18 @@ def changed_paths(github: GitHub, number: str) -> list[str] | None:
     except ReviewError as exc:
         notice(f"could not read the changed files ({exc}); classifying this pull request as reviewable")
         return None
-    paths = [str(row.get("filename") or "") for row in rows if isinstance(row, dict) and row.get("filename")]
+    paths: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        # A rename carries its old path in `previous_filename`. Without it,
+        # moving `.github/workflows/ci.yml` to `docs/old-ci.md` reads as a
+        # metadata-only diff -- the deleted-`on:`-block mismatch again, this
+        # time wearing the new name.
+        for key in ("filename", "previous_filename"):
+            value = row.get(key)
+            if value:
+                paths.append(str(value))
     return paths or None
 
 
@@ -521,12 +534,13 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
         return "P0", f"touches {critical[0]}"
     if "review-p1" in labels:
         return "P1", "label 'review-p1'"
-    # Both remaining signals are weaker than a path, so neither may fire while
-    # the paths are unknown: a "chore:" title on a workflow change is exactly
+    # The diff, never the title. A conventional `chore:`/`docs:` prefix on an
+    # ordinary code change would be an author-controlled skip of the
+    # merge-gating reviewer, and estate lanes use those prefixes on code pull
+    # requests every day; `review-p2` is the honest way to say "nit". Unknown
+    # paths never skip either: a "chore:" title on a workflow change is exactly
     # the mismatch that hides a deleted `on:` block.
     if not requested and paths is not None:
-        if P2_TITLE.match(env.get("PR_TITLE") or ""):
-            raise Skip(f"class P2 (the title marks this a chore, docs, or nit change); add '{REVIEW_NOW_LABEL}' to review it anyway")
         if all(is_metadata(path) for path in paths):
             raise Skip(f"class P2 (all {len(paths)} changed files are metadata); add '{REVIEW_NOW_LABEL}' to review it anyway")
     return "P1", f"label '{REVIEW_NOW_LABEL}' re-request" if requested else "code change"
@@ -673,7 +687,7 @@ def post_review(github: GitHub, env: dict[str, str], result: dict[str, Any], con
     number = env["PR_NUMBER"]
     pull = github.call("GET", f"pulls/{number}")
     if pull.get("head", {}).get("sha") != env["PR_HEAD_SHA"]:
-        raise Skip(f"PR #{number} moved to {str(pull.get('head', {}).get('sha'))[:12]} while the review ran; the new head gets its own review")
+        raise Skip(f"PR #{number} moved to {str(pull.get('head', {}).get('sha'))[:12]} while the review ran; a push no longer re-reviews, so add the '{REVIEW_NOW_LABEL}' label to review the new head")
     self_authored = (pull.get("user") or {}).get("login") == BOT_LOGIN
     event = review_event(result, approve_on_clean=env_bool(env.get("APPROVE_ON_CLEAN", "true")), self_authored=self_authored)
     index = diff_index(github.pages(f"pulls/{number}/files"))
@@ -774,7 +788,7 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
         review, event = post_review(github, env, result, context)
     except Skip as skip:
         notice(f"review skipped: {skip}")
-        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` was superseded by a newer head (agent [{agent_id}]({agent_url})).")
+        upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` was superseded by a newer head (agent [{agent_id}]({agent_url})). A push no longer re-reviews: add the `{REVIEW_NOW_LABEL}` label to review the new head.")
         return 0
     except ReviewError as exc:
         upsert_marker(github, number, marker, f"{agent_marker(agent_id, env['PR_HEAD_SHA'])}\nCursor review of `{env['PR_HEAD_SHA'][:12]}` did not complete: {str(exc)[:500]} (agent [{agent_id}]({agent_url})). The job is red; re-run it or push a new head.")

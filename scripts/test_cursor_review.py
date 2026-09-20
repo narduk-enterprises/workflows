@@ -15,8 +15,9 @@ Properties worth this machinery (agent-infrastructure#1564):
   * Inline comments anchor only to new-side lines inside the PR diff; the rest
     land in the body, so no bad anchor can 422 the whole review.
   * A non-blocking review dismisses this bot's own stale REQUEST_CHANGES.
-  * A head that moved while the agent ran posts nothing (the new head gets its
-    own review), and a reviewer error makes the job red, never silently green.
+  * A head that moved while the agent ran posts nothing and tells the lane to
+    add `review-now`, and a reviewer error makes the job red, never silently
+    green.
   * The callable itself passes the repository's structural rules and wires
     every value the script reads.
 
@@ -482,7 +483,13 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertIs(inputs["fast"]["default"], False)
         secrets = (self.doc.get("on") or self.doc.get(True))["workflow_call"]["secrets"]
         self.assertIs(secrets["CURSOR_CLOUD_AGENTS_API_KEY"]["required"], False)
-        self.assertEqual("${{ inputs.enabled }}", self.job["if"])
+        # `inputs.enabled` alone would let a `bot-inbox` label reach the job,
+        # claim its concurrency group, and cancel the in-flight review before
+        # the script could print a skip.
+        self.assertIn("inputs.enabled", self.job["if"])
+        self.assertIn("github.event.action != 'labeled'", self.job["if"])
+        for label in ("review-now", "review-p0", "review-p1"):
+            self.assertIn(label, self.job["if"])
 
     def test_permissions_are_exactly_what_posting_a_review_needs(self):
         self.assertEqual({"contents": "read", "pull-requests": "write"}, self.doc["permissions"])
@@ -533,9 +540,6 @@ class ClassRuleTests(unittest.TestCase):
             ("dependabot author", {"PR_AUTHOR": "dependabot[bot]"}, None),
             ("actions author", {"PR_AUTHOR": "github-actions[bot]"}, None),
             ("changeset release head", {"PR_HEAD_REF": "changeset-release/main"}, None),
-            ("chore title", {"PR_TITLE": "chore: bump the lockfile"}, None),
-            ("docs title", {"PR_TITLE": "docs(readme): typo"}, None),
-            ("nit title", {"PR_TITLE": "nit: rename a local"}, None),
             ("explicit label", {"PR_LABELS": '["review-p2"]'}, None),
             ("metadata-only diff", {}, [{"filename": "README.md", "patch": PATCH}, {"filename": "LICENSE", "patch": None}]),
         ):
@@ -550,7 +554,6 @@ class ClassRuleTests(unittest.TestCase):
         for label, overrides, files in (
             ("dependabot author", {"PR_AUTHOR": "dependabot[bot]"}, None),
             ("changeset release head", {"PR_HEAD_REF": "changeset-release/main"}, None),
-            ("chore title", {"PR_TITLE": "chore: bump the lockfile"}, None),
             ("explicit label", {"PR_LABELS": '["review-p2", "review-now"]'}, None),
             ("metadata-only diff", {}, [{"filename": "README.md", "patch": PATCH}]),
         ):
@@ -560,6 +563,26 @@ class ClassRuleTests(unittest.TestCase):
                 code, _ = run(transport, **overrides)
                 self.assertEqual(0, code)
                 self.assertTrue(self.launched(transport), "review-now must defeat the P2 signal")
+
+    def test_a_chore_title_on_a_code_change_is_still_reviewed(self):
+        """The title is author-controlled and estate lanes use `chore:` on code
+        pull requests; only the diff decides the class."""
+        for title in ("chore: bump the lockfile", "docs(readme): typo", "nit: rename a local"):
+            with self.subTest(title):
+                transport = FakeTransport()
+                code, out = run(transport, PR_TITLE=title)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P1", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_a_rename_out_of_an_always_review_path_is_still_p0(self):
+        """`.github/workflows/ci.yml` -> `docs/old-ci.md` reads as metadata-only
+        unless the rename's previous_filename is counted."""
+        transport = FakeTransport(files=[{"filename": "docs/old-ci.md", "previous_filename": ".github/workflows/ci.yml", "patch": PATCH}])
+        code, out = run(transport, PR_TITLE="docs: move the old gate")
+        self.assertEqual(0, code)
+        self.assertIn("::notice::review class P0", out)
+        self.assertTrue(self.launched(transport))
 
     def test_p0_paths_are_reviewed_whatever_the_title_says(self):
         for path in (".github/workflows/ci.yml", ".github/actions/setup/action.yml", "docs/agents/review-routing.md", "AGENTS.md", "skills/x/CLAUDE.md"):

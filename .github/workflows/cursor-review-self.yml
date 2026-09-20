@@ -8,11 +8,13 @@
 # Public repository: the job stays on GitHub-hosted ubuntu-latest.
 name: Cursor review
 
-# No `synchronize`: a push does not re-review. A lane that wants the new head
-# reviewed adds the `review-now` label, which the callable clears again.
+# The trigger set changes with the pin, never before it: `labeled` against the
+# workflows#120 callable would launch a full review on every label add. It
+# moves to [opened, reopened, ready_for_review, labeled] in the caller wave
+# that pins this commit.
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review, labeled]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
   contents: read

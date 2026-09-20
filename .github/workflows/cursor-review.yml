@@ -141,7 +141,14 @@ on:
 jobs:
   cursor-review:
     name: Cursor review
-    if: ${{ inputs.enabled }}
+    # The re-request allow-list is HERE, not only in the script: job-level
+    # concurrency is claimed when a job is queued, so a `bot-inbox` or triage
+    # label reaching the job would cancel the in-flight review and only then
+    # print its skip. A job whose `if:` is false never enters the group.
+    # A caller that declares workflow-level concurrency needs the same
+    # discrimination in its GROUP NAME, because a run-level cancel happens
+    # before any job condition is evaluated. The README caller shape has it.
+    if: ${{ inputs.enabled && (github.event.action != 'labeled' || contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name)) }}
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 45
     permissions:

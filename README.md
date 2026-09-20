@@ -368,8 +368,11 @@ on:
   pull_request:
     types: [opened, reopened, ready_for_review, labeled]
 
+# A label addition that is NOT a review re-request must never cancel a live
+# review: a run-level cancel happens before any job condition is evaluated, so
+# the discrimination has to be in the GROUP NAME, not only in the callable.
 concurrency:
-  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ github.event.action == 'labeled' && !startsWith(github.event.label.name, 'review-') && 'other-label' || 'review' }}
   cancel-in-progress: true
 
 permissions:
