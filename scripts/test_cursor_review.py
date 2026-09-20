@@ -607,6 +607,73 @@ class ClassRuleTests(unittest.TestCase):
                 self.assertIn("::notice::review class P0", out)
                 self.assertTrue(self.launched(transport))
 
+    def test_an_unknown_file_list_defeats_every_p2_skip_signal(self):
+        """`changed_paths` returning None means the API could not finish
+        listing the diff, so nothing is known about whether a workflow file is
+        in there. A dependabot pull request with 300 files is exactly that
+        shape, and it is the one that hides a deleted `on:` block."""
+
+        class Broken(FakeTransport):
+            """Only the classification read fails; `post_review` still needs a
+            diff index to place its inline comments."""
+
+            seen = False
+
+            def github(self, method, path, payload):
+                if method == "GET" and path.endswith("/pulls/7/files") and not self.seen:
+                    self.seen = True
+                    return 500, {"message": "boom"}
+                return super().github(method, path, payload)
+
+        for label, overrides in (
+            ("dependabot author", {"PR_AUTHOR": "dependabot[bot]"}),
+            ("actions author", {"PR_AUTHOR": "github-actions[bot]"}),
+            ("changeset release head", {"PR_HEAD_REF": "changeset-release/main"}),
+            ("review-p2 label", {"PR_LABELS": '["review-p2"]'}),
+        ):
+            with self.subTest(label):
+                transport = Broken()
+                code, out = run(transport, **overrides)
+                self.assertEqual(0, code)
+                self.assertIn("classifying this pull request as reviewable", out)
+                self.assertIn("::notice::review class P1 (unknown file list", out)
+                self.assertTrue(self.launched(transport), "an unknown file list must never take a P2 skip")
+
+    def test_a_diff_past_the_page_bound_is_reviewed_not_skipped(self):
+        """`GitHub.pages` gives up after `cr.CHANGED_FILE_PAGES` full pages; the
+        rows already fetched are discarded, so the class must fail open."""
+
+        class Paged(FakeTransport):
+            """Three full pages exhaust the bound; the fourth read is
+            `post_review` building its diff index and may be short."""
+
+            pages_served = 0
+
+            def github(self, method, path, payload):
+                if method == "GET" and path.endswith("/pulls/7/files"):
+                    self.pages_served += 1
+                    if self.pages_served <= cr.CHANGED_FILE_PAGES:
+                        return 200, [{"filename": f"pkg/f{i}.ts", "patch": PATCH} for i in range(100)]
+                    return 200, []
+                return super().github(method, path, payload)
+
+        transport = Paged()
+        code, out = run(transport, PR_AUTHOR="dependabot[bot]")
+        self.assertEqual(0, code)
+        self.assertIn("::notice::review class P1 (unknown file list", out)
+        self.assertTrue(self.launched(transport))
+
+    def test_codeowners_and_ignore_files_are_code_not_prose(self):
+        """A CODEOWNERS edit can drop required reviewers and a `.gitignore`
+        edit can stop ignoring secret material; neither is a README typo."""
+        for path in (".github/CODEOWNERS", "CODEOWNERS", ".gitignore", ".gitattributes"):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P1", out)
+                self.assertTrue(self.launched(transport))
+
     def test_a_rename_out_of_an_always_review_path_is_still_p0(self):
         """`.github/workflows/ci.yml` -> `docs/old-ci.md` reads as metadata-only
         unless the rename's previous_filename is counted."""

@@ -28,9 +28,11 @@ name: Reusable Cursor Review
 #       `AGENTS.md`/`CLAUDE.md`, or the `review-p0` label. Always reviewed.
 #   P1  ordinary code. Reviewed once per open/reopen/ready, again on request.
 #   P2  an automation author (dependabot, github-actions, renovate), a
-#       `changeset-release/*` head, a metadata-only diff, or the `review-p2`
-#       label. The TITLE is never a signal: it is author-controlled, and
-#       `chore:` on a code change would be a free skip. NEVER launches an agent;
+#       `changeset-release/*` head, a metadata-only diff (prose only --
+#       CODEOWNERS and .gitignore are code), or the `review-p2` label. The
+#       TITLE is never a signal: it is author-controlled, and `chore:` on a
+#       code change would be a free skip. An UNKNOWN file list is never P2
+#       either. NEVER launches an agent;
 #       the orchestrating session self-reviews it. `review-now` overrides P2.
 # There is no launch counter and no ledger here on purpose: the ledger is
 # `gh run list --workflow cursor-review.yml` against each enrolled repository.

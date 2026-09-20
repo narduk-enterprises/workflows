@@ -72,8 +72,11 @@ AUTOMATION_HEAD_REFS = ("changeset-release/",)
 ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/", "docs/agents/")
 ALWAYS_REVIEW_NAMES = ("AGENTS.md", "CLAUDE.md")
 # Everything here is prose: a diff made only of these launches no agent.
+# `CODEOWNERS`, `.gitignore` and `.gitattributes` are deliberately NOT here:
+# a CODEOWNERS edit can drop required reviewers and a `.gitignore` edit can
+# stop ignoring secret material, so they classify as ordinary code.
 METADATA_SUFFIXES = (".md", ".mdx", ".txt", ".rst")
-METADATA_NAMES = ("LICENSE", "NOTICE", "CODEOWNERS", ".gitignore", ".gitattributes")
+METADATA_NAMES = ("LICENSE", "NOTICE")
 CHANGED_FILE_PAGES = 3
 TERMINAL_RUN_STATUSES = frozenset({"FINISHED", "ERROR", "CANCELLED", "EXPIRED"})
 ACTIVE_AGENT_STATUSES = frozenset({"CREATING", "RUNNING", "ACTIVE", "PENDING"})
@@ -513,7 +516,9 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
           only when a lane asks by adding `review-now`.
       P2  nits: an automation author, a release branch, a metadata-only
           diff, or the `review-p2` label. P2 never launches an agent; the
-          orchestrating session self-reviews it. The title is never a signal.
+          orchestrating session self-reviews it. The title is never a signal,
+          and an UNKNOWN file list is never P2: if the API could not finish
+          listing the diff, the pull request is reviewed.
 
     `review-now` is the override: it defeats every inferred P2 signal and the
     explicit `review-p2` label, because a lane adding it has asked for this
@@ -532,6 +537,13 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
         return "P0", "label 'review-p0'"
     if critical:
         return "P0", f"touches {critical[0]}"
+    # UNKNOWN never means P2, and that has to hold for the author and head-ref
+    # signals too, not only for the metadata one. A files-API failure, or a
+    # diff past the page bound, hides whether `.github/workflows/ci.yml` is in
+    # there -- and a dependabot pull request with 300 files is exactly the
+    # shape that hides it. Fail open.
+    if paths is None:
+        return "P1", "unknown file list; classifying as reviewable"
     if "review-p2" in labels and not requested:
         raise Skip(f"class P2 (label 'review-p2'); add '{REVIEW_NOW_LABEL}' to review this head anyway")
     if not requested:
@@ -546,10 +558,8 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
     # The diff, never the title. A conventional `chore:`/`docs:` prefix on an
     # ordinary code change would be an author-controlled skip of the
     # merge-gating reviewer, and estate lanes use those prefixes on code pull
-    # requests every day; `review-p2` is the honest way to say "nit". Unknown
-    # paths never skip either: a "chore:" title on a workflow change is exactly
-    # the mismatch that hides a deleted `on:` block.
-    if not requested and paths is not None:
+    # requests every day; `review-p2` is the honest way to say "nit".
+    if not requested:
         if all(is_metadata(path) for path in paths):
             raise Skip(f"class P2 (all {len(paths)} changed files are metadata); add '{REVIEW_NOW_LABEL}' to review it anyway")
     return "P1", f"label '{REVIEW_NOW_LABEL}' re-request" if requested else "code change"

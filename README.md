@@ -350,9 +350,14 @@ class rule"*. P0 (`.github/workflows/**`, `.github/actions/**`, `docs/agents/**`
 ordinary code, reviewed once per open/reopen/ready; P2 — an automation author
 (`dependabot[bot]`, `github-actions[bot]`, `renovate[bot]`), a
 `changeset-release/*` head, a metadata-only diff, or the `review-p2` label —
-never launches an agent, and `review-now` overrides every P2 signal. The title
-is never a signal: it is author-controlled, and `chore:` on a code change would
-be a free skip of the merge-gating reviewer. There is no launch counter here on purpose; the
+never launches an agent, and `review-now` overrides every P2 signal. P0 is
+decided first, so a `review-p2` label or an automation author never lowers a
+workflow change out of review, and metadata means prose only: `CODEOWNERS`,
+`.gitignore` and `.gitattributes` are code, because one can drop required
+reviewers and another can stop ignoring secret material. The title is never a
+signal either — it is author-controlled, and `chore:` on a code change would be
+a free skip of the merge-gating reviewer. An **unknown** file list (a files-API
+failure, or a diff past the page bound) is classified reviewable, never P2. There is no launch counter here on purpose; the
 ledger is `gh run list --repo narduk-enterprises/<repo> --workflow cursor-review.yml`.
 
 Provider failure is reported as provider failure. In particular,
@@ -408,9 +413,14 @@ What happens per pull request head:
    that wants the new head reviewed adds `review-now`, which cancels any
    in-flight job and its agent run, reviews the new head, and is cleared again
    so the next add is a fresh event. A non-blocking review dismisses the bot's
-   own stale REQUEST_CHANGES; enable `dismiss_stale_reviews_on_push` and
-   `required_review_thread_resolution` on the repo's ruleset to make lanes
-   answer every thread.
+   own stale REQUEST_CHANGES itself, on the new head, with the reason recorded.
+   Enable `required_review_thread_resolution` on the repo's ruleset to make
+   lanes answer every thread. Do **not** enable `dismiss_stale_reviews_on_push`
+   alongside this trigger set: with `synchronize` gone, a push would clear a
+   REQUEST_CHANGES and nothing would launch to replace it, so
+   `scripts/verify-pr-gate.py` would print green on a head no reviewer ever
+   saw. A repository that keeps `dismiss_stale_reviews_on_push` on must treat
+   `review-now` after every push as mandatory rather than optional.
 
 The only secret is `CURSOR_CLOUD_AGENTS_API_KEY`, a GitHub Actions repository
 secret delivered from nvault at a workstation (company-hq D-CLOUD-SECRETS-1). No
