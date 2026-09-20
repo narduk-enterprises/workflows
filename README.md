@@ -1275,8 +1275,8 @@ cannot suppress a build hardcoded inside an application script.
 #### Skipping irrelevant changes (`e2e-skip-paths`)
 
 E2E now skips by default when **every** changed path is documentation or
-repository metadata: root Markdown, Markdown under `docs/`, nested README and
-agent guidance files, licenses, issue/PR templates, or CODEOWNERS. Runtime
+repository metadata: root Markdown, Markdown under `docs/`, app/package-root
+READMEs, agent guidance files, licenses, issue/PR templates, or CODEOWNERS. Runtime
 Markdown under `content/`, executable files under `docs/`, app code, CSS,
 dependencies, configuration, workflows, tests and unknown paths still run.
 

@@ -275,6 +275,9 @@ def _default_and_push_cases() -> list:
         for files, expected in (
             (["README.md", "docs/setup.md", "docs/ci/nested.md", ".github/CODEOWNERS"], "true"),
             (["content/home.md"], "false"),
+            (["content/README.md"], "false"),
+            (["LICENSE.ts"], "false"),
+            (["apps/web/README.md", "packages/core/README.md"], "true"),
             (["content/notREADME.md"], "false"),
             (["docs/check.mjs"], "false"),
             (["apps/web/app/pages/index.vue"], "false"),

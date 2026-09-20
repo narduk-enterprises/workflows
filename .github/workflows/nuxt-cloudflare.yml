@@ -472,7 +472,7 @@ on:
           diffs run E2E. Manual, scheduled and merge-group runs never skip.
         required: false
         type: string
-        default: "*.md docs/**/*.md **/README.md **/AGENTS.md **/CLAUDE.md LICENSE LICENSE.* .github/ISSUE_TEMPLATE/** .github/PULL_REQUEST_TEMPLATE.md .github/pull_request_template.md .github/CODEOWNERS"
+        default: "*.md docs/**/*.md apps/*/README.md packages/*/README.md **/AGENTS.md **/CLAUDE.md LICENSE LICENSE.txt .github/ISSUE_TEMPLATE/** .github/PULL_REQUEST_TEMPLATE.md .github/pull_request_template.md .github/CODEOWNERS"
       e2e-reuse-pr-results:
         description: >-
           On a default-branch push, reuse a successful same-repository PR run
