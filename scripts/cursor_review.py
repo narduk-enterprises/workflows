@@ -64,13 +64,19 @@ CLASS_LABELS = {"review-p0": "P0", "review-p1": "P1", "review-p2": "P2"}
 # label addition (`bot-inbox`, `hold merge`, a triage label) must not launch
 # an agent, because the caller now listens for every `labeled` event.
 RE_REQUEST_LABELS = frozenset({REVIEW_NOW_LABEL, "review-p0", "review-p1"})
+# The only `pull_request` actions that start a review. Anything else -- above
+# all `synchronize` -- is refused here and in the callable's job `if:`.
+REVIEW_ACTIONS = frozenset({"opened", "reopened", "ready_for_review", "labeled"})
 # Heads no human is waiting on: the bot opened them and a lane merges them.
 AUTOMATION_AUTHORS = frozenset({"dependabot[bot]", "github-actions[bot]", "renovate[bot]"})
 AUTOMATION_HEAD_REFS = ("changeset-release/",)
 # Always worth a review whatever the title says: a workflow change can delete
 # an `on:` block silently, and the operating manual is estate policy.
 ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/", "docs/agents/")
-ALWAYS_REVIEW_NAMES = ("AGENTS.md", "CLAUDE.md")
+# Basenames, matched case-insensitively so `harness/claude.md` counts as much
+# as `CLAUDE.md`. These are policy, not prose: a SKILL.md edit can drop a
+# review-follow-through rule and a DECISIONS.md edit can invent an approval.
+ALWAYS_REVIEW_NAMES = ("agents.md", "claude.md", "codex.md", "skill.md", "decisions.md")
 # Everything here is prose: a diff made only of these launches no agent.
 # `CODEOWNERS`, `.gitignore` and `.gitattributes` are deliberately NOT here:
 # a CODEOWNERS edit can drop required reviewers and a `.gitignore` edit can
@@ -465,7 +471,7 @@ def label_names(env: dict[str, str]) -> set[str]:
 
 
 def is_always_review(path: str) -> bool:
-    return path.startswith(ALWAYS_REVIEW_PREFIXES) or path.rsplit("/", 1)[-1] in ALWAYS_REVIEW_NAMES
+    return path.startswith(ALWAYS_REVIEW_PREFIXES) or path.rsplit("/", 1)[-1].casefold() in ALWAYS_REVIEW_NAMES
 
 
 def is_metadata(path: str) -> bool:
@@ -508,7 +514,9 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
     decides whether an agent starts.
 
       P0  merge-blocking work: `.github/workflows/**`, `.github/actions/**`,
-          `docs/agents/**`, `AGENTS.md`/`CLAUDE.md`, or the `review-p0` label.
+          `docs/agents/**`, a policy basename
+          (`AGENTS.md`, `CLAUDE.md`, `CODEX.md`, `SKILL.md`, `DECISIONS.md`,
+          matched case-insensitively), or the `review-p0` label.
           Never deferred, so P0 is decided FIRST and outranks every P2 signal:
           dependabot bumping a pinned action inside `.github/workflows/`, or a
           `review-p2` label on a workflow change, still gets a review.
@@ -594,10 +602,19 @@ def preconditions(env: dict[str, str]) -> None:
         raise Skip(f"PR #{number} is a draft; mark it ready for review to get a review")
     if env_bool(env.get("PR_OPTED_OUT")):
         raise Skip(f"opted out (label '{OPT_OUT_LABEL}' on PR #{number})")
-    if (env.get("PR_EVENT_ACTION") or "").strip() == "labeled":
+    action = (env.get("PR_EVENT_ACTION") or "").strip()
+    if action == "labeled":
         added = (env.get("PR_EVENT_LABEL") or "").strip()
         if added.casefold() not in RE_REQUEST_LABELS:
             raise Skip(f"label '{added or 'unknown'}' is not a review re-request; add '{REVIEW_NOW_LABEL}' to review the current head")
+    elif action and action not in REVIEW_ACTIONS:
+        # An ALLOW-list, not a deny-list, and it lives here as well as in the
+        # job `if:`. Every enrolled caller still carried `synchronize` when this
+        # landed, and a pin-only follow-up would otherwise recreate the
+        # push-driven storm the whole change exists to stop (165 runs over 80
+        # heads, 2026-09-19). A caller that forgot to drop it now spends
+        # nothing.
+        raise Skip(f"event '{action}' does not request a review; a push no longer re-reviews, add '{REVIEW_NOW_LABEL}' instead")
     if env.get("PR_HEAD_REPOSITORY", "") != env.get("GITHUB_REPOSITORY", ""):
         raise Skip(f"PR #{number} head is a fork ({env.get('PR_HEAD_REPOSITORY') or 'unknown'}); same-repo heads only")
     if not env.get("CURSOR_CLOUD_AGENTS_API_KEY", "").strip():

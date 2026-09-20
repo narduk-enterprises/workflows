@@ -25,7 +25,9 @@ name: Reusable Cursor Review
 # Within that, Logan's answer of 2026-09-19 governs how much gets reviewed, in
 # his words: "No numeric cap, only the P0/P1/P2 class rule".
 #   P0  `.github/workflows/**`, `.github/actions/**`, `docs/agents/**`,
-#       `AGENTS.md`/`CLAUDE.md`, or the `review-p0` label. Always reviewed.
+#       a policy basename
+#       (`AGENTS.md`, `CLAUDE.md`, `CODEX.md`, `SKILL.md`, `DECISIONS.md`, matched
+#       case-insensitively), or the `review-p0` label. Always reviewed.
 #   P1  ordinary code. Reviewed once per open/reopen/ready, again on request.
 #   P2  an automation author (dependabot, github-actions, renovate), a
 #       `changeset-release/*` head, a metadata-only diff (prose only --
@@ -148,14 +150,17 @@ on:
 jobs:
   cursor-review:
     name: Cursor review
-    # The re-request allow-list is HERE, not only in the script: job-level
-    # concurrency is claimed when a job is queued, so a `bot-inbox` or triage
-    # label reaching the job would cancel the in-flight review and only then
-    # print its skip. A job whose `if:` is false never enters the group.
+    # An ALLOW-list of the actions that start a review, HERE and not only in
+    # the script: job-level concurrency is claimed when a job is queued, so a
+    # `synchronize`, `bot-inbox` or triage event reaching the job would cancel
+    # the in-flight review and only then print its skip. A job whose `if:` is
+    # false never enters the group. `synchronize` is refused on purpose: a
+    # caller that has not yet dropped it from its own `on:` block spends
+    # nothing here.
     # A caller that declares workflow-level concurrency needs the same
     # discrimination in its GROUP NAME, because a run-level cancel happens
     # before any job condition is evaluated. The README caller shape has it.
-    if: ${{ inputs.enabled && (github.event.action != 'labeled' || contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name)) }}
+    if: ${{ inputs.enabled && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name))) }}
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 45
     permissions:

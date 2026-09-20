@@ -487,7 +487,8 @@ class WorkflowShapeTests(unittest.TestCase):
         # claim its concurrency group, and cancel the in-flight review before
         # the script could print a skip.
         self.assertIn("inputs.enabled", self.job["if"])
-        self.assertIn("github.event.action != 'labeled'", self.job["if"])
+        self.assertIn("github.event.action == 'opened'", self.job["if"])
+        self.assertNotIn("synchronize", self.job["if"])
         for label in ("review-now", "review-p0", "review-p1"):
             self.assertIn(label, self.job["if"])
 
@@ -740,6 +741,56 @@ class ClassRuleTests(unittest.TestCase):
         self.assertIn("could not load the previous agent marker", out)
         self.assertIn("::notice::review skipped: class P2", out)
         self.assertFalse(self.launched(transport))
+
+    def test_policy_markdown_is_never_prose(self):
+        """A SKILL.md edit can drop a review-follow-through rule and a
+        DECISIONS.md edit can invent an approval; agent-infrastructure is an
+        enrolled caller, so these land here."""
+        for path in (
+            "skills/repo-hygiene-execute/SKILL.md",
+            "harness/claude.md",
+            "harness/codex.md",
+            "DECISIONS.md",
+            "docs/agents/credentials.md",
+            "AGENTS.md",
+            "nested/dir/CLAUDE.md",
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_ordinary_prose_is_still_p2(self):
+        """The policy names are an exception to the `.md` default, not a
+        repeal of it."""
+        for path in ("README.md", "docs/architecture.md", "CHANGELOG.md", "LICENSE"):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH}])
+                code, out = run(transport)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review skipped: class P2", out)
+                self.assertFalse(self.launched(transport))
+
+    def test_synchronize_is_refused_by_the_script_too(self):
+        """Every enrolled caller still carried `synchronize` when this landed.
+        A pin-only follow-up must not recreate the push-driven storm."""
+        for action in ("synchronize", "edited", "assigned"):
+            with self.subTest(action):
+                transport = FakeTransport()
+                code, out = run(transport, PR_EVENT_ACTION=action)
+                self.assertEqual(0, code)
+                self.assertIn("does not request a review", out)
+                self.assertEqual([], transport.calls, "a refused event must cost no network call")
+
+    def test_the_opening_actions_still_review(self):
+        for action in ("opened", "reopened", "ready_for_review", ""):
+            with self.subTest(action or "(no action)"):
+                transport = FakeTransport()
+                code, _ = run(transport, PR_EVENT_ACTION=action)
+                self.assertEqual(0, code)
+                self.assertTrue(self.launched(transport))
 
     def test_a_rename_out_of_an_always_review_path_is_still_p0(self):
         """`.github/workflows/ci.yml` -> `docs/old-ci.md` reads as metadata-only
