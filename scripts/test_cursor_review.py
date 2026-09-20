@@ -1344,6 +1344,109 @@ class SpendLimitTests(unittest.TestCase):
         self.assertEqual(45, row["diff_lines"])
 
 
+class LimitMessageLeverTests(unittest.TestCase):
+    """A skip message must name a label that actually clears THAT limit.
+
+    Shipped 2026-09-20 with all four messages naming `review-deep`. Only the
+    size gate has a P0 exemption, so on that one `review-p0` clears the gate at
+    composer-2.5 `fast: false` prices ($0.50/$0.20/$2.50 per Mtok) while
+    `review-deep` buys grok-4.6 xhigh ($2/$0.50/$6) -- roughly the 6x unit the
+    estate had just spent a day migrating off, aimed at the smallest diffs in
+    the queue, which is where the size floors bite by construction. A fix-lane
+    handoff was already routing lanes that way, on guidance taken from these
+    very messages (workflows#132).
+
+    These messages are the only guidance a lane sees at the moment it is
+    looking for a lever, so they are load-bearing, and nothing previously bound
+    them to the exemption logic they describe.
+    """
+
+    def launched(self, transport: FakeTransport) -> bool:
+        return any(c["method"] == "POST" and c["url"].endswith("/v1/agents") for c in transport.calls)
+
+    # Each scenario trips exactly one limit from a clean state.
+    def size_gate(self) -> FakeTransport:
+        return FakeTransport(files=[{"filename": "src/a.ts", "patch": PATCH, "additions": 3, "deletions": 0}])
+
+    def round_cap(self) -> FakeTransport:
+        return FakeTransport(marker_comment=marker_comment(9))
+
+    def delta_gate(self) -> FakeTransport:
+        transport = FakeTransport(marker_comment=marker_comment(1, head=BASE))
+        transport.compare_files = [{"filename": "src/a.ts", "additions": 1, "deletions": 0}]
+        return transport
+
+    def daily_cap(self) -> FakeTransport:
+        return FakeTransport(agent_ledger=ledger(12))
+
+    def scenarios(self) -> dict[str, Any]:
+        return {"size gate": self.size_gate, "round cap": self.round_cap,
+                "delta gate": self.delta_gate, "daily cap": self.daily_cap}
+
+    def test_every_label_a_skip_message_names_actually_clears_that_limit(self):
+        """The binding this class exists for.
+
+        Reads each limit's real message, extracts every `review-*` label it
+        offers, and proves each one launches a review in that same scenario. A
+        message that advertises a lever the gate does not honour fails here --
+        which is the shape of the shipped defect, in reverse.
+        """
+        for name, build in self.scenarios().items():
+            with self.subTest(limit=name):
+                transport = build()
+                code, out = run(transport)
+                self.assertEqual(0, code)
+                self.assertFalse(self.launched(transport), f"{name} should have skipped")
+                offered = set(re.findall(r"'(review-[a-z0-9-]+)'", out))
+                self.assertTrue(offered, f"{name} names no lever at all")
+                for label in sorted(offered):
+                    with self.subTest(limit=name, label=label):
+                        retry = build()
+                        code, _ = run(retry, PR_LABELS=json.dumps([label]))
+                        self.assertEqual(0, code)
+                        self.assertTrue(
+                            self.launched(retry),
+                            f"the {name} message offers '{label}' but that label does not clear it")
+
+    def test_the_size_gate_offers_the_cheap_lever_first(self):
+        """Ordering is the whole fix: a lane reaches for the first thing named."""
+        code, out = run(self.size_gate())
+        self.assertEqual(0, code)
+        line = next((l for l in out.splitlines() if "line floor" in l), "")
+        self.assertTrue(line, "the size gate printed no floor message at all")
+        self.assertIn(f"'{cr.P0_LABEL}'", line,
+                      f"the size gate must offer the cheap lever: {line}")
+        self.assertIn(f"'{cr.DEEP_LABEL}'", line,
+                      f"the size gate must still offer the strong reviewer: {line}")
+        self.assertLess(line.index(f"'{cr.P0_LABEL}'"), line.index(f"'{cr.DEEP_LABEL}'"),
+                        f"'{cr.P0_LABEL}' must come first -- a lane reaches for "
+                        f"the first lever named: {line}")
+
+    def test_review_p0_clears_the_size_gate(self):
+        transport = self.size_gate()
+        code, _ = run(transport, PR_LABELS=json.dumps([cr.P0_LABEL]))
+        self.assertEqual(0, code)
+        self.assertTrue(self.launched(transport))
+
+    def test_review_p0_clears_nothing_but_the_size_gate(self):
+        """The asymmetry that produced the defect, stated as behaviour.
+
+        `priority != "P0"` guards the size gate alone; the round cap, delta
+        gate and daily cap have no class exemption. So `review-p0` must NOT be
+        advertised as a general escape hatch, and `review-deep` stays the only
+        lever for the other three.
+        """
+        for name, build in (("round cap", self.round_cap),
+                            ("delta gate", self.delta_gate),
+                            ("daily cap", self.daily_cap)):
+            with self.subTest(limit=name):
+                transport = build()
+                code, _ = run(transport, PR_LABELS=json.dumps([cr.P0_LABEL]))
+                self.assertEqual(0, code)
+                self.assertFalse(
+                    self.launched(transport),
+                    f"'{cr.P0_LABEL}' must not clear the {name}")
+
 
 if __name__ == "__main__":
     unittest.main()

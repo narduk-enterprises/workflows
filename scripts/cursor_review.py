@@ -61,18 +61,27 @@ OPT_OUT_LABEL = "no-ai-review"
 # Priority classes (Logan, 2026-09-19: "No numeric cap, only the P0/P1/P2
 # class rule"). A label is the explicit form; everything else is inferred.
 REVIEW_NOW_LABEL = "review-now"
-CLASS_LABELS = {"review-p0": "P0", "review-p1": "P1", "review-p2": "P2"}
+P0_LABEL = "review-p0"
+CLASS_LABELS = {P0_LABEL: "P0", "review-p1": "P1", "review-p2": "P2"}
 # Which labels, when ADDED, mean "review the current head now". Any other
 # label addition (`bot-inbox`, `hold merge`, a triage label) must not launch
 # an agent, because the caller now listens for every `labeled` event.
 # "This one matters": `review-deep` forces the strong model AND bypasses every
-# spend control below (size gate, round cap, delta gate, daily cap). ONE label,
-# one meaning, so a lane never has to reason about which cap it is hitting.
+# spend control below (size gate, round cap, delta gate, daily cap) -- the
+# universal lever for a lane that does not want to reason about which limit it
+# hit. It is not the CHEAPEST one everywhere. Only the size gate has a P0
+# exemption, so `review-p0` clears THAT gate while keeping composer-2.5 at
+# `fast: false`, where `review-deep` would buy grok-4.6 xhigh for it -- roughly
+# the 6x unit the estate migrated off on 2026-09-20, spent on the smallest
+# diffs in the queue, which is where the floors bite by construction. So the
+# size gate's message names `review-p0` first and the other three name
+# `review-deep`, because nothing else clears them (workflows#132). The lane
+# still does not have to reason: the message names the lever that works.
 # `review-now` deliberately does NOT bypass them: lanes add it after every
 # push, which is precisely what produced 2.55 launches per pull request, so a
 # `review-now` override would make the caps decorative.
 DEEP_LABEL = "review-deep"
-RE_REQUEST_LABELS = frozenset({REVIEW_NOW_LABEL, "review-p0", "review-p1", DEEP_LABEL})
+RE_REQUEST_LABELS = frozenset({REVIEW_NOW_LABEL, P0_LABEL, "review-p1", DEEP_LABEL})
 # The only `pull_request` actions that start a review. Anything else -- above
 # all `synchronize` -- is refused here and in the callable's job `if:`.
 REVIEW_ACTIONS = frozenset({"opened", "reopened", "ready_for_review", "labeled"})
@@ -945,7 +954,10 @@ def spend_gates(
     #    exactly the deleted-`on:`-block hazard, and small is not safe there.
     min_lines = env_int(env, "MIN_LINES", DEFAULT_MIN_LINES)
     if min_lines and priority != "P0" and lines is not None and lines <= min_lines:
-        raise Skip(f"class {priority} diff is {lines} changed line(s), at or under the {min_lines}-line floor; add '{DEEP_LABEL}' to review it anyway")
+        # `review-p0` FIRST: it is the only limit a class label clears, and it
+        # clears it at composer prices. Naming `review-deep` alone here sent
+        # lanes to the strong reviewer for the smallest diffs (workflows#132).
+        raise Skip(f"class {priority} diff is {lines} changed line(s), at or under the {min_lines}-line floor; add '{P0_LABEL}' to review it anyway, or '{DEEP_LABEL}' if it also needs the strong reviewer")
 
     rounds = marker_rounds(state)
     # 2. Rounds. Measured over 199 launches: no `request_changes` verdict ever
