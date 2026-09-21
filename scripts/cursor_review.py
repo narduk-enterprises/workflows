@@ -66,20 +66,9 @@ CLASS_LABELS = {P0_LABEL: "P0", "review-p1": "P1", "review-p2": "P2"}
 # Which labels, when ADDED, mean "review the current head now". Any other
 # label addition (`bot-inbox`, `hold merge`, a triage label) must not launch
 # an agent, because the caller now listens for every `labeled` event.
-# "This one matters": `review-deep` forces the strong model AND bypasses every
-# spend control below (size gate, round cap, delta gate, daily cap) -- the
-# universal lever for a lane that does not want to reason about which limit it
-# hit. It is not the CHEAPEST one everywhere. Only the size gate has a P0
-# exemption, so `review-p0` clears THAT gate while keeping composer-2.5 at
-# `fast: false`, where `review-deep` would buy grok-4.6 xhigh for it -- roughly
-# the 6x unit the estate migrated off on 2026-09-20, spent on the smallest
-# diffs in the queue, which is where the floors bite by construction. So the
-# size gate's message names `review-p0` first and the other three name
-# `review-deep`, because nothing else clears them (workflows#132). The lane
-# still does not have to reason: the message names the lever that works.
-# `review-now` deliberately does NOT bypass them: lanes add it after every
-# push, which is precisely what produced 2.55 launches per pull request, so a
-# `review-now` override would make the caps decorative.
+# Explicit review requests always run, without spend gates. `review-now`
+# uses Composer standard; `review-deep` explicitly selects Grok. Both request
+# labels are consumed so a previous deep review cannot upgrade later requests.
 DEEP_LABEL = "review-deep"
 RE_REQUEST_LABELS = frozenset({REVIEW_NOW_LABEL, P0_LABEL, "review-p1", DEEP_LABEL})
 # The only `pull_request` actions that start a review. Anything else -- above
@@ -142,16 +131,12 @@ DEFAULT_EFFORT = ""
 DEFAULT_FAST = False
 DEFAULT_DEEP_MODEL = "grok-4.6"
 DEFAULT_DEEP_EFFORT = "xhigh"
-# Measured over 199 launches on 78 pull requests: every `request_changes`
-# verdict arrived by round 4. Rounds 5-13 were 31 launches and 251 compute
-# minutes that produced no blocking finding at all.
-DEFAULT_MAX_ROUNDS = 4
-# Per repository, per rolling 24h, counted from Cursor's own agent list. On
-# 2026-09-19 nothing existed to stop 99 launches in six hours; that evening
-# alone spent 13% of the month's pool.
-DEFAULT_DAILY_CAP = 12
-# A non-P0 diff this small is cheaper for the orchestrating session to read
-# than to send: nine reviewed pull requests changed <=20 lines, one of them 3.
+# No default quota: requesting another review must not require a model upgrade.
+# Legacy inputs remain available for automatic reviews; explicit requests
+# bypass all spend gates, including caller-supplied limits.
+DEFAULT_MAX_ROUNDS = 0
+DEFAULT_DAILY_CAP = 0
+# Small automatic reviews can still be skipped; an explicit request runs.
 DEFAULT_MIN_LINES = 20
 # A re-request whose head barely moved since the reviewed head is re-reading a
 # diff it already reviewed. This attacks the 2.55x multiplier at its root.
@@ -589,8 +574,8 @@ def env_bool(value: str | None) -> bool:
 def env_int(env: dict[str, str], key: str, default: int) -> int:
     """A spend limit from the caller. 0 disables that limit; junk uses the default.
 
-    Junk must not silently disable a cap -- a caller that typos `daily-cap: twelve`
-    should get the estate default, not unlimited spend.
+    Invalid input uses the declared default -- a caller that typos `daily-cap: twelve`
+    gets the estate default (currently unlimited for numeric quotas).
     """
     raw = (env.get(key) or "").strip()
     if not raw:
@@ -811,7 +796,7 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
     # exits 0, the cancel-then-skip shape this callable already closed for
     # ignored labels. An explicit class label is a human statement about this
     # pull request; an author name and a branch prefix are guesses.
-    requested = REVIEW_NOW_LABEL in labels or "review-p1" in labels
+    requested = review_request(env) is not None or "review-p1" in labels
     critical = [path for path in (paths or []) if is_always_review(path)]
 
     # P0 before every skip. An automation author and a `review-p2` label are
@@ -867,19 +852,26 @@ def effective_labels(env: dict[str, str]) -> set[str]:
     return labels
 
 
-def clear_review_now(github: GitHub, number: str, env: dict[str, str]) -> None:
-    """Remove `review-now` so the next re-request is a fresh `labeled` event.
+def review_request(env: dict[str, str]) -> str | None:
+    """The request that triggered this run, independent of stale labels."""
+    if (env.get("PR_EVENT_ACTION") or "").strip() == "labeled":
+        added = (env.get("PR_EVENT_LABEL") or "").strip().casefold()
+        return added if added in RE_REQUEST_LABELS else None
+    labels = effective_labels(env)
+    # A retained deep label is not a fresh request to spend on Grok.
+    return REVIEW_NOW_LABEL if REVIEW_NOW_LABEL in labels else None
 
-    Adding a label that is already present raises no event, so leaving it on
-    would make the second re-request silently do nothing.
-    """
-    if REVIEW_NOW_LABEL not in effective_labels(env):
-        return
-    try:
-        github.call("DELETE", f"issues/{number}/labels/{REVIEW_NOW_LABEL}", ok=(200, 204, 404))
-        notice(f"cleared the '{REVIEW_NOW_LABEL}' label; add it again to re-request a review")
-    except ReviewError as exc:
-        notice(f"could not clear the '{REVIEW_NOW_LABEL}' label: {exc}")
+
+def clear_review_requests(github: GitHub, number: str, env: dict[str, str]) -> None:
+    """Consume one-shot requests, including stale deep labels, before launch."""
+    for label in (REVIEW_NOW_LABEL, DEEP_LABEL):
+        if label not in effective_labels(env):
+            continue
+        try:
+            github.call("DELETE", f"issues/{number}/labels/{label}", ok=(200, 204, 404))
+            notice(f"cleared the '{label}' label; add it again to re-request a review")
+        except ReviewError as exc:
+            notice(f"could not clear the '{label}' label: {exc}")
 
 
 def preconditions(env: dict[str, str]) -> None:
@@ -948,23 +940,20 @@ def spend_gates(
     hours on 2026-09-19, 13% of the month), not to become a new way for a
     review to disappear quietly.
 
-    `review-deep` bypasses all four, which is checked by the caller.
+    Explicit review requests bypass all four, which is checked by the caller.
     """
     # 1. Size. P0 is exempt: a three-line `.github/workflows/` change is
     #    exactly the deleted-`on:`-block hazard, and small is not safe there.
     min_lines = env_int(env, "MIN_LINES", DEFAULT_MIN_LINES)
     if min_lines and priority != "P0" and lines is not None and lines <= min_lines:
-        # `review-p0` FIRST: it is the only limit a class label clears, and it
-        # clears it at composer prices. Naming `review-deep` alone here sent
-        # lanes to the strong reviewer for the smallest diffs (workflows#132).
-        raise Skip(f"class {priority} diff is {lines} changed line(s), at or under the {min_lines}-line floor; add '{P0_LABEL}' to review it anyway, or '{DEEP_LABEL}' if it also needs the strong reviewer")
+        raise Skip(f"class {priority} diff is {lines} changed line(s), at or under the {min_lines}-line floor; add '{REVIEW_NOW_LABEL}' to review it anyway")
 
     rounds = marker_rounds(state)
     # 2. Rounds. Measured over 199 launches: no `request_changes` verdict ever
     #    arrived after round 4, while rounds 5-13 cost 251 compute minutes.
     max_rounds = env_int(env, "MAX_ROUNDS", DEFAULT_MAX_ROUNDS)
     if max_rounds and rounds >= max_rounds:
-        raise Skip(f"this pull request has already had {rounds} review(s), the cap is {max_rounds}; add '{DEEP_LABEL}' to review it again")
+        raise Skip(f"this pull request has already had {rounds} review(s), the cap is {max_rounds}; add '{REVIEW_NOW_LABEL}' to review it again")
 
     # 3. Delta. A re-request whose head barely moved re-reads a diff already
     #    reviewed. Only meaningful once something HAS been reviewed.
@@ -973,7 +962,7 @@ def spend_gates(
     if min_delta and rounds and reviewed_sha:
         moved = delta_lines(github, reviewed_sha, env["PR_HEAD_SHA"])
         if moved is not None and moved <= min_delta:
-            raise Skip(f"only {moved} line(s) changed since the reviewed head {reviewed_sha[:12]}, at or under the {min_delta}-line floor; add '{DEEP_LABEL}' to review it anyway")
+            raise Skip(f"only {moved} line(s) changed since the reviewed head {reviewed_sha[:12]}, at or under the {min_delta}-line floor; add '{REVIEW_NOW_LABEL}' to review it anyway")
 
     # 4. Daily cap, per repository, from Cursor's own ledger. Last because it
     #    is the only gate that costs a network round trip to Cursor.
@@ -981,7 +970,7 @@ def spend_gates(
     if daily_cap:
         used = cursor.recent_reviews(repository, since=now - DAILY_WINDOW_SECONDS)
         if used is not None and used >= daily_cap:
-            raise Skip(f"{repository} has launched {used} review(s) in the last 24h, the cap is {daily_cap}; add '{DEEP_LABEL}' to review this one anyway")
+            raise Skip(f"{repository} has launched {used} review(s) in the last 24h, the cap is {daily_cap}; add '{REVIEW_NOW_LABEL}' to review this one anyway")
 
 
 def find_marker_comment(github: GitHub, number: str) -> dict[str, Any] | None:
@@ -1178,13 +1167,14 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
     # 2026-09-19), and `find_marker_comment` can raise on its own; if the label
     # outlived either, re-adding it would raise no `labeled` event and the lane
     # would have no way to ask again.
-    clear_review_now(github, number, env)
+    clear_review_requests(github, number, env)
     marker = find_marker_comment(github, number)
     # `find_marker_comment` returns the COMMENT; the ledger is inside its body.
     state = parse_agent_marker((marker or {}).get("body") or "")
-    deep = DEEP_LABEL in effective_labels(env)
-    if deep:
-        notice(f"'{DEEP_LABEL}': using the deep model and bypassing every spend limit")
+    request = review_request(env)
+    deep = request == DEEP_LABEL
+    if request:
+        notice(f"'{request}': explicitly requested review; bypassing every spend limit")
     else:
         try:
             spend_gates(env, github, cursor, repository=repository, priority=priority, lines=lines, state=state, now=now())

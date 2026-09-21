@@ -70,7 +70,7 @@ in their app-class workflow.
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional web-foundation conformance check, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | Generic Node CI: script-probed lint, typecheck, test, build (pnpm or npm), fail-closed by default through `require-scripts`. Zero live callers as of 2026-07-27 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
 | `code-review.yml` | **Advisory, default-off, not a CI gate.** Requests one containerized read-only agent review of a PR head from the estate's ephemeral pool, by firing a single `repository_dispatch` at `agent-infrastructure`. No `Required` job, never part of `ci / Required`, and every refusal path (opted out, fork, no secret, dispatch failure) exits SUCCESS. `enabled` defaults to `false`, so adopting the tag that carries it changes nothing until a repo opts in. See [Advisory code review](#advisory-code-review) |
-| `cursor-review.yml` | **Default-off PR reviewer, not a CI gate.** Reviews a pull request with one Cursor Cloud agent (`grok-4.6`, effort `xhigh`, `fast: false`) that has the caller checked out at the PR head plus read-only context repos (estate manual, coding standards, decisions), then posts a REAL pull-request review on the reviewed head — APPROVE / COMMENT / REQUEST_CHANGES with inline comments — using the job's own `GITHUB_TOKEN`. Skips (draft, fork, `no-ai-review`, no secret) exit SUCCESS; a reviewer error fails the job. A REQUEST_CHANGES review blocks merge under the repo's pull-request rule. See [Cursor review](#cursor-review) (agent-infrastructure#1564) |
+| `cursor-review.yml` | **Default-off PR reviewer, not a CI gate.** Reviews a pull request with one Cursor Cloud agent (`composer-2.5`, `fast: false`; explicit `review-deep` uses Grok 4.6 xhigh) that has the caller checked out at the PR head plus read-only context repos (estate manual, coding standards, decisions), then posts a REAL pull-request review on the reviewed head — APPROVE / COMMENT / REQUEST_CHANGES with inline comments — using the job's own `GITHUB_TOKEN`. Skips (draft, fork, `no-ai-review`, no secret) exit SUCCESS; a reviewer error fails the job. A REQUEST_CHANGES review blocks merge under the repo's pull-request rule. See [Cursor review](#cursor-review) (agent-infrastructure#1564) |
 | `closing-syntax-check.yml` | PR-closing-syntax gate (agent-infrastructure#837, #1085): rejects a PR body whose closing keyword is ambiguous (a bare comma-separated list) or sits outside a canonical closing line/list item, and rejects any commit in the PR's own commit range that carries a closing keyword at all — GitHub's squash-merge auto-close scan reads the landed commit message independently of the curated PR body. **Fully self-contained**: the checker's source (canonically `narduk-enterprises/agent-infrastructure`'s `scripts/check_pr_closing_syntax.py`) is vendored directly inside this callable, so an adopting repo needs no local copy at all — see the workflow file's own header for the sync procedure |
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 
@@ -327,6 +327,18 @@ so a private caller that passes nothing is Blacksmith-eligible (it is on the
 
 ## Cursor review
 
+**On-demand reviews (2026-09-21).** Add `review-now` whenever a review is
+wanted: it uses Composer 2.5 standard and bypasses every spend gate. Daily
+and per-PR round caps default to zero (unlimited). Automatic reviews retain
+the class rule and small-diff floors. Their skip messages recommend
+`review-now`; there is no need to select a more expensive model to get a review.
+
+`review-deep` explicitly requests Grok 4.6 xhigh, with fast mode off. Both
+request labels are cleared before launch, including failed launches, so the
+next add is a fresh request. A later `review-now` stays on Composer even if
+an old deep label remains. Draft, fork, opt-out and credential checks still
+apply. Callers must update their immutable pin to adopt this behavior.
+
 `cursor-review.yml` is the estate's pull-request reviewer (design and decisions:
 [agent-infrastructure#1564](https://github.com/narduk-enterprises/agent-infrastructure/issues/1564)).
 It is default-off and never part of `ci / Required`. Every enrolled repository
@@ -343,7 +355,7 @@ set deliberately omits `synchronize`: on 2026-09-19 push-driven re-reviews took
 the estate to 165 runs over 80 heads and exhausted the Cursor Models pool for
 seven and a half hours. A lane that wants the new head reviewed adds the
 `review-now` label; the callable clears it again so the next add is a fresh
-event, and every other label addition skips. One ordering matters: the job
+event. `review-deep` is also consumed; unrelated label additions skip. One ordering matters: the job
 refuses to wake at all while `no-ai-review` is on, and removing that label is
 an `unlabeled` event nothing listens for — so **clear the opt-out first, then
 add `review-now`**, not the other way round. The callable's job `if:` is an
@@ -396,7 +408,7 @@ on:
 # review: a run-level cancel happens before any job condition is evaluated, so
 # the discrimination has to be in the GROUP NAME, not only in the callable.
 concurrency:
-  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1"]'), github.event.label.name)))) && 'review' || 'other' }}
+  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1","review-deep"]'), github.event.label.name)))) && 'review' || 'other' }}
   cancel-in-progress: true
 
 permissions:

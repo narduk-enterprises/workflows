@@ -1,7 +1,7 @@
 name: Reusable Cursor Review
 
-# Reviews a pull request with ONE Cursor Cloud agent (grok-4.6, effort xhigh,
-# fast) and posts a real GitHub pull-request review on the reviewed head:
+# Reviews a pull request with ONE Cursor Cloud agent (Composer 2.5 standard;
+# explicit review-deep uses Grok 4.6 xhigh, also with fast: false) and posts a real GitHub pull-request review on the reviewed head:
 # APPROVE / COMMENT / REQUEST_CHANGES with one inline comment per finding.
 # Design and decisions: narduk-enterprises/agent-infrastructure#1564.
 #
@@ -22,25 +22,15 @@ name: Reusable Cursor Review
 # `synchronize`: a push no longer re-reviews on its own. A lane that wants the
 # new head reviewed adds the `review-now` label, which this job clears again so
 # the next add is a fresh event. Every other label addition skips.
-# SPEND CONTROLS (2026-09-20). Logan's 2026-09-19 answer was "No numeric cap,
-# only the P0/P1/P2 class rule"; he re-took that decision on 2026-09-20 against
-# the cost evidence, in his words: "Ok numeric cap per repo, and settable at
-# the repo level....some need more oversight than others....or perhaps a label
-# that forces review after the cap?". Measured over 199 launches on 78 pull
-# requests: 2.55 reviews per pull request, 139 in one day, 99 of them in one
-# evening -- 13% of the month's Cursor pool. Four limits, each settable per
-# caller and each disabled by 0, all four bypassed by `review-deep`:
-#   max-rounds (4)       no `request_changes` verdict in the sample arrived
-#                        after round 4; rounds 5-13 cost 251 compute minutes
-#                        and produced no blocking finding.
-#   daily-cap (12)       per repository, per rolling 24h, counted from
-#                        Cursor's own agent ledger so a skipped run is free.
-#   min-lines (20)       a non-P0 diff that small is cheaper to self-review.
-#   min-delta-lines (10) a re-request whose head barely moved is a re-read.
-# Every one fails OPEN: an unknown diff size, an unreadable comparison or a
-# Cursor ledger outage lets the review proceed. `review-now` deliberately does
-# NOT bypass them -- lanes add it after every push, which is what produced the
-# 2.55x, so a `review-now` override would make the caps decorative.
+# ON-DEMAND REVIEWS (2026-09-21). Numeric caps encouraged agents to use
+# review-deep solely to escape a quota, upgrading to Grok unnecessarily.
+# max-rounds and daily-cap now default to 0 (unlimited). Every explicit
+# review request bypasses all spend gates, even caller-supplied limits:
+# review-now selects Composer 2.5 standard; review-deep explicitly selects
+# Grok 4.6 xhigh. Both one-shot labels are cleared before launch. A stale
+# review-deep label never upgrades a later review-now event.
+# Automatic events still apply the class rule and the min-lines (20) /
+# min-delta-lines (10) floors. Skips recommend review-now, never a model upgrade.
 #   P0  `.github/workflows/**`, `.github/actions/**`, `DECISIONS.md`,
 #       `cursor_review_brief.md`, or the `review-p0` label. Always reviewed
 #       and exempt from the size gate.
@@ -69,8 +59,7 @@ name: Reusable Cursor Review
 # the `no-ai-review` label, a FORK head (same-repo heads only: a fork must not
 # steer estate Cursor capacity, and a public caller's fork PR has no secret
 # anyway), a caller that was never given the secret, a label addition that is
-# not a review re-request, a P2 pull request, or any of the four spend limits
-# above. A reviewer error or a
+# not a review re-request, a P2 pull request, or an automatic review below its configured spend limits. A reviewer error or a
 # run that exceeds `wait-minutes` FAILS the job so the check is visibly red;
 # this job is never part of `ci / Required`, so red here blocks nothing by
 # itself. What blocks a merge is the REQUEST_CHANGES review under the
@@ -121,8 +110,8 @@ on:
           https://api.cursor.com/v1/models` lists valid ids. Composer 2.5 sits
           in the same first-party "Cursor Models" pool as Grok 4.6 at roughly
           a third of the cost per review ($0.50/$0.20/$2.50 per Mtok against
-          $2/$0.50/$6). A pull request that needs the stronger reviewer gets
-          the `review-deep` label.
+          $2/$0.50/$6). Use `review-now` for an on-demand standard review;
+          `review-deep` explicitly requests the stronger reviewer.
         required: false
         type: string
         default: composer-2.5
@@ -157,41 +146,30 @@ on:
         default: xhigh
       max-rounds:
         description: >-
-          Most agent reviews one pull request may consume before further
-          re-requests are skipped. 0 disables the cap. Measured over 199
-          launches on 78 pull requests: every `request_changes` verdict
-          arrived by round 4, while rounds 5-13 cost 251 compute minutes and
-          produced no blocking finding. `review-deep` bypasses it.
+          Optional round cap for automatic reviews. 0 (default) is unlimited.
+          Explicit requests, including review-now, always bypass this cap.
         required: false
         type: number
-        default: 4
+        default: 0
       daily-cap:
         description: >-
-          Most reviews this REPOSITORY may launch in a rolling 24 hours,
-          counted from Cursor's own agent ledger so a skipped workflow run
-          costs nothing against it. 0 disables the cap. Set it per repository:
-          some need more oversight than others. `review-deep` bypasses it.
+          Optional per-repository rolling 24h cap for automatic reviews.
+          0 (default) is unlimited. Explicit requests always bypass this cap.
         required: false
         type: number
-        default: 12
+        default: 0
       min-lines:
         description: >-
-          A non-P0 diff at or under this many changed lines is skipped; the
-          orchestrating session self-reviews it. 0 disables the gate. P0 is
-          exempt on purpose -- a three-line workflow change is the
-          deleted-`on:`-block hazard. So the CHEAP lever here is `review-p0`,
-          which makes the diff P0 and clears this gate at the ordinary model;
-          `review-deep` also bypasses it but buys the strong reviewer, which a
-          small diff rarely needs. This is the only one of the four limits a
-          class label clears (workflows#132).
+          Skip automatic non-P0 reviews at or under this changed-line count.
+          0 disables the floor. An explicit review-now request always runs
+          with the ordinary model, regardless of diff size.
         required: false
         type: number
         default: 20
       min-delta-lines:
         description: >-
-          A re-request whose head moved this few lines or fewer since the
-          reviewed head is skipped as a re-read of a diff already reviewed.
-          0 disables the gate. `review-deep` bypasses it.
+          Skip automatic reviews when the head moved this few lines or fewer
+          since the last review. 0 disables the floor. Explicit requests bypass it.
         required: false
         type: number
         default: 10
