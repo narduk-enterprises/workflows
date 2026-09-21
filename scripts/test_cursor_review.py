@@ -174,6 +174,9 @@ def env(**overrides: str) -> dict[str, str]:
         "CURSOR_FAST": "false",
         "CONTEXT_REPOS": "narduk-enterprises/agent-infrastructure,narduk-enterprises/company-hq",
         "WAIT_MINUTES": "30",
+        # Exercise optional automatic limits; the production defaults are unlimited.
+        "MAX_ROUNDS": "4",
+        "DAILY_CAP": "12",
         "APPROVE_ON_CLEAN": "true",
         "BRIEF_PATH": str(BRIEF),
     }
@@ -523,14 +526,16 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertEqual("", inputs["effort"]["default"])
         self.assertEqual("grok-4.6", inputs["deep-model"]["default"])
         self.assertEqual("xhigh", inputs["deep-effort"]["default"])
+        self.assertEqual(0, cr.DEFAULT_MAX_ROUNDS)
+        self.assertEqual(0, cr.DEFAULT_DAILY_CAP)
         # fast=false for reviews: the job already budgets wait-minutes and
         # blocks nobody, so the reviewer is never the latency-critical lane.
         # For composer this is also a COST trap, not just latency: its own
         # default variant is fast=true, billed at 6x base ($3/$0.50/$15),
         # which is more expensive than the grok-4.6 it replaced.
         self.assertIs(inputs["fast"]["default"], False)
-        self.assertEqual(4, inputs["max-rounds"]["default"])
-        self.assertEqual(12, inputs["daily-cap"]["default"])
+        self.assertEqual(0, inputs["max-rounds"]["default"])
+        self.assertEqual(0, inputs["daily-cap"]["default"])
         self.assertEqual(20, inputs["min-lines"]["default"])
         self.assertEqual(10, inputs["min-delta-lines"]["default"])
         secrets = (self.doc.get("on") or self.doc.get(True))["workflow_call"]["secrets"]
@@ -1115,14 +1120,12 @@ class SpendLimitTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertTrue(self.launched(transport))
 
-    def test_a_re_request_on_the_very_same_head_is_skipped(self):
-        """Nothing moved since the reviewed head, so there is nothing new to
-        read. The marker's headSha IS the last reviewed head."""
+    def test_an_explicit_re_request_on_the_same_head_runs(self):
         transport = FakeTransport(marker_comment=marker_comment(1, head=HEAD))
-        code, out = run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+        code, _ = run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
         self.assertEqual(0, code)
-        self.assertIn("only 0 line(s) changed", out)
-        self.assertFalse(self.launched(transport))
+        self.assertTrue(self.launched(transport))
+
 
     def test_the_round_count_survives_every_later_marker_rewrite(self):
         """The completion rewrite must carry the count forward. Writing the
@@ -1202,7 +1205,7 @@ class SpendLimitTests(unittest.TestCase):
         self.assertIn("in the last 24h, the cap is 12", out)
         # The skip advises adding `review-deep`; that advice was a dead end
         # until the label reached the job `if:` (LabelAllowListTests).
-        self.assertIn(cr.DEEP_LABEL, out)
+        self.assertIn(cr.REVIEW_NOW_LABEL, out)
         self.assertFalse(self.launched(transport), "the cap binds on the live shape")
 
     def test_the_v0_agents_key_is_still_tolerated(self):
@@ -1249,13 +1252,13 @@ class SpendLimitTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertTrue(self.launched(transport))
 
-    def test_a_junk_limit_uses_the_default_rather_than_unlimited(self):
-        """A typo must not silently buy unlimited spend."""
+    def test_a_junk_limit_uses_the_unlimited_default(self):
+        """Invalid input follows the documented unlimited default."""
         transport = FakeTransport(agent_ledger=ledger(12))
         code, out = run(transport, DAILY_CAP="twelve")
         self.assertEqual(0, code)
         self.assertIn("is not a whole number", out)
-        self.assertFalse(self.launched(transport))
+        self.assertTrue(self.launched(transport))
 
     # --- review-deep -----------------------------------------------------
     def test_review_deep_bypasses_every_limit_at_once(self):
@@ -1264,20 +1267,48 @@ class SpendLimitTests(unittest.TestCase):
             marker_comment=marker_comment(99),
             files=[{"filename": "src/a.ts", "patch": PATCH, "additions": 1, "deletions": 0}],
         )
-        code, out = run(transport, PR_LABELS='["review-deep"]')
+        code, out = run(transport, PR_LABELS='["review-deep"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-deep")
         self.assertEqual(0, code)
         self.assertIn("bypassing every spend limit", out)
         self.assertTrue(self.launched(transport))
 
-    def test_review_now_does_not_bypass_the_caps(self):
-        """Lanes add `review-now` after every push -- that is what produced
-        2.55 launches per pull request. If it bypassed the caps they would be
-        decorative."""
-        transport = FakeTransport(marker_comment=marker_comment(9))
-        code, out = run(transport, PR_LABELS='["review-now"]', PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now")
+    def test_review_now_bypasses_every_gate_without_upgrading_the_model(self):
+        transport = FakeTransport(
+            agent_ledger=ledger(99), marker_comment=marker_comment(99),
+            files=[{"filename": "src/a.ts", "patch": PATCH, "additions": 1, "deletions": 0}],
+        )
+        code, out = run(transport, PR_LABELS='["review-now", "review-deep"]',
+                      PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-now",
+                      CURSOR_MODEL="", CURSOR_EFFORT="")
         self.assertEqual(0, code)
-        self.assertIn("already had 9 review(s)", out)
-        self.assertFalse(self.launched(transport))
+        self.assertIn("bypassing every spend limit", out)
+        launch = next(c for c in transport.calls if c["method"] == "POST" and c["url"].endswith("/v1/agents"))
+        self.assertEqual({"id": "composer-2.5", "params": [{"id": "fast", "value": "false"}]}, launch["body"]["model"])
+        self.assertEqual(["review-now", "review-deep"], transport.labels_removed)
+        self.assertFalse(any(c["method"] == "GET" and c["url"].endswith("/v1/agents") for c in transport.calls))
+
+    def test_deep_request_is_consumed_and_uses_grok_even_on_a_tiny_prose_diff(self):
+        transport = FakeTransport(files=[{"filename": "README.md", "additions": 1, "deletions": 0}])
+        code, _ = run(transport, PR_EVENT_ACTION="labeled", PR_EVENT_LABEL="review-deep")
+        self.assertEqual(0, code)
+        launch = next(c for c in transport.calls if c["method"] == "POST" and c["url"].endswith("/v1/agents"))
+        self.assertEqual("grok-4.6", launch["body"]["model"]["id"])
+        self.assertEqual(["review-deep"], transport.labels_removed)
+
+    def test_reopening_with_a_stale_deep_label_does_not_upgrade_the_model(self):
+        transport = FakeTransport()
+        code, _ = run(transport, PR_EVENT_ACTION="reopened", PR_LABELS='["review-deep"]', CURSOR_MODEL="", CURSOR_EFFORT="")
+        self.assertEqual(0, code)
+        launch = next(c for c in transport.calls if c["method"] == "POST" and c["url"].endswith("/v1/agents"))
+        self.assertEqual("composer-2.5", launch["body"]["model"]["id"])
+        self.assertEqual(["review-deep"], transport.labels_removed)
+
+    def test_automatic_reviews_have_no_default_daily_or_round_cap(self):
+        transport = FakeTransport(agent_ledger=ledger(99), marker_comment=marker_comment(99))
+        code, _ = run(transport, DAILY_CAP=str(cr.DEFAULT_DAILY_CAP), MAX_ROUNDS=str(cr.DEFAULT_MAX_ROUNDS), MIN_DELTA_LINES="0")
+        self.assertEqual(0, code)
+        self.assertTrue(self.launched(transport))
+        self.assertFalse(any(c["method"] == "GET" and c["url"].endswith("/v1/agents") for c in transport.calls))
 
     def test_a_gated_head_still_frees_the_review_now_label(self):
         """A cap that left the label on would strand the lane: adding a label
@@ -1347,18 +1378,8 @@ class SpendLimitTests(unittest.TestCase):
 class LimitMessageLeverTests(unittest.TestCase):
     """A skip message must name a label that actually clears THAT limit.
 
-    Shipped 2026-09-20 with all four messages naming `review-deep`. Only the
-    size gate has a P0 exemption, so on that one `review-p0` clears the gate at
-    composer-2.5 `fast: false` prices ($0.50/$0.20/$2.50 per Mtok) while
-    `review-deep` buys grok-4.6 xhigh ($2/$0.50/$6) -- roughly the 6x unit the
-    estate had just spent a day migrating off, aimed at the smallest diffs in
-    the queue, which is where the size floors bite by construction. A fix-lane
-    handoff was already routing lanes that way, on guidance taken from these
-    very messages (workflows#132).
-
-    These messages are the only guidance a lane sees at the moment it is
-    looking for a lever, so they are load-bearing, and nothing previously bound
-    them to the exemption logic they describe.
+    Every automatic skip now offers review-now, which runs with the ordinary
+    model. No quota message may direct an agent to the expensive model.
     """
 
     def launched(self, transport: FakeTransport) -> bool:
@@ -1408,19 +1429,12 @@ class LimitMessageLeverTests(unittest.TestCase):
                             self.launched(retry),
                             f"the {name} message offers '{label}' but that label does not clear it")
 
-    def test_the_size_gate_offers_the_cheap_lever_first(self):
-        """Ordering is the whole fix: a lane reaches for the first thing named."""
-        code, out = run(self.size_gate())
-        self.assertEqual(0, code)
-        line = next((l for l in out.splitlines() if "line floor" in l), "")
-        self.assertTrue(line, "the size gate printed no floor message at all")
-        self.assertIn(f"'{cr.P0_LABEL}'", line,
-                      f"the size gate must offer the cheap lever: {line}")
-        self.assertIn(f"'{cr.DEEP_LABEL}'", line,
-                      f"the size gate must still offer the strong reviewer: {line}")
-        self.assertLess(line.index(f"'{cr.P0_LABEL}'"), line.index(f"'{cr.DEEP_LABEL}'"),
-                        f"'{cr.P0_LABEL}' must come first -- a lane reaches for "
-                        f"the first lever named: {line}")
+    def test_every_skip_offers_only_the_standard_review_request(self):
+        for name, build in self.scenarios().items():
+            with self.subTest(limit=name):
+                code, out = run(build())
+                self.assertEqual(0, code)
+                self.assertEqual({cr.REVIEW_NOW_LABEL}, set(re.findall(r"'(review-[a-z0-9-]+)'", out)))
 
     def test_review_p0_clears_the_size_gate(self):
         transport = self.size_gate()
@@ -1433,8 +1447,8 @@ class LimitMessageLeverTests(unittest.TestCase):
 
         `priority != "P0"` guards the size gate alone; the round cap, delta
         gate and daily cap have no class exemption. So `review-p0` must NOT be
-        advertised as a general escape hatch, and `review-deep` stays the only
-        lever for the other three.
+        advertised as a general escape hatch. An explicit `review-now` event
+        bypasses every gate without changing the model.
         """
         for name, build in (("round cap", self.round_cap),
                             ("delta gate", self.delta_gate),
