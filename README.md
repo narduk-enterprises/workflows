@@ -975,18 +975,33 @@ workflow's job — that stays a separate `nuxt-cloudflare-deploy.yml` sibling
 #### Exact candidate validation
 
 `expected-candidate-sha` is an optional full, lowercase 40-character commit SHA.
-Use it in a manual-only application caller dispatched on the pushed candidate
-branch. Every source checkout is pinned to that SHA, then verifies the event
-type, branch ref, event SHA and actual checkout before running package code.
-A moved branch at dispatch or a different checkout fails the existing
-`ci / Required` gate. Leaving the input empty preserves normal callers.
+For an explicit validation request, create a fresh branch ref
+`narduk-validation/<full-sha>/<request-id>` pointing at that already-pushed
+candidate. The app-owned validation caller listens **only** to pushes under
+`narduk-validation/**`, retains job ID `ci`, and passes `github.sha` as this
+input. Ordinary development branches do not trigger it. This is an explicit
+full-validation operation, never part of a local development deployment.
 
-The manual caller must pass the application's full normal release checks,
-including its browser coverage. Do not reuse an off-main expression that
-disables E2E, add a success substitute for held automatic workflows, or attach
-promotion/migration jobs. The caller's job ID remains `ci`; branch protections
-continue requiring the real `ci / Required` context. Dispatch and validation
-are explicit operations; this input adds no automatic triggers or runners.
+Every source checkout is pinned to the requested SHA, then verifies the push
+event, ref-encoded candidate, event SHA and actual checkout before running
+package code. A mismatched ref or checkout fails the real `ci / Required` gate.
+Leaving the input empty preserves normal callers. The requesting CLI verifies
+the selected source branch still points at the requested candidate before
+creating the validation ref and records its reason and resulting run.
+
+Do **not** use `workflow_dispatch` for release evidence: GitHub excludes those
+job checks from pull-request required-check evaluation, even on the correct
+head commit. See [GitHub's event eligibility documentation](https://docs.github.com/en/enterprise-cloud@latest/pull-requests/how-tos/merge-and-close-pull-requests/troubleshooting-required-status-checks#checks-from-some-workflow-jobs-are-not-evaluated).
+The dedicated push ref lets the existing real required check count without
+changing branch protections or introducing a synthetic success check.
+
+The explicit caller must pass the application's full normal release checks,
+including its browser coverage. Exact-candidate mode disables browser path
+skipping and reuse; push semantics select the full shard/argument configuration.
+Do not reuse an off-main expression that disables E2E, add a success substitute
+for held workflows, or attach promotion/migration jobs. Required checks and
+review rules stay intact. Record the exact successful run and candidate; a
+later merged revision requires its own exact-revision evidence.
 
 #### `node-version-file`: single-sourcing the Node version
 

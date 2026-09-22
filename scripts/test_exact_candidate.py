@@ -48,10 +48,12 @@ class ExactCandidate(unittest.TestCase):
                 'commit', '--allow-empty', '-qm', 'candidate')
             sha = git('rev-parse', 'HEAD')
             base = dict(os.environ, EXPECTED_CANDIDATE=sha, EVENT_SHA=sha,
-                        EVENT_NAME='workflow_dispatch', EVENT_REF='refs/heads/candidate')
+                        EVENT_NAME='push', EVENT_REF=f'refs/heads/narduk-validation/{sha}/request-1')
             scenarios = [({}, True), ({'EXPECTED_CANDIDATE': sha[:12]}, False),
-                         ({'EVENT_SHA': 'a' * 40}, False), ({'EVENT_NAME': 'push'}, False),
+                         ({'EVENT_SHA': 'a' * 40}, False), ({'EVENT_NAME': 'workflow_dispatch'}, False),
                          ({'EVENT_REF': 'refs/tags/candidate'}, False),
+                         ({'EVENT_REF': 'refs/heads/main'}, False),
+                         ({'EVENT_REF': 'refs/heads/narduk-validation/' + 'a' * 40 + '/request-1'}, False),
                          ({'EXPECTED_CANDIDATE': 'a' * 40, 'EVENT_SHA': 'a' * 40}, False),
                          ({'EXPECTED_CANDIDATE': '$(touch injected)'}, False)]
             for overrides, expected in scenarios:
@@ -80,6 +82,18 @@ class ExactCandidate(unittest.TestCase):
                 result = subprocess.run(['bash', '-c', script], env=base | {job: outcome},
                                         capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0, (job, outcome))
+
+    def test_exact_candidate_never_skips_full_browser_coverage(self):
+        step = next(s for s in self.workflow['jobs']['e2e-plan']['steps']
+                    if s.get('name') == 'Decide whether E2E can be skipped')
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory, 'output')
+            env = dict(os.environ, EXPECTED_CANDIDATE='a' * 40, REUSED='true',
+                       SKIP_PATTERNS='**', GITHUB_OUTPUT=str(output))
+            result = subprocess.run(['bash', '-c', step['run']], env=env,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(output.read_text(), 'skipped=false\nfull=true\n')
 
     def test_node_route_guards_follow_node_setup(self):
         # A fresh manifest-routed Linux guest need not have node on PATH.

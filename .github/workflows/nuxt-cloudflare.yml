@@ -111,8 +111,8 @@ on:
       expected-candidate-sha:
         description: >-
           Optional full 40-character commit SHA for explicitly requested release
-          validation. Requires workflow_dispatch on a branch whose event SHA
-          equals this candidate. Every source checkout is pinned and verified.
+          validation. Requires an explicit push to narduk-validation/<sha>/<request>
+          whose event SHA equals this candidate. Every checkout is verified.
           Empty preserves normal callers. This validates only; it never deploys.
         required: false
         type: string
@@ -747,8 +747,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
-             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
-            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
             exit 1
           fi
           if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
@@ -1634,8 +1634,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
-             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
-            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
             exit 1
           fi
           if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
@@ -1869,8 +1869,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
-             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
-            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
             exit 1
           fi
           if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
@@ -2060,6 +2060,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.after }}
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
           REUSED: ${{ steps.proof.outputs.reused }}
           SKIP_PATTERNS: ${{ inputs.e2e-skip-paths }}
           FULL_PATTERNS: ${{ inputs.e2e-full-paths }}
@@ -2071,6 +2072,12 @@ jobs:
           # `**/*.md` in a workspace holding `docs/readme.md` silently became that
           # one file, and a docs-only PR stopped skipping (workflows#118).
           set -f
+          if [ -n "${EXPECTED_CANDIDATE:-}" ]; then
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "full=true" >> "$GITHUB_OUTPUT"
+            echo "explicit exact-candidate validation runs full browser coverage"
+            exit 0
+          fi
           if [ "${REUSED:-false}" = true ]; then
             echo "skipped=true" >> "$GITHUB_OUTPUT"
             echo "full=false" >> "$GITHUB_OUTPUT"
@@ -2389,8 +2396,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
-             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
-            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
             exit 1
           fi
           if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
@@ -3048,8 +3055,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
-             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
-            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
             exit 1
           fi
           if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
@@ -3205,8 +3212,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
-             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
-            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
             exit 1
           fi
           if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
@@ -3749,8 +3756,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
-             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
-            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
             exit 1
           fi
           if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
@@ -3944,8 +3951,8 @@ jobs:
         run: |
           set -euo pipefail
           if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
-             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
-            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
             exit 1
           fi
           if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
@@ -4134,6 +4141,7 @@ jobs:
           # `set -e` (workflows#83).
           E2E_SHARDS: ${{ needs.e2e-plan.outputs.shard-total || inputs.e2e-shards }}
           E2E_PLAN_SKIPPED: ${{ needs.e2e-plan.outputs.skipped }}
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
           RUN_DEPLOY_DRY_RUN: ${{ inputs.wrangler-dry-run }}
         run: |
           set -euo pipefail
@@ -4151,6 +4159,10 @@ jobs:
               status=1
             fi
           }
+          if [ -n "${EXPECTED_CANDIDATE:-}" ] && [ "$E2E_PLAN_SKIPPED" = true ]; then
+            echo '::error::Explicit candidate validation cannot skip configured browser coverage.'
+            status=1
+          fi
           require_success build "$BUILD_RESULT"
           require_success checks "$CHECKS_RESULT"
           # caller-lint has no `if:` -- it always runs, same as build.
