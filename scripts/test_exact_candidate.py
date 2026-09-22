@@ -81,6 +81,16 @@ class ExactCandidate(unittest.TestCase):
                                         capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0, (job, outcome))
 
+    def test_node_route_guards_follow_node_setup(self):
+        # A fresh manifest-routed Linux guest need not have node on PATH.
+        for name in ['e2e', 'e2e-quarantine', 'preview']:
+            steps = self.workflow['jobs'][name]['steps']
+            setup = next(i for i, step in enumerate(steps)
+                         if str(step.get('uses', '')).startswith('actions/setup-node@'))
+            guard = next(i for i, step in enumerate(steps)
+                         if step.get('name') == 'Guard isolated Playwright route')
+            self.assertLess(setup, guard, name)
+
 
 if __name__ == '__main__':
     unittest.main()

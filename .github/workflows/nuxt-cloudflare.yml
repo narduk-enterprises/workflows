@@ -2419,6 +2419,28 @@ jobs:
           merge-multiple: true
           path: ${{ inputs.working-directory }}/${{ needs.build.outputs.e2e-build-path }}
 
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # node-version and node-version-file are mutually exclusive on
+          # setup-node (passing both is rejected), so resolve them as two
+          # exclusive expressions: node-version-file wins when the caller
+          # sets it, and node-version otherwise reproduces prior behaviour.
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          # v7 caches the package manager BY DEFAULT (`package-manager-cache`
+          # defaults to true) — dropping the `cache:` input does NOT turn it
+          # off. Without this line the explicit restore/save below is a SECOND
+          # cache running alongside the built-in one, and the `Post Run
+          # actions/setup-node` tar the split was meant to remove is still
+          # there: measured 27s on marketing-web `Build` after the split, on
+          # top of a 22s explicit save. Two caches for one dependency tree is
+          # strictly worse than the one it replaced.
+          package-manager-cache: false
+
+
       - name: Guard isolated Playwright route
         env:
           BROWSERS_OVERRIDE: ${{ inputs.e2e-browsers-path }}
@@ -2467,26 +2489,6 @@ jobs:
         if: inputs.e2e-browsers-path != ''
         run: echo "PLAYWRIGHT_BROWSERS_PATH=${{ inputs.e2e-browsers-path }}" >> "$GITHUB_ENV"
 
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
-        if: inputs.package-manager == 'pnpm'
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          # node-version and node-version-file are mutually exclusive on
-          # setup-node (passing both is rejected), so resolve them as two
-          # exclusive expressions: node-version-file wins when the caller
-          # sets it, and node-version otherwise reproduces prior behaviour.
-          node-version-file: ${{ inputs.node-version-file }}
-          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
-          # v7 caches the package manager BY DEFAULT (`package-manager-cache`
-          # defaults to true) — dropping the `cache:` input does NOT turn it
-          # off. Without this line the explicit restore/save below is a SECOND
-          # cache running alongside the built-in one, and the `Post Run
-          # actions/setup-node` tar the split was meant to remove is still
-          # there: measured 27s on marketing-web `Build` after the split, on
-          # top of a 22s explicit save. Two caches for one dependency tree is
-          # strictly worse than the one it replaced.
-          package-manager-cache: false
 
       # Dependency cache: restore everywhere, write only on the default branch
       # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh
@@ -3267,14 +3269,6 @@ jobs:
       # BEFORE dependency installation, exactly as in the e2e job: once an
       # install has run, a browser could already have been acquired and the
       # guard would be auditing state it no longer controls. Same anchored text.
-      - name: Guard isolated Playwright route
-        if: contains(inputs.preview-checks, 'e2e-subset')
-        env:
-          BROWSERS_OVERRIDE: ${{ inputs.e2e-browsers-path }}
-          INSTALL_BROWSERS: ${{ inputs.e2e-install-browsers }}
-          ROUTE: ${{ inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner }}
-        run: *guard_isolated_playwright_route
-
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
 
@@ -3283,6 +3277,16 @@ jobs:
           node-version-file: ${{ inputs.node-version-file }}
           node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
           package-manager-cache: false
+
+
+      - name: Guard isolated Playwright route
+        if: contains(inputs.preview-checks, 'e2e-subset')
+        env:
+          BROWSERS_OVERRIDE: ${{ inputs.e2e-browsers-path }}
+          INSTALL_BROWSERS: ${{ inputs.e2e-install-browsers }}
+          ROUTE: ${{ inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner }}
+        run: *guard_isolated_playwright_route
+
 
       - name: Configure package registry auth
         if: inputs.install-script == ''
