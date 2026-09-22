@@ -108,6 +108,15 @@ permissions:
 on:
   workflow_call:
     inputs:
+      expected-candidate-sha:
+        description: >-
+          Optional full 40-character commit SHA for explicitly requested release
+          validation. Requires workflow_dispatch on a branch whose event SHA
+          equals this candidate. Every source checkout is pinned and verified.
+          Empty preserves normal callers. This validates only; it never deploys.
+        required: false
+        type: string
+        default: ""
       node-version:
         description: "Node.js version"
         required: false
@@ -724,6 +733,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
@@ -1589,6 +1620,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -1802,6 +1855,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -2300,6 +2375,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       # The producing job's artifact ID survives 'rerun failed jobs': the
       # successful build may belong to an earlier attempt of this same run.
@@ -2935,6 +3032,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -3070,6 +3189,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       # Rejects a mistyped selection BEFORE spending a runner on it. `og` and
       # `e2e-subset` are the only checks; `none` is exclusive; and
@@ -3590,6 +3731,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
@@ -3763,6 +3926,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching the dispatched branch event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       # This step imports PyYAML. Hosted images currently include it, but
       # keep the checked fallback so a runner-image update cannot silently

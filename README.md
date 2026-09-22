@@ -972,6 +972,22 @@ workflow's job — that stays a separate `nuxt-cloudflare-deploy.yml` sibling
 (deferred, not built in this pass), matching hydrogen's existing two-job
 `ci` / `deploy` split rather than folding deploy secrets into the CI gate.
 
+#### Exact candidate validation
+
+`expected-candidate-sha` is an optional full, lowercase 40-character commit SHA.
+Use it in a manual-only application caller dispatched on the pushed candidate
+branch. Every source checkout is pinned to that SHA, then verifies the event
+type, branch ref, event SHA and actual checkout before running package code.
+A moved branch at dispatch or a different checkout fails the existing
+`ci / Required` gate. Leaving the input empty preserves normal callers.
+
+The manual caller must pass the application's full normal release checks,
+including its browser coverage. Do not reuse an off-main expression that
+disables E2E, add a success substitute for held automatic workflows, or attach
+promotion/migration jobs. The caller's job ID remains `ci`; branch protections
+continue requiring the real `ci / Required` context. Dispatch and validation
+are explicit operations; this input adds no automatic triggers or runners.
+
 #### `node-version-file`: single-sourcing the Node version
 
 | Input | Type | Default | Purpose |
