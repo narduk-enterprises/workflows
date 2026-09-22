@@ -108,6 +108,15 @@ permissions:
 on:
   workflow_call:
     inputs:
+      expected-candidate-sha:
+        description: >-
+          Optional full 40-character commit SHA for explicitly requested release
+          validation. Requires an explicit push to narduk-validation/<sha>/<request>
+          whose event SHA equals this candidate. Every checkout is verified.
+          Empty preserves normal callers. This validates only; it never deploys.
+        required: false
+        type: string
+        default: ""
       node-version:
         description: "Node.js version"
         required: false
@@ -724,6 +733,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
@@ -1589,6 +1620,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -1802,6 +1855,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -1985,6 +2060,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.after }}
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
           REUSED: ${{ steps.proof.outputs.reused }}
           SKIP_PATTERNS: ${{ inputs.e2e-skip-paths }}
           FULL_PATTERNS: ${{ inputs.e2e-full-paths }}
@@ -1996,6 +2072,12 @@ jobs:
           # `**/*.md` in a workspace holding `docs/readme.md` silently became that
           # one file, and a docs-only PR stopped skipping (workflows#118).
           set -f
+          if [ -n "${EXPECTED_CANDIDATE:-}" ]; then
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "full=true" >> "$GITHUB_OUTPUT"
+            echo "explicit exact-candidate validation runs full browser coverage"
+            exit 0
+          fi
           if [ "${REUSED:-false}" = true ]; then
             echo "skipped=true" >> "$GITHUB_OUTPUT"
             echo "full=false" >> "$GITHUB_OUTPUT"
@@ -2300,6 +2382,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       # The producing job's artifact ID survives 'rerun failed jobs': the
       # successful build may belong to an earlier attempt of this same run.
@@ -2321,6 +2425,28 @@ jobs:
           artifact-ids: ${{ needs.build.outputs.e2e-build-id }}
           merge-multiple: true
           path: ${{ inputs.working-directory }}/${{ needs.build.outputs.e2e-build-path }}
+
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # node-version and node-version-file are mutually exclusive on
+          # setup-node (passing both is rejected), so resolve them as two
+          # exclusive expressions: node-version-file wins when the caller
+          # sets it, and node-version otherwise reproduces prior behaviour.
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          # v7 caches the package manager BY DEFAULT (`package-manager-cache`
+          # defaults to true) — dropping the `cache:` input does NOT turn it
+          # off. Without this line the explicit restore/save below is a SECOND
+          # cache running alongside the built-in one, and the `Post Run
+          # actions/setup-node` tar the split was meant to remove is still
+          # there: measured 27s on marketing-web `Build` after the split, on
+          # top of a 22s explicit save. Two caches for one dependency tree is
+          # strictly worse than the one it replaced.
+          package-manager-cache: false
+
 
       - name: Guard isolated Playwright route
         env:
@@ -2370,26 +2496,6 @@ jobs:
         if: inputs.e2e-browsers-path != ''
         run: echo "PLAYWRIGHT_BROWSERS_PATH=${{ inputs.e2e-browsers-path }}" >> "$GITHUB_ENV"
 
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
-        if: inputs.package-manager == 'pnpm'
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          # node-version and node-version-file are mutually exclusive on
-          # setup-node (passing both is rejected), so resolve them as two
-          # exclusive expressions: node-version-file wins when the caller
-          # sets it, and node-version otherwise reproduces prior behaviour.
-          node-version-file: ${{ inputs.node-version-file }}
-          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
-          # v7 caches the package manager BY DEFAULT (`package-manager-cache`
-          # defaults to true) — dropping the `cache:` input does NOT turn it
-          # off. Without this line the explicit restore/save below is a SECOND
-          # cache running alongside the built-in one, and the `Post Run
-          # actions/setup-node` tar the split was meant to remove is still
-          # there: measured 27s on marketing-web `Build` after the split, on
-          # top of a 22s explicit save. Two caches for one dependency tree is
-          # strictly worse than the one it replaced.
-          package-manager-cache: false
 
       # Dependency cache: restore everywhere, write only on the default branch
       # (company-hq#269). `setup-node`'s built-in `cache:` writes a fresh
@@ -2935,6 +3041,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -3070,6 +3198,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       # Rejects a mistyped selection BEFORE spending a runner on it. `og` and
       # `e2e-subset` are the only checks; `none` is exclusive; and
@@ -3126,14 +3276,6 @@ jobs:
       # BEFORE dependency installation, exactly as in the e2e job: once an
       # install has run, a browser could already have been acquired and the
       # guard would be auditing state it no longer controls. Same anchored text.
-      - name: Guard isolated Playwright route
-        if: contains(inputs.preview-checks, 'e2e-subset')
-        env:
-          BROWSERS_OVERRIDE: ${{ inputs.e2e-browsers-path }}
-          INSTALL_BROWSERS: ${{ inputs.e2e-install-browsers }}
-          ROUTE: ${{ inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner }}
-        run: *guard_isolated_playwright_route
-
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
 
@@ -3142,6 +3284,16 @@ jobs:
           node-version-file: ${{ inputs.node-version-file }}
           node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
           package-manager-cache: false
+
+
+      - name: Guard isolated Playwright route
+        if: contains(inputs.preview-checks, 'e2e-subset')
+        env:
+          BROWSERS_OVERRIDE: ${{ inputs.e2e-browsers-path }}
+          INSTALL_BROWSERS: ${{ inputs.e2e-install-browsers }}
+          ROUTE: ${{ inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner }}
+        run: *guard_isolated_playwright_route
+
 
       - name: Configure package registry auth
         if: inputs.install-script == ''
@@ -3590,6 +3742,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
@@ -3763,6 +3937,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
 
       # This step imports PyYAML. Hosted images currently include it, but
       # keep the checked fallback so a runner-image update cannot silently
@@ -3945,6 +4141,7 @@ jobs:
           # `set -e` (workflows#83).
           E2E_SHARDS: ${{ needs.e2e-plan.outputs.shard-total || inputs.e2e-shards }}
           E2E_PLAN_SKIPPED: ${{ needs.e2e-plan.outputs.skipped }}
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
           RUN_DEPLOY_DRY_RUN: ${{ inputs.wrangler-dry-run }}
         run: |
           set -euo pipefail
@@ -3962,6 +4159,10 @@ jobs:
               status=1
             fi
           }
+          if [ -n "${EXPECTED_CANDIDATE:-}" ] && [ "$E2E_PLAN_SKIPPED" = true ]; then
+            echo '::error::Explicit candidate validation cannot skip configured browser coverage.'
+            status=1
+          fi
           require_success build "$BUILD_RESULT"
           require_success checks "$CHECKS_RESULT"
           # caller-lint has no `if:` -- it always runs, same as build.

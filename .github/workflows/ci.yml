@@ -243,6 +243,9 @@ jobs:
       # the ONE place that computes it. Three copies of that conditional is
       # how `--shard=<n>/<total>` and the `Required` aggregation drift into a
       # suite that silently runs a third of its tests and reports success.
+      - name: Exact candidate validation tests
+        run: python3 scripts/test_exact_candidate.py
+
       - name: E2E pull-request subset contract tests
         run: python3 scripts/test_e2e_pr_subset.py
 
