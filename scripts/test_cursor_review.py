@@ -71,7 +71,7 @@ def review_json(**overrides: Any) -> str:
 class FakeTransport:
     """Routes by (method, path) and records everything that was sent."""
 
-    def __init__(self, *, result: str = review_json(), run_statuses: list[str] | None = None, pr_author: str = "loganrenz", head_now: str = HEAD, prior_reviews: list[dict[str, Any]] | None = None, marker_comment: dict[str, Any] | None = None, review_status: int = 200, files: list[dict[str, Any]] | None = None, agent_ledger: list[dict[str, Any]] | None = None) -> None:
+    def __init__(self, *, result: str = review_json(), run_statuses: list[str] | None = None, pr_author: str = "loganrenz", head_now: str = HEAD, prior_reviews: list[dict[str, Any]] | None = None, marker_comment: dict[str, Any] | None = None, review_status: int = 200, files: list[dict[str, Any]] | None = None, agent_ledger: list[dict[str, Any]] | None = None, compare_commits: list[dict[str, Any]] | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
         self.result = result
         self.run_statuses = list(run_statuses or ["RUNNING", "FINISHED"])
@@ -89,6 +89,10 @@ class FakeTransport:
         # `GET /compare/<old>...<new>` -- the delta gate. None means the
         # comparison is unreadable, which must fail open.
         self.compare_files: list[dict[str, Any]] | None = [{"filename": "src/a.ts", "additions": 40, "deletions": 5}]
+        # Same endpoint's `commits` array -- the moved-head reviewer-push
+        # check (`reviewer_pushed_commits`). Empty by default: no test here
+        # exercises a moved head unless it sets this explicitly.
+        self.compare_commits = list(compare_commits) if compare_commits is not None else []
 
     def __call__(self, method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: int) -> tuple[int, Any]:
         payload = json.loads(body) if body else None
@@ -137,7 +141,7 @@ class FakeTransport:
         if method == "GET" and "/compare/" in path:
             if self.compare_files is None:
                 return 500, {"message": "boom"}
-            return 200, {"files": self.compare_files}
+            return 200, {"files": self.compare_files, "commits": self.compare_commits}
         if method == "GET" and path.endswith("/pulls/7/reviews"):
             return 200, self.prior_reviews
         if method == "POST" and path.endswith("/pulls/7/reviews"):
@@ -315,6 +319,38 @@ class ReviewFlowTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertIn("moved to", out)
         self.assertFalse(any(c["url"].endswith("/pulls/7/reviews") and c["method"] == "POST" for c in transport.calls))
+
+    def test_a_head_moved_by_the_reviewer_itself_fails_the_job_loudly(self):
+        """round-4 re-verify MEDIUM finding: the b73f49 incident shape (the
+        reviewer pushes a commit onto the PR's own head while its review is
+        in flight) must not be silently absorbed as an ordinary supersede --
+        it has to fail the job and say so, since `workOnCurrentBranch=False`
+        alone is unproven as a real credential boundary."""
+        transport = FakeTransport(
+            head_now="d" * 40,
+            compare_commits=[{"sha": "b73f49" + "0" * 34, "author": {"login": "cursoragent"}, "commit": {"author": {"name": "Cursor Agent"}}}],
+        )
+        with self.assertRaisesRegex(cr.ReviewError, "b73f49 shape"):
+            run(transport)
+        self.assertFalse(any(c["url"].endswith("/pulls/7/reviews") and c["method"] == "POST" for c in transport.calls))
+        last_patch = [c for c in transport.calls if c["method"] == "PATCH"][-1]
+        self.assertIn("did not complete", last_patch["body"]["body"])
+
+    def test_a_head_moved_by_someone_else_still_only_skips(self):
+        """The same moved-head shape, but the new commit is NOT the
+        reviewer's own -- an ordinary human push race, which must stay a
+        quiet Skip exactly as before."""
+        transport = FakeTransport(
+            head_now="d" * 40,
+            compare_commits=[{"sha": "c" * 40, "author": {"login": "loganrenz"}, "commit": {"author": {"name": "Logan Renz"}}}],
+        )
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("moved to", out)
+
+    def test_reviewer_pushed_commits_fails_open_when_the_compare_is_unreadable(self):
+        github = cr.GitHub("tok", REPO, lambda *a, **k: (500, {"message": "boom"}))
+        self.assertEqual([], cr.reviewer_pushed_commits(github, BASE, HEAD))
 
     def test_a_refused_inline_anchor_falls_back_to_a_body_only_review(self):
         transport = FakeTransport(review_status=422)
@@ -1007,6 +1043,154 @@ class ClassRuleTests(unittest.TestCase):
                 self.assertTrue(self.launched(transport))
                 self.assertIn("class P0", posted_review(transport)["body"])
 
+    def test_t2_sensitive_paths_are_always_reviewed(self):
+        """narduk-reboot P3-C2 / O-D7: auth, session, payments and
+        credential-table paths always get a review, like ALWAYS_REVIEW_PREFIXES,
+        whatever the label, author or diff size."""
+        for path in (
+            "src/routes/auth/login.ts",
+            "lib/session/store.ts",
+            "app/payments/checkout.vue",
+            "Config/nvault-provider-credentials.json",
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 1, "deletions": 0}])
+                code, out = run(transport, PR_TITLE="chore: routine wording", PR_AUTHOR="dependabot[bot]")
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_t2_marker_substrings_are_not_p0(self):
+        """PR #142 review, cursor_review.py:644 (blocking): a bare `marker in
+        lowered` substring check made `author`, `authoring` and `repayment`
+        all P0. is_t2_sensitive() now matches whole path tokens, so an
+        ordinary word that merely contains a T2 marker's letters stays P1
+        (and can still be skipped by the P2 signals, unlike a real P0)."""
+        for path in (
+            "src/author/service.ts",
+            "docs/authoring.md",
+            "lib/repayment/calc.ts",
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 1, "deletions": 0}])
+                code, out = run(transport, PR_TITLE="chore: routine wording")
+                self.assertEqual(0, code)
+                self.assertNotIn("::notice::review class P0", out)
+
+    def test_t2_camel_case_and_derived_forms_are_p0(self):
+        """PR #142 review, second round: whole-TOKEN matching (casefold()
+        then split) stopped catching compound identifiers because casefold()
+        destroys the camelCase/PascalCase boundary a split needs. Also
+        covers the reviewer's own CONSIDER finding (cursor_review.py:119):
+        derived forms like "authentication"/"authorization"/"oauth" that
+        the original bare word list did not enumerate."""
+        for path in (
+            "app/composables/useAuth.ts",
+            "app/stores/authStore.ts",
+            "server/middleware/authMiddleware.ts",
+            "server/utils/sessions.ts",
+            "lib/oauth/callback.ts",
+            "src/authentication/index.ts",
+            "src/authorization/policy.ts",
+            "SessionStore.swift",
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 1, "deletions": 0}])
+                code, out = run(transport, PR_TITLE="chore: routine wording", PR_AUTHOR="dependabot[bot]")
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+
+    def test_t2_acronym_prefixed_words_are_p0(self):
+        """PR #142 review, third round (LOW): the lower-to-upper camelCase
+        split never fires inside a run of capitals, so an acronym glued
+        straight onto a T2 word -- `HTTPAuth.ts`, `SSOAuth.ts`,
+        `JWTSession.ts` -- fell through as a single unsplit word and stayed
+        P1. `_ACRONYM_SPLIT` closes that: it splits the acronym from the
+        capitalised word that follows it, same as a plain camelCase word."""
+        for path in (
+            "src/HTTPAuth.ts",
+            "lib/SSOAuth.ts",
+            "server/JWTSession.ts",
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 1, "deletions": 0}])
+                code, out = run(transport, PR_TITLE="chore: routine wording", PR_AUTHOR="dependabot[bot]")
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+
+    def test_t2_derived_false_positive_words_stay_p1(self):
+        """The camelCase/prefix widening must not reopen the exact
+        false-positive class test_t2_marker_substrings_are_not_p0 closed:
+        ordinary English words built on a T2 root stay P1 even when they
+        appear as their own path segment or inside a compound identifier."""
+        for path in (
+            "docs/authorship.md",
+            "finance/repayments/schedule.ts",
+            "billing/PrepaymentPlan.ts",
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 1, "deletions": 0}])
+                code, out = run(transport, PR_TITLE="chore: routine wording")
+                self.assertEqual(0, code)
+                self.assertNotIn("::notice::review class P0", out)
+
+    def test_t2_matcher_stays_exactly_the_o_velocity_categories(self):
+        """PR #142 review, third round (MEDIUM): a round-2 fix widened the
+        T2 matcher past O-velocity's path-escalation list (O-velocity.md
+        §3.2, PLAN.md row 365, infrastructure.md I1-A: auth, session,
+        payments, the credential table) by adding `nvault`, `migration`,
+        `wrangler` and a bare `schema` root. `schema` alone forced P0 on
+        ordinary JSON Schema config, SEO-schema composables and
+        logging-schema files that have nothing to do with a D1 migration --
+        infrastructure.md I1-A says migrations and wrangler bindings "are
+        guarded by the deploy tool, not by rulesets", and nvault is a
+        repo/tier classification, not a path inside an arbitrary caller
+        repo. Table-driven: every one of these near-miss paths must now
+        classify P1 (reviewed once, but not forced P0), the same as an
+        ordinary code change."""
+        near_misses = (
+            # D1/ORM schema files: legitimate T2 concern, but "schema" is
+            # not itself a T2 category -- migrations already covers the
+            # literal directory a real D1 change lives under.
+            "server/database/schema.ts",
+            "drizzle/schema.ts",
+            # Generic (non-D1) schema files a bare "schema" root swept in.
+            "Config/machine-setup.schema.json",
+            "narduk-seo/composables/useWebPageSchema.ts",
+            "narduk-logging/schema/log-record.schema.json",
+            # nvault: a repo/tier classification, not a path-escalation
+            # category for an arbitrary caller repo's own diff.
+            "apps/nvault/cmd/main.go",
+            "Config/nvault-selectors.json",
+            # Migrations and wrangler bindings: guarded by the deploy tool.
+            "db/migrations/0007_add_index.sql",
+            "wrangler.toml",
+            "wrangler.jsonc",
+        )
+        for path in near_misses:
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 1, "deletions": 0}])
+                code, out = run(transport, PR_TITLE="chore: routine wording")
+                self.assertEqual(0, code)
+                self.assertNotIn("::notice::review class P0", out)
+
+    def test_t2_matcher_still_catches_every_named_category(self):
+        """Companion to the near-miss table above: narrowing the roots must
+        not have narrowed past the four O-velocity categories themselves.
+        One representative path per category, plus the literal credential
+        registry file the reboot's own Config/ carries."""
+        for path in (
+            "src/routes/auth/login.ts",           # auth
+            "lib/session/store.ts",               # session
+            "app/payments/checkout.vue",          # payments
+            "Config/nvault-provider-credentials.json",  # the credential table
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 1, "deletions": 0}])
+                code, out = run(transport, PR_TITLE="chore: routine wording", PR_AUTHOR="dependabot[bot]")
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+
     def test_policy_prose_is_p1_not_p0_so_the_spend_limits_apply(self):
         """The narrowing itself. These were P0 -- the class no cap may skip --
         which made the class rule inert in exactly the two repositories with
@@ -1065,6 +1249,121 @@ class ClassRuleTests(unittest.TestCase):
         run(transport)
         self.assertIn("A push no longer re-reviews on its own", posted_review(transport)["body"])
         self.assertIn("review-now", posted_review(transport)["body"])
+
+
+class NoPushTests(unittest.TestCase):
+    """narduk-reboot wave 4, P3-C2 fix round: a wave-2 lane merged
+    narduk-libs#830, and the Cursor reviewer used the writable branch its
+    launch gave it to push a test-loosening "autofix" commit (b73f49) onto
+    narduk-libs#837 -- a SECURITY fix PR -- which shipped. The brief's own
+    "do not push" HARD RULE existed since the callable's first commit and did
+    not stop it, so the control has to be in the launch payload, not just
+    the prompt: for a diff touching `.github/workflows/**`, `**/*.test.*`,
+    `scripts/ci-runner-routing*`, or a T2-sensitive path, `workOnCurrentBranch`
+    must be `False` -- no branch the agent can push onto lands on the
+    reviewed pull request -- regardless of what the model does."""
+
+    def launch_body(self, transport: FakeTransport) -> dict[str, Any]:
+        launch = next(c for c in transport.calls if c["method"] == "POST" and c["url"].endswith("/v1/agents"))
+        return launch["body"]
+
+    def test_ordinary_diff_keeps_write_access(self):
+        transport = FakeTransport(files=[{"filename": "src/widget.ts", "patch": PATCH, "additions": 40, "deletions": 5}])
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertTrue(self.launch_body(transport)["workOnCurrentBranch"])
+        self.assertNotIn("no-push mode", out)
+
+    def test_no_push_paths_disable_write_access(self):
+        for label, path in (
+            ("a workflow file", ".github/workflows/ci.yml"),
+            ("a test file", "src/widget.test.ts"),
+            ("a nested test file", "server/routes/handler.test.py"),
+            ("the ci-runner-routing script", "scripts/ci-runner-routing.py"),
+            ("a ci-runner-routing variant", "scripts/ci-runner-routing-v2.py"),
+            ("a T2-sensitive path", "src/routes/auth/login.ts"),
+        ):
+            with self.subTest(label):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 40, "deletions": 5}])
+                code, out = run(transport)
+                self.assertEqual(0, code)
+                self.assertFalse(self.launch_body(transport)["workOnCurrentBranch"], f"{path} must disable push access")
+                self.assertIn("::notice::no-push mode:", out)
+
+    def test_unknown_diff_fails_closed_to_no_push(self):
+        """The same UNKNOWN-never-means-safe direction as review_class's own
+        P2 handling (test_an_unknown_file_list_defeats_every_p2_skip_signal):
+        a diff this reviewer could not enumerate might touch a no-push path,
+        so it is treated as if it did."""
+
+        class Broken(FakeTransport):
+            seen = False
+
+            def github(self, method, path, payload):
+                if method == "GET" and path.endswith("/pulls/7/files") and not self.seen:
+                    self.seen = True
+                    return 500, {"message": "boom"}
+                return super().github(method, path, payload)
+
+        transport = Broken()
+        code, out = run(transport, PR_AUTHOR="dependabot[bot]")
+        self.assertEqual(0, code)
+        self.assertFalse(self.launch_body(transport)["workOnCurrentBranch"])
+        self.assertIn("::notice::no-push mode: diff list unavailable", out)
+
+    def test_no_push_brief_tells_the_agent_it_cannot_write(self):
+        transport = FakeTransport(files=[{"filename": ".github/workflows/ci.yml", "patch": PATCH, "additions": 40, "deletions": 5}])
+        run(transport)
+        body = self.launch_body(transport)
+        self.assertIn("NO-PUSH MODE", body["prompt"]["text"])
+        self.assertIn("WITHOUT write access", body["prompt"]["text"])
+
+    def test_ordinary_diff_brief_carries_no_no_push_notice(self):
+        transport = FakeTransport(files=[{"filename": "src/widget.ts", "patch": PATCH, "additions": 40, "deletions": 5}])
+        run(transport)
+        body = self.launch_body(transport)
+        self.assertNotIn("NO-PUSH MODE", body["prompt"]["text"])
+
+    def test_is_no_push_sensitive_table(self):
+        """Direct, table-driven unit coverage of the classifier itself, name
+        by name -- independent of the end-to-end launch plumbing above."""
+        sensitive = (
+            ".github/workflows/ci.yml",
+            ".github/workflows/nested/reusable.yml",
+            ".github/actions/setup/action.yml",  # round-4 re-verify LOW: Actions definitions were a gap
+            ".github/actions/nested/composite/action.yaml",
+            "Component.test.tsx",
+            "server/util.test.d.ts",
+            "scripts/test_cursor_review.py",  # round-4 re-verify LOW: this repo's own test convention
+            "scripts/test_red_main_listener.py",
+            "e2e/login.spec.ts",  # round-4 re-verify LOW: Playwright
+            "e2e/checkout.spec.js",
+            "pkg/x_test.go",  # round-4 re-verify LOW: Go
+            "internal/routing/ci_runner_routing_test.go",
+            "Tests/FooTests.swift",  # round-4 re-verify LOW: Swift/XCTest
+            "narduk-libs/Sources/App/Tests/SessionServiceTests.swift",
+            "scripts/ci-runner-routing.py",
+            "scripts/ci-runner-routing-v2/config.json",
+            "src/routes/auth/login.ts",
+            "app/payments/checkout.vue",
+            "Config/nvault-provider-credentials.json",
+        )
+        for path in sensitive:
+            with self.subTest(path):
+                self.assertTrue(cr.is_no_push_sensitive(path), f"{path} should be no-push sensitive")
+        not_sensitive = (
+            "src/widget.ts",
+            "docs/agents/review-routing.md",
+            "scripts/ci-runner.py",  # not the ci-runner-routing script
+            "server/database/schema.ts",  # narrowed off the T2 matcher this same round
+            "scripts/testing_helpers.py",  # "testing_", not the `test_*.py` convention
+            "src/specimen.ts",  # "spec" is a substring, not the `.spec.` convention
+            "cmd/attest/main.go",  # "test" is a substring, not the `_test.go` convention
+            "docs/GuestsTests.md",  # "Tests" suffix, but not a `.swift` file
+        )
+        for path in not_sensitive:
+            with self.subTest(path):
+                self.assertFalse(cr.is_no_push_sensitive(path), f"{path} should not be no-push sensitive")
 
 
 class SpendLimitTests(unittest.TestCase):

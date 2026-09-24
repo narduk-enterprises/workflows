@@ -66,13 +66,15 @@ in their app-class workflow.
 | `python-data.yml` | CI gate for Python / data-pipeline repos: explicit `uv` or Python provisioning, pytest, opt-in exact-version Ruff and **Pyright** (real static checking, not `py_compile`), plus an `extra-checks` hook |
 | `reusable-browser-tests.yml` | Private-repo browser CI: validates the exact manifest browser-group object before any shard is scheduled, consumes a same-run production build, asserts the immutable Playwright package/browser image and real launch, runs three Chromium shards plus opt-in WebKit, then merges 14-day HTML/trace evidence on Linux CI |
 | `docs-governance.yml` | Thin generic gate for docs/handbook-shaped repos: checkout, optionally provision Python/Node, run one repo-provided check command. Generalizes company-hq's `handbook-spine-check.yml` / `untangle-project-sync.yml` shape |
-| `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: script-probed lint/typecheck/test/build, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern. See [relationship to `reusable-node-ci.yml`](#relationship-between-node-libraryyml-and-reusable-node-ciyml) below |
+| `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: script-probed lint/typecheck/test/build, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern |
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional web-foundation conformance check, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
-| `reusable-node-ci.yml` | Generic Node CI: script-probed lint, typecheck, test, build (pnpm or npm), fail-closed by default through `require-scripts`. Zero live callers as of 2026-07-27 — kept for compatibility; `node-library.yml` is the richer, preferred surface for new adoption |
-| `code-review.yml` | **Advisory, default-off, not a CI gate.** Requests one containerized read-only agent review of a PR head from the estate's ephemeral pool, by firing a single `repository_dispatch` at `agent-infrastructure`. No `Required` job, never part of `ci / Required`, and every refusal path (opted out, fork, no secret, dispatch failure) exits SUCCESS. `enabled` defaults to `false`, so adopting the tag that carries it changes nothing until a repo opts in. See [Advisory code review](#advisory-code-review) |
-| `cursor-review.yml` | **Default-off PR reviewer, not a CI gate.** Reviews a pull request with one Cursor Cloud agent (`composer-2.5`, `fast: false`; explicit `review-deep` uses Grok 4.6 xhigh) that has the caller checked out at the PR head plus read-only context repos (estate manual, coding standards, decisions), then posts a REAL pull-request review on the reviewed head — APPROVE / COMMENT / REQUEST_CHANGES with inline comments — using the job's own `GITHUB_TOKEN`. Skips (draft, fork, `no-ai-review`, no secret) exit SUCCESS; a reviewer error fails the job. A REQUEST_CHANGES review blocks merge under the repo's pull-request rule. See [Cursor review](#cursor-review) (agent-infrastructure#1564) |
-| `closing-syntax-check.yml` | PR-closing-syntax gate (agent-infrastructure#837, #1085): rejects a PR body whose closing keyword is ambiguous (a bare comma-separated list) or sits outside a canonical closing line/list item, and rejects any commit in the PR's own commit range that carries a closing keyword at all — GitHub's squash-merge auto-close scan reads the landed commit message independently of the curated PR body. **Fully self-contained**: the checker's source (canonically `narduk-enterprises/agent-infrastructure`'s `scripts/check_pr_closing_syntax.py`) is vendored directly inside this callable, so an adopting repo needs no local copy at all — see the workflow file's own header for the sync procedure |
+| `reusable-node-ci.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8): zero live callers estate-wide, re-verified via `gh search code` / `gh api search/code` across narduk-enterprises, narduk-incubator and narduk-enterprises-clients. `node-library.yml` was always the richer, preferred surface — see workflows#14/#16 |
+| `code-review.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8, extending the 2026-09-19 advisory retirement below): zero live pool adopters, file deleted. Current review uses `cursor-review.yml` |
+| `cursor-review.yml` | **Default-off PR reviewer, not a CI gate.** Reviews a pull request with one Cursor Cloud agent (`composer-2.5`, `fast: false`; explicit `review-deep` uses Grok 4.6 xhigh) that has the caller checked out at the PR head plus read-only context repos (estate manual, coding standards, decisions), then posts a REAL pull-request review on the reviewed head — APPROVE / COMMENT / REQUEST_CHANGES with inline comments — using the job's own `GITHUB_TOKEN`. Skips (draft, fork, `no-ai-review`, no secret) exit SUCCESS; a reviewer error fails the job. A REQUEST_CHANGES review blocks merge under the repo's pull-request rule. The P0/P1/P2 class rule now also treats an auth/session/payments/credential-table (T2) path as always-reviewed (narduk-reboot P3-C2 / O-D7). See [Cursor review](#cursor-review) (agent-infrastructure#1564) |
+| `closing-syntax-check.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8): zero adopters, file deleted. `narduk-enterprises/agent-infrastructure` keeps its own local, canonical invocation of the same (commit-scanning) checker (agent-infrastructure#837, #1085) |
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
+| `red-main-listener.yml` | **New 2026-09-24** (narduk-reboot P3-C2 / O-D8). Opens or refreshes ONE "main is red: `<workflow-name>`" issue, labelled `red-main`, per repo per listened workflow, the first time that workflow goes red on the default branch; closes it on the next green run. **Prerequisite: the adopting repo must already have the `red-main` label** (`gh label create red-main --color B60205 --description "Main default-branch CI is failing"`) — opening the first issue passes `labels[]=red-main` and GitHub 422s a repo without it, so an adopter that skips this step fails closed on its first real red run (PR #142 review, second round). Optional fail-open portal-mirror POST hook. No automatic revert or rollback — that stays in the app's own deploy tooling |
+| `flake-digest.yml` | **New 2026-09-24** (narduk-reboot P3-C2). Weekly, advisory: scans a caller's completed runs of one workflow, counts failures in jobs matching `quarantine-job-pattern` (nuxt-cloudflare.yml's `e2e-quarantine` by default), and files or refreshes one digest issue per ISO week. Never gates `main`, never opens `red-main` |
 
 All nine shipped callables are `on: workflow_call` only — none of them declare their own
 triggers, and none declare `concurrency:` (see "How to consume" below for why).
@@ -92,10 +94,12 @@ branch, read back from the API — not that the caller parses.
 | `docs-governance.yml` | `narduk-enterprises/company-hq` | yes — repo ruleset `require-docs-governance` |
 | `node-library.yml` | `narduk-enterprises/narduk-charts` | yes — repo ruleset `require-ci-required` |
 | `nuxt-cloudflare.yml` | `hydrogen` | no — `hydrogen` has no branch protection; it called `@v1` unenforced for months, which is the failure mode this column exists to make visible |
-| `reusable-node-ci.yml` | none | — |
-| `code-review.yml` | retired 2026-09-19 — source retained, no live pool adopters | n/a — historical advisory callable; current review uses `cursor-review.yml` |
-| `closing-syntax-check.yml` | none yet — a re-home issue is filed on `narduk-enterprises-clients/pacc-trac` (agent-infrastructure#837), the repo the motivating incidents happened in; `narduk-enterprises/agent-infrastructure` stays on its own local, canonical invocation of the same (now commit-scanning) checker rather than adding a redundant cross-repo call to its own required gate | not yet |
+| `reusable-node-ci.yml` | retired 2026-09-24 — zero live callers estate-wide, file deleted (narduk-reboot P3-C2 / O-D8) | — |
+| `code-review.yml` | retired 2026-09-19, file deleted 2026-09-24 — no live pool adopters | n/a — historical advisory callable; current review uses `cursor-review.yml` |
+| `closing-syntax-check.yml` | retired 2026-09-24 — zero adopters, file deleted (narduk-reboot P3-C2 / O-D8); `narduk-enterprises/agent-infrastructure` stays on its own local, canonical invocation of the same (now commit-scanning) checker | — |
 | `reusable-weekly-drift-check.yml` | retired — zero live callers verified across `narduk-enterprises` and `narduk-incubator` | — |
+| `red-main-listener.yml` | `narduk-enterprises/workflows` itself (`red-main-self.yml`, listening to this repo's own `CI`) | not yet |
+| `flake-digest.yml` | none yet — no adopter here has a quarantine lane of its own; `nuxt-cloudflare.yml` adopters with `e2e-quarantine-args` set are the natural first callers | not yet |
 
 ## The `ci / Required` convention
 
@@ -141,7 +145,7 @@ discovered by inspection.
 ## Dependency caching: restore on every ref, write only on the default branch
 
 Every Node workflow here (`node-library.yml`, `nuxt-cloudflare.yml`,
-`docs-governance.yml`, `reusable-node-ci.yml`) used to hand `cache:` to
+`docs-governance.yml`) used to hand `cache:` to
 `actions/setup-node` and let it manage the whole round trip. That is the wrong
 shape, and company-hq#269 measured why.
 
@@ -217,9 +221,9 @@ which is why the explicit hosted value is the four-character JSON string
 
 ### Default route (empty `runner`)
 
-The `runner` inputs of `closing-syntax-check.yml`, `code-review.yml`,
-`docs-governance.yml`, `node-library.yml`, `python-data.yml` and
-`reusable-node-ci.yml`, and `apple.yml`'s `lint-runner`, default to the empty
+The `runner` inputs of `docs-governance.yml`, `node-library.yml`,
+`python-data.yml`, `red-main-listener.yml` and `flake-digest.yml`, and
+`apple.yml`'s `lint-runner`, default to the empty
 string (row 18 Q3, Logan 2026-09-18, "Flip the default (Recommended)"). Every
 `runs-on:` resolves the **effective route** as:
 
@@ -266,18 +270,13 @@ checkout, then copy the returned `runsOn` object verbatim. Every workflow file
 in this repo repeats this rule in a loud top-of-file comment; don't rely on
 this README alone when adding the next one.
 
-`reusable-node-ci.yml`'s existing `runner` input is a **plain string only**
-(no `fromJSON` on the caller's value) — it predates this convention. Don't pass
-a JSON-encoded value to it; it isn't decoded. Its empty default follows the same
-visibility-gated route as above.
-
 ### Blacksmith overflow (`BLACKSMITH_RUNNERS_ENABLED`)
 
 D-CI-CAP-1 (c) (2026-09-07, extends D-BLACKSMITH-2; company-hq `DECISIONS.md`,
 fleet#337) makes Blacksmith a kill-switched overflow for the `linux-ci`
 class's ordinary private CI. Every `runs-on: ${{ fromJSON(inputs.runner) }}`
-site in `nuxt-cloudflare.yml`, `node-library.yml`, `docs-governance.yml`,
-`python-data.yml`, `closing-syntax-check.yml`, and `code-review.yml`
+site in `nuxt-cloudflare.yml`, `node-library.yml`, `docs-governance.yml`, and
+`python-data.yml`
 (16 sites, none of them a deploy-credentialed job — `nuxt-cloudflare.yml`'s
 only deploy-shaped job, `deploy-dry-run`, runs `wrangler deploy --dry-run`
 with zero Cloudflare secrets in scope) resolves as:
@@ -579,7 +578,7 @@ Which gates each callable exposes this way:
 | `reusable-browser-tests.yml` | `run-webkit` (`webkit`) | `validate`, `chromium`, `report` |
 | `node-library.yml` | `run-lint`, `run-typecheck`, `run-tests`, `run-build` | `package` |
 | `reusable-weekly-drift-check.yml` | all three jobs | — |
-| `docs-governance.yml`, `reusable-node-ci.yml` | — | the single job |
+| `docs-governance.yml` | — | the single job |
 
 **The "always runs" column is deliberate and is not a gap to be closed.** Those
 jobs are the ones the required check actually certifies. Giving them a path
@@ -1715,130 +1714,33 @@ caller search found no live consumer (`workflows#20`, Actions-optimization
 audit). `narduk-template-smoke-app` is disabled and documentation references
 were not runtime callers.
 
-### Generic Node CI
+### Generic Node CI (retired 2026-09-24)
 
-```yaml
-jobs:
-  ci:
-    uses: narduk-enterprises/workflows/.github/workflows/reusable-node-ci.yml@<sha-of-v2> # v2
-    with:
-      node-version: "22"
-      run-lint: true
-      run-tests: true
-      require-scripts: true
-    secrets:
-      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-```
+`reusable-node-ci.yml` was removed in narduk-reboot P3-C2 / O-D8: a fresh
+organization-wide code search across `narduk-enterprises`,
+`narduk-incubator`, and `narduk-enterprises-clients` (2026-09-24, `gh search
+code` / `gh api search/code`, restricted to `path:.github/workflows`) found
+**zero** live callers — the same result the 2026-07-27 search recorded when
+`node-library.yml` shipped as its richer, preferred replacement (workflows#14,
+workflows#16). `node-library.yml` is a strict superset for `library`/`cli`
+surfaces: the `Required` aggregator job and the optional `package-matrix`
+input (see "The `ci / Required` convention" above) plus a `runner` input that
+accepts the JSON array/object form, not only a plain string. New callers use
+`node-library.yml`; there is no migration to perform because there was no
+live caller to migrate.
 
-Notes:
+## Historical advisory code review (retired 2026-09-19, file deleted 2026-09-24)
 
-- Secrets are optional for public-only dependencies; private package installs fail early when no
-  token is passed, so public/forked callers still run.
-- Every enabled lint/typecheck/test/build lane probes for its package script
-  before running it. Missing scripts fail by default. A caller with no such
-  lane disables the matching `run-*` input; `require-scripts: false` is only
-  an explicit temporary remediation opt-out and emits a visible warning.
-- **Public repos must never pass a self-hosted `runner`/label** (fork PRs
-  would run attacker code on estate infrastructure) — see "Runner routing"
-  above.
-
-## Historical advisory code review (retired 2026-09-19)
-
-`code-review.yml` is retained as a compatibility and provenance surface, not a
-current route. It is worth understanding why it was built: **it is not a CI
-gate.** Every other
-callable here exists to produce `ci / Required`. This one produces nothing a
-branch ruleset can require, has no `Required` job, and cannot fail your build.
-It asked the estate's ephemeral agent pool for one read-only review of a pull
-request head. The pool is retired, its allowlist is empty, and no current
-workflow should adopt this callable; current adoption uses `cursor-review.yml`.
-
-That framing is load-bearing. A review request that can redden CI turns an
-optional quality aid into an outage every time the pool is busy, the dispatch
-token rotates, or the network hiccups. So every refusal path exits SUCCESS with
-a `::notice::` naming which one fired:
-
-| Condition | Result |
-|---|---|
-| `enabled` not passed (the default) | job skipped, nothing dispatched |
-| PR carries the `no-ai-review` label | `review skipped: opted out` |
-| PR head is a fork | `review skipped: ... head is a fork` |
-| `AGENT_REVIEW_DISPATCH_TOKEN` not available | `review skipped: ... not available` |
-| the dispatch call fails or returns non-204 | `::warning::`, job still green |
-| the retired pool is unavailable | historical behavior: nothing queues, nothing retries |
-
-### Consuming it
-
-```yaml
-  code-review:
-    uses: narduk-enterprises/workflows/.github/workflows/code-review.yml@<sha-of-v2> # v2
-    with:
-      enabled: true
-      review-tier: cheapest-capable
-      runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
-    secrets:
-      AGENT_REVIEW_DISPATCH_TOKEN: ${{ secrets.AGENT_REVIEW_DISPATCH_TOKEN }}
-```
-
-Call it as a job **beside** your `ci` job, never inside its `needs:` chain —
-putting it upstream of `Required` would reintroduce exactly the coupling the
-advisory design removes.
-
-Adding `enabled: true` is not sufficient on its own: the receiving repository
-keeps a closed allowlist (`Config/agent-review-repos.json` in
-`agent-infrastructure`) and refuses a dispatch from anything absent from it.
-Enabling a new repo is therefore two one-line changes in two repositories, on
-purpose — one caller-side opt-in and one estate-side admission.
-
-### What the reviewer can and cannot do
-
-The container holds a read-only clone and a `contents: read` token. It cannot
-push, cannot approve, cannot dismiss a review, and cannot reach the pull
-requests API. Its whole output is one comment. Findings are required to name a
-`file:line` the reviewer actually opened, and PR content is treated as
-untrusted data rather than as instructions — the brief that says so lives in
-`agent-infrastructure` at
-`skills/proxmox-agent-execution/references/agent-review-brief.md`, so tuning the
-reviewer is a docs pull request there rather than a change here.
-
-Refs `narduk-enterprises/agent-infrastructure#333` (D-AGENT-POOL-1).
-
-## Relationship between `node-library.yml` and `reusable-node-ci.yml`
-
-`reusable-node-ci.yml` already does the core of this — script-probed
-lint/typecheck/test/build, pnpm or npm — and a GitHub code search across
-`narduk-enterprises`, `narduk-incubator`, `narduk-enterprises-clients`, and
-`loganrenz` (2026-07-27, `reusable-node-ci`)
-found **zero** repos currently calling it. So `node-library.yml` did not
-migrate a live caller — it was additive — and hardening this compatibility
-surface does not disrupt a current consumer.
-
-`node-library.yml` is `reusable-node-ci.yml` plus two things `reusable-node-ci.yml`
-doesn't have:
-
-1. **The `Required` aggregator job**, generalizing narduk-libs' `package-gates`
-   → `verify` pattern (see "The `ci / Required` convention" above).
-2. **An optional `package-matrix` input**, generalizing narduk-libs'
-   per-package matrix so a pnpm/npm workspace monorepo gets one parallel lane
-   per package instead of one whole-repo job. The default is a single
-   whole-repo lane, so `narduk-charts` / `narduk-skills` / `narduk-eslint-config`
-   (none of which are monorepos) can ignore this input entirely and get the
-   same shape `reusable-node-ci.yml` already provides them.
-
-It also upgrades the `runner` input to accept the JSON array/object form (see
-"Runner routing" above) — a deliberate divergence from `reusable-node-ci.yml`'s
-plain-string-only `runner` input, called out explicitly rather than changing
-that file's existing behavior underneath any (currently nonexistent) caller.
-
-**Which one to adopt:** new callers should use `node-library.yml` — it is a
-strict superset of what `reusable-node-ci.yml` offers for the `library`/`cli`
-surfaces, and it's the workflow that produces the `ci / Required` check
-context this proposal exists to standardize. `reusable-node-ci.yml` stays
-published for compatibility since removing a public reusable workflow is a
-breaking change regardless of live-caller count; it is not deprecated by this
-PR, but it is not the recommended surface for new adoption either. Migrating
-it fully (or formally deprecating it) is a follow-up decision for Logan, not
-executed here.
+`code-review.yml` asked the estate's now-retired ephemeral agent pool for one
+read-only review of a pull request head, via a `repository_dispatch` at
+`agent-infrastructure`; it was never a CI gate and had no `Required` job. The
+pool was retired 2026-09-19 with an empty allowlist, and adoption moved to
+`cursor-review.yml` (Refs `narduk-enterprises/agent-infrastructure#333`,
+D-AGENT-POOL-1). A 2026-09-24 re-verify (`gh search code` / `gh api
+search/code` across narduk-enterprises, narduk-incubator and
+narduk-enterprises-clients) found zero live pool adopters, matching the state
+this section already described, so the file was deleted in narduk-reboot
+P3-C2 / O-D8 rather than kept as a dead compatibility surface.
 
 ## Versioning policy
 
@@ -2051,7 +1953,6 @@ unmeasured. Do not read the numbers above onto them:
 |---|---|---|---|
 | `nuxt-cloudflare.yml` | `E2E`, `E2E plan`, `E2E report` | 30 / 5 / 15 | **never executed on any adopter.** hydrogen and software-delivery set `run-e2e: false`; marketing-web and vtraceroute leave it at the default. 35 skipped instances, 0 runs |
 | `python-data.yml` | `lint` | 10 | narduk-data leaves `run-ruff` false — skipped in every run |
-| `reusable-node-ci.yml` | `ci` | 20 | **zero adopters, estate-wide.** Nothing has ever run it |
 
 **Nothing was changed as a result.** Every measured timeout sits between 6.2×
 and 76× its observed p95, so none is close to producing a false red. The one job

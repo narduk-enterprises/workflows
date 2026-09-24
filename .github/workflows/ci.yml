@@ -163,21 +163,29 @@ jobs:
       - name: Python static-analysis gate tests
         run: python3 scripts/test_python_static_gate.py
 
-      # Extracts the embedded checker and the two shipped run: blocks out of
-      # closing-syntax-check.yml and executes them against a real temp git
-      # repo, proving the vendored copy actually gates a PR body AND a
-      # commit-message closing keyword (agent-infrastructure#837, #1085).
-      - name: PR closing-syntax callable behaviour tests
-        run: python3 scripts/test_closing_syntax_check.py
+      # `closing-syntax-check.yml` and `code-review.yml` were deleted in
+      # narduk-reboot P3-C2 / O-D8: both had zero live callers/adopters,
+      # re-verified live via `gh search code` and `gh api search/code` across
+      # narduk-enterprises, narduk-incubator and narduk-enterprises-clients
+      # (2026-09-24), matching what README's Adopters table already said.
+      # Their dedicated test files (`test_closing_syntax_check.py`,
+      # `test_code_review_callable.py`) were deleted with them rather than
+      # kept green against files that no longer exist.
 
-      # code-review.yml is the only callable here that must NEVER fail a
-      # caller, and "never fails" is the property that rots silently: a
-      # `set -e` refactor or a stray `exit 1` in a refusal branch turns an
-      # advisory review into a merge blocker on the day the pool is down.
-      # This executes the shipped step against every refusal path with a stub
-      # curl, and re-checks the default-off no-op that makes moving `v1` safe.
-      - name: Advisory review callable fail-open tests
-        run: python3 scripts/test_code_review_callable.py
+      # Extracts the "Reconcile the red-main issue" step out of
+      # red-main-listener.yml and executes it against a fake `gh`-backed
+      # issue store: open-on-failure, no duplicate on a second failure,
+      # close-on-success, no-op when nothing is open, and zero API calls for
+      # a conclusion that is not a verdict (narduk-reboot P3-C2 / O-D8).
+      - name: Red-main listener behaviour tests
+        run: python3 scripts/test_red_main_listener.py
+
+      # Same discipline for flake-digest.yml: only quarantine-pattern jobs
+      # count, a second run in the same ISO week updates rather than
+      # duplicates the digest issue, and a zero-failure week still files one
+      # (narduk-reboot P3-C2).
+      - name: Weekly flake digest behaviour tests
+        run: python3 scripts/test_flake_digest.py
 
       # The reviewer launcher's suite was never wired in here. It shipped
       # 2026-09-20 with 98 tests -- the four spend limits, the daily-cap

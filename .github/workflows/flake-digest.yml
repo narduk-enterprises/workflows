@@ -1,0 +1,211 @@
+name: Reusable Weekly Flake Digest
+
+# narduk-reboot P3-C2 (PLAN.md row P3-C2; evidence/O-velocity/O-velocity.md
+# §3.5: "Quarantine-lane failures go to a weekly flake digest, not to
+# `red-main`"). A quarantine lane (nuxt-cloudflare.yml's `e2e-quarantine`
+# job, README "A non-blocking quarantine lane") is deliberately
+# `continue-on-error` and never gates `main` -- that is the whole point of
+# quarantining a flaky test -- but a lane nobody ever reads is not a
+# quarantine, it is a test that silently stopped running. This callable
+# scans a caller's own completed runs of one workflow over a trailing
+# window, counts how often the jobs matching `quarantine-job-pattern`
+# failed, and files (or refreshes) ONE digest issue per ISO week.
+#
+# This is advisory in effect -- it never blocks a merge and never opens a
+# `red-main` issue (that stays red-main-listener.yml's job, scoped to a
+# workflow's own conclusion, not a non-gating job inside it) -- but it is
+# fail-closed like any other job: a `gh`/`gh api` error exits 1 and turns
+# this job red. A caller that colocates it with other required work should
+# expect a transient GitHub API failure to fail the job, same as any other
+# `gh`-calling step.
+#
+# ADOPTION. A caller supplies its own weekly `schedule` trigger (plus
+# `workflow_dispatch` for a manual run) and calls this reusable workflow:
+#
+#   on:
+#     schedule:
+#       - cron: '17 13 * * 1'   # every Monday, off the hour
+#     workflow_dispatch:
+#   jobs:
+#     flake-digest:
+#       uses: narduk-enterprises/workflows/.github/workflows/flake-digest.yml@<sha> # v1
+#       permissions:
+#         contents: read
+#         issues: write
+#         actions: read   # `gh run list` / `gh run view` on a private repo need this
+#       with:
+#         workflow-name: CI
+#         quarantine-job-pattern: quarantine
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      workflow-name:
+        description: >-
+          The caller's own CI workflow name (or filename) to scan, exactly as
+          `gh run list --workflow` accepts -- e.g. "CI" or "ci.yml".
+        required: true
+        type: string
+      quarantine-job-pattern:
+        description: >-
+          Case-insensitive substring matched against each run's job names.
+          Only matching jobs count toward the digest. The default matches
+          nuxt-cloudflare.yml's `e2e-quarantine` job; a caller with a
+          differently-named non-gating lane overrides this.
+        required: false
+        type: string
+        default: "quarantine"
+      days:
+        description: "Trailing window, in days, of runs to scan."
+        required: false
+        type: number
+        default: 7
+      label:
+        description: "Issue label for the digest."
+        required: false
+        type: string
+        default: "flake-digest"
+      max-failures-listed:
+        description: "Most individual failing job runs listed in the issue body before it switches to a count."
+        required: false
+        type: number
+        default: 20
+      runner:
+        description: >-
+          JSON-encoded runner for this job: a plain string ("ubuntu-latest"),
+          a JSON array, or a JSON object matching the runner-fleet manifest's
+          `runsOn` shape. Decoded with fromJSON(). Empty (the default) routes
+          a PRIVATE caller to the fleet manifest's linux-ci organization-group
+          route and a public or visibility-unknown caller to GitHub-hosted
+          ubuntu-latest; an explicit value always wins. A PUBLIC (or
+          possibly-future-public) CALLER MUST NEVER PASS A SELF-HOSTED LABEL.
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  digest:
+    name: digest
+    runs-on: ${{ fromJSON(inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    concurrency:
+      group: flake-digest-${{ github.repository }}-${{ inputs.workflow-name }}
+      cancel-in-progress: false
+    steps:
+      - name: Build and file the weekly flake digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_NAME: ${{ inputs.workflow-name }}
+          QUARANTINE_PATTERN: ${{ inputs.quarantine-job-pattern }}
+          DAYS: ${{ inputs.days }}
+          LABEL: ${{ inputs.label }}
+          MAX_FAILURES_LISTED: ${{ inputs.max-failures-listed }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from datetime import datetime, timedelta, timezone
+
+          repo = os.environ["REPO"]
+          workflow = os.environ["WORKFLOW_NAME"]
+          pattern = os.environ["QUARANTINE_PATTERN"].casefold()
+          days = int(os.environ["DAYS"])
+          label = os.environ["LABEL"]
+          max_listed = int(os.environ["MAX_FAILURES_LISTED"])
+
+          def gh(args):
+              result = subprocess.run(["gh"] + args, capture_output=True, text=True)
+              if result.returncode != 0:
+                  print(f"::error::gh {args} failed: {result.stderr.strip()}")
+                  sys.exit(1)
+              return result.stdout
+
+          since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+          runs = json.loads(gh([
+              "run", "list", "--repo", repo, "--workflow", workflow,
+              "--created", f">={since}", "--status", "completed",
+              "--json", "databaseId,conclusion,headBranch,createdAt,url",
+              "--limit", "200",
+          ]))
+
+          total = 0
+          failed = []
+          for run in runs:
+              jobs = json.loads(gh([
+                  "run", "view", str(run["databaseId"]), "--repo", repo, "--json", "jobs",
+              ]))["jobs"]
+              for job in jobs:
+                  if pattern not in job.get("name", "").casefold():
+                      continue
+                  total += 1
+                  conclusion = job.get("conclusion")
+                  if conclusion not in ("success", "skipped", None):
+                      failed.append({"run_url": run["url"], "job": job["name"], "conclusion": conclusion})
+
+          now = datetime.now(timezone.utc)
+          iso_year, iso_week, _ = now.isocalendar()
+          week = f"{iso_year}-W{iso_week:02d}"
+          title = f"Flake digest: {week} ({workflow})"
+          now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          lines = [
+              f"Weekly flake digest for **{workflow}** on `{repo}`, jobs matching "
+              f"`{pattern}` (the quarantine lane), last {days} day(s).",
+              "",
+              f"- Quarantine job runs scanned: {total}",
+              f"- Failed: {len(failed)}",
+              "",
+          ]
+          if failed:
+              lines.append("Failures:")
+              for item in failed[:max_listed]:
+                  lines.append(f"- [{item['job']}]({item['run_url']}): {item['conclusion']}")
+              if len(failed) > max_listed:
+                  lines.append(f"- … and {len(failed) - max_listed} more")
+          else:
+              lines.append("No quarantine-lane failures this week.")
+          lines += [
+              "",
+              "This is advisory: a quarantine-lane failure never gates `main` and "
+              "never opens a `red-main` issue (narduk-reboot O-D8 / O §3.5).",
+              "",
+              "```json",
+              json.dumps({
+                  "schema": "flake-digest.v1", "repo": repo, "workflow": workflow,
+                  "week": week, "scanned": total, "failed": len(failed),
+                  "generated_at": now_str,
+              }),
+              "```",
+          ]
+          body = "\n".join(lines)
+
+          listing = json.loads(gh([
+              "api", f"repos/{repo}/issues", "-X", "GET",
+              "-f", f"labels={label}", "-f", "state=all", "-f", "per_page=100",
+          ]))
+          existing = next(
+              (i for i in listing if "pull_request" not in i and i.get("title") == title),
+              None,
+          )
+          if existing:
+              gh(["api", f"repos/{repo}/issues/{existing['number']}", "-X", "PATCH", "-f", f"body={body}"])
+              print(f"updated flake digest issue #{existing['number']} ({week})")
+          else:
+              created = json.loads(gh([
+                  "api", f"repos/{repo}/issues",
+                  "-f", f"title={title}",
+                  "-f", f"body={body}",
+                  "-f", f"labels[]={label}",
+              ]))
+              print(f"opened flake digest issue #{created['number']} ({week})")
+          PY

@@ -314,7 +314,7 @@ def registry_auth_behavior() -> None:
     """Execute shipped auth setup: missing auth is distinct from public deps."""
     sentinel = "fixture-package-read-credential"
     node_dir = str(Path(subprocess.check_output(["node", "-p", "process.execPath"], text=True, timeout=15).strip()).parent)
-    for workflow in ("nuxt-cloudflare.yml", "node-library.yml", "reusable-node-ci.yml", "reusable-browser-tests.yml"):
+    for workflow in ("nuxt-cloudflare.yml", "node-library.yml", "reusable-browser-tests.yml"):
         document = yaml.safe_load((Path(".github/workflows") / workflow).read_text())
         scripts = validate_registry_mapping(document, workflow)
         script = scripts.pop()

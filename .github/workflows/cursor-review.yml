@@ -55,6 +55,35 @@ name: Reusable Cursor Review
 # `cursor-review-telemetry {...}` JSON line per run, because the Cursor API
 # exposes no token counts and the 2026-09-20 analysis had to model them.
 #
+# NO-PUSH PATHS (narduk-reboot wave 4, P3-C2 fix round). A wave-2 lane
+# merged narduk-libs#830, and the reviewer used the writable branch that
+# launch gave it to push a test-loosening "autofix" commit (b73f49) onto
+# narduk-libs#837 -- a SECURITY fix PR -- which then shipped. The brief's own
+# "do not push" HARD RULE existed the whole time (7cf053b) and did not stop
+# it: a prompt is not a control once untrusted diff/comment content is in
+# play. cursor_review.py's `is_no_push_sensitive()` names the diffs where
+# that risk is unacceptable -- `.github/workflows/**`, `.github/actions/**`,
+# any test file (`**/*.test.*`, `test_*.py`, `**/*.spec.*`, `**/*_test.go`,
+# `**/*Tests.swift`), `scripts/ci-runner-routing*`, or a T2-sensitive path
+# (auth, session, payments, the credential table) -- and `launch()` asks
+# Cursor for `workOnCurrentBranch: False` on those diffs.
+#
+# THIS IS A DEFAULT-PATH REDIRECT, NOT A PROVEN CREDENTIAL BOUNDARY (round-4
+# re-verify MEDIUM finding: this comment previously overstated it as one).
+# Nothing live confirms Cursor's Cloud Agents API actually refuses a push to
+# the PR's own head ref when `workOnCurrentBranch` is `False` -- no estate
+# doc describes that field's semantics, and the reviewer keeps its
+# repo-scoped GitHub App write access regardless of this field's value, so a
+# model that ignores its brief can still attempt a push directly against the
+# GitHub remote. The second, independent layer is in `post_review()`:
+# `reviewer_pushed_commits()` inspects any commit that lands on the PR while
+# a round is in flight and fails the job loudly (not a quiet supersede) the
+# moment one is authored by the reviewer's own GitHub identity -- the exact
+# b73f49 shape -- regardless of what `workOnCurrentBranch` did or did not do.
+# The reviewer may still read, run checks, and post its findings as a
+# comment/review exactly as before on every one of these diffs; only a
+# write back onto THIS pull request's branch is targeted.
+#
 # SKIPS exit 0 with a `::notice::`: no pull request on this event, a draft PR,
 # the `no-ai-review` label, a FORK head (same-repo heads only: a fork must not
 # steer estate Cursor capacity, and a public caller's fork PR has no secret
@@ -82,7 +111,9 @@ name: Reusable Cursor Review
 # Use:
 #   cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1","review-deep"]'), github.event.label.name)))) && 'review' || 'other' }}
 #
-# RUNNER ROUTING: same shape as code-review.yml. The default resolves from the
+# RUNNER ROUTING: the same shape flake-digest.yml and red-main-listener.yml
+# use (code-review.yml, which used to set this pattern, was retired
+# 2026-09-24 -- narduk-reboot P3-C2 / O-D8). The default resolves from the
 # caller's own visibility: a PRIVATE caller lands on the fleet manifest's
 # linux-ci organization-group route, anything else on GitHub-hosted
 # ubuntu-latest. The job is a near-idle poller (30-second GET every cycle), so
