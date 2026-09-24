@@ -563,6 +563,67 @@ def test_fast_scripts_step() -> None:
     print("PASS  fast scripts run in order with FAST_BASE_REF on PRs; a missing script fails")
 
 
+def test_fast_escalation_is_published_on_the_check_named_fast() -> None:
+    """The check name stays Fast. Escalation is a job output, a summary line,
+    and the check run's output title and summary. Both jobs that can hold the
+    name run the same script and request checks: write."""
+    for job in ("fast", "fast-escalated"):
+        assert JOBS[job]["outputs"]["escalated"] == "${{ steps.escalation.outputs.escalated }}"
+        assert JOBS[job]["permissions"]["checks"] == "write"
+        publish = step(job, "Publish Fast escalation")
+        assert publish["id"] == "escalation"
+        assert publish["if"] == "success()"
+        assert "name" not in publish["run"] or "name` is omitted" in publish["run"]
+    assert step("fast", "Publish Fast escalation")["run"] == step("fast-escalated", "Publish Fast escalation")["run"]
+    # The name expressions are unchanged: escalation moves the name, it does not add one.
+    assert "|| 'Fast'" in JOBS["fast"]["name"]
+    assert "&& 'Fast' ||" in JOBS["fast-escalated"]["name"]
+    script = step("fast", "Publish Fast escalation")["run"]
+    assert '"name"' not in script  # the patch body must not rename the check
+    cases = [("true", "Fast escalated", "escalated: true"), ("false", "Fast", "escalated: false")]
+    for escalated, title, first_line in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bindir = root / "bin"
+            bindir.mkdir()
+            args = root / "args"
+            body = root / "body"
+            stub = bindir / "gh"
+            stub.write_text(
+                "#!/bin/bash\nset -euo pipefail\n"
+                f'printf "%s\\n" "$@" > {json.dumps(str(args))}\n'
+                f'cat > {json.dumps(str(body))}\n'
+            )
+            stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+            output = root / "out"
+            summary = root / "summary"
+            env = {
+                "PATH": f"{bindir}:/usr/bin:/bin",
+                "ESCALATED": escalated,
+                "CHECK_RUN_ID": "107725045234",
+                "GITHUB_REPOSITORY": "narduk-enterprises/example",
+                "GITHUB_OUTPUT": str(output),
+                "GITHUB_STEP_SUMMARY": str(summary),
+                "GH_TOKEN": "fake",
+            }
+            result = run_bash(script, env)
+            assert result.returncode == 0, (escalated, result.stdout, result.stderr)
+            assert output.read_text().strip() == f"escalated={escalated}"
+            assert summary.read_text().splitlines()[2] == first_line
+            recorded = args.read_text().splitlines()
+            assert "--method" in recorded and "PATCH" in recorded
+            assert "repos/narduk-enterprises/example/check-runs/107725045234" in recorded
+            payload = json.loads(body.read_text())
+            assert set(payload) == {"output"}
+            assert payload["output"]["title"] == title
+            assert payload["output"]["summary"].splitlines()[0] == first_line
+            assert "name" not in payload
+    refused = run_bash(script, {"ESCALATED": "true", "CHECK_RUN_ID": "not-a-number",
+                                "GITHUB_REPOSITORY": "narduk-enterprises/example", "GH_TOKEN": "fake"})
+    assert refused.returncode == 1 and "not numeric" in refused.stdout
+    print("PASS  Fast publishes escalated on the job output, the step summary and the check-run title/summary")
+
+
 def test_escalation_fails_closed_on_unknown_plan() -> None:
     script = step("fast", "Resolve protected-path escalation")["run"]
     ok = {"RUN_E2E": "true", "FULL_PATHS": "src/auth/**", "E2E_PLAN_RESULT": "success", "ESCALATED": "false"}
@@ -798,6 +859,7 @@ def main() -> None:
     test_fast_naming_never_skips_a_fast_check()
     test_fast_escalated_reuses_the_required_gate()
     test_fast_scripts_step()
+    test_fast_escalation_is_published_on_the_check_named_fast()
     test_escalation_fails_closed_on_unknown_plan()
     test_required_reuse_lookup()
     test_e2e_proof_key_ignores_default_fast_path_inputs()

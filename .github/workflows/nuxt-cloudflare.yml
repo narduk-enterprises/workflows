@@ -515,6 +515,8 @@ on:
           absent. Defaults to documentation and repository metadata; an
           explicitly empty value disables path skipping. Unknown or incomplete
           diffs run E2E. Manual, scheduled and merge-group runs never skip.
+          Globs match case-insensitively, the same way as `e2e-full-paths`:
+          `*.md` matches `README.MD` and `*auth*` matches `useAuth.ts`.
         required: false
         type: string
         default: "*.md docs/**/*.md apps/*/README.md packages/*/README.md **/AGENTS.md **/CLAUDE.md LICENSE LICENSE.txt .github/ISSUE_TEMPLATE/** .github/PULL_REQUEST_TEMPLATE.md .github/pull_request_template.md .github/CODEOWNERS"
@@ -542,7 +544,10 @@ on:
           determined (no `gh`, a failed compare, the 300-file compare cap),
           a caller that set this input gets the full suite. Empty (the
           default) leaves the tiers exactly as they were. Pushes use the full
-          configuration whenever E2E is selected.
+          configuration whenever E2E is selected. Globs match
+          case-insensitively, the same way as `e2e-skip-paths`, so `*auth*`
+          matches `useAuth.ts`, `AuthPanel.vue` and `OAuthCallback.ts`, and
+          `*session*` matches `useSession.ts`.
         required: false
         type: string
         default: ""
@@ -741,7 +746,15 @@ on:
           `run-e2e: true`, because `E2E plan` makes the decision: with
           `e2e-full-paths` set and `run-e2e: false` the job fails closed
           rather than pass protected paths on lint/unit alone. With
-          `e2e-full-paths` empty nothing escalates.
+          `e2e-full-paths` empty nothing escalates. The job that reports as
+          `Fast` publishes whether this run escalated: job output `escalated`
+          (`true` or `false`), a step-summary line `escalated: true|false`,
+          and the check run output title (`Fast escalated` or `Fast`) plus
+          the same first line in the check run output summary. The check
+          name stays `Fast` either way, so the required context `ci / Fast`
+          does not change. `true` means a protected path matched and a run
+          over 180s is the full gate; `false` is a plain Fast run. Publishing
+          the check run output needs `checks: write` on the caller's `ci` job.
         required: false
         type: string
         default: ""
@@ -2447,11 +2460,14 @@ jobs:
             echo "::warning::changed-file list hit the compare API's 300-file cap (silently truncated); running the full suite"
             exit 0
           fi
-          # Pure bash + grep -E glob matcher: no toolchain to provision.
+          # Pure bash + grep -iE glob matcher: no toolchain to provision.
           # '**' crosses '/', a lone '*' does not; everything else is
-          # literal. Self-hosted `linux-ci` capacity has no ambient `node`
-          # (this job deliberately never calls setup-node to stay fast and
-          # install nothing), so the matcher must not depend on it.
+          # literal. Matching is case-insensitive for both lists, so
+          # `*auth*` matches useAuth.ts, AuthPanel.vue and OAuthCallback.ts.
+          # LC_ALL=C keeps the fold ASCII-only. Self-hosted `linux-ci`
+          # capacity has no ambient `node` (this job deliberately never
+          # calls setup-node to stay fast and install nothing), so the
+          # matcher must not depend on it.
           glob_to_regex() {
             local pattern="$1" out="^" i=0 n c nextc
             local special='.+^(){}[]|$'
@@ -2493,7 +2509,7 @@ jobs:
             file_matched=false
             for pattern in $SKIP_PATTERNS; do
               regex=$(glob_to_regex "$pattern")
-              if printf '%s' "$file" | grep -Eq -- "$regex"; then
+              if printf '%s' "$file" | LC_ALL=C grep -iEq -- "$regex"; then
                 file_matched=true
                 break
               fi
@@ -2504,7 +2520,7 @@ jobs:
             fi
             for pattern in $FULL_PATTERNS; do
               regex=$(glob_to_regex "$pattern")
-              if printf '%s' "$file" | grep -Eq -- "$regex"; then
+              if printf '%s' "$file" | LC_ALL=C grep -iEq -- "$regex"; then
                 full=true
                 full_list="${full_list}- ${bq}${file}${bq}\n"
                 break
@@ -4426,10 +4442,18 @@ jobs:
   # evaluating skipped names. scripts/test_fast_path.py checks both. `always()`
   # rather than `!cancelled()` for the same reason: a cancelled run must not
   # turn this job into a skipped, and therefore passing, `Fast`.
+  #
+  # The check NAME stays `Fast` when this run escalates too: the name moves
+  # onto `fast-escalated`, and that job publishes the same `escalated` output,
+  # step-summary line and check-run title/summary. T1 readiness tells a full
+  # gate (allowed over 180s) from a slow plain Fast run by reading those, not
+  # by a second check name.
   fast:
     name: ${{ !(inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && 'Fast (not run)' || ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true') && 'Fast lanes (escalated)' || 'Fast' }}
     needs: [reuse-plan, e2e-plan]
     if: always() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'
+    outputs:
+      escalated: ${{ steps.escalation.outputs.escalated }}
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
@@ -4437,6 +4461,11 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # Writes this job's own check-run output (title and summary) so T1
+      # readiness can see `escalated`. A called job may only request a
+      # permission its caller granted; every adopter must add `checks: write`
+      # before the moving tag advances (workflows#59).
+      checks: write
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -4468,6 +4497,73 @@ jobs:
           else
             echo "No protected-path escalation: this job is ci / Fast."
           fi
+      # `if: success()` is the default. It is written out so the contract
+      # tests, which execute every unconditional `run:` step, do not call
+      # the checks API. The check name is not touched: only output title
+      # and summary change. `fast-escalated` runs this same script when it
+      # holds the name `Fast`.
+      - name: Publish Fast escalation
+        id: escalation
+        if: success()
+        working-directory: ${{ github.workspace }}
+        env:
+          ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
+          CHECK_RUN_ID: ${{ format('{0}', job.check_run_id) }}
+          GH_TOKEN: ${{ github.token }}
+        run: &fast_escalation_publish |
+          set -euo pipefail
+          case "${ESCALATED:-}" in
+            true) escalated=true ;;
+            false) escalated=false ;;
+            *)
+              echo "::error::ESCALATED must be true or false (got '${ESCALATED:-}')"
+              exit 1
+              ;;
+          esac
+          if [ -n "${GITHUB_OUTPUT:-}" ]; then
+            echo "escalated=${escalated}" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$escalated" = true ]; then
+            title="Fast escalated"
+            summary=$(printf '%s\n\n%s' "escalated: true" "A protected path matched e2e-full-paths. The check named Fast is the full gate, so a run over 180s is allowed.")
+          else
+            title="Fast"
+            summary=$(printf '%s\n\n%s' "escalated: false" "No protected path matched. The check named Fast is the plain lane and should finish within 180s.")
+          fi
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              printf '### Fast escalation\n\n'
+              printf '%s\n' "$summary"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if ! [[ "${CHECK_RUN_ID:-}" =~ ^[0-9]+$ ]]; then
+            echo "::error::job.check_run_id is missing or not numeric; cannot publish the Fast escalation flag"
+            exit 1
+          fi
+          if ! [[ "${GITHUB_REPOSITORY:-}" =~ ^[^/]+/[^/]+$ ]]; then
+            echo "::error::GITHUB_REPOSITORY must be owner/repo"
+            exit 1
+          fi
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::gh is required to publish the Fast escalation flag on the check run"
+            exit 1
+          fi
+          json_escape() {
+            local s=$1
+            s=${s//\\/\\\\}
+            s=${s//\"/\\\"}
+            s=${s//$'\n'/\\n}
+            s=${s//$'\r'/\\r}
+            printf '%s' "$s"
+          }
+          # `name` is omitted on purpose. Patching it would rename `ci / Fast`.
+          payload="{\"output\":{\"title\":\"$(json_escape "$title")\",\"summary\":\"$(json_escape "$summary")\"}}"
+          printf '%s' "$payload" | gh api --method PATCH \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --input - \
+            "repos/${GITHUB_REPOSITORY}/check-runs/${CHECK_RUN_ID}" >/dev/null
+          echo "check run output title: ${title}"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -5187,6 +5283,11 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
+      # Same check-run output write as `fast`. Required even though this job
+      # is usually skipped: GitHub checks the permission before the `if`.
+      checks: write
+    outputs:
+      escalated: ${{ steps.escalation.outputs.escalated }}
     steps:
       - name: Require the fast lanes to succeed
         env:
@@ -5197,4 +5298,12 @@ jobs:
             echo "::error::fast job reported '$FAST_RESULT' (must succeed)"
             exit 1
           fi
+      - name: Publish Fast escalation
+        id: escalation
+        if: success()
+        env:
+          ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
+          CHECK_RUN_ID: ${{ format('{0}', job.check_run_id) }}
+          GH_TOKEN: ${{ github.token }}
+        run: *fast_escalation_publish
       - *required_gate_step

@@ -130,7 +130,10 @@ CALLER_GRANTS: dict[str, set[str]] = {
     # Cloudflare's preview comment and updates the sticky one.
     # E2E proof reuse additionally requires actions: read; a new major /
     # explicit SHA adoption must migrate caller grants before use.
-    "nuxt-cloudflare.yml": {"contents", "packages", "pull-requests", "actions"},
+    # `checks` is the Fast escalation flag on the check run's own output
+    # (title and summary). Same workflows#59 rule: every adopter's `ci` job
+    # must grant `checks: write` before the moving tag advances.
+    "nuxt-cloudflare.yml": {"contents", "packages", "pull-requests", "actions", "checks"},
     "python-data.yml": {"contents"},
     "reusable-browser-tests.yml": {"contents", "packages", "actions"},
     # Opens, comments on and closes the per-repo `red-main` issue.

@@ -391,6 +391,47 @@ def _full_paths_cases() -> list:
                  full_patterns="server/database/**", files=["server/database/schema.ts"]),
             {"skipped": "false", "full": "true"},
         ),
+        (
+            "mixed-case useAuth.ts matches a lowercase auth glob",
+            dict(pr, skip_patterns="", full_patterns="**/*auth*.* **/*session*.*",
+                 files=["app/composables/useAuth.ts"]),
+            {"skipped": "false", "full": "true"},
+        ),
+        (
+            "AuthPanel.vue matches *auth*",
+            dict(pr, skip_patterns="", full_patterns="**/*auth*.*",
+                 files=["components/AuthPanel.vue"]),
+            {"skipped": "false", "full": "true"},
+        ),
+        (
+            "OAuthCallback.ts matches *auth*",
+            dict(pr, skip_patterns="", full_patterns="**/*auth*.*",
+                 files=["server/routes/OAuthCallback.ts"]),
+            {"skipped": "false", "full": "true"},
+        ),
+        (
+            "useSession.ts matches *session*",
+            dict(pr, skip_patterns="", full_patterns="**/*session*.*",
+                 files=["app/composables/useSession.ts"]),
+            {"skipped": "false", "full": "true"},
+        ),
+        (
+            "uppercase AUTH glob matches a lowercase path",
+            dict(pr, skip_patterns="", full_patterns="**/*AUTH*.*",
+                 files=["app/composables/useauth.ts"]),
+            {"skipped": "false", "full": "true"},
+        ),
+        (
+            "unrelated file does not match an auth glob",
+            dict(pr, skip_patterns="", full_patterns="**/*auth*.*",
+                 files=["app/pages/index.vue"]),
+            {"skipped": "false", "full": "false"},
+        ),
+        (
+            "oddly cased README.MD matches *.md and skips",
+            dict(pr, skip_patterns="*.md", full_patterns="", files=["README.MD"]),
+            {"skipped": "true", "full": "false"},
+        ),
     ]
 
 
@@ -496,6 +537,68 @@ def _check_failing_gh_degrades_safely() -> int:
         return 1
 
 
+def extract_glob_to_regex(script: str) -> str:
+    marker = "glob_to_regex() {"
+    start = script.index(marker)
+    depth = 0
+    for index, char in enumerate(script[start:], start):
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return script[start:index + 1]
+    raise AssertionError("glob_to_regex is unterminated")
+
+
+def check_glob_matcher_is_case_insensitive() -> None:
+    """The shipped function, applied the way the step applies it (grep -iE)."""
+    script = skip_step_script()
+    assert script.count("LC_ALL=C grep -iEq --") == 2, "both path lists must use the case-insensitive grep"
+    assert "grep -Eq --" not in script
+    pairs = [
+        ("**/*auth*.*", "app/composables/useAuth.ts", True),
+        ("**/*auth*.*", "components/AuthPanel.vue", True),
+        ("**/*auth*.*", "server/routes/OAuthCallback.ts", True),
+        ("**/*session*.*", "app/composables/useSession.ts", True),
+        ("**/*AUTH*.*", "app/composables/useauth.ts", True),
+        ("**/*auth*/**", "src/Auth/token.ts", True),
+        ("**/*auth*.*", "app/pages/index.vue", False),
+        ("*.md", "README.MD", True),
+        ("*.md", "README.md", True),
+        ("*.md", "docs/README.MD", False),
+        ("docs/**/*.md", "Docs/Guide.MD", True),
+        ("server/database/**", "server/database/schema.ts", True),
+    ]
+    body = extract_glob_to_regex(script) + """
+match() {
+  regex=$(glob_to_regex "$1")
+  if printf '%s' "$2" | LC_ALL=C grep -iEq -- "$regex"; then
+    printf match
+  else
+    printf miss
+  fi
+}
+match "$PATTERN" "$FILE"
+"""
+    failures = 0
+    for pattern, path, want in pairs:
+        result = subprocess.run(
+            ["bash", "-c", body],
+            capture_output=True,
+            text=True,
+            env={"PATTERN": pattern, "FILE": path, "PATH": "/usr/bin:/bin"},
+        )
+        got = result.stdout.strip() == "match"
+        if result.returncode != 0 or got is not want:
+            failures += 1
+            print(f"FAIL  glob {pattern!r} vs {path!r}: want {want} got {result.stdout!r} {result.stderr!r}")
+        else:
+            print(f"PASS  glob {pattern!r} vs {path!r} -> {want}")
+    if failures:
+        raise SystemExit(f"{failures} glob case(s) failed")
+
+
 def check_shard_list_empties_on_skip() -> None:
     script = plan_step_script()
     for skipped, expect in (("true", "shards=[]"), ("false", "shards=[1,2,3]")):
@@ -537,6 +640,7 @@ def main() -> None:
     check_input_declared()
     check_job_wiring()
     check_behavior()
+    check_glob_matcher_is_case_insensitive()
     check_shard_list_empties_on_skip()
     print("\ne2e-skip-paths contract passed")
 
