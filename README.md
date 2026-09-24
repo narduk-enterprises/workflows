@@ -1496,7 +1496,8 @@ The check name stays `Fast` in both cases, so the required context
 `ci / Fast` does not change. Whichever job holds that name publishes:
 
 - job output `escalated`, `true` or `false`
-- a step-summary line whose first line is `escalated: true` or `escalated: false`
+- a `### Fast escalation` step-summary section whose first line is
+  `escalated: true` or `escalated: false`
 - the check run output title `Fast escalated` or `Fast`, and the same first
   line in the check run output summary
 
