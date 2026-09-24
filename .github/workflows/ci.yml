@@ -233,6 +233,12 @@ jobs:
       - name: E2E proof reuse behavior tests
         run: python3 scripts/test_e2e_reuse.py
 
+      # nuxt-cloudflare.yml fast-path inputs (ci / Fast, Required reuse,
+      # --only-changed, journey smoke + rollback hook) and their default-off
+      # backward-compatibility contract.
+      - name: Fast-path contract tests
+        run: python3 scripts/test_fast_path.py
+
       - name: E2E report minimal-install tests
         run: python3 scripts/test_e2e_report_minimal_install.py
 
