@@ -1007,6 +1007,23 @@ class ClassRuleTests(unittest.TestCase):
                 self.assertTrue(self.launched(transport))
                 self.assertIn("class P0", posted_review(transport)["body"])
 
+    def test_t2_sensitive_paths_are_always_reviewed(self):
+        """narduk-reboot P3-C2 / O-D7: auth, session, payments and
+        credential-table paths always get a review, like ALWAYS_REVIEW_PREFIXES,
+        whatever the label, author or diff size."""
+        for path in (
+            "src/routes/auth/login.ts",
+            "lib/session/store.ts",
+            "app/payments/checkout.vue",
+            "Config/nvault-provider-credentials.json",
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 1, "deletions": 0}])
+                code, out = run(transport, PR_TITLE="chore: routine wording", PR_AUTHOR="dependabot[bot]")
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+                self.assertTrue(self.launched(transport))
+
     def test_policy_prose_is_p1_not_p0_so_the_spend_limits_apply(self):
         """The narrowing itself. These were P0 -- the class no cap may skip --
         which made the class rule inert in exactly the two repositories with

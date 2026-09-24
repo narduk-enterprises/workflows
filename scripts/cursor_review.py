@@ -95,6 +95,18 @@ ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/")
 # can invent an approval the human-approval citation gate would then honour,
 # and a `cursor_review_brief.md` edit is the reviewer editing its own brief.
 ALWAYS_REVIEW_NAMES = ("decisions.md", "cursor_review_brief.md")
+# T2-sensitive application code (narduk-reboot P3-C2, PLAN.md row P3-C2 /
+# O-D7): auth, session, payments and credential-table paths always get a
+# review, the same as ALWAYS_REVIEW_PREFIXES, regardless of label, author or
+# size. Matched as a case-insensitive substring anywhere in the path (not
+# just a prefix or basename) because these markers show up mid-path
+# (`src/routes/auth/`, `lib/session/store.ts`, `Config/nvault-provider-
+# credentials.json`) far more often than at a fixed position, and a narrower
+# match would be the same silent-dilution risk the 2026-09-20 P0 narrowing
+# above was written to avoid. Fail open toward reviewing, never toward
+# skipping: a false positive here costs one extra review, a false negative
+# skips a security-sensitive diff by default.
+T2_SENSITIVE_MARKERS = ("auth", "session", "payment", "credential")
 # Policy prose: NOT P0 any more (so the size gate, round cap, delta gate and
 # daily cap all apply to it), but explicitly NOT metadata either.
 #
@@ -627,6 +639,11 @@ def is_always_review(path: str) -> bool:
     return path.startswith(ALWAYS_REVIEW_PREFIXES) or path.rsplit("/", 1)[-1].casefold() in ALWAYS_REVIEW_NAMES
 
 
+def is_t2_sensitive(path: str) -> bool:
+    lowered = path.casefold()
+    return any(marker in lowered for marker in T2_SENSITIVE_MARKERS)
+
+
 def is_policy(path: str) -> bool:
     return path.startswith(POLICY_PREFIXES) or path.rsplit("/", 1)[-1].casefold() in POLICY_NAMES
 
@@ -773,7 +790,9 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
       P0  merge-blocking work: `.github/workflows/**`, `.github/actions/**`,
           `docs/agents/**`, a policy basename
           (`AGENTS.md`, `CLAUDE.md`, `CODEX.md`, `SKILL.md`, `DECISIONS.md`,
-          matched case-insensitively), or the `review-p0` label.
+          matched case-insensitively), a T2-sensitive path (auth, session,
+          payments or credential-table, narduk-reboot P3-C2 / O-D7), or the
+          `review-p0` label.
           Never deferred, so P0 is decided FIRST and outranks every P2 signal:
           dependabot bumping a pinned action inside `.github/workflows/`, or a
           `review-p2` label on a workflow change, still gets a review.
@@ -798,6 +817,12 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
     # pull request; an author name and a branch prefix are guesses.
     requested = review_request(env) is not None or "review-p1" in labels
     critical = [path for path in (paths or []) if is_always_review(path)]
+    # Policy prose (docs/agents/**, AGENTS.md, ...) that happens to mention
+    # "credential" or "session" in its own text -- docs/agents/credentials.md
+    # is the estate's actual example -- stays P1 like the rest of policy
+    # prose (is_policy already has its own deliberate P1 carve-out above);
+    # is_t2_sensitive is for application code paths, not docs about them.
+    t2 = [path for path in (paths or []) if is_t2_sensitive(path) and not is_policy(path)]
 
     # P0 before every skip. An automation author and a `review-p2` label are
     # both weaker evidence than the diff itself: dependabot bumping a pinned
@@ -808,6 +833,8 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
         return "P0", "label 'review-p0'"
     if critical:
         return "P0", f"touches {critical[0]}"
+    if t2:
+        return "P0", f"touches T2-sensitive path {t2[0]}"
     # UNKNOWN never means P2, and that has to hold for the author and head-ref
     # signals too, not only for the metadata one. A files-API failure, or a
     # diff past the page bound, hides whether `.github/workflows/ci.yml` is in

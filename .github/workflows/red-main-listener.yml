@@ -1,0 +1,279 @@
+name: Reusable Red-Main Listener
+
+# narduk-reboot P3-C2 / O-D8 (PLAN.md row P3-C2; O-D8 in
+# evidence/O-velocity/O-velocity.md §3.5/§4, "Auto-managed `red-main` issue +
+# board + SessionStart hook; 24h deploy guard; rollback only on production
+# smoke failure"). Opens or refreshes ONE issue per repository per listened
+# workflow, titled "main is red: <workflow-name>" and labelled `red-main`,
+# the first time that workflow's run on the default branch goes red; closes
+# it again on the next green run of the SAME workflow. This callable does
+# NOT file an automatic revert commit and does NOT roll anything back --
+# O-D8 keeps revert/rollback out of the notifier and inside the app's own
+# deploy tooling (narduk-app deploy rollback), triggered on a failed
+# post-deploy smoke, never here.
+#
+# ADOPTION. A caller listens with its own `on: workflow_run:` trigger against
+# its main-branch CI workflow(s) and passes the completed run straight
+# through. This repository's own `red-main-self.yml` is the reference
+# adopter:
+#
+#   on:
+#     workflow_run:
+#       workflows: ["CI"]
+#       types: [completed]
+#   jobs:
+#     red-main:
+#       if: github.event.workflow_run.head_branch == github.event.repository.default_branch
+#       uses: narduk-enterprises/workflows/.github/workflows/red-main-listener.yml@<sha> # v1
+#       permissions:
+#         contents: read
+#         issues: write
+#       with:
+#         workflow-name: ${{ github.event.workflow_run.name }}
+#         conclusion: ${{ github.event.workflow_run.conclusion }}
+#         run-id: ${{ github.event.workflow_run.id }}
+#         run-url: ${{ github.event.workflow_run.html_url }}
+#         head-sha: ${{ github.event.workflow_run.head_sha }}
+#
+# A DEVELOPMENT-MODE `development validate` run is the development-mode
+# equivalent of `main` CI (O §3.5) and routes here the same way, under
+# whatever `workflow-name` the caller gives that run.
+#
+# QUARANTINE STAYS OUT (O §3.5). A quarantine-only lane's red is not this
+# callable's concern -- route it to `flake-digest.yml` instead. Passing a
+# `workflow_run` conclusion that is `success` or `failure` for a workflow
+# whose ONLY content is a quarantine lane would be a caller-side mistake,
+# not something this callable can detect from the conclusion alone.
+#
+# PORTAL MIRROR HOOK POINT (mirroring the state itself is a different lane's
+# job, not this callable's). `portal-mirror-url` is OPTIONAL (R7): empty
+# (the default) is a pure no-op, so adopting this callable changes nothing
+# for a repo that has not been given a mirror endpoint. When set, this job
+# POSTs the same machine-readable JSON the issue body carries
+# (`schema: "red-main.v1"`) to that URL, with `PORTAL_MIRROR_TOKEN` as an
+# optional bearer credential. The POST is fail-open: a network error or a
+# non-2xx response is a `::warning::`, never a job failure, so a portal
+# outage cannot turn an advisory mirror into a red required check.
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      workflow-name:
+        description: >-
+          Display name for the listened workflow, used verbatim in the issue
+          title ("main is red: <workflow-name>") and the JSON payload. Pass
+          `github.event.workflow_run.name`.
+        required: true
+        type: string
+      conclusion:
+        description: >-
+          The completed run's conclusion. Pass
+          `github.event.workflow_run.conclusion`. `failure` opens or
+          refreshes the issue, `success` closes it, anything else
+          (`cancelled`, `skipped`, `timed_out`, `action_required`,
+          `neutral`, `stale`) is a no-op: none of those is a verdict on the
+          tree.
+        required: true
+        type: string
+      run-id:
+        description: "Pass `github.event.workflow_run.id`."
+        required: true
+        type: string
+      run-url:
+        description: "Pass `github.event.workflow_run.html_url`."
+        required: true
+        type: string
+      head-sha:
+        description: "Pass `github.event.workflow_run.head_sha`. Optional; only used in the issue body."
+        required: false
+        type: string
+        default: ""
+      label:
+        description: "Issue label. Change only for a caller that already owns `red-main` for something unrelated."
+        required: false
+        type: string
+        default: "red-main"
+      portal-mirror-url:
+        description: >-
+          Optional URL to POST the same JSON payload to, for a board like
+          agents.nard.uk. Empty (the default) is a no-op -- see the header note.
+        required: false
+        type: string
+        default: ""
+      runner:
+        description: >-
+          JSON-encoded runner for this job: a plain string ("ubuntu-latest"),
+          a JSON array, or a JSON object matching the runner-fleet manifest's
+          `runsOn` shape. Decoded with fromJSON(). Empty (the default) routes
+          a PRIVATE caller to the fleet manifest's linux-ci organization-group
+          route and a public or visibility-unknown caller to GitHub-hosted
+          ubuntu-latest; an explicit value always wins. A PUBLIC (or
+          possibly-future-public) CALLER MUST NEVER PASS A SELF-HOSTED LABEL.
+        required: false
+        type: string
+        default: ''
+    secrets:
+      PORTAL_MIRROR_TOKEN:
+        description: "Optional bearer token for `portal-mirror-url`. Unused when that input is empty."
+        required: false
+
+jobs:
+  reconcile:
+    name: reconcile
+    runs-on: ${{ fromJSON(inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    # One reconcile at a time per repo+workflow: two runs completing within
+    # seconds of each other (a flaky retry landing green right after a red
+    # original) must not race to create two issues or double-close one.
+    concurrency:
+      group: red-main-${{ github.repository }}-${{ inputs.workflow-name }}
+      cancel-in-progress: false
+    steps:
+      - name: Reconcile the red-main issue
+        id: reconcile
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_NAME: ${{ inputs.workflow-name }}
+          CONCLUSION: ${{ inputs.conclusion }}
+          RUN_ID: ${{ inputs.run-id }}
+          RUN_URL: ${{ inputs.run-url }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from datetime import datetime, timezone
+
+          repo = os.environ["REPO"]
+          workflow_name = os.environ["WORKFLOW_NAME"]
+          conclusion = os.environ["CONCLUSION"]
+          run_id = os.environ["RUN_ID"]
+          run_url = os.environ["RUN_URL"]
+          head_sha = os.environ.get("HEAD_SHA", "")
+          label = os.environ["LABEL"]
+          title = f"main is red: {workflow_name}"
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          def gh_api(args):
+              result = subprocess.run(["gh", "api"] + args, capture_output=True, text=True)
+              if result.returncode != 0:
+                  print(f"::error::gh api {args} failed: {result.stderr.strip()}")
+                  sys.exit(1)
+              return result.stdout
+
+          def payload_out(value: str) -> None:
+              out_path = os.environ.get("GITHUB_OUTPUT")
+              if not out_path:
+                  return
+              with open(out_path, "a", encoding="utf-8") as fh:
+                  fh.write("payload<<PAYLOAD_EOF\n")
+                  fh.write(value + "\n")
+                  fh.write("PAYLOAD_EOF\n")
+
+          if conclusion not in ("success", "failure"):
+              print(f"conclusion '{conclusion}' is not a verdict on the tree; no-op")
+              payload_out("")
+              sys.exit(0)
+
+          listing = gh_api([
+              f"repos/{repo}/issues", "-X", "GET",
+              "-f", "state=open", "-f", f"labels={label}", "-f", "per_page=100",
+          ])
+          issues = json.loads(listing)
+          existing = next(
+              (i for i in issues if "pull_request" not in i and i.get("title") == title),
+              None,
+          )
+
+          if conclusion == "failure":
+              if existing:
+                  number = existing["number"]
+                  print(f"red-main issue #{number} already open for '{workflow_name}'; leaving it open")
+                  gh_api([f"repos/{repo}/issues/{number}/comments", "-f", f"body=Still red: {run_url} ({now})"])
+                  state = "open"
+              else:
+                  body = (
+                      f"main is red for **{workflow_name}** on `{repo}`.\n\n"
+                      f"Run: {run_url}\nHead: `{head_sha}`\nOpened: {now}\n\n"
+                      "This issue closes automatically on the next green run of "
+                      "the same workflow (narduk-reboot O-D8). No automatic "
+                      "revert is filed for this.\n\n```json\n"
+                      + json.dumps({
+                          "schema": "red-main.v1", "repo": repo,
+                          "workflow": workflow_name, "run_id": run_id,
+                          "run_url": run_url, "head_sha": head_sha,
+                          "state": "open", "opened_at": now,
+                      })
+                      + "\n```\n"
+                  )
+                  created = json.loads(gh_api([
+                      f"repos/{repo}/issues",
+                      "-f", f"title={title}",
+                      "-f", f"body={body}",
+                      "-f", f"labels[]={label}",
+                  ]))
+                  number = created["number"]
+                  print(f"opened red-main issue #{number} for '{workflow_name}'")
+                  state = "open"
+          else:
+              if not existing:
+                  print(f"no open red-main issue for '{workflow_name}'; nothing to close")
+                  payload_out("")
+                  sys.exit(0)
+              number = existing["number"]
+              close_body = (
+                  f"Green: {run_url} ({now})\n\n```json\n"
+                  + json.dumps({
+                      "schema": "red-main.v1", "repo": repo,
+                      "workflow": workflow_name, "run_id": run_id,
+                      "run_url": run_url, "head_sha": head_sha,
+                      "state": "closed", "closed_at": now,
+                  })
+                  + "\n```\n"
+              )
+              gh_api([f"repos/{repo}/issues/{number}/comments", "-f", f"body={close_body}"])
+              gh_api([f"repos/{repo}/issues/{number}", "-X", "PATCH", "-f", "state=closed", "-f", "state_reason=completed"])
+              print(f"closed red-main issue #{number} for '{workflow_name}'")
+              state = "closed"
+
+          payload = json.dumps({
+              "schema": "red-main.v1", "repo": repo, "workflow": workflow_name,
+              "run_id": run_id, "run_url": run_url, "head_sha": head_sha,
+              "state": state, "issue_number": number, "at": now,
+          })
+          payload_out(payload)
+          PY
+
+      - name: Mirror to the portal (optional)
+        if: inputs.portal-mirror-url != ''
+        env:
+          MIRROR_URL: ${{ inputs.portal-mirror-url }}
+          MIRROR_TOKEN: ${{ secrets.PORTAL_MIRROR_TOKEN }}
+          PAYLOAD: ${{ steps.reconcile.outputs.payload }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PAYLOAD:-}" ]; then
+            echo "no payload produced (conclusion was not a verdict, or nothing to close); skipping portal mirror"
+            exit 0
+          fi
+          auth_header=()
+          if [ -n "${MIRROR_TOKEN:-}" ]; then
+            auth_header=(-H "Authorization: Bearer ${MIRROR_TOKEN}")
+          fi
+          status="$(curl -sS --max-time 10 --retry 2 -o /dev/null -w '%{http_code}' \
+            -X POST "${auth_header[@]}" -H 'Content-Type: application/json' \
+            -d "${PAYLOAD}" "${MIRROR_URL}" || echo "000")"
+          case "$status" in
+            2??) echo "portal mirror accepted (HTTP $status)" ;;
+            *) echo "::warning::portal mirror returned HTTP $status; this never fails the caller" ;;
+          esac

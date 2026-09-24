@@ -1,0 +1,27 @@
+# Reference adopter (narduk-reboot P3-C2): this repository listens to its
+# own `CI` workflow the same way any other adopter would, so red-main-
+# listener.yml has a live caller from day one instead of shipping with zero
+# adopters like reusable-node-ci.yml did.
+name: Red-main listener (self)
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  red-main:
+    if: github.event.workflow_run.head_branch == github.event.repository.default_branch
+    uses: ./.github/workflows/red-main-listener.yml
+    permissions:
+      contents: read
+      issues: write
+    with:
+      workflow-name: ${{ github.event.workflow_run.name }}
+      conclusion: ${{ github.event.workflow_run.conclusion }}
+      run-id: ${{ github.event.workflow_run.id }}
+      run-url: ${{ github.event.workflow_run.html_url }}
+      head-sha: ${{ github.event.workflow_run.head_sha }}
