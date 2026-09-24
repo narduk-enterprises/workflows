@@ -1482,12 +1482,13 @@ routing, the Playwright config itself. The rules:
 - **Full-tier selection is for pull requests.** Pushes use the full tier when
   neither path skipping nor equivalent PR proof applies.
 - The `E2E plan` job summary lists which changed files forced the full run.
-- **Matching is case-insensitive** for both `e2e-skip-paths` and
-  `e2e-full-paths`. `*auth*` matches `useAuth.ts`, `AuthPanel.vue` and
-  `OAuthCallback.ts`; `*session*` matches `useSession.ts`. `*` still does
-  not cross `/`. An empty `e2e-full-paths` still never escalates. The
-  default skip list is unchanged; an oddly cased `README.MD` now counts as
-  documentation.
+- **`e2e-full-paths` matches case-insensitively** (ASCII only). `*auth*`
+  matches `useAuth.ts`, `AuthPanel.vue` and `OAuthCallback.ts`; `*session*`
+  matches `useSession.ts`. `*` still does not cross `/`. An empty
+  `e2e-full-paths` still never escalates. **`e2e-skip-paths` stays
+  case-sensitive**: each list folds case only in the direction that adds
+  proof, so the default skip list skips exactly what it did before and an
+  oddly cased `README.MD` runs E2E.
 
 #### What `ci / Fast` reports when a protected path matches
 

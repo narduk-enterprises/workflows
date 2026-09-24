@@ -428,9 +428,9 @@ def _full_paths_cases() -> list:
             {"skipped": "false", "full": "false"},
         ),
         (
-            "oddly cased README.MD matches *.md and skips",
+            "skip globs stay case-sensitive: README.MD does not skip on *.md",
             dict(pr, skip_patterns="*.md", full_patterns="", files=["README.MD"]),
-            {"skipped": "true", "full": "false"},
+            {"skipped": "false", "full": "false"},
         ),
     ]
 
@@ -554,8 +554,13 @@ def extract_glob_to_regex(script: str) -> str:
 def check_glob_matcher_is_case_insensitive() -> None:
     """The shipped function, applied the way the step applies it (grep -iE)."""
     script = skip_step_script()
-    assert script.count("LC_ALL=C grep -iEq --") == 2, "both path lists must use the case-insensitive grep"
-    assert "grep -Eq --" not in script
+    # Fail-safe folding: the escalation list folds case (a wider match only
+    # adds proof); the skip list must not (a wider match would drop proof).
+    assert script.count("LC_ALL=C grep -iEq --") == 1, "only e2e-full-paths may use the case-insensitive grep"
+    skip_loop = script[script.index("for pattern in $SKIP_PATTERNS"):script.index("for pattern in $FULL_PATTERNS")]
+    full_loop = script[script.index("for pattern in $FULL_PATTERNS"):]
+    assert "| grep -Eq --" in skip_loop and "-iE" not in skip_loop, "e2e-skip-paths must stay case-sensitive"
+    assert "LC_ALL=C grep -iEq --" in full_loop, "e2e-full-paths must match case-insensitively"
     pairs = [
         ("**/*auth*.*", "app/composables/useAuth.ts", True),
         ("**/*auth*.*", "components/AuthPanel.vue", True),
@@ -564,10 +569,8 @@ def check_glob_matcher_is_case_insensitive() -> None:
         ("**/*AUTH*.*", "app/composables/useauth.ts", True),
         ("**/*auth*/**", "src/Auth/token.ts", True),
         ("**/*auth*.*", "app/pages/index.vue", False),
-        ("*.md", "README.MD", True),
         ("*.md", "README.md", True),
-        ("*.md", "docs/README.MD", False),
-        ("docs/**/*.md", "Docs/Guide.MD", True),
+        ("*.md", "docs/README.md", False),
         ("server/database/**", "server/database/schema.ts", True),
     ]
     body = extract_glob_to_regex(script) + """

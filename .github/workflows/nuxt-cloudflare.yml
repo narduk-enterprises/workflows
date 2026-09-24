@@ -515,8 +515,9 @@ on:
           absent. Defaults to documentation and repository metadata; an
           explicitly empty value disables path skipping. Unknown or incomplete
           diffs run E2E. Manual, scheduled and merge-group runs never skip.
-          Globs match case-insensitively, the same way as `e2e-full-paths`:
-          `*.md` matches `README.MD` and `*auth*` matches `useAuth.ts`.
+          Globs match case-sensitively (`*.md` does not match `README.MD`,
+          which runs E2E); only `e2e-full-paths` folds case, because there a
+          wider match can only add proof.
         required: false
         type: string
         default: "*.md docs/**/*.md apps/*/README.md packages/*/README.md **/AGENTS.md **/CLAUDE.md LICENSE LICENSE.txt .github/ISSUE_TEMPLATE/** .github/PULL_REQUEST_TEMPLATE.md .github/pull_request_template.md .github/CODEOWNERS"
@@ -545,7 +546,8 @@ on:
           a caller that set this input gets the full suite. Empty (the
           default) leaves the tiers exactly as they were. Pushes use the full
           configuration whenever E2E is selected. Globs match
-          case-insensitively, the same way as `e2e-skip-paths`, so `*auth*`
+          case-insensitively (ASCII only; `e2e-skip-paths` stays
+          case-sensitive), so `*auth*`
           matches `useAuth.ts`, `AuthPanel.vue` and `OAuthCallback.ts`, and
           `*session*` matches `useSession.ts`.
         required: false
@@ -755,6 +757,9 @@ on:
           does not change. `true` means a protected path matched and a run
           over 180s is the full gate; `false` is a plain Fast run. Publishing
           the check run output needs `checks: write` on the caller's `ci` job.
+          GitHub validates that grant at startup for every job, so every
+          caller of this revision needs it, even with this input empty; a
+          caller without it ends in startup_failure (workflows#59).
         required: false
         type: string
         default: ""
@@ -2460,11 +2465,14 @@ jobs:
             echo "::warning::changed-file list hit the compare API's 300-file cap (silently truncated); running the full suite"
             exit 0
           fi
-          # Pure bash + grep -iE glob matcher: no toolchain to provision.
+          # Pure bash + grep -E glob matcher: no toolchain to provision.
           # '**' crosses '/', a lone '*' does not; everything else is
-          # literal. Matching is case-insensitive for both lists, so
-          # `*auth*` matches useAuth.ts, AuthPanel.vue and OAuthCallback.ts.
-          # LC_ALL=C keeps the fold ASCII-only. Self-hosted `linux-ci`
+          # literal. Each list folds case only in its fail-safe direction:
+          # `e2e-full-paths` matches case-insensitively (LC_ALL=C grep -iE,
+          # ASCII-only), so `*auth*` escalates useAuth.ts, AuthPanel.vue and
+          # OAuthCallback.ts; `e2e-skip-paths` stays case-sensitive, so the
+          # default skip list skips exactly what it skipped before and a
+          # case variant runs E2E rather than skipping it. Self-hosted `linux-ci`
           # capacity has no ambient `node` (this job deliberately never
           # calls setup-node to stay fast and install nothing), so the
           # matcher must not depend on it.
@@ -2509,7 +2517,7 @@ jobs:
             file_matched=false
             for pattern in $SKIP_PATTERNS; do
               regex=$(glob_to_regex "$pattern")
-              if printf '%s' "$file" | LC_ALL=C grep -iEq -- "$regex"; then
+              if printf '%s' "$file" | grep -Eq -- "$regex"; then
                 file_matched=true
                 break
               fi
