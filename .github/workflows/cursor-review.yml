@@ -41,7 +41,10 @@ name: Reusable Cursor Review
 #       still reviewed, but subject to the limits. They are explicitly NOT
 #       metadata, so narrowing did not silently turn "always reviewed" into
 #       "never reviewed" for policy prose.
-#   P1  ordinary code. Reviewed once per open/reopen/ready, again on request.
+#   P1  ordinary code. Reviewed on request only (`review-now`/`review-p1`)
+#       unless the caller passes `review-ordinary-code: true`, which restores
+#       one automatic review per open/reopen/ready (narduk-reboot O-D7; Logan,
+#       2026-09-24: "Review on request + sensitive paths (Recommended)").
 #   P2  an automation author (dependabot, github-actions, renovate), a
 #       `changeset-release/*` head, a metadata-only diff (prose only --
 #       CODEOWNERS and .gitignore are code), or the `review-p2` label. The
@@ -197,6 +200,18 @@ on:
         required: false
         type: number
         default: 20
+      review-ordinary-code:
+        description: >-
+          Automatically review ordinary (P1) code once at open / reopen /
+          ready. FALSE by default (narduk-reboot O-D7; Logan, 2026-09-24:
+          "Review on request + sensitive paths (Recommended)"): ordinary code
+          is reviewed when a `review-now` or `review-p1` label asks, while
+          P0 -- workflows, actions, policy files, T2-sensitive paths, or the
+          `review-p0` label -- still launches automatically. TRUE restores the
+          2026-09-19 once-per-open rule.
+        required: false
+        type: boolean
+        default: false
       min-delta-lines:
         description: >-
           Skip automatic reviews when the head moved this few lines or fewer
@@ -324,6 +339,7 @@ jobs:
           DAILY_CAP: ${{ inputs.daily-cap }}
           MIN_LINES: ${{ inputs.min-lines }}
           MIN_DELTA_LINES: ${{ inputs.min-delta-lines }}
+          REVIEW_ORDINARY_CODE: ${{ inputs.review-ordinary-code }}
           CONTEXT_REPOS: ${{ inputs.context-repos }}
           WAIT_MINUTES: ${{ inputs.wait-minutes }}
           APPROVE_ON_CLEAN: ${{ inputs.approve-on-clean }}

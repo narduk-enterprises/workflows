@@ -15,9 +15,14 @@ Flow (agent-infrastructure#1564):
   1b. Skip when a `labeled` event added a label that is not a review
      re-request, and skip when the priority class is P2. The class rule is
      Logan's answer of 2026-09-19 to the reviewer-untangle round, verbatim:
-     "No numeric cap, only the P0/P1/P2 class rule". P0 (workflows, the
-     operating manual, routed agent docs, or an explicit `review-p0` label)
-     always launches; P1 launches once per open/ready/re-request; P2
+     "No numeric cap, only the P0/P1/P2 class rule". P0 (workflows and
+     actions, DECISIONS.md, this reviewer's own brief, a T2-sensitive path, or
+     an explicit `review-p0` label) always launches; P1 (ordinary code, and
+     policy prose: the operating manual, routed agent docs, SKILL.md) launches
+     only on request -- a `review-now`/`review-p1` label -- unless the caller opts
+     back into one automatic review per open/ready with
+     `review-ordinary-code: true` (Logan, 2026-09-24, narduk-reboot O-D7:
+     "Review on request + sensitive paths (Recommended)"); P2
      (automation authors, release branches, metadata-only diffs, or an
      explicit `review-p2` label) never launches an agent at all. The TITLE is
      never a signal: it is author-controlled, and `chore:` on a code change
@@ -184,8 +189,14 @@ _ACRONYM_SPLIT = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
 # merely stops being P0 falls all the way through to the all-metadata P2 skip
 # and is never reviewed at all. In a repository whose product IS its policy
 # prose -- agent-infrastructure, company-hq -- that would have turned "always
-# review" into "never review" in one step. These paths classify P1: reviewed
-# once, and subject to every spend limit like any other code change.
+# review" into "never review" in one step. These paths classify P1 and are
+# subject to every spend limit like any other code change. Since 2026-09-24
+# (narduk-reboot O-D7, Logan: "Review on request + sensitive paths
+# (Recommended)") P1 is reviewed on request only by default, so policy prose
+# gets no automatic review unless the caller sets `review-ordinary-code: true`;
+# a `review-now` or `review-p1` label still reviews it. The carve-out still
+# matters: it keeps policy prose in P1 rather than the all-metadata P2 skip, so
+# a caller that opts back in with `review-ordinary-code: true` reviews it.
 POLICY_PREFIXES = ("docs/agents/",)
 POLICY_NAMES = ("agents.md", "claude.md", "codex.md", "skill.md")
 # Everything here is prose: a diff made only of these launches no agent.
@@ -219,6 +230,11 @@ DEFAULT_MAX_ROUNDS = 0
 DEFAULT_DAILY_CAP = 0
 # Small automatic reviews can still be skipped; an explicit request runs.
 DEFAULT_MIN_LINES = 20
+# Ordinary (P1) code is reviewed on request only by default (narduk-reboot
+# O-D7; Logan, 2026-09-24: "Review on request + sensitive paths
+# (Recommended)"). A caller passing `review-ordinary-code: true` restores the
+# 2026-09-19 rule: one automatic review per open / reopen / ready.
+ORDINARY_CODE_ENV = "REVIEW_ORDINARY_CODE"
 # A re-request whose head barely moved since the reviewed head is re-reading a
 # diff it already reviewed. This attacks the 2.55x multiplier at its root.
 DEFAULT_MIN_DELTA_LINES = 10
@@ -948,16 +964,18 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
     decides whether an agent starts.
 
       P0  merge-blocking work: `.github/workflows/**`, `.github/actions/**`,
-          `docs/agents/**`, a policy basename
-          (`AGENTS.md`, `CLAUDE.md`, `CODEX.md`, `SKILL.md`, `DECISIONS.md`,
-          matched case-insensitively), a T2-sensitive path (auth, session,
+          `DECISIONS.md` or `cursor_review_brief.md` (matched
+          case-insensitively), a T2-sensitive path (auth, session,
           payments or credential-table, narduk-reboot P3-C2 / O-D7), or the
           `review-p0` label.
           Never deferred, so P0 is decided FIRST and outranks every P2 signal:
           dependabot bumping a pinned action inside `.github/workflows/`, or a
           `review-p2` label on a workflow change, still gets a review.
-      P1  ordinary code work. One review at open / reopen / ready, and another
-          only when a lane asks by adding `review-now`.
+      P1  ordinary code work, and policy prose (`docs/agents/**`, `AGENTS.md`,
+          `CLAUDE.md`, `CODEX.md`, `SKILL.md`; P1 since the 2026-09-20
+          narrowing). Reviewed only when asked (`review-now` or
+          `review-p1`); a caller with `review-ordinary-code: true` also gets
+          one automatic review at open / reopen / ready (narduk-reboot O-D7).
       P2  nits: an automation author, a release branch, a metadata-only
           diff, or the `review-p2` label. P2 never launches an agent; the
           orchestrating session self-reviews it. The title is never a signal,
@@ -1020,6 +1038,12 @@ def review_class(env: dict[str, str], paths: list[str] | None) -> tuple[str, str
     if not requested:
         if all(is_metadata(path) for path in paths):
             raise Skip(f"class P2 (all {len(paths)} changed files are metadata); add '{REVIEW_NOW_LABEL}' to review it anyway")
+        # O-D7: ordinary code is reviewed on request. Decided after every P0
+        # signal above, so workflows, policy files and T2-sensitive paths
+        # still launch automatically, and after the UNKNOWN fail-open, so a
+        # diff this run could not list is still reviewed.
+        if not env_bool(env.get(ORDINARY_CODE_ENV)):
+            raise Skip(f"class P1 ordinary code is reviewed on request only; add '{REVIEW_NOW_LABEL}' to review this head")
     return "P1", f"label '{REVIEW_NOW_LABEL}' re-request" if requested else "code change"
 
 

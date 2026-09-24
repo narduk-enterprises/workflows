@@ -180,6 +180,10 @@ def env(**overrides: str) -> dict[str, str]:
         "WAIT_MINUTES": "30",
         # Exercise optional automatic limits; the production defaults are unlimited.
         "MAX_ROUNDS": "4",
+        # Exercise the opt-in automatic ordinary-code review the spend limits
+        # below gate; the production default is on-request (O-D7), covered by
+        # OnRequestDefaultTests.
+        "REVIEW_ORDINARY_CODE": "true",
         "DAILY_CAP": "12",
         "APPROVE_ON_CLEAN": "true",
         "BRIEF_PATH": str(BRIEF),
@@ -1759,6 +1763,72 @@ class LimitMessageLeverTests(unittest.TestCase):
                 self.assertFalse(
                     self.launched(transport),
                     f"'{cr.P0_LABEL}' must not clear the {name}")
+
+
+class OnRequestDefaultTests(unittest.TestCase):
+    """narduk-reboot O-D7 (Logan, 2026-09-24: "Review on request + sensitive
+    paths (Recommended)"): with the callable's default, ordinary code launches
+    only when asked; P0 and T2-sensitive paths still launch on their own."""
+
+    def launched(self, transport: FakeTransport) -> bool:
+        return any(c["method"] == "POST" and c["url"].endswith("/v1/agents") for c in transport.calls)
+
+    def test_ordinary_code_is_not_reviewed_automatically_by_default(self):
+        for action in ("opened", "reopened", "ready_for_review"):
+            with self.subTest(action):
+                transport = FakeTransport()
+                code, out = run(transport, REVIEW_ORDINARY_CODE="", PR_EVENT_ACTION=action)
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review skipped: class P1 ordinary code is reviewed on request only", out)
+                self.assertIn("add 'review-now'", out)
+                self.assertFalse(self.launched(transport))
+
+    def test_a_request_label_reviews_ordinary_code(self):
+        for label in ("review-now", "review-p1"):
+            with self.subTest(label):
+                transport = FakeTransport()
+                code, out = run(transport, REVIEW_ORDINARY_CODE="", PR_EVENT_ACTION="labeled",
+                                PR_EVENT_LABEL=label, PR_LABELS=json.dumps([label]))
+                self.assertEqual(0, code, out)
+                self.assertIn("::notice::review class P1", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_sensitive_paths_are_still_reviewed_automatically(self):
+        for path in (".github/workflows/release.yml", "src/routes/auth/login.ts", "Config/nvault-provider-credentials.json"):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 40, "deletions": 5}])
+                code, out = run(transport, REVIEW_ORDINARY_CODE="")
+                self.assertEqual(0, code, out)
+                self.assertIn("::notice::review class P0", out)
+                self.assertTrue(self.launched(transport))
+
+    def test_policy_prose_is_p1_on_request_only_by_default(self):
+        # The README and review_class docstring say so; pin it so docs and code
+        # cannot drift apart again (policy prose left P0 on 2026-09-20).
+        for path in ("AGENTS.md", "docs/agents/credentials.md", "skills/x/SKILL.md"):
+            with self.subTest(path):
+                with self.assertRaisesRegex(cr.Skip, "class P1 ordinary code is reviewed on request only"):
+                    cr.review_class(env(REVIEW_ORDINARY_CODE=""), [path])
+                self.assertEqual("P1", cr.review_class(env(REVIEW_ORDINARY_CODE="true"), [path])[0])
+                self.assertEqual("P1", cr.review_class(env(REVIEW_ORDINARY_CODE="", PR_LABELS=json.dumps(["review-p1"])), [path])[0])
+
+    def test_an_unlistable_diff_still_fails_open(self):
+        env_ = env(REVIEW_ORDINARY_CODE="")
+        self.assertEqual("P1", cr.review_class(env_, None)[0])
+
+    def test_opting_back_in_restores_one_automatic_review(self):
+        transport = FakeTransport()
+        code, out = run(transport, REVIEW_ORDINARY_CODE="true")
+        self.assertEqual(0, code, out)
+        self.assertIn("::notice::review class P1 (code change)", out)
+        self.assertTrue(self.launched(transport))
+
+    def test_the_callable_defaults_the_input_off_and_passes_it_through(self):
+        workflow = (ROOT / ".github/workflows/cursor-review.yml").read_text(encoding="utf-8")
+        block = workflow.split("      review-ordinary-code:\n", 1)[1].split("\n      min-delta-lines:", 1)[0]
+        self.assertIn("type: boolean", block)
+        self.assertIn("default: false", block)
+        self.assertIn("REVIEW_ORDINARY_CODE: ${{ inputs.review-ordinary-code }}", workflow)
 
 
 if __name__ == "__main__":
