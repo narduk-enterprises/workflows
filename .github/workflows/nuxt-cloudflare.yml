@@ -515,6 +515,9 @@ on:
           absent. Defaults to documentation and repository metadata; an
           explicitly empty value disables path skipping. Unknown or incomplete
           diffs run E2E. Manual, scheduled and merge-group runs never skip.
+          Globs match case-sensitively (`*.md` does not match `README.MD`,
+          which runs E2E); only `e2e-full-paths` folds case, because there a
+          wider match can only add proof.
         required: false
         type: string
         default: "*.md docs/**/*.md apps/*/README.md packages/*/README.md **/AGENTS.md **/CLAUDE.md LICENSE LICENSE.txt .github/ISSUE_TEMPLATE/** .github/PULL_REQUEST_TEMPLATE.md .github/pull_request_template.md .github/CODEOWNERS"
@@ -542,7 +545,11 @@ on:
           determined (no `gh`, a failed compare, the 300-file compare cap),
           a caller that set this input gets the full suite. Empty (the
           default) leaves the tiers exactly as they were. Pushes use the full
-          configuration whenever E2E is selected.
+          configuration whenever E2E is selected. Globs match
+          case-insensitively (ASCII only; `e2e-skip-paths` stays
+          case-sensitive), so `*auth*`
+          matches `useAuth.ts`, `AuthPanel.vue` and `OAuthCallback.ts`, and
+          `*session*` matches `useSession.ts`.
         required: false
         type: string
         default: ""
@@ -741,7 +748,14 @@ on:
           `run-e2e: true`, because `E2E plan` makes the decision: with
           `e2e-full-paths` set and `run-e2e: false` the job fails closed
           rather than pass protected paths on lint/unit alone. With
-          `e2e-full-paths` empty nothing escalates.
+          `e2e-full-paths` empty nothing escalates. The check name stays
+          `Fast` either way, so the required context `ci / Fast` does not
+          change. An escalated run also has a check named
+          `Fast lanes (escalated)` in the same run; that check is the
+          machine-readable flag (a run over 180s is then the full gate),
+          and reading it needs no extra permission. The job holding `Fast`
+          also writes a `### Fast escalation` step-summary section with the
+          line `escalated: true` or `escalated: false`.
         required: false
         type: string
         default: ""
@@ -2449,9 +2463,15 @@ jobs:
           fi
           # Pure bash + grep -E glob matcher: no toolchain to provision.
           # '**' crosses '/', a lone '*' does not; everything else is
-          # literal. Self-hosted `linux-ci` capacity has no ambient `node`
-          # (this job deliberately never calls setup-node to stay fast and
-          # install nothing), so the matcher must not depend on it.
+          # literal. Each list folds case only in its fail-safe direction:
+          # `e2e-full-paths` matches case-insensitively (LC_ALL=C grep -iE,
+          # ASCII-only), so `*auth*` escalates useAuth.ts, AuthPanel.vue and
+          # OAuthCallback.ts; `e2e-skip-paths` stays case-sensitive, so the
+          # default skip list skips exactly what it skipped before and a
+          # case variant runs E2E rather than skipping it. Self-hosted `linux-ci`
+          # capacity has no ambient `node` (this job deliberately never
+          # calls setup-node to stay fast and install nothing), so the
+          # matcher must not depend on it.
           glob_to_regex() {
             local pattern="$1" out="^" i=0 n c nextc
             local special='.+^(){}[]|$'
@@ -2504,7 +2524,7 @@ jobs:
             fi
             for pattern in $FULL_PATTERNS; do
               regex=$(glob_to_regex "$pattern")
-              if printf '%s' "$file" | grep -Eq -- "$regex"; then
+              if printf '%s' "$file" | LC_ALL=C grep -iEq -- "$regex"; then
                 full=true
                 full_list="${full_list}- ${bq}${file}${bq}\n"
                 break
@@ -4426,6 +4446,12 @@ jobs:
   # evaluating skipped names. scripts/test_fast_path.py checks both. `always()`
   # rather than `!cancelled()` for the same reason: a cancelled run must not
   # turn this job into a skipped, and therefore passing, `Fast`.
+  #
+  # The check NAME stays `Fast` when this run escalates too: the name moves
+  # onto `fast-escalated`, and this job reports as `Fast lanes (escalated)`.
+  # T1 readiness tells a full gate (allowed over 180s) from a slow plain Fast
+  # run by that sibling check in the same run. Reading check-run names needs
+  # no permission, so no caller grant changes (workflows#59).
   fast:
     name: ${{ !(inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && 'Fast (not run)' || ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true') && 'Fast lanes (escalated)' || 'Fast' }}
     needs: [reuse-plan, e2e-plan]
@@ -4623,6 +4649,37 @@ jobs:
               printf '\nscripts total: %ss (target: the whole job at 3 min or less, p90)\n' "$(( $(date +%s) - total_start ))"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+      # After the scripts, for people reading the run: the machine-readable
+      # flag is the `Fast lanes (escalated)` check name, which needs no API
+      # call. This step only writes the step summary and never fails the job,
+      # so a summary problem cannot turn a passing `ci / Fast` red.
+      # `fast-escalated` runs this same script when it holds the name `Fast`,
+      # after the full gate.
+      - name: Publish Fast escalation
+        if: success()
+        working-directory: ${{ github.workspace }}
+        env:
+          ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
+        run: &fast_escalation_publish |
+          set -uo pipefail
+          case "${ESCALATED:-}" in
+            true)
+              detail="A protected path matched e2e-full-paths. The check named Fast is the full gate, so a run over 180s is allowed. This run also has a check named Fast lanes (escalated)."
+              ;;
+            false)
+              detail="No protected path matched. The check named Fast is the plain lane and should finish within 180s."
+              ;;
+            *)
+              echo "::warning::ESCALATED should be true or false (got '${ESCALATED:-}'); no Fast escalation summary written"
+              exit 0
+              ;;
+          esac
+          echo "escalated: ${ESCALATED}"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### Fast escalation\n\nescalated: %s\n\n%s\n' "$ESCALATED" "$detail" >> "$GITHUB_STEP_SUMMARY" \
+              || echo "::warning::could not write the Fast escalation step summary"
+          fi
+          exit 0
 
   # POST-DEPLOY JOURNEY SMOKE (`journey-smoke-url`, P3-C1, O-velocity D5/D6).
   # A caller's promote or deploy workflow calls this callable a second time,
@@ -5167,8 +5224,9 @@ jobs:
           retention-days: 7
           overwrite: true
 
-  # Placed after `Required` on purpose: its last step is a YAML alias of
-  # `Required`'s gate step, and an alias must follow its anchor.
+  # Placed after `Required` on purpose: it runs a YAML alias of `Required`'s
+  # gate step, and an alias must follow its anchor. The escalation summary
+  # follows that gate and never fails, so it cannot skip or redden the proof.
   # The `Fast` check for a pull request that touches a protected path
   # (`e2e-full-paths`). It needs every lane the full gate needs and applies the
   # IDENTICAL `Required` gate step (a YAML alias of it, not a copy), so on those
@@ -5198,3 +5256,8 @@ jobs:
             exit 1
           fi
       - *required_gate_step
+      - name: Publish Fast escalation
+        if: success()
+        env:
+          ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
+        run: *fast_escalation_publish

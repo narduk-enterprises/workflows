@@ -1475,6 +1475,32 @@ routing, the Playwright config itself. The rules:
 - **Full-tier selection is for pull requests.** Pushes use the full tier when
   neither path skipping nor equivalent PR proof applies.
 - The `E2E plan` job summary lists which changed files forced the full run.
+- **`e2e-full-paths` matches case-insensitively** (ASCII only). `*auth*`
+  matches `useAuth.ts`, `AuthPanel.vue` and `OAuthCallback.ts`; `*session*`
+  matches `useSession.ts`. `*` still does not cross `/`. An empty
+  `e2e-full-paths` still never escalates. **`e2e-skip-paths` stays
+  case-sensitive**: each list folds case only in the direction that adds
+  proof, so the default skip list skips exactly what it did before and an
+  oddly cased `README.MD` runs E2E.
+
+#### What `ci / Fast` reports when a protected path matches
+
+The check name stays `Fast` in both cases, so the required context
+`ci / Fast` does not change. What differs is the sibling check in the same
+workflow run:
+
+| Run | Check named `Fast` | Other Fast checks |
+| --- | --- | --- |
+| Plain | the `fast` job (lint and unit scripts) | `fast-escalated` is skipped |
+| Escalated | the `fast-escalated` job (the full `Required` gate) | `Fast lanes (escalated)` (the lint and unit scripts) |
+
+So a readiness check that needs to know whether a `ci / Fast` run over 180
+seconds was the full gate looks for a `ci / Fast lanes (escalated)` check run
+in the same check suite. Reading check-run names needs no extra permission,
+so callers grant nothing new for this. For people reading the run, the job
+holding `Fast` also writes a `### Fast escalation` step-summary section with
+the line `escalated: true` or `escalated: false`; that step never fails the
+job. Callers that leave `fast-scripts` empty still skip both jobs.
 
 #### A non-blocking quarantine lane (`e2e-quarantine-args`)
 

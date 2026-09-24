@@ -528,8 +528,13 @@ def test_fast_naming_never_skips_a_fast_check() -> None:
 
 def test_fast_escalated_reuses_the_required_gate() -> None:
     job = JOBS["fast-escalated"]
-    assert job["steps"][-1] == step("required", GATE_STEP), "escalated Fast must run the Required gate step"
-    referenced = set(re.findall(r"needs\.([a-z0-9-]+)\.", json.dumps(job["steps"][-1])))
+    # The gate runs before the escalation publish, so a check-run update
+    # failure cannot skip the full-suite proof. The gate step itself is the
+    # Required step, not a copy.
+    gate = job["steps"][-2]
+    assert gate == step("required", GATE_STEP), "escalated Fast must run the Required gate step"
+    assert job["steps"][-1].get("name") == "Publish Fast escalation"
+    referenced = set(re.findall(r"needs\.([a-z0-9-]+)\.", json.dumps(gate)))
     assert referenced <= set(job["needs"]), referenced - set(job["needs"])
     assert "fast" in job["needs"] and "required" not in job["needs"]
     assert "fast-escalated" in JOBS["required"]["needs"]
@@ -561,6 +566,48 @@ def test_fast_scripts_step() -> None:
     checkout = next(s for s in JOBS["fast"]["steps"] if str(s.get("uses", "")).startswith("actions/checkout@"))
     assert checkout["with"]["fetch-depth"] == 2
     print("PASS  fast scripts run in order with FAST_BASE_REF on PRs; a missing script fails")
+
+
+def test_fast_escalation_is_published_on_the_check_named_fast() -> None:
+    """The check name stays Fast. The machine-readable escalation flag is the
+    sibling `Fast lanes (escalated)` check, which needs no permission, so
+    neither job may request `checks: write` (a caller that bumps without that
+    grant would end in startup_failure, workflows#59). Both jobs that can hold
+    the name run the same summary-only script, and it never fails the job."""
+    for job in ("fast", "fast-escalated"):
+        assert "checks" not in JOBS[job]["permissions"], job
+        assert "outputs" not in JOBS[job], job
+        publish = step(job, "Publish Fast escalation")
+        assert publish["if"] == "success()"
+        assert set(publish["env"]) == {"ESCALATED"}, publish["env"]
+    assert step("fast", "Publish Fast escalation")["run"] == step("fast-escalated", "Publish Fast escalation")["run"]
+    # The name expressions carry the flag: escalation moves `Fast` and names
+    # the lint/unit job `Fast lanes (escalated)`.
+    assert "'Fast lanes (escalated)'" in JOBS["fast"]["name"]
+    assert "|| 'Fast'" in JOBS["fast"]["name"]
+    assert "&& 'Fast' ||" in JOBS["fast-escalated"]["name"]
+    # The publish step is the fast job's last step and the escalated job's
+    # step after the Required gate, so it can never skip the proof.
+    assert JOBS["fast"]["steps"][-1]["name"] == "Publish Fast escalation"
+    script = step("fast", "Publish Fast escalation")["run"]
+    assert "gh " not in script and "check-runs" not in script, "the summary step must not call the API"
+    cases = [("true", "escalated: true"), ("false", "escalated: false")]
+    for escalated, line in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = Path(tmp) / "summary"
+            result = run_bash(script, {"ESCALATED": escalated, "GITHUB_STEP_SUMMARY": str(summary)})
+            assert result.returncode == 0, (escalated, result.stdout, result.stderr)
+            lines = summary.read_text().splitlines()
+            assert lines[0] == "### Fast escalation" and lines[2] == line, lines
+    # Never red: an unexpected value, a missing summary file and an
+    # unwritable summary path all warn and exit 0.
+    odd = run_bash(script, {"ESCALATED": "", "GITHUB_STEP_SUMMARY": ""})
+    assert odd.returncode == 0 and "::warning::" in odd.stdout, odd
+    with tempfile.TemporaryDirectory() as tmp:
+        unwritable = str(Path(tmp) / "missing-dir" / "summary")
+        blocked = run_bash(script, {"ESCALATED": "true", "GITHUB_STEP_SUMMARY": unwritable})
+        assert blocked.returncode == 0 and "::warning::" in blocked.stdout, blocked
+    print("PASS  Fast escalation: flag is the sibling check name, summary step never fails, no checks: write")
 
 
 def test_escalation_fails_closed_on_unknown_plan() -> None:
@@ -798,6 +845,7 @@ def main() -> None:
     test_fast_naming_never_skips_a_fast_check()
     test_fast_escalated_reuses_the_required_gate()
     test_fast_scripts_step()
+    test_fast_escalation_is_published_on_the_check_named_fast()
     test_escalation_fails_closed_on_unknown_plan()
     test_required_reuse_lookup()
     test_e2e_proof_key_ignores_default_fast_path_inputs()
