@@ -696,6 +696,11 @@ on:
       # pre-existing jobs run exactly as before: the jobs added for them
       # (`Reuse plan`, `Fast`, `Fast (escalated)`, `Journey smoke`) are skipped
       # at job level without a runner, and `Required` reads them as skipped.
+      # Two of those four skipped checks show a raw `${{ ... }}` name, because
+      # GitHub does not evaluate a skipped job's computed name (see NAMING IS
+      # THE GATE at `fast`). The lanes that sit below the skipped `Reuse plan`
+      # carry explicit status guards so the skip does not propagate (see SKIP
+      # PROPAGATION at `reuse-plan`).
       # They also stay out of the E2E proof key while at their defaults, so
       # proof minted by the previous revision still matches (see `E2E plan`).
       # ---------------------------------------------------------------------
@@ -717,7 +722,11 @@ on:
           already makes), the job that reports as `Fast` is `Fast
           (escalated)`, which waits for the full gate and applies the exact
           `Required` checks, so auth, payment, binding and migration changes
-          still prove the whole suite before merge.
+          still prove the whole suite before merge. Escalation needs
+          `run-e2e: true`, because `E2E plan` makes the decision: with
+          `e2e-full-paths` set and `run-e2e: false` the job fails closed
+          rather than pass protected paths on lint/unit alone. With
+          `e2e-full-paths` empty nothing escalates.
         required: false
         type: string
         default: ""
@@ -833,6 +842,18 @@ jobs:
   # every lane below then runs as it always has. When the input is off this
   # job is skipped at job level, and the lanes that list it in `needs:` use
   # `!cancelled()`, so a skipped `Reuse plan` delays nothing and skips nothing.
+  #
+  # SKIP PROPAGATION. GitHub applies a skip to the WHOLE dependency chain
+  # below it: a job whose `if:` has no status function gets an implicit
+  # `success()`, and at job level that is false when ANY ancestor, not just a
+  # direct `needs:` entry, was skipped (actions/runner#2205). `Reuse plan` is
+  # skipped for every default caller and is an ancestor of every CI lane, so
+  # every job that needs `Build` or `E2E plan` states its own status guard
+  # (`!cancelled() && needs.<job>.result == 'success' && ...`, the old
+  # implicit `success()` over its direct needs) instead of relying on the
+  # implicit one. scripts/test_fast_path.py simulates the job graph with this
+  # rule and fails when any pre-existing job runs or skips differently from
+  # the previous revision's graph.
   reuse-plan:
     name: Reuse plan
     if: >-
@@ -2590,7 +2611,8 @@ jobs:
     # to anyone reading the PR, which is most of the time given e2e is
     # opt-in and off by default.
     name: E2E
-    if: inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'
+    # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
+    if: "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'"
     needs: [build, e2e-plan]
     # `e2e-runner` when the caller routes browsers to an isolated pool,
     # otherwise `runner` — same guest as the build, the previous behaviour.
@@ -3211,7 +3233,8 @@ jobs:
   # `matrix.shard == 'quarantine'`; GitHub renders the name `E2E (quarantine)`.
   e2e-quarantine:
     name: E2E
-    if: inputs.run-e2e && inputs.e2e-quarantine-args != '' && needs.e2e-plan.outputs.skipped != 'true'
+    # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
+    if: "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && inputs.run-e2e && inputs.e2e-quarantine-args != '' && needs.e2e-plan.outputs.skipped != 'true'"
     needs: [build, e2e-plan]
     runs-on: ${{ fromJSON(inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
@@ -3410,8 +3433,10 @@ jobs:
   # default.
   preview:
     name: Preview
+    # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
     if: >-
-      inputs.preview-checks != 'none'
+      !cancelled() && needs.build.result == 'success'
+      && inputs.preview-checks != 'none'
       && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
     needs: build
     runs-on: ${{ fromJSON(contains(inputs.preview-checks, 'e2e-subset') && (inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) || (github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')))) }}
@@ -3967,7 +3992,8 @@ jobs:
 
   deploy-dry-run:
     name: Deploy dry run
-    if: inputs.wrangler-dry-run
+    # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
+    if: "!cancelled() && needs.build.result == 'success' && inputs.wrangler-dry-run"
     needs: build
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
@@ -4355,11 +4381,16 @@ jobs:
   #
   # NAMING IS THE GATE. GitHub reports a SKIPPED job as a passing check, so a
   # job named `Fast` must never be skipped while a ruleset could be relying on
-  # it. The name is therefore computed: `Fast` only when this job is the one
-  # doing the work, `Fast (not run)` when the input is off (the default, so no
-  # existing caller ever reports a `ci / Fast` context) or the lanes were
-  # reused or replaced by journey-smoke mode, and `Fast lanes (escalated)` when
-  # a protected path hands the `Fast` name to `fast-escalated` below. `always()`
+  # it. The name is therefore computed, and it evaluates to `Fast` only when
+  # this job runs and is the one doing the work; it is `Fast lanes
+  # (escalated)` when a protected path hands the `Fast` name to
+  # `fast-escalated` below. GitHub does NOT evaluate the `name:` of a job it
+  # skips (community discussions #13261 and #152293): a skipped job's check
+  # shows this raw `${{ ... }}` template, which is never exactly `Fast`. So a
+  # default caller (input off), a reused tree and journey-smoke mode all show
+  # a skipped check with the raw template as its name, never a skipped `Fast`.
+  # The `Fast (not run)` branch keeps that true if GitHub ever starts
+  # evaluating skipped names. scripts/test_fast_path.py checks both. `always()`
   # rather than `!cancelled()` for the same reason: a cancelled run must not
   # turn this job into a skipped, and therefore passing, `Fast`.
   fast:
@@ -4379,7 +4410,9 @@ jobs:
     steps:
       # Escalation is only as good as the `E2E plan` decision it reads. When
       # the caller configured `e2e-full-paths` and that plan did not succeed,
-      # whether this PR touches a protected path is unknown: fail closed.
+      # whether this PR touches a protected path is unknown: fail closed. That
+      # includes `run-e2e: false`, where `E2E plan` never runs, so protected
+      # paths could never escalate and `Fast` would pass on lint/unit alone.
       - name: Resolve protected-path escalation
         working-directory: ${{ github.workspace }}
         env:
@@ -4389,7 +4422,11 @@ jobs:
           ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
         run: |
           set -euo pipefail
-          if [ "$RUN_E2E" = true ] && [ -n "$FULL_PATHS" ] && [ "$E2E_PLAN_RESULT" != success ]; then
+          if [ -n "$FULL_PATHS" ] && [ "$RUN_E2E" != true ]; then
+            echo "::error::e2e-full-paths is set but run-e2e is false: E2E plan never runs, so protected-path escalation cannot be decided; set run-e2e: true or clear e2e-full-paths"
+            exit 1
+          fi
+          if [ -n "$FULL_PATHS" ] && [ "$E2E_PLAN_RESULT" != success ]; then
             echo "::error::E2E plan reported '$E2E_PLAN_RESULT', so protected-path escalation is unknown; failing closed"
             exit 1
           fi
@@ -5102,8 +5139,10 @@ jobs:
   # The `Fast` check for a pull request that touches a protected path
   # (`e2e-full-paths`). It needs every lane the full gate needs and applies the
   # IDENTICAL `Required` gate step (a YAML alias of it, not a copy), so on those
-  # PRs `ci / Fast` means "the full gate passed". Skipped, and named `Fast
-  # (escalation not needed)`, everywhere else. A job waiting on its needs has
+  # PRs `ci / Fast` means "the full gate passed". Skipped everywhere else,
+  # where its check shows the raw name template (GitHub does not evaluate a
+  # skipped job's name; see NAMING IS THE GATE at `fast`), or `Fast
+  # (escalation not needed)` if GitHub ever does. A job waiting on its needs has
   # no check run yet, so the `Fast` context stays pending, which blocks the
   # merge, until the full gate has finished.
   fast-escalated:

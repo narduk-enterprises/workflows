@@ -19,6 +19,7 @@ Run: python3 scripts/test_fast_path.py
 
 from __future__ import annotations
 
+import functools
 import itertools
 import json
 import os
@@ -33,7 +34,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_e2e_reuse  # noqa: E402  (shared github-script harness)
-from test_runner_default import Evaluator  # noqa: E402
+from test_runner_default import Evaluator, loose_eq, to_num, truthy  # noqa: E402
 
 WORKFLOW = Path(".github/workflows/nuxt-cloudflare.yml")
 DOC = yaml.safe_load(WORKFLOW.read_text())
@@ -103,6 +104,287 @@ def step(job: str, name: str) -> dict:
     return next(s for s in JOBS[job]["steps"] if s.get("name") == name)
 
 
+# ---------------------------------------------------------------------------
+# Job-graph simulation with GitHub's skip propagation.
+#
+# A job whose `if:` names no status function gets an implicit `success()`,
+# and at job level that is false when ANY ancestor in the needs chain was
+# skipped or failed, not only a direct `needs:` entry: "a failure or skip
+# applies to all jobs in the dependency chain from the point of failure or
+# skip onwards" (the workflow-syntax docs for jobs.<job_id>.needs, reproduced
+# in actions/runner#2205). Evaluating each `if:` against hand-fed `needs`
+# results cannot see that, and it once let a skipped `Reuse plan` silently skip
+# `E2E`, `Preview` and `Deploy dry run` for every default caller, turning
+# `Required` red. These helpers propagate results through the real graph.
+# ---------------------------------------------------------------------------
+GRAPH_TOKEN = re.compile(
+    r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<op>\|\||&&|==|!=|>=|<=|>|<|!|\(|\)|,)"
+    r"|(?P<num>-?\d+(?:\.\d+)?)|(?P<id>[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*))")
+STATUS_CALL = re.compile(r"\b(?:always|success|failure|cancelled)\s*\(")
+TEMPLATE = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+
+
+@functools.lru_cache(maxsize=None)
+def graph_tokens(src: str) -> tuple:
+    out, pos, src = [], 0, src.strip()
+    while pos < len(src):
+        m = GRAPH_TOKEN.match(src, pos)
+        if not m or m.end() == pos:
+            raise ValueError(f"cannot tokenize at {src[pos:pos + 30]!r}")
+        out.append((m.lastgroup, m.group(m.lastgroup)))
+        pos = m.end()
+    return tuple(out)
+
+
+class GraphEvaluator(Evaluator):
+    """Job-level evaluation: status functions over the job's ANCESTORS
+    (ctx["__job_status"]) plus the numeric comparison `E2E report` uses."""
+
+    def run(self, src: str):
+        self.toks, self.i = list(graph_tokens(src)), 0
+        value = self.or_()
+        assert self.i == len(self.toks), f"trailing tokens in {src!r}"
+        return value
+
+    def cmp(self):
+        left = self.unary()
+        op = self.peek()[1]
+        if op not in ("==", "!=", ">", "<", ">=", "<="):
+            return left
+        self.i += 1
+        right = self.unary()
+        if op in ("==", "!="):
+            return loose_eq(left, right) == (op == "==")
+        a, b = to_num(left), to_num(right)
+        return {">": a > b, "<": a < b, ">=": a >= b, "<=": a <= b}[op]
+
+    def call(self, name, args):  # type: ignore[override]
+        if name in ("always", "success", "failure", "cancelled"):
+            return self.ctx["__job_status"][name]
+        return Evaluator.call(name, args)
+
+
+def gh_str(value) -> str:
+    """How GitHub renders an expression value into env or a script."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def render(value, ctx: dict):
+    """Evaluate a whole `${{ }}` value, or interpolate templates in a string."""
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if text.startswith("${{") and text.endswith("}}") and text.count("${{") == 1:
+        return GraphEvaluator(ctx).run(text[3:-2])
+    return TEMPLATE.sub(lambda m: gh_str(GraphEvaluator(ctx).run(m.group(1))), value)
+
+
+def job_condition(job: dict) -> str:
+    cond = job.get("if")
+    if cond is None:
+        return "success()"
+    text = str(cond).strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2].strip()
+    return text if STATUS_CALL.search(text) else f"success() && ({text})"
+
+
+def needs_of(job: dict) -> list:
+    needs = job.get("needs") or []
+    return [needs] if isinstance(needs, str) else list(needs)
+
+
+def simulate(jobs: dict, inputs: dict, event: str, ref: str = "refs/heads/main",
+             outputs: dict | None = None, results: dict | None = None,
+             cancelled: bool = False) -> dict:
+    """{job: {"result", "outputs", "ctx"}} for one run of `jobs`. A job whose
+    `if:` holds gets results.get(job, "success") and outputs.get(job, {}); any
+    other job is "skipped" with no outputs, exactly as GitHub reports it."""
+    outputs, results = outputs or {}, results or {}
+    base = context(event, ref, inputs)
+    state: dict = {}
+    ancestors: dict = {}
+
+    def settle(job_id: str) -> None:
+        if job_id in state:
+            return
+        job = jobs[job_id]
+        direct = needs_of(job)
+        for dep in direct:
+            settle(dep)
+        ancestors[job_id] = set(direct).union(*(ancestors[dep] for dep in direct))
+        upstream = [state[a]["result"] for a in ancestors[job_id]]
+        ctx = {**base, "needs": {dep: {"result": state[dep]["result"], "outputs": state[dep]["outputs"]}
+                                 for dep in direct}}
+        ctx["__job_status"] = {"always": True, "cancelled": cancelled,
+                               "success": not cancelled and all(r == "success" for r in upstream),
+                               "failure": any(r == "failure" for r in upstream)}
+        runs = truthy(GraphEvaluator(ctx).run(job_condition(job)))
+        state[job_id] = {"result": results.get(job_id, "success") if runs else "skipped",
+                         "outputs": dict(outputs.get(job_id, {})) if runs else {}, "ctx": ctx}
+
+    for job_id in jobs:
+        settle(job_id)
+    return state
+
+
+def run_gates(job_id: str, state: dict) -> list:
+    """Run every unconditional `run:` step of `job_id` (the Required gate
+    steps) with env rendered from the simulated `needs`; [(name, rc, out)]."""
+    ctx = state[job_id]["ctx"]
+    ran = []
+    for s in JOBS[job_id]["steps"]:
+        if "run" not in s or "if" in s:
+            continue
+        env = {key: gh_str(render(value, ctx)) for key, value in (s.get("env") or {}).items()}
+        result = run_bash(render(s["run"], ctx), env)
+        ran.append((s["name"], result.returncode, result.stdout + result.stderr))
+    return ran
+
+
+# origin/main (67968e3) job graph, verbatim: the baseline every default
+# caller must keep.
+OLD_GRAPH = {
+    "build": {},
+    "checks": {},
+    "extra-gate": {"if": "inputs.extra-gate-scripts != ''"},
+    "e2e-plan": {"if": "inputs.run-e2e"},
+    "e2e": {"needs": ["build", "e2e-plan"],
+            "if": "inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'"},
+    "e2e-quarantine": {"needs": ["build", "e2e-plan"],
+                       "if": "inputs.run-e2e && inputs.e2e-quarantine-args != '' && needs.e2e-plan.outputs.skipped != 'true'"},
+    "e2e-report": {"needs": ["e2e-plan", "e2e"],
+                   "if": "!cancelled() && inputs.run-e2e && needs.e2e-plan.outputs.shard-total > 1 && needs.e2e-plan.result == 'success' && needs.e2e-plan.outputs.skipped != 'true'"},
+    "preview": {"needs": "build",
+                "if": "inputs.preview-checks != 'none' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')"},
+    "deploy-dry-run": {"needs": "build", "if": "inputs.wrangler-dry-run"},
+    "caller-lint": {},
+    "required": {"needs": ["build", "checks", "extra-gate", "e2e-plan", "e2e", "e2e-report", "preview",
+                           "deploy-dry-run", "caller-lint"], "if": "always()"},
+}
+NEW_JOBS = {"reuse-plan", "fast", "fast-escalated", "journey-smoke"}
+CI_LANES = ["build", "checks", "extra-gate", "e2e-plan", "e2e", "e2e-quarantine", "e2e-report",
+            "preview", "deploy-dry-run"]
+
+
+def plan_outputs(skipped: str = "false", shards: str = "1", full: str = "false") -> dict:
+    return {"e2e-plan": {"skipped": skipped, "shard-total": shards, "full": full, "e2e-args": ""}}
+
+
+def test_simulator_models_skip_propagation() -> None:
+    # actions/runner#2205: a skipped job, then an always() job that runs, then
+    # a default-`if` job, which GitHub skips; an explicit guard runs.
+    graph = {"a": {"if": "false"}, "b": {"needs": ["a"], "if": "always()"}, "c": {"needs": ["b"]},
+             "d": {"needs": ["b"], "if": "!cancelled() && needs.b.result == 'success'"}}
+    state = simulate(graph, {}, "push")
+    assert [state[j]["result"] for j in "abcd"] == ["skipped", "success", "skipped", "success"], state
+    print("PASS  simulator: a skip anywhere upstream skips every default-`if` job below it")
+
+
+def test_default_graph_matches_origin_main() -> None:
+    """Every fast-path input at its default: each pre-existing job must run,
+    skip or fail exactly as on origin/main, for every event, lane input, one
+    failing lane and a cancelled run; every new job must be skipped."""
+    assert set(JOBS) == set(OLD_GRAPH) | NEW_JOBS, set(JOBS) ^ (set(OLD_GRAPH) | NEW_JOBS)
+    faults = [(None, False), (None, True)] + [
+        (job, False) for job in ("build", "checks", "extra-gate", "e2e-plan", "e2e", "preview", "caller-lint")]
+    cases = 0
+    for (event, ref), run_e2e, dry_run, preview, extra, quarantine, skipped, shards in itertools.product(
+            EVENTS, [True, False], [True, False], ["og", "none"], ["", "lint"], ["", "--grep=@quarantine"],
+            ["false", "true"], ["1", "2"]):
+        inputs = {"run-e2e": run_e2e, "wrangler-dry-run": dry_run, "preview-checks": preview,
+                  "extra-gate-scripts": extra, "e2e-quarantine-args": quarantine}
+        outs = plan_outputs(skipped, shards)
+        for failing, cancelled in faults:
+            results = {failing: "failure"} if failing else {}
+            new = simulate(JOBS, inputs, event, ref, outs, results, cancelled)
+            old = simulate(OLD_GRAPH, inputs, event, ref, outs, results, cancelled)
+            for job in OLD_GRAPH:
+                assert new[job]["result"] == old[job]["result"], (
+                    job, new[job]["result"], old[job]["result"], event, inputs, skipped, shards, failing, cancelled)
+            for job in NEW_JOBS:
+                assert new[job]["result"] == "skipped", (job, event, inputs)
+            cases += 1
+    print(f"PASS  defaults: every pre-existing job runs/skips as on origin/main with skip propagation ({cases} runs)")
+
+
+def test_default_callers_required_passes_on_the_real_graph() -> None:
+    """End to end for a default caller: simulate the graph, then run
+    `Required`'s own gate steps on the results. A green run must be green.
+    `Required` tells events apart only as pull request or not, so one push
+    stands for schedule and manual runs (each gate step is a bash process)."""
+    runs = 0
+    events = [("pull_request", "refs/pull/1/merge"), ("pull_request_target", "refs/heads/main"),
+              ("push", "refs/heads/main")]
+    for (event, ref), run_e2e, dry_run, preview, extra, skipped, shards in itertools.product(
+            events, [True, False], [True, False], ["og", "none"], ["", "lint"], ["false", "true"], ["1", "2"]):
+        inputs = {"run-e2e": run_e2e, "wrangler-dry-run": dry_run, "preview-checks": preview,
+                  "extra-gate-scripts": extra}
+        state = simulate(JOBS, inputs, event, ref, plan_outputs(skipped, shards))
+        gates = run_gates("required", state)
+        assert [name for name, _, _ in gates] == [GATE_STEP, FAST_STEP], gates
+        for name, code, out in gates:
+            assert code == 0, (name, event, inputs, skipped, shards, out)
+        runs += 1
+    # A real failure still fails.
+    state = simulate(JOBS, {"run-e2e": True}, "pull_request", "refs/pull/1/merge", plan_outputs(),
+                     {"e2e": "failure"})
+    assert run_gates("required", state)[0][1] == 1
+    print(f"PASS  default callers: Required passes on the simulated graph ({runs} runs); a failed E2E fails it")
+
+
+def test_enabled_modes_on_the_real_graph() -> None:
+    full = {"run-e2e": True, "wrangler-dry-run": True, "extra-gate-scripts": "lint",
+            "e2e-quarantine-args": "--grep=@quarantine", "e2e-shards": 2, "preview-checks": "og",
+            "fast-scripts": "lint"}
+
+    def green(job_id: str, state: dict) -> None:
+        for name, code, out in run_gates(job_id, state):
+            assert code == 0, (job_id, name, out)
+
+    # Required reuse on a default-branch push: a proven tree skips every lane.
+    reuse = {**full, "required-reuse-pr-results": True}
+    state = simulate(JOBS, reuse, "push", "refs/heads/main", {"reuse-plan": {"reused": "true"}, **plan_outputs("false", "2")})
+    assert {j: state[j]["result"] for j in CI_LANES + ["fast", "fast-escalated", "journey-smoke"]} == dict.fromkeys(
+        CI_LANES + ["fast", "fast-escalated", "journey-smoke"], "skipped")
+    assert state["reuse-plan"]["result"] == state["caller-lint"]["result"] == "success"
+    green("required", state)
+    # No proof: the full gate runs, as before.
+    state = simulate(JOBS, reuse, "push", "refs/heads/main", {"reuse-plan": {"reused": "false"}, **plan_outputs("false", "2")})
+    ran = {j for j in JOBS if state[j]["result"] == "success"}
+    assert ran == set(CI_LANES) - {"preview"} | {"reuse-plan", "caller-lint", "fast", "required"}, ran
+    green("required", state)
+    # Journey-smoke mode: every CI lane skipped, the smoke runs.
+    smoke = {**full, "journey-smoke-url": "https://app.example"}
+    state = simulate(JOBS, smoke, "workflow_dispatch", "refs/heads/main", plan_outputs())
+    ran = {j for j in JOBS if state[j]["result"] == "success"}
+    assert ran == {"journey-smoke", "caller-lint", "required"}, ran
+    green("required", state)
+    # ci / Fast on a pull request without a protected path.
+    state = simulate(JOBS, full, "pull_request", "refs/pull/1/merge", plan_outputs("false", "2", "false"))
+    assert state["fast"]["result"] == "success" and state["fast-escalated"]["result"] == "skipped"
+    assert render(JOBS["fast"]["name"], state["fast"]["ctx"]) == "Fast"
+    assert all(state[j]["result"] == "success" for j in CI_LANES), state
+    green("required", state)
+    # A protected path: `fast-escalated` becomes `Fast` and runs the full gate.
+    state = simulate(JOBS, full, "pull_request", "refs/pull/1/merge", plan_outputs("false", "2", "true"))
+    assert state["fast"]["result"] == state["fast-escalated"]["result"] == "success"
+    assert render(JOBS["fast"]["name"], state["fast"]["ctx"]) == "Fast lanes (escalated)"
+    assert render(JOBS["fast-escalated"]["name"], state["fast-escalated"]["ctx"]) == "Fast"
+    green("fast-escalated", state)
+    green("required", state)
+    state = simulate(JOBS, full, "pull_request", "refs/pull/1/merge", plan_outputs("false", "2", "true"),
+                     {"e2e": "failure"})
+    assert any(code == 1 for _, code, _ in run_gates("fast-escalated", state))
+    print("PASS  enabled modes on the simulated graph: reuse, journey smoke, Fast and escalated Fast")
+
+
 def test_new_inputs_default_off() -> None:
     for name, default in NEW_INPUTS.items():
         spec = INPUTS[name]
@@ -128,6 +410,8 @@ def test_defaults_leave_every_lane_as_before() -> None:
         needs = dict(SKIPPED_REUSE, **{"e2e-plan": {"result": "success", "outputs": {"full": "true"}}})
         ctx["needs"] = needs
         assert ev(JOBS["fast"]["if"], ctx) is False
+        # GitHub shows a skipped job's raw name template today; this is the
+        # name if it ever evaluates it (test_skipped_fast_jobs_never_show_fast).
         assert ev(JOBS["fast"]["name"], ctx) == "Fast (not run)"
         assert ev(JOBS["fast-escalated"]["if"], ctx) is False
         assert ev(JOBS["fast-escalated"]["name"], ctx) != "Fast"
@@ -286,7 +570,29 @@ def test_escalation_fails_closed_on_unknown_plan() -> None:
     for outcome in ("failure", "cancelled", "skipped", ""):
         assert run_bash(script, {**ok, "E2E_PLAN_RESULT": outcome}).returncode == 1, outcome
     assert run_bash(script, {**ok, "FULL_PATHS": "", "E2E_PLAN_RESULT": "failure"}).returncode == 0
-    print("PASS  escalation fails closed when e2e-full-paths is set and the plan did not succeed")
+    # run-e2e false: `E2E plan` never runs, so a protected path could never
+    # escalate and `Fast` would pass on lint/unit alone. Fail closed instead.
+    for outcome in ("skipped", "success"):
+        result = run_bash(script, {**ok, "RUN_E2E": "false", "E2E_PLAN_RESULT": outcome})
+        assert result.returncode == 1 and "run-e2e is false" in result.stdout, (outcome, result.stdout)
+    assert run_bash(script, {**ok, "RUN_E2E": "false", "FULL_PATHS": "", "E2E_PLAN_RESULT": "skipped"}).returncode == 0
+    print("PASS  escalation fails closed when e2e-full-paths is set and the plan did not succeed or cannot run")
+
+
+def test_skipped_fast_jobs_never_show_fast() -> None:
+    """GitHub does not evaluate the `name:` of a job it skips (community
+    discussions #13261 and #152293): the check shows the raw template. So the
+    two computed names must never BE `Fast` as raw text, and every other job
+    name must be static and not `Fast`. test_fast_naming_never_skips_a_fast_check
+    covers the other case, a GitHub that does evaluate skipped names."""
+    for job in ("fast", "fast-escalated"):
+        raw = JOBS[job]["name"].strip()
+        assert raw.startswith("${{") and raw.endswith("}}") and raw != "Fast", (job, raw)
+    for job_id, job in JOBS.items():
+        if job_id in ("fast", "fast-escalated"):
+            continue
+        assert "${{" not in job["name"] and job["name"] != "Fast", (job_id, job["name"])
+    print("PASS  a skipped fast job shows its raw template, never `Fast`; no other job can be named Fast")
 
 
 def run_script(script: str, scenario: dict, inputs: dict, env_name: str,
@@ -481,7 +787,12 @@ def test_journey_smoke_validation() -> None:
 
 def main() -> None:
     test_new_inputs_default_off()
+    test_simulator_models_skip_propagation()
     test_defaults_leave_every_lane_as_before()
+    test_default_graph_matches_origin_main()
+    test_default_callers_required_passes_on_the_real_graph()
+    test_enabled_modes_on_the_real_graph()
+    test_skipped_fast_jobs_never_show_fast()
     test_required_gate_reuse_and_smoke_branches()
     test_required_fast_path_step()
     test_fast_naming_never_skips_a_fast_check()
