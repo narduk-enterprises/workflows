@@ -528,8 +528,13 @@ def test_fast_naming_never_skips_a_fast_check() -> None:
 
 def test_fast_escalated_reuses_the_required_gate() -> None:
     job = JOBS["fast-escalated"]
-    assert job["steps"][-1] == step("required", GATE_STEP), "escalated Fast must run the Required gate step"
-    referenced = set(re.findall(r"needs\.([a-z0-9-]+)\.", json.dumps(job["steps"][-1])))
+    # The gate runs before the escalation publish, so a check-run update
+    # failure cannot skip the full-suite proof. The gate step itself is the
+    # Required step, not a copy.
+    gate = job["steps"][-2]
+    assert gate == step("required", GATE_STEP), "escalated Fast must run the Required gate step"
+    assert job["steps"][-1].get("name") == "Publish Fast escalation"
+    referenced = set(re.findall(r"needs\.([a-z0-9-]+)\.", json.dumps(gate)))
     assert referenced <= set(job["needs"]), referenced - set(job["needs"])
     assert "fast" in job["needs"] and "required" not in job["needs"]
     assert "fast-escalated" in JOBS["required"]["needs"]
