@@ -96,17 +96,28 @@ ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/")
 # and a `cursor_review_brief.md` edit is the reviewer editing its own brief.
 ALWAYS_REVIEW_NAMES = ("decisions.md", "cursor_review_brief.md")
 # T2-sensitive application code (narduk-reboot P3-C2, PLAN.md row P3-C2 /
-# O-D7): auth, session, payments and credential-table paths always get a
-# review, the same as ALWAYS_REVIEW_PREFIXES, regardless of label, author or
-# size. Matched as a case-insensitive substring anywhere in the path (not
-# just a prefix or basename) because these markers show up mid-path
-# (`src/routes/auth/`, `lib/session/store.ts`, `Config/nvault-provider-
-# credentials.json`) far more often than at a fixed position, and a narrower
-# match would be the same silent-dilution risk the 2026-09-20 P0 narrowing
-# above was written to avoid. Fail open toward reviewing, never toward
-# skipping: a false positive here costs one extra review, a false negative
-# skips a security-sensitive diff by default.
-T2_SENSITIVE_MARKERS = ("auth", "session", "payment", "credential")
+# O-D7; O-velocity.md §3.7 path escalation: "auth, session, payments"): auth,
+# session, payments and credential-table paths always get a review, the same
+# as ALWAYS_REVIEW_PREFIXES, regardless of label, author or size.
+#
+# Matched against whole path TOKENS, not a bare substring anywhere in the
+# path (PR #142 review, cursor_review.py:644 blocking finding). A plain
+# `marker in lowered` check made `src/author/service.ts`, `docs/authoring.md`
+# and `lib/repayment/calc.ts` all P0 -- "auth" inside "author" and "payment"
+# inside "repayment" are common English words, not the deleted-`on:`-block
+# class of hazard this reviewer exists for, and forcing P0 (no size, round,
+# delta or daily gate; spend_gates() only exempts P0 from the size gate) on
+# them is the same silent-dilution risk the 2026-09-20 P0 narrowing above was
+# written to avoid, just from the other direction.
+#
+# Tokens are path segments split further on non-alphanumeric characters, so
+# a marker still fires mid-segment (`Config/nvault-provider-credentials.json`
+# tokenizes to ..., "credentials", "json") without matching a word that
+# merely contains the marker's letters. Fail open toward reviewing, never
+# toward skipping: an exact-token false positive here still costs one extra
+# review, and a false negative skips a security-sensitive diff by default.
+T2_SENSITIVE_TOKENS = frozenset({"auth", "session", "payment", "payments", "credential", "credentials"})
+_TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
 # Policy prose: NOT P0 any more (so the size gate, round cap, delta gate and
 # daily cap all apply to it), but explicitly NOT metadata either.
 #
@@ -641,7 +652,8 @@ def is_always_review(path: str) -> bool:
 
 def is_t2_sensitive(path: str) -> bool:
     lowered = path.casefold()
-    return any(marker in lowered for marker in T2_SENSITIVE_MARKERS)
+    tokens = (t for t in _TOKEN_SPLIT.split(lowered) if t)
+    return any(token in T2_SENSITIVE_TOKENS for token in tokens)
 
 
 def is_policy(path: str) -> bool:

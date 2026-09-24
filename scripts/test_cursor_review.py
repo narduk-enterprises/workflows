@@ -1024,6 +1024,23 @@ class ClassRuleTests(unittest.TestCase):
                 self.assertIn("::notice::review class P0", out)
                 self.assertTrue(self.launched(transport))
 
+    def test_t2_marker_substrings_are_not_p0(self):
+        """PR #142 review, cursor_review.py:644 (blocking): a bare `marker in
+        lowered` substring check made `author`, `authoring` and `repayment`
+        all P0. is_t2_sensitive() now matches whole path tokens, so an
+        ordinary word that merely contains a T2 marker's letters stays P1
+        (and can still be skipped by the P2 signals, unlike a real P0)."""
+        for path in (
+            "src/author/service.ts",
+            "docs/authoring.md",
+            "lib/repayment/calc.ts",
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 1, "deletions": 0}])
+                code, out = run(transport, PR_TITLE="chore: routine wording")
+                self.assertEqual(0, code)
+                self.assertNotIn("::notice::review class P0", out)
+
     def test_policy_prose_is_p1_not_p0_so_the_spend_limits_apply(self):
         """The narrowing itself. These were P0 -- the class no cap may skip --
         which made the class rule inert in exactly the two repositories with

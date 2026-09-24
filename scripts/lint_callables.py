@@ -135,8 +135,10 @@ CALLER_GRANTS: dict[str, set[str]] = {
     "reusable-browser-tests.yml": {"contents", "packages", "actions"},
     # Opens, comments on and closes the per-repo `red-main` issue.
     "red-main-listener.yml": {"contents", "issues"},
-    # Files or updates the weekly digest issue.
-    "flake-digest.yml": {"contents", "issues"},
+    # Files or updates the weekly digest issue. `gh run list` / `gh run view`
+    # need `actions: read` on a private caller (PR #142 review, high finding);
+    # every adopter's ADOPTION block permissions must include it.
+    "flake-digest.yml": {"contents", "issues", "actions"},
 }
 
 # Local composite/local-path uses are exempt from SHA pinning: `./...` and

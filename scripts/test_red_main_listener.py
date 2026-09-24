@@ -36,6 +36,7 @@ import yaml
 
 WORKFLOW = Path(".github/workflows/red-main-listener.yml")
 STEP_NAME = "Reconcile the red-main issue"
+SELF_ADOPTER = Path(".github/workflows/red-main-self.yml")
 
 GH_STUB = '''#!/usr/bin/env python3
 import json
@@ -198,10 +199,27 @@ def check(label: str, ok: bool, detail: str = "") -> bool:
     return ok
 
 
+def check_self_adopter_event_guard() -> tuple[bool, str]:
+    """PR #142 review (low): `head_branch == default_branch` alone also
+    passes for a `pull_request` run whose PR head branch happens to be named
+    `main` -- `workflow_run.head_branch` is the PR's OWN branch in that case,
+    not the repository's default branch's actual tip. The job `if:` must
+    also require `workflow_run.event == 'push'`."""
+    doc = yaml.safe_load(SELF_ADOPTER.read_text())
+    condition = doc["jobs"]["red-main"].get("if") or ""
+    ok = "workflow_run.event == 'push'" in condition and "head_branch" in condition
+    return ok, f"red-main-self.yml job `if:` was: {condition!r}"
+
+
 def main() -> int:
     script = extract_step_script()
     total = 0
     failures = 0
+
+    total += 1
+    ok, detail = check_self_adopter_event_guard()
+    if not check("self-adopter if: requires event == 'push' as well as head_branch", ok, detail):
+        failures += 1
 
     with tempfile.TemporaryDirectory() as tmp_str:
         tmp = Path(tmp_str)

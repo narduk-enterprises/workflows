@@ -234,10 +234,28 @@ FIXTURE_CLEAN = {
 }
 
 
+def check_job_permissions() -> tuple[bool, str]:
+    """PR #142 review (high): `gh run list` / `gh run view` need `actions:
+    read` on a private caller (the estate default). A stub `gh` cannot catch
+    a live 403, so this checks the shipped permissions block directly."""
+    doc = yaml.safe_load(WORKFLOW.read_text())
+    perms = doc["jobs"]["digest"].get("permissions") or {}
+    needed = {"contents": "read", "issues": "write", "actions": "read"}
+    missing = {k: v for k, v in needed.items() if perms.get(k) != v}
+    if missing:
+        return False, f"digest job permissions {perms} missing/wrong {missing}"
+    return True, ""
+
+
 def main() -> int:
     script = extract_step_script()
     total = 0
     failures = 0
+
+    total += 1
+    ok, detail = check_job_permissions()
+    if not check("digest job requests contents:read, issues:write, actions:read", ok, detail):
+        failures += 1
 
     with tempfile.TemporaryDirectory() as tmp_str:
         tmp = Path(tmp_str)

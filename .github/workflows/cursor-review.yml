@@ -82,7 +82,9 @@ name: Reusable Cursor Review
 # Use:
 #   cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1","review-deep"]'), github.event.label.name)))) && 'review' || 'other' }}
 #
-# RUNNER ROUTING: same shape as code-review.yml. The default resolves from the
+# RUNNER ROUTING: the same shape flake-digest.yml and red-main-listener.yml
+# use (code-review.yml, which used to set this pattern, was retired
+# 2026-09-24 -- narduk-reboot P3-C2 / O-D8). The default resolves from the
 # caller's own visibility: a PRIVATE caller lands on the fleet manifest's
 # linux-ci organization-group route, anything else on GitHub-hosted
 # ubuntu-latest. The job is a near-idle poller (30-second GET every cycle), so

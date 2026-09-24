@@ -23,7 +23,12 @@ name: Reusable Red-Main Listener
 #       types: [completed]
 #   jobs:
 #     red-main:
-#       if: github.event.workflow_run.head_branch == github.event.repository.default_branch
+#       # `event == 'push'` matters: CI also runs on `pull_request`, whose
+#       # `head_branch` is the PR's OWN branch, not `main` -- a branch that
+#       # happens to be named `main` would otherwise pass the filter below.
+#       if: |
+#         github.event.workflow_run.event == 'push' &&
+#         github.event.workflow_run.head_branch == github.event.repository.default_branch
 #       uses: narduk-enterprises/workflows/.github/workflows/red-main-listener.yml@<sha> # v1
 #       permissions:
 #         contents: read
@@ -97,8 +102,10 @@ on:
         default: "red-main"
       portal-mirror-url:
         description: >-
-          Optional URL to POST the same JSON payload to, for a board like
-          agents.nard.uk. Empty (the default) is a no-op -- see the header note.
+          Optional URL to POST the same JSON payload to -- the Operator
+          Portal's red-main endpoint (PLAN.md §(f).5: red-main issues mirror
+          to the portal, never to agents.nard.uk). Empty (the default) is a
+          no-op -- see the header note.
         required: false
         type: string
         default: ""
