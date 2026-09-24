@@ -14,13 +14,19 @@ permissions:
 
 jobs:
   red-main:
-    # `event == 'push'` (not merely `head_branch == default_branch`, PR
-    # review LOW finding): CI also runs on `pull_request`, whose
-    # `workflow_run.head_branch` is the PR's own head branch -- a branch
-    # literally named `main` (fork or same-repo) would otherwise pass this
-    # filter and post a red-main issue for someone else's pull request.
+    # `event == 'push' || event == 'workflow_dispatch'` (not merely
+    # `head_branch == default_branch`, PR review LOW finding): CI also runs
+    # on `pull_request`, whose `workflow_run.head_branch` is the PR's own
+    # head branch -- a branch literally named `main` (fork or same-repo)
+    # would otherwise pass this filter and post a red-main issue for
+    # someone else's pull request. `workflow_dispatch` is included (PR
+    # review CONSIDER finding, second round): `ci.yml` also runs on manual
+    # dispatch, and a red manual run dispatched against the default branch
+    # is exactly as real a "main is red" signal as a red push -- the
+    # `head_branch == default_branch` check still excludes a manual dispatch
+    # against any other branch or ref.
     if: |
-      github.event.workflow_run.event == 'push' &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
       github.event.workflow_run.head_branch == github.event.repository.default_branch
     uses: ./.github/workflows/red-main-listener.yml
     permissions:

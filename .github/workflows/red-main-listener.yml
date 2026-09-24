@@ -17,17 +17,33 @@ name: Reusable Red-Main Listener
 # through. This repository's own `red-main-self.yml` is the reference
 # adopter:
 #
+# PREREQUISITE (PR #142 review, second round, blocking finding): the
+# caller's OWN repository must already have the label the `label` input
+# names -- `red-main` by default. Opening the very first issue passes
+# `labels[]=<label>` to the GitHub API, which returns 422 (not an
+# auto-create) when that label does not exist, so the reusable job fails
+# closed on its first real red run in any repo that skipped this step.
+# Create it once per adopting repo, e.g.:
+#   gh label create red-main --color B60205 --description "Main default-branch CI is failing"
+# (or pass a different `label` input for a repo that already owns a
+# same-named label for something unrelated).
+#
 #   on:
 #     workflow_run:
 #       workflows: ["CI"]
 #       types: [completed]
 #   jobs:
 #     red-main:
-#       # `event == 'push'` matters: CI also runs on `pull_request`, whose
-#       # `head_branch` is the PR's OWN branch, not `main` -- a branch that
-#       # happens to be named `main` would otherwise pass the filter below.
+#       # `event == 'push' || event == 'workflow_dispatch'` matters: CI also
+#       # runs on `pull_request`, whose `head_branch` is the PR's OWN
+#       # branch, not `main` -- a branch that happens to be named `main`
+#       # would otherwise pass the filter below. `workflow_dispatch` is
+#       # included because a manually-dispatched CI run against the default
+#       # branch is just as real a "main is red" signal as a push; drop it
+#       # from this list if a given caller's `workflow_dispatch` runs never
+#       # target the default branch as CI.
 #       if: |
-#         github.event.workflow_run.event == 'push' &&
+#         (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
 #         github.event.workflow_run.head_branch == github.event.repository.default_branch
 #       uses: narduk-enterprises/workflows/.github/workflows/red-main-listener.yml@<sha> # v1
 #       permissions:

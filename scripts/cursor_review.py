@@ -96,28 +96,61 @@ ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/")
 # and a `cursor_review_brief.md` edit is the reviewer editing its own brief.
 ALWAYS_REVIEW_NAMES = ("decisions.md", "cursor_review_brief.md")
 # T2-sensitive application code (narduk-reboot P3-C2, PLAN.md row P3-C2 /
-# O-D7; O-velocity.md §3.7 path escalation: "auth, session, payments"): auth,
-# session, payments and credential-table paths always get a review, the same
-# as ALWAYS_REVIEW_PREFIXES, regardless of label, author or size.
+# O-D7; O-velocity.md §3.2/§3.7: the T2 tier -- nvault, auth/payment/
+# credential code, D1 schema changes, the credential registry -- and its
+# path escalation -- auth, session, payments, wrangler binding changes,
+# migrations, the credential table): a T2-sensitive path always gets a
+# review, the same as ALWAYS_REVIEW_PREFIXES, regardless of label, author or
+# size.
 #
-# Matched against whole path TOKENS, not a bare substring anywhere in the
-# path (PR #142 review, cursor_review.py:644 blocking finding). A plain
-# `marker in lowered` check made `src/author/service.ts`, `docs/authoring.md`
-# and `lib/repayment/calc.ts` all P0 -- "auth" inside "author" and "payment"
-# inside "repayment" are common English words, not the deleted-`on:`-block
-# class of hazard this reviewer exists for, and forcing P0 (no size, round,
-# delta or daily gate; spend_gates() only exempts P0 from the size gate) on
-# them is the same silent-dilution risk the 2026-09-20 P0 narrowing above was
-# written to avoid, just from the other direction.
+# Matched by path-segment WORD, not a bare substring anywhere in the path
+# (PR #142 review, first round, cursor_review.py:644 blocking finding). A
+# plain `marker in lowered` check made `src/author/service.ts`,
+# `docs/authoring.md` and `lib/repayment/calc.ts` all P0 -- "auth" inside
+# "author" and "payment" inside "repayment" are common English words, not
+# the deleted-`on:`-block class of hazard this reviewer exists for, and
+# forcing P0 on them (no SIZE gate -- round, delta and daily caps still
+# apply; `spend_gates()` only exempts P0 from the size gate) is the same
+# silent-dilution risk the 2026-09-20 P0 narrowing above was written to
+# avoid, just from the other direction. T2_FALSE_POSITIVE_WORDS is the exact,
+# minimal exclusion list for that: ordinary English derivatives of a root
+# below that are not security code.
 #
-# Tokens are path segments split further on non-alphanumeric characters, so
-# a marker still fires mid-segment (`Config/nvault-provider-credentials.json`
-# tokenizes to ..., "credentials", "json") without matching a word that
-# merely contains the marker's letters. Fail open toward reviewing, never
-# toward skipping: an exact-token false positive here still costs one extra
-# review, and a false negative skips a security-sensitive diff by default.
-T2_SENSITIVE_TOKENS = frozenset({"auth", "session", "payment", "payments", "credential", "credentials"})
-_TOKEN_SPLIT = re.compile(r"[^a-z0-9]+")
+# A "word" is a path segment (split on non-alphanumeric characters) further
+# split on camelCase/PascalCase boundaries (PR #142 review, second round,
+# consider finding: whole-TOKEN matching stopped catching
+# `useAuth.ts`, `authStore.ts`, `SessionStore.swift`, `sessionGrant.ts` and
+# similar compound identifiers, because casefold()-then-split can never
+# recover a case boundary once it is gone -- the split happens on the raw
+# path, before casefolding). A word matches when it STARTS WITH a root below
+# (so "session" also catches "sessions", "sessioned", "authentication" and
+# "authorization" catch themselves under the "auth" root, etc.) and is not
+# in the exclusion list. Fail open toward reviewing, never toward skipping:
+# a false positive here still costs one extra review, and a false negative
+# skips a security-sensitive diff by default -- so when a root and an
+# ordinary English word collide (auth/author, payment/repayment), the
+# collision is closed by naming the ordinary word, never by narrowing the
+# root.
+#
+# Known gap, not closed here: an ORM's own default output-directory name
+# (e.g. `drizzle/0003_add_users.sql`) is a D1-migration path this list does
+# not catch generically, because that word is also an ordinary English
+# weather term ("drizzle") that appears in this estate's own marine/weather
+# apps (buoys, riverstatus, lakestat-us) -- adding it as a root would revive
+# the exact author/repayment false-positive class this design exists to
+# avoid. The generic "migration(s)" root still catches a literal
+# `migrations/` directory, the common non-ORM-specific convention.
+T2_SENSITIVE_ROOTS = (
+    "auth", "oauth", "session", "payment", "credential",
+    "nvault", "migration", "wrangler", "schema",
+)
+T2_FALSE_POSITIVE_WORDS = frozenset({
+    "author", "authors", "authored", "authoring", "authorship",
+    "repayment", "repayments", "prepayment", "prepayments",
+    "copayment", "copayments",
+})
+_TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9]+")
+_CAMEL_SPLIT = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 # Policy prose: NOT P0 any more (so the size gate, round cap, delta gate and
 # daily cap all apply to it), but explicitly NOT metadata either.
 #
@@ -650,10 +683,26 @@ def is_always_review(path: str) -> bool:
     return path.startswith(ALWAYS_REVIEW_PREFIXES) or path.rsplit("/", 1)[-1].casefold() in ALWAYS_REVIEW_NAMES
 
 
+def _path_words(path: str) -> list[str]:
+    """Path segments, further split on camelCase/PascalCase boundaries,
+    each casefolded. Case-boundary splitting must happen BEFORE casefold():
+    `"useAuth".casefold()` is `"useauth"`, and no regex can split that back
+    into `["use", "auth"]` once the case information is gone."""
+    words: list[str] = []
+    for raw in _TOKEN_SPLIT.split(path):
+        if not raw:
+            continue
+        words.extend(w for w in _CAMEL_SPLIT.split(raw) if w)
+    return [w.casefold() for w in words]
+
+
 def is_t2_sensitive(path: str) -> bool:
-    lowered = path.casefold()
-    tokens = (t for t in _TOKEN_SPLIT.split(lowered) if t)
-    return any(token in T2_SENSITIVE_TOKENS for token in tokens)
+    for word in _path_words(path):
+        if word in T2_FALSE_POSITIVE_WORDS:
+            continue
+        if any(word.startswith(root) for root in T2_SENSITIVE_ROOTS):
+            return True
+    return False
 
 
 def is_policy(path: str) -> bool:

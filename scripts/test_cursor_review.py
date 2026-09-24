@@ -1041,6 +1041,51 @@ class ClassRuleTests(unittest.TestCase):
                 self.assertEqual(0, code)
                 self.assertNotIn("::notice::review class P0", out)
 
+    def test_t2_camel_case_and_derived_forms_are_p0(self):
+        """PR #142 review, second round: whole-TOKEN matching (casefold()
+        then split) stopped catching compound identifiers because casefold()
+        destroys the camelCase/PascalCase boundary a split needs. Also
+        covers the reviewer's own CONSIDER finding (cursor_review.py:119):
+        derived forms like "authentication"/"authorization"/"oauth" that
+        the original bare word list did not enumerate, plus the T2-tier and
+        path-escalation categories from O-velocity.md (nvault, D1 schema,
+        migrations, wrangler bindings) that the original narrowing missed."""
+        for path in (
+            "app/composables/useAuth.ts",
+            "app/stores/authStore.ts",
+            "server/middleware/authMiddleware.ts",
+            "server/utils/sessions.ts",
+            "lib/oauth/callback.ts",
+            "src/authentication/index.ts",
+            "src/authorization/policy.ts",
+            "SessionStore.swift",
+            "server/database/schema.ts",
+            "apps/nvault/cmd/main.go",
+            "db/migrations/0007_add_index.sql",
+            "wrangler.toml",
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 1, "deletions": 0}])
+                code, out = run(transport, PR_TITLE="chore: routine wording", PR_AUTHOR="dependabot[bot]")
+                self.assertEqual(0, code)
+                self.assertIn("::notice::review class P0", out)
+
+    def test_t2_derived_false_positive_words_stay_p1(self):
+        """The camelCase/prefix widening must not reopen the exact
+        false-positive class test_t2_marker_substrings_are_not_p0 closed:
+        ordinary English words built on a T2 root stay P1 even when they
+        appear as their own path segment or inside a compound identifier."""
+        for path in (
+            "docs/authorship.md",
+            "finance/repayments/schedule.ts",
+            "billing/PrepaymentPlan.ts",
+        ):
+            with self.subTest(path):
+                transport = FakeTransport(files=[{"filename": path, "patch": PATCH, "additions": 1, "deletions": 0}])
+                code, out = run(transport, PR_TITLE="chore: routine wording")
+                self.assertEqual(0, code)
+                self.assertNotIn("::notice::review class P0", out)
+
     def test_policy_prose_is_p1_not_p0_so_the_spend_limits_apply(self):
         """The narrowing itself. These were P0 -- the class no cap may skip --
         which made the class rule inert in exactly the two repositories with
