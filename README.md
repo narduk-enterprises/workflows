@@ -373,10 +373,12 @@ label all share one bucket that no live review is ever in. `review-p0` and `revi
 wake the reviewer, and because waking it cancels any in-flight waiter they beat
 the inferred P2 signals too. Inside that, Logan's answer of
 2026-09-19 governs volume, in his words: *"No numeric cap, only the P0/P1/P2
-class rule"*. P0 (`.github/workflows/**`, `.github/actions/**`, `docs/agents/**`, a policy
-basename — `AGENTS.md`, `CLAUDE.md`, `CODEX.md`, `SKILL.md`, `DECISIONS.md`,
-matched case-insensitively — a T2-sensitive path, or the `review-p0` label) is always
-reviewed; P1 is ordinary code, reviewed **on request only** (`review-now` or `review-p1`)
+class rule"*. P0 (`.github/workflows/**`, `.github/actions/**`, `DECISIONS.md` or
+`cursor_review_brief.md` matched case-insensitively, a T2-sensitive path — auth, session,
+payments or the credential table — or the `review-p0` label) is always
+reviewed; P1 is ordinary code **and policy prose** (`docs/agents/**` and the basenames
+`AGENTS.md`, `CLAUDE.md`, `CODEX.md`, `SKILL.md`, P1 since the 2026-09-20 narrowing),
+reviewed **on request only** (`review-now` or `review-p1`)
 by default since 2026-09-24 (narduk-reboot O-D7; Logan: *"Review on request + sensitive
 paths (Recommended)"*) — a caller passing `review-ordinary-code: true` restores one
 automatic review per open/reopen/ready; P2 — an automation author

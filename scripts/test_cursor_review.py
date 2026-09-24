@@ -1802,6 +1802,16 @@ class OnRequestDefaultTests(unittest.TestCase):
                 self.assertIn("::notice::review class P0", out)
                 self.assertTrue(self.launched(transport))
 
+    def test_policy_prose_is_p1_on_request_only_by_default(self):
+        # The README and review_class docstring say so; pin it so docs and code
+        # cannot drift apart again (policy prose left P0 on 2026-09-20).
+        for path in ("AGENTS.md", "docs/agents/credentials.md", "skills/x/SKILL.md"):
+            with self.subTest(path):
+                with self.assertRaisesRegex(cr.Skip, "class P1 ordinary code is reviewed on request only"):
+                    cr.review_class(env(REVIEW_ORDINARY_CODE=""), [path])
+                self.assertEqual("P1", cr.review_class(env(REVIEW_ORDINARY_CODE="true"), [path])[0])
+                self.assertEqual("P1", cr.review_class(env(REVIEW_ORDINARY_CODE="", PR_LABELS=json.dumps(["review-p1"])), [path])[0])
+
     def test_an_unlistable_diff_still_fails_open(self):
         env_ = env(REVIEW_ORDINARY_CODE="")
         self.assertEqual("P1", cr.review_class(env_, None)[0])
