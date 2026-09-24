@@ -5,9 +5,10 @@ name: Reusable Node Library CI
 # reusable-node-ci.yml's lint/typecheck/test/build --if-present pattern plus
 # narduk-libs' package-gates matrix + verify aggregator
 # (narduk-enterprises/narduk-libs .github/workflows/ci.yml) into one reusable
-# workflow. reusable-node-ci.yml has zero live callers today (GitHub code
-# search, 2026-07-24) so nothing breaks by adding this alongside it — see
-# README "Relationship to reusable-node-ci.yml" for which file to pick.
+# workflow. reusable-node-ci.yml had zero live callers (GitHub code search,
+# 2026-07-24) and was retired 2026-09-24 (narduk-reboot P3-C2 / O-D8; see the
+# Catalog table in README.md) — this file is now the only Node-library CI
+# callable in this repo, so there is no longer a choice between the two.
 # Publish/release stays a separate per-repo workflow; credentials and
 # versioning strategy (Changesets vs manual bump) differ enough across
 # publishers that this file intentionally does not cover it.

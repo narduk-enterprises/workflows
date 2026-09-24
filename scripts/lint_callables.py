@@ -116,8 +116,6 @@ INPUT_EXPR = re.compile(r"^\$\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*\}\}$")
 # every adopter first and only then moving the tag (workflows#59).
 CALLER_GRANTS: dict[str, set[str]] = {
     "apple.yml": {"contents"},
-    "closing-syntax-check.yml": {"contents"},
-    "code-review.yml": {"contents"},
     # Posts a real pull-request review (APPROVE / COMMENT / REQUEST_CHANGES
     # with inline comments) and edits one sticky progress comment, so the
     # caller's `cursor-review:` job must grant `pull-requests: write`.
@@ -135,7 +133,12 @@ CALLER_GRANTS: dict[str, set[str]] = {
     "nuxt-cloudflare.yml": {"contents", "packages", "pull-requests", "actions"},
     "python-data.yml": {"contents"},
     "reusable-browser-tests.yml": {"contents", "packages", "actions"},
-    "reusable-node-ci.yml": {"contents", "packages"},
+    # Opens, comments on and closes the per-repo `red-main` issue.
+    "red-main-listener.yml": {"contents", "issues"},
+    # Files or updates the weekly digest issue. `gh run list` / `gh run view`
+    # need `actions: read` on a private caller (PR #142 review, high finding);
+    # every adopter's ADOPTION block permissions must include it.
+    "flake-digest.yml": {"contents", "issues", "actions"},
 }
 
 # Local composite/local-path uses are exempt from SHA pinning: `./...` and

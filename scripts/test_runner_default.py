@@ -52,12 +52,12 @@ DEFAULT_TAIL = f"github.event.repository.private == true && '{LINUX_CI}' || '\"u
 # callable -> the input that carries the caller's route
 CALLABLES = {
     "apple.yml": "lint-runner",
-    "closing-syntax-check.yml": "runner",
-    "code-review.yml": "runner",
     "docs-governance.yml": "runner",
     "node-library.yml": "runner",
     "python-data.yml": "runner",
     "nuxt-cloudflare.yml": "runner",
+    "red-main-listener.yml": "runner",
+    "flake-digest.yml": "runner",
 }
 BLACKSMITH_LABEL = "blacksmith-2vcpu-ubuntu-2404"
 
@@ -304,19 +304,6 @@ def check_browser_tests() -> None:
     print("ok  reusable-browser-tests.yml: contract + required")
 
 
-def check_node_ci() -> None:
-    doc = yaml.safe_load((WORKFLOWS / "reusable-node-ci.yml").read_text())
-    assert doc[True]["workflow_call"]["inputs"]["runner"]["default"] == ""
-    ro = doc["jobs"]["ci"]["runs-on"]
-    for vis in (False, None):
-        assert evaluate(ro, ctx_for(vis, "runner", "")) == "ubuntu-latest"
-    assert evaluate(ro, ctx_for(True, "runner", "")) == json.loads(LINUX_CI)
-    for val in ("ubuntu-latest", "ubuntu-24.04", "self-hosted"):  # plain-string contract
-        for vis in (True, False, None):
-            assert evaluate(ro, ctx_for(vis, "runner", val)) == val
-    print("ok  reusable-node-ci.yml: plain-string runner")
-
-
 def check_single_literal() -> None:
     literals = set()
     for f in WORKFLOWS.glob("*.yml"):
@@ -338,7 +325,6 @@ def main() -> int:
     self_test()
     total = sum(check_callable(f, n) for f, n in CALLABLES.items())
     check_browser_tests()
-    check_node_ci()
     check_single_literal()
     print(f"test_runner_default: all passed ({total} evaluations)")
     return 0
