@@ -1368,19 +1368,12 @@ alongside the existing `contents: read`, `packages: read`, and
 callers do not change. This is a breaking permission change: do not advance
 `v2` over it; publish a new major only after an adopter canary is green.
 
-The Fast escalation flag adds `checks: write` on the same rule. `Fast` and
-`Fast (escalated)` patch their own check run's output title and summary.
-GitHub rejects the whole caller run at startup if that grant is missing,
-whether or not `fast-scripts` is set. Do not advance `v2` until every
-nuxt-cloudflare caller has added it.
-
 ```yaml
     permissions:
       contents: read
       packages: read
       pull-requests: write
       actions: read # read the prior PR's E2E proof
-      checks: write # Fast escalation flag on the check run output
     with:
       run-e2e: true
       # Defaults: conservative path skipping and full-PR proof reuse.
@@ -1493,17 +1486,21 @@ routing, the Playwright config itself. The rules:
 #### What `ci / Fast` reports when a protected path matches
 
 The check name stays `Fast` in both cases, so the required context
-`ci / Fast` does not change. Whichever job holds that name publishes:
+`ci / Fast` does not change. What differs is the sibling check in the same
+workflow run:
 
-- job output `escalated`, `true` or `false`
-- a `### Fast escalation` step-summary section whose first line is
-  `escalated: true` or `escalated: false`
-- the check run output title `Fast escalated` or `Fast`, and the same first
-  line in the check run output summary
+| Run | Check named `Fast` | Other Fast checks |
+| --- | --- | --- |
+| Plain | the `fast` job (lint and unit scripts) | `fast-escalated` is skipped |
+| Escalated | the `fast-escalated` job (the full `Required` gate) | `Fast lanes (escalated)` (the lint and unit scripts) |
 
-`true` means a protected path matched and a run over 180 seconds is the full
-gate. `false` is a plain Fast run. Callers that leave `fast-scripts` empty
-still skip the job.
+So a readiness check that needs to know whether a `ci / Fast` run over 180
+seconds was the full gate looks for a `ci / Fast lanes (escalated)` check run
+in the same check suite. Reading check-run names needs no extra permission,
+so callers grant nothing new for this. For people reading the run, the job
+holding `Fast` also writes a `### Fast escalation` step-summary section with
+the line `escalated: true` or `escalated: false`; that step never fails the
+job. Callers that leave `fast-scripts` empty still skip both jobs.
 
 #### A non-blocking quarantine lane (`e2e-quarantine-args`)
 
@@ -1919,10 +1916,9 @@ Logan, 2026-09-18 (askme, 13:41 CT): "Moving v2 tag; repos move when touched
      with a `# v2` comment (`git ls-remote https://github.com/narduk-enterprises/workflows refs/tags/v2`;
      `3cc8c736d07aa821daeb417e7f6682ecd3935aa8` on 2026-09-18). A bare `@v2` fails caller-lint
      ("is not pinned to a full 40-character commit SHA") and foundation item 5.1;
-  2. a `nuxt-cloudflare.yml` caller adds `pull-requests: write` and
-     `checks: write` to its `ci:` job's `permissions:` (`checks: write`
-     publishes the Fast escalation flag), and passes `preview-checks: none`
-     if the repo has no Workers Builds preview (see [the preview gate](#nuxt-cloudflareyml));
+  2. a `nuxt-cloudflare.yml` caller adds `pull-requests: write` to its `ci:`
+     job's `permissions:`, and passes `preview-checks: none` if the repo has
+     no Workers Builds preview (see [the preview gate](#nuxt-cloudflareyml));
   3. a **private** caller that passes no `runner` now lands on the
      `linux-ci` organization group ([Default route](#default-route-empty-runner)).
      Confirm the repo is in that group. If it is not, it queues forever
