@@ -71,7 +71,7 @@ def review_json(**overrides: Any) -> str:
 class FakeTransport:
     """Routes by (method, path) and records everything that was sent."""
 
-    def __init__(self, *, result: str = review_json(), run_statuses: list[str] | None = None, pr_author: str = "loganrenz", head_now: str = HEAD, prior_reviews: list[dict[str, Any]] | None = None, marker_comment: dict[str, Any] | None = None, review_status: int = 200, files: list[dict[str, Any]] | None = None, agent_ledger: list[dict[str, Any]] | None = None) -> None:
+    def __init__(self, *, result: str = review_json(), run_statuses: list[str] | None = None, pr_author: str = "loganrenz", head_now: str = HEAD, prior_reviews: list[dict[str, Any]] | None = None, marker_comment: dict[str, Any] | None = None, review_status: int = 200, files: list[dict[str, Any]] | None = None, agent_ledger: list[dict[str, Any]] | None = None, compare_commits: list[dict[str, Any]] | None = None) -> None:
         self.calls: list[dict[str, Any]] = []
         self.result = result
         self.run_statuses = list(run_statuses or ["RUNNING", "FINISHED"])
@@ -89,6 +89,10 @@ class FakeTransport:
         # `GET /compare/<old>...<new>` -- the delta gate. None means the
         # comparison is unreadable, which must fail open.
         self.compare_files: list[dict[str, Any]] | None = [{"filename": "src/a.ts", "additions": 40, "deletions": 5}]
+        # Same endpoint's `commits` array -- the moved-head reviewer-push
+        # check (`reviewer_pushed_commits`). Empty by default: no test here
+        # exercises a moved head unless it sets this explicitly.
+        self.compare_commits = list(compare_commits) if compare_commits is not None else []
 
     def __call__(self, method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: int) -> tuple[int, Any]:
         payload = json.loads(body) if body else None
@@ -137,7 +141,7 @@ class FakeTransport:
         if method == "GET" and "/compare/" in path:
             if self.compare_files is None:
                 return 500, {"message": "boom"}
-            return 200, {"files": self.compare_files}
+            return 200, {"files": self.compare_files, "commits": self.compare_commits}
         if method == "GET" and path.endswith("/pulls/7/reviews"):
             return 200, self.prior_reviews
         if method == "POST" and path.endswith("/pulls/7/reviews"):
@@ -315,6 +319,38 @@ class ReviewFlowTests(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertIn("moved to", out)
         self.assertFalse(any(c["url"].endswith("/pulls/7/reviews") and c["method"] == "POST" for c in transport.calls))
+
+    def test_a_head_moved_by_the_reviewer_itself_fails_the_job_loudly(self):
+        """round-4 re-verify MEDIUM finding: the b73f49 incident shape (the
+        reviewer pushes a commit onto the PR's own head while its review is
+        in flight) must not be silently absorbed as an ordinary supersede --
+        it has to fail the job and say so, since `workOnCurrentBranch=False`
+        alone is unproven as a real credential boundary."""
+        transport = FakeTransport(
+            head_now="d" * 40,
+            compare_commits=[{"sha": "b73f49" + "0" * 34, "author": {"login": "cursoragent"}, "commit": {"author": {"name": "Cursor Agent"}}}],
+        )
+        with self.assertRaisesRegex(cr.ReviewError, "b73f49 shape"):
+            run(transport)
+        self.assertFalse(any(c["url"].endswith("/pulls/7/reviews") and c["method"] == "POST" for c in transport.calls))
+        last_patch = [c for c in transport.calls if c["method"] == "PATCH"][-1]
+        self.assertIn("did not complete", last_patch["body"]["body"])
+
+    def test_a_head_moved_by_someone_else_still_only_skips(self):
+        """The same moved-head shape, but the new commit is NOT the
+        reviewer's own -- an ordinary human push race, which must stay a
+        quiet Skip exactly as before."""
+        transport = FakeTransport(
+            head_now="d" * 40,
+            compare_commits=[{"sha": "c" * 40, "author": {"login": "loganrenz"}, "commit": {"author": {"name": "Logan Renz"}}}],
+        )
+        code, out = run(transport)
+        self.assertEqual(0, code)
+        self.assertIn("moved to", out)
+
+    def test_reviewer_pushed_commits_fails_open_when_the_compare_is_unreadable(self):
+        github = cr.GitHub("tok", REPO, lambda *a, **k: (500, {"message": "boom"}))
+        self.assertEqual([], cr.reviewer_pushed_commits(github, BASE, HEAD))
 
     def test_a_refused_inline_anchor_falls_back_to_a_body_only_review(self):
         transport = FakeTransport(review_status=422)
@@ -1294,8 +1330,18 @@ class NoPushTests(unittest.TestCase):
         sensitive = (
             ".github/workflows/ci.yml",
             ".github/workflows/nested/reusable.yml",
+            ".github/actions/setup/action.yml",  # round-4 re-verify LOW: Actions definitions were a gap
+            ".github/actions/nested/composite/action.yaml",
             "Component.test.tsx",
             "server/util.test.d.ts",
+            "scripts/test_cursor_review.py",  # round-4 re-verify LOW: this repo's own test convention
+            "scripts/test_red_main_listener.py",
+            "e2e/login.spec.ts",  # round-4 re-verify LOW: Playwright
+            "e2e/checkout.spec.js",
+            "pkg/x_test.go",  # round-4 re-verify LOW: Go
+            "internal/routing/ci_runner_routing_test.go",
+            "Tests/FooTests.swift",  # round-4 re-verify LOW: Swift/XCTest
+            "narduk-libs/Sources/App/Tests/SessionServiceTests.swift",
             "scripts/ci-runner-routing.py",
             "scripts/ci-runner-routing-v2/config.json",
             "src/routes/auth/login.ts",
@@ -1308,9 +1354,12 @@ class NoPushTests(unittest.TestCase):
         not_sensitive = (
             "src/widget.ts",
             "docs/agents/review-routing.md",
-            ".github/actions/setup/action.yml",  # ALWAYS_REVIEW, but not a no-push category
             "scripts/ci-runner.py",  # not the ci-runner-routing script
             "server/database/schema.ts",  # narrowed off the T2 matcher this same round
+            "scripts/testing_helpers.py",  # "testing_", not the `test_*.py` convention
+            "src/specimen.ts",  # "spec" is a substring, not the `.spec.` convention
+            "cmd/attest/main.go",  # "test" is a substring, not the `_test.go` convention
+            "docs/GuestsTests.md",  # "Tests" suffix, but not a `.swift` file
         )
         for path in not_sensitive:
             with self.subTest(path):

@@ -379,6 +379,61 @@ def main() -> int:
         if not check("no run-number: success still closes the issue", rc == 0 and '"state": "closed"' in output, out):
             failures += 1
 
+    # 8. The gap in the gap-closer (PR #142 review, round 4, LOW finding): a
+    # green run with NO issue open or ever created for this workflow must
+    # not vanish without a trace -- the classic race is a fast run N+1
+    # going green first (no issue exists yet to record it against), then a
+    # slow run N's failure arriving late and, without anything recorded,
+    # opening a false red-main issue.
+    with tempfile.TemporaryDirectory() as tmp_str:
+        tmp = Path(tmp_str)
+        h = Harness(tmp)
+
+        # Fast run N+1 (run_number=2) goes green FIRST. Nothing was ever
+        # open, so before the round-4 fix this was silently a no-op.
+        rc, out, output = h.run(script, CONCLUSION="success", RUN_NUMBER="2", RUN_ID="2")
+        total += 1
+        if not check("gap-closer: first-ever green with nothing open is recorded, not dropped", rc == 0 and '"state": "closed"' in output, out):
+            failures += 1
+        opened_or_patched = [c for c in h.calls() if c[:2] == ["api", "repos/narduk-enterprises/example/issues"] and "-X" not in c]
+        total += 1
+        if not check("gap-closer: recording it opened exactly one (pre-closed) tracking issue", len(opened_or_patched) == 1, str(h.calls())):
+            failures += 1
+
+        # Slow run N (run_number=1) finishes late and reports failure. It is
+        # OLDER than the run_number=2 green already recorded, so it must be
+        # skipped as stale -- no false red-main issue.
+        calls_before = len(h.calls())
+        rc, out, output = h.run(script, CONCLUSION="failure", RUN_NUMBER="1", RUN_ID="1")
+        total += 1
+        if not check("gap-closer: the late, older failure is skipped as stale, not opened", rc == 0 and output.strip() == "payload<<PAYLOAD_EOF\n\nPAYLOAD_EOF", out):
+            failures += 1
+        new_calls = h.calls()[calls_before:]
+        only_the_listing_get = new_calls == [["api", "repos/narduk-enterprises/example/issues", "-X", "GET", "-f", "state=all", "-f", "labels=red-main", "-f", "per_page=100"]]
+        total += 1
+        if not check("gap-closer: the stale late failure makes no follow-up gh API call", only_the_listing_get, str(new_calls)):
+            failures += 1
+        total += 1
+        opened_total = [c for c in h.calls() if c[:2] == ["api", "repos/narduk-enterprises/example/issues"] and "-X" not in c]
+        if not check("gap-closer: still exactly one issue ever created (no false red-main issue)", len(opened_total) == 1, str(h.calls())):
+            failures += 1
+
+        # A genuinely newer failure (run_number=3) DOES open normally.
+        rc, out, output = h.run(script, CONCLUSION="failure", RUN_NUMBER="3", RUN_ID="3")
+        total += 1
+        if not check("gap-closer: a genuinely newer failure (run 3) still opens", rc == 0 and '"state": "open"' in output, out):
+            failures += 1
+
+        # A caller that has NOT opted into ordering (no run-number) keeps
+        # the original bare no-op for this exact shape -- no tracking issue
+        # appears where none existed before.
+        h2 = Harness(tmp / "no-run-number")
+        rc, out, output = h2.run(script, CONCLUSION="success")
+        total += 1
+        only_the_listing_get_h2 = h2.calls() == [["api", "repos/narduk-enterprises/example/issues", "-X", "GET", "-f", "state=all", "-f", "labels=red-main", "-f", "per_page=100"]]
+        if not check("gap-closer: without run-number, first-ever green stays a pure no-op", rc == 0 and only_the_listing_get_h2 and output.strip() == "payload<<PAYLOAD_EOF\n\nPAYLOAD_EOF", out):
+            failures += 1
+
     print(f"\ntest_red_main_listener: {total} case(s), {failures} failure(s)")
     return 1 if failures else 0
 

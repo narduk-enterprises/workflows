@@ -74,6 +74,20 @@ name: Reusable Red-Main Listener
 # updated to pass them keeps today's un-ordered behaviour rather than being
 # newly blocked by it.
 #
+# THE GAP IN THE GAP-CLOSER (PR #142 review, round 4, LOW finding): the
+# ordering guard above only ever compares against an EXISTING issue's body,
+# and a green run with no open issue used to be a pure no-op that recorded
+# nothing. So the same race it was built to close still got through once:
+# no issue open yet, a slow run N fails and finishes AFTER a fast run N+1
+# has already gone green -- N+1 left no trace, so N's late failure has
+# nothing to compare against and opens a false "main is red" issue (it
+# self-heals on the next real green run, but the bad signal still fires).
+# A caller that opted in (passes `run-number`) now gets that green run
+# recorded as a CLOSED tracking issue -- refreshing one that already exists
+# for this workflow, or opening one pre-closed if none does -- so the next
+# out-of-order event has a run_number to be skipped against. A caller that
+# has not opted in keeps the exact original no-op.
+#
 # A DEVELOPMENT-MODE `development validate` run is the development-mode
 # equivalent of `main` CI (O §3.5) and routes here the same way, under
 # whatever `workflow-name` the caller gives that run.
@@ -345,8 +359,54 @@ jobs:
                   state = "open"
           else:
               if not existing:
-                  print(f"no open red-main issue for '{workflow_name}'; nothing to close")
-                  payload_out("")
+                  # ROUND-4 FIX (P3-C2, re-verify LOW finding): a plain
+                  # no-op here was the actual ordering gap, not a fixed one
+                  # -- it only compared against the newest issue's BODY, and
+                  # a green run with no open issue recorded nothing at all.
+                  # The common race this misses: no issue is open yet, a
+                  # slow run N fails and finishes AFTER a fast run N+1 has
+                  # already gone green. With nothing recorded for N+1, the
+                  # late failure for N has no reference to compare against
+                  # and opens a false "main is red" issue (it self-heals on
+                  # the next green run, but a bad signal still fires). When
+                  # the caller opted into ordering (run_number is not None),
+                  # record this green run as a CLOSED tracking issue -- open
+                  # a new one if none exists yet for this workflow, or just
+                  # refresh the existing (closed) one's body -- so a later
+                  # out-of-order failure has a run_number to compare against
+                  # and the stale-skip above catches it. A caller that has
+                  # not opted in (run_number is None) keeps the exact
+                  # original no-op: this never becomes new, unrequested
+                  # issue traffic for an un-updated adopter.
+                  if run_number is None:
+                      print(f"no open red-main issue for '{workflow_name}'; nothing to close")
+                      payload_out("")
+                      sys.exit(0)
+                  tracked_body = (
+                      f"main is green for **{workflow_name}** on `{repo}` "
+                      "(tracking only -- this issue stays closed; it exists "
+                      "so a late, out-of-order failure event cannot open a "
+                      "false red-main issue with no newer verdict to compare "
+                      "against).\n\n"
+                      f"Run: {run_url}\nHead: `{head_sha}`\nUpdated: {now}\n\n```json\n"
+                      + json.dumps(verdict_json("closed"))
+                      + "\n```\n"
+                  )
+                  if reference is not None:
+                      number = reference["number"]
+                      gh_api([f"repos/{repo}/issues/{number}", "-X", "PATCH", "-f", f"body={tracked_body}"])
+                      print(f"no open red-main issue for '{workflow_name}'; refreshed the closed tracking issue #{number} so a later out-of-order failure has a run to compare against")
+                  else:
+                      created = json.loads(gh_api([
+                          f"repos/{repo}/issues",
+                          "-f", f"title={title}",
+                          "-f", f"body={tracked_body}",
+                          "-f", f"labels[]={label}",
+                      ]))
+                      number = created["number"]
+                      gh_api([f"repos/{repo}/issues/{number}", "-X", "PATCH", "-f", "state=closed", "-f", "state_reason=completed"])
+                      print(f"no red-main issue existed yet for '{workflow_name}'; opened tracking issue #{number} already closed so ordering has a baseline")
+                  payload_out(json.dumps({**verdict_json("closed"), "issue_number": number}))
                   sys.exit(0)
               number = existing["number"]
               close_body = (

@@ -61,15 +61,28 @@ name: Reusable Cursor Review
 # narduk-libs#837 -- a SECURITY fix PR -- which then shipped. The brief's own
 # "do not push" HARD RULE existed the whole time (7cf053b) and did not stop
 # it: a prompt is not a control once untrusted diff/comment content is in
-# play. cursor_review.py's `is_no_push_sensitive()` now names the diffs
-# where that risk is unacceptable -- `.github/workflows/**`, any
-# `**/*.test.*` file, `scripts/ci-runner-routing*`, or a T2-sensitive path
-# (auth, session, payments, the credential table) -- and `launch()` responds
-# at the API level, not just in prose: `workOnCurrentBranch` goes `False`,
-# so the agent has no branch it can push a commit onto that lands on the
-# reviewed pull request. It may still read, run checks, and post its
-# findings as a comment/review exactly as before; only its ability to write
-# back onto THIS pull request's branch is removed.
+# play. cursor_review.py's `is_no_push_sensitive()` names the diffs where
+# that risk is unacceptable -- `.github/workflows/**`, `.github/actions/**`,
+# any test file (`**/*.test.*`, `test_*.py`, `**/*.spec.*`, `**/*_test.go`,
+# `**/*Tests.swift`), `scripts/ci-runner-routing*`, or a T2-sensitive path
+# (auth, session, payments, the credential table) -- and `launch()` asks
+# Cursor for `workOnCurrentBranch: False` on those diffs.
+#
+# THIS IS A DEFAULT-PATH REDIRECT, NOT A PROVEN CREDENTIAL BOUNDARY (round-4
+# re-verify MEDIUM finding: this comment previously overstated it as one).
+# Nothing live confirms Cursor's Cloud Agents API actually refuses a push to
+# the PR's own head ref when `workOnCurrentBranch` is `False` -- no estate
+# doc describes that field's semantics, and the reviewer keeps its
+# repo-scoped GitHub App write access regardless of this field's value, so a
+# model that ignores its brief can still attempt a push directly against the
+# GitHub remote. The second, independent layer is in `post_review()`:
+# `reviewer_pushed_commits()` inspects any commit that lands on the PR while
+# a round is in flight and fails the job loudly (not a quiet supersede) the
+# moment one is authored by the reviewer's own GitHub identity -- the exact
+# b73f49 shape -- regardless of what `workOnCurrentBranch` did or did not do.
+# The reviewer may still read, run checks, and post its findings as a
+# comment/review exactly as before on every one of these diffs; only a
+# write back onto THIS pull request's branch is targeted.
 #
 # SKIPS exit 0 with a `::notice::`: no pull request on this event, a draft PR,
 # the `no-ai-review` label, a FORK head (same-repo heads only: a fork must not

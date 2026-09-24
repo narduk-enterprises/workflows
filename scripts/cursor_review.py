@@ -96,20 +96,36 @@ ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/")
 # and a `cursor_review_brief.md` edit is the reviewer editing its own brief.
 ALWAYS_REVIEW_NAMES = ("decisions.md", "cursor_review_brief.md")
 # T2-sensitive application code (narduk-reboot P3-C2, PLAN.md row P3-C2 /
-# O-D7). Scope is EXACTLY O-velocity's path-escalation list for a T0/T1
-# repo (O-velocity.md §3.2 "Path escalation", PLAN.md row 365,
-# sections/infrastructure.md I1-A "Contents:"): auth, session, payments and
-# the credential table -- neither broader nor narrower (PR #142 review,
-# third round, MEDIUM finding: a round-2 fix widened this past that list --
-# `nvault`, `migration`, `wrangler` and a bare `schema` root -- which forced
-# P0 on JSON Schema config, SEO-schema composables and logging-schema files
-# that have nothing to do with a D1 migration). Those three other
-# categories are real, but they are NOT this matcher's job:
+# O-D7). Scope is auth, session, payments and the credential table -- four
+# roots, neither broader nor narrower (PR #142 review, third round, MEDIUM
+# finding: a round-2 fix widened this past that list -- `nvault`,
+# `migration`, `wrangler` and a bare `schema` root -- which forced P0 on
+# JSON Schema config, SEO-schema composables and logging-schema files that
+# have nothing to do with a D1 migration).
+#
+# THIS IS NOT "exactly O-velocity's path-escalation list" (round-4 re-verify
+# LOW finding on that exact wording, previously here): O-velocity.md's own
+# path-escalation section (§3.2, lines 377-382) also names `wrangler`
+# binding changes and migrations, which this matcher deliberately excludes.
+# The citation that actually matches is sections/infrastructure.md I1-A,
+# which gives migrations and wrangler bindings to the deploy tool instead --
+# "guarded by the deploy tool, not by rulesets" -- narduk-app-tools' own
+# 12.9 expand-only check and binding diff, not this reviewer. That exclusion
+# is PLAN hazard (d), a still-open Logan pick recommended "no" (i.e. keep
+# them out of this reviewer); it is a defensible narrowing under I1-A, not a
+# claim of matching O-velocity's list exactly.
+#
+# I1-A's OWN list is not an exact match either -- it also names nvault, the
+# credential registry, and hook leak guards, none of which are per-path
+# classifications a matcher like this one can apply to an arbitrary caller
+# repo's diff:
 #   - nvault is a whole repo/tier classification (the T2 "who" row), not a
 #     path inside an arbitrary caller repo.
-#   - migrations and wrangler binding changes are "guarded by the deploy
-#     tool, not by rulesets" (infrastructure.md I1-A) -- narduk-app-tools'
-#     own 12.9 expand-only check and binding diff, not this reviewer.
+#   - the credential registry and hook leak guards are agent-infrastructure-
+#     specific mechanisms, not a path shape a generic path matcher can name.
+# So the honest description is: this matcher covers the PATH-SHAPED subset
+# of I1-A's T2 application code -- auth, session, payments, credential
+# table -- and nothing else in I1-A's or O-velocity's wider lists.
 # "oauth" stays as its own root: it is the same auth category by another
 # name (OAuth IS an authentication mechanism), not a fifth category, so
 # including it does not broaden scope beyond "auth".
@@ -725,26 +741,63 @@ def is_t2_sensitive(path: str) -> bool:
 # test-loosening "autofix" commit (b73f49) onto narduk-libs#837, a SECURITY
 # fix PR, and it shipped -- because nothing but the brief's own prose (HARD
 # RULES: "Do not commit, push...", present since the very first commit of
-# this callable, 7cf053b) stood between the agent and a writable branch. A
-# prompt is not a control: a model that ignores it, or is steered by
-# untrusted diff/comment content it was told to treat as data, still has the
-# write access if the launch payload grants it. is_no_push_sensitive() names
-# the diffs where that is unacceptable regardless of what the model does --
-# CI/workflow definitions, test files (a loosened assertion is exactly the
-# b73f49 shape), the runner-routing script (misroute a job onto the wrong
-# trust boundary), and any T2-sensitive path (auth/session/payments/
-# credential-table) -- and launch() responds by refusing to give the agent a
-# branch it can push commits onto for those diffs: `workOnCurrentBranch` goes
-# False, so any change the agent makes (in violation of its own brief) lands
-# on a throwaway branch of the agent's own, never on the reviewed PR. The
-# review itself is unaffected either way: findings come back from the
-# agent's final JSON message, never from its git state.
-NO_PUSH_PREFIXES = (".github/workflows/", "scripts/ci-runner-routing")
-_TEST_FILE = re.compile(r"(^|/)[^/]*\.test\.[^/]+$")
+# this callable, 7cf053b) stood between the agent and a writable branch.
+#
+# THIS IS A DEFAULT-PATH REDIRECT, NOT A PROVEN CREDENTIAL BOUNDARY (round-4
+# re-verify MEDIUM finding on the round-1 fix, which overclaimed this).
+# `workOnCurrentBranch: False` is the only control here, and no estate doc or
+# live test proves that Cursor's Cloud Agents API actually refuses a push to
+# `PR_HEAD_REF` when it is False -- `rg workOnCurrentBranch` across this repo
+# finds only the launcher setting it and this comment describing it, nothing
+# from Cursor's own side. The agent also keeps its repo-scoped GitHub App
+# write access regardless of this field, so a model that ignores its brief
+# (or is steered by untrusted diff/comment content it was told to treat as
+# data) can still attempt `git push origin HEAD:<pr-branch>` directly against
+# the GitHub remote, bypassing whatever `workOnCurrentBranch` does inside
+# Cursor's own sandbox entirely. Until that is verified live, treat this as
+# raising the bar for the DEFAULT path, not as a credential-level guarantee:
+# `reviewer_pushed_commits()` below is the second layer that does not depend
+# on Cursor's behaviour -- it detects the b73f49 SHAPE after the fact (a
+# commit landing on the PR's head, authored by the reviewer's own login,
+# while a round is in flight) and fails the job loudly instead of silently
+# treating a moved head as an ordinary supersede.
+#
+# is_no_push_sensitive() names the diffs where a reviewer-authored push is
+# unacceptable regardless of what the model does -- CI/workflow and Actions
+# definitions, test files in every convention this estate uses (a loosened
+# assertion is exactly the b73f49 shape), the runner-routing script (misroute
+# a job onto the wrong trust boundary), and any T2-sensitive path
+# (auth/session/payments/credential-table, see is_t2_sensitive()) -- and
+# launch() responds by asking Cursor not to give the agent a branch it can
+# push commits onto for those diffs. The review itself is unaffected either
+# way: findings come back from the agent's final JSON message, never from
+# its git state.
+NO_PUSH_PREFIXES = (".github/workflows/", ".github/actions/", "scripts/ci-runner-routing")
+# Test-file conventions across the estate's stacks (round-4 re-verify LOW
+# finding: the original `\.test\.` pattern alone missed `.github/actions/**`
+# action definitions, this repo's own `test_*.py` scripts, Playwright's
+# `*.spec.ts`, Go's `*_test.go` and Swift's `*Tests.swift` -- all of them
+# ordinary, common test-file shapes that a loosened assertion could hide in
+# just as well as `src/a.test.ts` can). Fail open toward no-push, never
+# toward allowing a push: an unmatched test convention this list still
+# misses costs nothing (every OTHER estate repo pins a SHA, so this list can
+# grow without touching a live caller), while a missed one is exactly the
+# b73f49 risk this callable exists to close.
+_TEST_FILE_PATTERNS = (
+    re.compile(r"(^|/)[^/]*\.test\.[^/]+$"),   # src/a.test.ts, useAuth.test.tsx
+    re.compile(r"(^|/)test_[^/]*\.py$"),        # scripts/test_cursor_review.py
+    re.compile(r"(^|/)[^/]*\.spec\.[^/]+$"),    # e2e/login.spec.ts (Playwright)
+    re.compile(r"(^|/)[^/]*_test\.go$"),        # pkg/x_test.go
+    re.compile(r"(^|/)[^/]*Tests\.swift$"),     # Tests/FooTests.swift (XCTest)
+)
+
+
+def is_test_file(path: str) -> bool:
+    return any(pattern.search(path) for pattern in _TEST_FILE_PATTERNS)
 
 
 def is_no_push_sensitive(path: str) -> bool:
-    return path.startswith(NO_PUSH_PREFIXES) or bool(_TEST_FILE.search(path)) or is_t2_sensitive(path)
+    return path.startswith(NO_PUSH_PREFIXES) or is_test_file(path) or is_t2_sensitive(path)
 
 
 def no_push_reasons(paths: list[str] | None) -> list[str]:
@@ -1149,13 +1202,18 @@ def launch(cursor: Cursor, env: dict[str, str], brief: str, repository: str, rep
         + [{"url": f"https://github.com/{name}"} for name in repos],
         "model": {"id": model, "params": params},
         "name": f"review {repository}#{env['PR_NUMBER']} @{env['PR_HEAD_SHA'][:7]}",
-        # `no_push` (a diff touching .github/workflows/**, **/*.test.*,
+        # `no_push` (a diff touching .github/workflows/**, .github/actions/**,
+        # a test file in any convention is_test_file() names,
         # scripts/ci-runner-routing* or a T2-sensitive path -- see
-        # is_no_push_sensitive()) turns this OFF. False here means any commit
-        # the agent makes lands on a throwaway branch of its own, never on
-        # `PR_HEAD_REF` itself -- a code-level control the b73f49 incident
-        # showed the brief's own "do not push" prose cannot be trusted alone
-        # to enforce.
+        # is_no_push_sensitive()) turns this OFF. This is the DEFAULT-PATH
+        # redirect the round-1 fix (b73f49 incident) added, not a proven
+        # credential boundary: nothing live confirms that Cursor's Cloud
+        # Agents API actually refuses a push to `PR_HEAD_REF` when this is
+        # False (see the long NO-PUSH comment above `NO_PUSH_PREFIXES`), and
+        # the agent keeps its repo-scoped GitHub App write access either way.
+        # `reviewer_pushed_commits()` in `post_review()` is the layer that
+        # does not depend on this field doing what it is named for: it
+        # detects the b73f49 shape after the fact and fails the job loudly.
         "workOnCurrentBranch": not no_push,
     }
     value = cursor.call("POST", "/v1/agents", body)
@@ -1203,11 +1261,59 @@ def dismiss_stale_request_changes(github: GitHub, number: str, head_sha: str) ->
     return dismissed
 
 
+# The b73f49 incident's own commit (`gh api repos/narduk-enterprises/
+# narduk-libs/commits/b73f49...`) carries author login "cursoragent" and
+# author name "Cursor Agent". `reviewer_pushed_commits()` below is the
+# second layer of the no-push control (round-4 re-verify MEDIUM finding: the
+# only other layer, `workOnCurrentBranch=False`, is unproven -- see the
+# NO-PUSH comment above `NO_PUSH_PREFIXES`). It does not depend on Cursor
+# honouring that field at all: whenever the PR's head moves while a review
+# is in flight, it inspects the NEW commits directly and fails the job
+# loudly (::error::, non-zero exit) the moment one of them is authored by
+# the reviewer's own identity -- exactly the shape of a reviewer pushing
+# onto the PR it was reviewing, whatever caused the head to move.
+REVIEWER_LOGINS = frozenset({"cursoragent"})
+REVIEWER_AUTHOR_NAMES = frozenset({"cursor agent"})
+
+
+def reviewer_pushed_commits(github: GitHub, old_sha: str, new_sha: str) -> list[dict[str, Any]]:
+    """New commits between `old_sha` and `new_sha` authored by the Cursor
+    reviewer's own GitHub identity. Returns `[]` when the comparison itself
+    cannot be read (fail OPEN on the query -- the caller still treats an
+    unexplained moved head as a Skip either way) or when it lists no such
+    commit."""
+    try:
+        compare = github.call("GET", f"compare/{old_sha}...{new_sha}")
+    except ReviewError as exc:
+        notice(f"could not compare {old_sha[:12]}...{new_sha[:12]} to check for a reviewer-authored push: {exc}")
+        return []
+    hits = []
+    for commit in compare.get("commits", []) or []:
+        login = ((commit.get("author") or {}).get("login") or "").casefold()
+        author_name = ((commit.get("commit") or {}).get("author") or {}).get("name") or ""
+        if login in REVIEWER_LOGINS or author_name.casefold() in REVIEWER_AUTHOR_NAMES:
+            hits.append({"sha": commit.get("sha") or "", "login": login or None, "name": author_name or None})
+    return hits
+
+
 def post_review(github: GitHub, env: dict[str, str], result: dict[str, Any], context: dict[str, Any]) -> tuple[dict[str, Any], str]:
     number = env["PR_NUMBER"]
     pull = github.call("GET", f"pulls/{number}")
-    if pull.get("head", {}).get("sha") != env["PR_HEAD_SHA"]:
-        raise Skip(f"PR #{number} moved to {str(pull.get('head', {}).get('sha'))[:12]} while the review ran; a push no longer re-reviews, so add the '{REVIEW_NOW_LABEL}' label to review the new head")
+    new_head = str(pull.get("head", {}).get("sha") or "")
+    if new_head != env["PR_HEAD_SHA"]:
+        pushed = reviewer_pushed_commits(github, env["PR_HEAD_SHA"], new_head)
+        if pushed:
+            shas = ", ".join(c["sha"][:12] for c in pushed if c.get("sha"))
+            who = next((c["login"] or c["name"] for c in pushed if c.get("login") or c.get("name")), "the reviewer")
+            raise ReviewError(
+                f"PR #{number} head moved from {env['PR_HEAD_SHA'][:12]} to "
+                f"{new_head[:12]} while the review ran, and commit(s) [{shas}] on the new "
+                f"head are authored by {who} -- the Cursor reviewer's own identity. This "
+                "is the b73f49 shape (the reviewer pushed a commit onto the PR it was "
+                "reviewing) and must not be silently treated as an ordinary superseded "
+                "review."
+            )
+        raise Skip(f"PR #{number} moved to {new_head[:12]} while the review ran; a push no longer re-reviews, so add the '{REVIEW_NOW_LABEL}' label to review the new head")
     self_authored = (pull.get("user") or {}).get("login") == BOT_LOGIN
     event = review_event(result, approve_on_clean=env_bool(env.get("APPROVE_ON_CLEAN", "true")), self_authored=self_authored)
     index = diff_index(github.pages(f"pulls/{number}/files"))
