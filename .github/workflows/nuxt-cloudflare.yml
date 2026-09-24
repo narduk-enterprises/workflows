@@ -353,6 +353,21 @@ on:
         required: false
         type: string
         default: "auto"
+      artifact-scope:
+        description: >-
+          Optional caller-scoped disambiguator folded into the internal E2E
+          build artifact's name. GitHub only guarantees artifact-name
+          uniqueness within a whole workflow RUN, not within one call of this
+          reusable workflow, so calling it more than once in a single run
+          (e.g. two `uses:` jobs) without this set risks GitHub folding both
+          uploads into one artifact and failing the losing caller's download
+          with "None of the provided artifact IDs were found" (workflows#144).
+          Give each concurrent call a distinct value, such as its own job id.
+          Leave unset for a single call per run; the workflow then falls back
+          to a random per-call token so it never collides either.
+        required: false
+        type: string
+        default: ""
       e2e-browsers:
         description: >-
           Space-separated required browser engines. On a non-isolated runner
@@ -1559,11 +1574,13 @@ jobs:
         env:
           BUILD_PATH: ${{ inputs.e2e-build-artifact-path }}
           RUN_E2E: ${{ inputs.run-e2e }}
+          ARTIFACT_SCOPE: ${{ inputs.artifact-scope }}
         run: |
           set -euo pipefail
           node <<'NODE'
           const fs = require('node:fs')
           const path = require('node:path')
+          const crypto = require('node:crypto')
           let output = process.env.BUILD_PATH
           if (output === 'auto') {
             if (process.env.RUN_E2E !== 'true') process.exit(0)
@@ -1582,7 +1599,23 @@ jobs:
           if (!resolved.startsWith(fs.realpathSync('.') + path.sep) || !fs.statSync(resolved).isDirectory()) {
             throw new Error('Build output must be a directory inside working-directory')
           }
+          // The upload below is only unique within THIS job; GitHub scopes
+          // artifact-name uniqueness to the whole workflow RUN. Two `uses:`
+          // calls of this reusable workflow in one run share
+          // github.run_id/run_attempt, so an unscoped name collides and
+          // GitHub's list-artifacts-by-run response folds both uploads into
+          // one -- whichever caller captured the OTHER upload's numeric ID
+          // then fails download with "None of the provided artifact IDs were
+          // found" (workflows#144; reproduced in development-deploy-proof PR
+          // #5, run 36004204360, case_b_nomatch / E2E (1)). `artifact-scope`
+          // lets a caller give each concurrent call a stable, readable name;
+          // left unset -- including by a caller that does not yet know it
+          // calls this workflow twice in one run -- it falls back to a
+          // random per-call token so it never collides either.
+          const sanitizedScope = (process.env.ARTIFACT_SCOPE || '').replace(/[^A-Za-z0-9._-]/g, '-')
+          const scope = sanitizedScope || crypto.randomBytes(6).toString('hex')
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `path=${output}\n`)
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `scope=${scope}\n`)
           NODE
 
       - name: Upload prebuilt E2E application
@@ -1590,7 +1623,7 @@ jobs:
         if: steps.e2e-build-path.outputs.path != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-build-${{ github.run_id }}-${{ github.run_attempt }}
+          name: e2e-build-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.e2e-build-path.outputs.scope }}
           path: ${{ inputs.working-directory }}/${{ steps.e2e-build-path.outputs.path }}
           if-no-files-found: error
           include-hidden-files: true
