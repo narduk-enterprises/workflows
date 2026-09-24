@@ -77,6 +77,27 @@ name: Reusable Nuxt + Cloudflare CI
 # check context `ci / Required` on every adopting repo regardless of whether
 # e2e or the deploy dry-run gate ran. See README for the full explanation.
 #
+# THE FAST PATH (narduk reboot P3-C1; DECISIONS Round 3 Q1 "Local proof, CI
+# after"). Four opt-in inputs, all default off, let CI become the asynchronous
+# safety net instead of the thing a merge waits on:
+#   fast-scripts                 -> `ci / Fast`, the one required check for a
+#                                   T1 repo (affected lint/type/unit, no e2e),
+#                                   escalating to the full gate on protected
+#                                   paths (`e2e-full-paths`)
+#   required-reuse-pr-results    -> a default-branch push whose tree already
+#                                   passed the full PR gate skips every lane
+#   e2e-pr-only-changed          -> PR-tier Playwright `--only-changed`
+#   journey-smoke-url (+ rollback-script/-to) -> post-deploy `@smoke` journeys
+#                                   (90 s, one retry) with a rollback hook,
+#                                   called from the caller's promote workflow
+# NIGHTLY FULL E2E needs no input: a `schedule:` trigger on the caller's CI
+# workflow already takes the full configuration, because path skips, the PR
+# subset, `--only-changed` and both proof reuses apply only to pull requests
+# and pushes. For example, in the caller's ci.yml:
+#   on: { schedule: [{ cron: "17 8 * * *" }] }   # 08:17 UTC = 3:17 AM CT
+# alongside its push/pull_request triggers, with the same `ci:` job. The
+# quarantine lane (`e2e-quarantine-args`) runs there too.
+#
 # RUNNER ROUTING: `runner` is a caller-controlled, JSON-encoded string input —
 # a plain string ("ubuntu-latest"), a JSON array, or a JSON object matching
 # Config/github-runner-fleet.json's `runsOn` shape — decoded with fromJSON()
@@ -684,6 +705,128 @@ on:
         required: false
         type: string
         default: "package-token"
+      # ---------------------------------------------------------------------
+      # FAST-PATH DELIVERY INPUTS (narduk reboot P3-C1, O-velocity §3.4-§3.6).
+      # Every input below defaults OFF. With all of them at their defaults the
+      # pre-existing jobs run exactly as before: the jobs added for them
+      # (`Reuse plan`, `Fast`, `Fast (escalated)`, `Journey smoke`) are skipped
+      # at job level without a runner, and `Required` reads them as skipped.
+      # Two of those four skipped checks show a raw `${{ ... }}` name, because
+      # GitHub does not evaluate a skipped job's computed name (see NAMING IS
+      # THE GATE at `fast`). The lanes that sit below the skipped `Reuse plan`
+      # carry explicit status guards so the skip does not propagate (see SKIP
+      # PROPAGATION at `reuse-plan`).
+      # They also stay out of the E2E proof key while at their defaults, so
+      # proof minted by the previous revision still matches (see `E2E plan`).
+      # ---------------------------------------------------------------------
+      fast-scripts:
+        description: >-
+          Space-separated package.json scripts for the `Fast` job, run in
+          order (for example `lint typecheck test:changed`). Non-empty turns
+          the job on; empty (the default) leaves it off. The job adds no e2e
+          and no build, and targets 3 minutes or less at p90, so it can be the
+          one required check (`ci / Fast`) for a repository whose full
+          `ci / Required` runs as an asynchronous net. On `pull_request`
+          events the scripts see FAST_BASE_REF=HEAD^1 (the checkout is the PR
+          merge commit fetched at depth 2, so HEAD^1 is the base tip) for
+          affected-only selection such as `vitest --changed="$FAST_BASE_REF"`
+          or `eslint` over `git diff --name-only "$FAST_BASE_REF"`; on every
+          other event FAST_BASE_REF is empty and a script should run its full
+          selection. PROTECTED-PATH ESCALATION: when `e2e-full-paths` matches
+          a changed file on a pull request (the same decision `E2E plan`
+          already makes), the job that reports as `Fast` is `Fast
+          (escalated)`, which waits for the full gate and applies the exact
+          `Required` checks, so auth, payment, binding and migration changes
+          still prove the whole suite before merge. Escalation needs
+          `run-e2e: true`, because `E2E plan` makes the decision: with
+          `e2e-full-paths` set and `run-e2e: false` the job fails closed
+          rather than pass protected paths on lint/unit alone. With
+          `e2e-full-paths` empty nothing escalates.
+        required: false
+        type: string
+        default: ""
+      required-reuse-pr-results:
+        description: >-
+          Tree-match reuse for the whole `Required` result, extending
+          `e2e-reuse-pr-results`. On a pull request whose `Required` passed
+          with the full configuration (every enabled lane ran; E2E, when
+          enabled, ran its full `e2e-args`/`e2e-shards` rather than a path
+          skip or the PR subset), `Required` publishes a proof keyed on the
+          tested Git tree, the caller workflow and every callable input. On a
+          default-branch push, `Reuse plan` looks that proof up; when the
+          merged tree is identical and the proof's source run completed
+          successfully, `Build`, `Checks`, `Extra gate`, `E2E plan` and
+          `Fast` are skipped and `Required` passes on the proof (`Caller lint`
+          still runs). Missing, expired, unreadable or mismatched proof runs
+          the full gate. Requires `actions: read` on the caller's `ci` job.
+        required: false
+        type: boolean
+        default: false
+      e2e-pr-only-changed:
+        description: >-
+          On `pull_request` events that take the pull-request tier (no
+          `e2e-full-paths` match), append `--only-changed=HEAD^1
+          --pass-with-no-tests` to the effective E2E arguments so Playwright
+          (1.46 or later) runs only the spec files this PR changed or whose
+          imports it changed. The E2E checkout fetches depth 2 so HEAD^1 (the
+          base tip of the PR merge commit) exists. Never applied to pushes,
+          schedules, manual runs or full-path escalations, and a subset run
+          never mints E2E or `Required` proof. Default false.
+        required: false
+        type: boolean
+        default: false
+      journey-smoke-url:
+        description: >-
+          POST-DEPLOY JOURNEY SMOKE MODE. An `https://` production URL turns
+          this call into a smoke run for a caller's promote or deploy
+          workflow: `Journey smoke` installs the caller's dependencies, runs
+          `e2e-script` with `journey-smoke-args` against the URL
+          (PLAYWRIGHT_BASE_URL) under a hard 90-second budget, and every CI
+          lane (`Build`, `Checks`, `Extra gate`, `E2E plan`, `Fast`, `Reuse
+          plan`) is skipped. Browser routing and the isolated-pool toolchain
+          contract are the `E2E` job's (`e2e-runner`, `e2e-browsers`,
+          `e2e-install-browsers`, `e2e-browsers-path`). The caller's
+          Playwright config must skip its `webServer` when PLAYWRIGHT_BASE_URL
+          is set, as the preview e2e-subset already requires. Empty (the
+          default) is normal CI.
+        required: false
+        type: string
+        default: ""
+      journey-smoke-args:
+        description: >-
+          Playwright arguments for the journey smoke. The default selects the
+          `@smoke`-tagged critical journeys with one retry, so a journey must
+          fail twice before it counts. This workflow adds its own JSON
+          reporter to classify the result.
+        required: false
+        type: string
+        default: "--grep=@smoke --retries=1"
+      journey-smoke-rollback-script:
+        description: >-
+          ROLLBACK HOOK. A package.json script the `Journey smoke` job runs
+          when at least one smoke journey failed after its retry (for example
+          a script wrapping `narduk-app deploy rollback --to
+          "$ROLLBACK_TO_VERSION"`). It is NOT run when the result is
+          inconclusive: no smoke test matched, the reporter wrote nothing, or
+          the 90-second budget ran out. Those fail the job without touching
+          production. The script receives ROLLBACK_TO_VERSION
+          (`journey-smoke-rollback-to`), JOURNEY_SMOKE_URL and ROLLBACK_TOKEN
+          (the optional JOURNEY_SMOKE_ROLLBACK_TOKEN secret, exposed to this
+          one step only). The job stays red after a rollback. Leave empty
+          (the default) for report-only smoke; pass empty on deploys whose
+          rollback Cloudflare cannot perform (a Durable Object class change,
+          a removed binding, a migration that did not pass the expand-only
+          check) so they page instead.
+        required: false
+        type: string
+        default: ""
+      journey-smoke-rollback-to:
+        description: >-
+          The last verified Worker version ID, exported to the rollback
+          script as ROLLBACK_TO_VERSION. Empty lets the script choose.
+        required: false
+        type: string
+        default: ""
     secrets:
       # CI alias for the single estate packages-read PAT. This is the only
       # credential foundation checks and legacy direct installs may consume.
@@ -698,13 +841,107 @@ on:
       # PAT. Generic caller-owned installers may omit it.
       NVAULT_TOKEN:
         required: false
+      # Journey-smoke rollback credential. Exposed as ROLLBACK_TOKEN to the
+      # rollback-hook step only, and only in journey-smoke mode. Never read by
+      # a CI lane.
+      JOURNEY_SMOKE_ROLLBACK_TOKEN:
+        required: false
 
 env:
   NUXT_TELEMETRY_DISABLED: 1
 
 jobs:
+  # TREE-MATCH REUSE OF THE WHOLE GATE (`required-reuse-pr-results`, P3-C1).
+  # Runs only on a default-branch push of a caller that opted in. It never
+  # fails the run on a lookup problem: any error leaves `reused` unset, and
+  # every lane below then runs as it always has. When the input is off this
+  # job is skipped at job level, and the lanes that list it in `needs:` use
+  # `!cancelled()`, so a skipped `Reuse plan` delays nothing and skips nothing.
+  #
+  # SKIP PROPAGATION. GitHub applies a skip to the WHOLE dependency chain
+  # below it: a job whose `if:` has no status function gets an implicit
+  # `success()`, and at job level that is false when ANY ancestor, not just a
+  # direct `needs:` entry, was skipped (actions/runner#2205). `Reuse plan` is
+  # skipped for every default caller and is an ancestor of every CI lane, so
+  # every job that needs `Build` or `E2E plan` states its own status guard
+  # (`!cancelled() && needs.<job>.result == 'success' && ...`, the old
+  # implicit `success()` over its direct needs) instead of relying on the
+  # implicit one. scripts/test_fast_path.py simulates the job graph with this
+  # rule and fails when any pre-existing job runs or skips differently from
+  # the previous revision's graph.
+  reuse-plan:
+    name: Reuse plan
+    if: >-
+      inputs.required-reuse-pr-results
+      && inputs.journey-smoke-url == ''
+      && github.event_name == 'push'
+      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    # CI lightweight route (company-hq CI policy); caller override takes precedence.
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
+    # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reused: ${{ steps.proof.outputs.reused }}
+    steps:
+      - name: Find equivalent successful PR Required proof
+        id: proof
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          PROOF_INPUTS: ${{ toJSON(inputs) }}
+        with:
+          # Anchored: `Required` computes the SAME key with this SAME text on
+          # the pull request that mints the proof, so the two can never drift.
+          # On a pull request it only computes the key; on a push it also
+          # looks the proof up.
+          script: &required_proof_script |
+            const { createHash } = require('node:crypto');
+            core.setOutput('reused', 'false');
+            try {
+              const repo = context.repo;
+              const repositoryId = context.payload.repository.id;
+              const workflow = process.env.CALLER_WORKFLOW_REF.split('@')[0];
+              const workflowPath = workflow.slice(`${repo.owner}/${repo.repo}/`.length);
+              const inputs = JSON.parse(process.env.PROOF_INPUTS);
+              const canonicalInputs = Object.fromEntries(Object.entries(inputs).sort(([a], [b]) => a.localeCompare(b)));
+              const { data: commit } = await github.rest.repos.getCommit({ ...repo, ref: context.sha, request: { timeout: 10000 } });
+              const tree = commit.commit.tree.sha;
+              if (!/^[a-f0-9]{40}$/.test(tree)) throw new Error('missing tested Git tree');
+              const digest = createHash('sha256').update(JSON.stringify({ tree, workflow, inputs: canonicalInputs })).digest('hex');
+              const key = `required-proof-v1-${digest}`;
+              core.setOutput('key', key);
+              if (context.eventName !== 'push') return;
+              // Bound the lookup. An absent proof costs a run, never coverage.
+              const { data } = await github.rest.actions.listArtifactsForRepo({ ...repo, name: key, per_page: 5, request: { timeout: 10000 } });
+              const candidates = data.artifacts.slice(0, 5).filter(artifact => artifact.name === key && !artifact.expired && artifact.workflow_run?.repository_id === repositoryId && artifact.workflow_run?.head_repository_id === repositoryId);
+              const proofs = await Promise.all(candidates.map(async artifact => {
+                const { data: run } = await github.rest.actions.getWorkflowRun({ ...repo, run_id: artifact.workflow_run.id, request: { timeout: 10000 } });
+                return { artifact, run };
+              }));
+              for (const { artifact, run } of proofs) {
+                if (run.event !== 'pull_request' || run.status !== 'completed' || run.conclusion !== 'success' || run.path !== workflowPath || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) continue;
+                // A rerun must publish fresh proof, not inherit an older attempt.
+                if (!(Date.parse(artifact.created_at) >= Date.parse(run.run_started_at))) continue;
+                core.setOutput('reused', 'true');
+                core.notice(`Reusing the full Required result from ${run.html_url} for Git tree ${tree}`);
+                await core.summary.addRaw(`The full Required gate already passed for this Git tree and configuration: ${run.html_url}\n`).write();
+                return;
+              }
+              core.info('No equivalent successful PR Required proof; running the full gate.');
+            } catch (error) {
+              core.warning(`Required proof unavailable; running the full gate: ${error.message}`);
+            }
+
   build:
     name: Build
+    # P3-C1: skipped only when `Reuse plan` proved this exact tree, or in
+    # journey-smoke mode. `!cancelled()` keeps it running when `Reuse plan`
+    # was skipped (the default) or could not decide.
+    needs: [reuse-plan]
+    if: "!cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     outputs:
       e2e-build-path: ${{ steps.e2e-build-path.outputs.path }}
       e2e-build-id: ${{ steps.e2e-build-upload.outputs.artifact-id }}
@@ -1640,6 +1877,9 @@ jobs:
   # belong in `extra-gate-scripts`, which already runs in parallel.
   checks:
     name: Checks
+    # P3-C1: same reuse/smoke gating as `Build`.
+    needs: [reuse-plan]
+    if: "!cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
@@ -1874,7 +2114,9 @@ jobs:
 
   extra-gate:
     name: Extra gate
-    if: inputs.extra-gate-scripts != ''
+    # P3-C1: same reuse/smoke gating as `Build`.
+    needs: [reuse-plan]
+    if: "!cancelled() && inputs.extra-gate-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
@@ -2010,7 +2252,9 @@ jobs:
   # whose build failed.
   e2e-plan:
     name: E2E plan
-    if: inputs.run-e2e
+    # P3-C1: same reuse/smoke gating as `Build`.
+    needs: [reuse-plan]
+    if: "!cancelled() && inputs.run-e2e && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     # CI lightweight route (company-hq CI policy); caller override takes precedence.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
@@ -2056,6 +2300,12 @@ jobs:
               const workflow = process.env.CALLER_WORKFLOW_REF.split('@')[0];
               const workflowPath = workflow.slice(`${repo.owner}/${repo.repo}/`.length);
               const inputs = JSON.parse(process.env.E2E_INPUTS);
+              // Fast-path inputs (P3-C1) stay out of the key at their defaults,
+              // so proof minted before they existed still matches.
+              const fastPathDefaults = { 'fast-scripts': '', 'required-reuse-pr-results': false, 'e2e-pr-only-changed': false, 'journey-smoke-url': '', 'journey-smoke-args': '--grep=@smoke --retries=1', 'journey-smoke-rollback-script': '', 'journey-smoke-rollback-to': '' };
+              for (const [name, value] of Object.entries(fastPathDefaults)) {
+                if (inputs[name] === value) delete inputs[name];
+              }
               const canonicalInputs = Object.fromEntries(Object.entries(inputs).sort(([a], [b]) => a.localeCompare(b)));
               const { data: commit } = await github.rest.repos.getCommit({ ...repo, ref: context.sha, request: { timeout: 10000 } });
               const tree = commit.commit.tree.sha;
@@ -2309,6 +2559,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           SKIPPED: ${{ steps.skip.outputs.skipped }}
           FULL: ${{ steps.skip.outputs.full }}
+          ONLY_CHANGED: ${{ inputs.e2e-pr-only-changed }}
         run: |
           set -euo pipefail
           # `e2e-shards`/`e2e-args` are validated FIRST and unconditionally,
@@ -2362,6 +2613,13 @@ jobs:
               fi
               ;;
           esac
+          # `e2e-pr-only-changed` (P3-C1): the pull-request tier only, never a
+          # full-path escalation, and never `pull_request_target`, whose
+          # checkout is the base rather than the PR merge commit. HEAD^1 is the
+          # merge commit's base parent; the E2E checkout fetches depth 2 for it.
+          if [ "${ONLY_CHANGED:-false}" = true ] && [ "$EVENT_NAME" = pull_request ] && [ "$FULL" != true ]; then
+            effective_args="${effective_args:+$effective_args }--only-changed=HEAD^1 --pass-with-no-tests"
+          fi
           {
             echo "shard-total=$effective_total"
             echo "e2e-args=$effective_args"
@@ -2386,7 +2644,8 @@ jobs:
     # to anyone reading the PR, which is most of the time given e2e is
     # opt-in and off by default.
     name: E2E
-    if: inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'
+    # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
+    if: "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'"
     needs: [build, e2e-plan]
     # `e2e-runner` when the caller routes browsers to an isolated pool,
     # otherwise `runner` — same guest as the build, the previous behaviour.
@@ -2416,6 +2675,9 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.expected-candidate-sha }}
+          # 1 is actions/checkout's own default. Depth 2 only for
+          # `e2e-pr-only-changed` on a pull request, so HEAD^1 exists.
+          fetch-depth: ${{ inputs.e2e-pr-only-changed && github.event_name == 'pull_request' && 2 || 1 }}
 
       - name: Verify exact validation candidate
         if: inputs.expected-candidate-sha != ''
@@ -3004,7 +3266,8 @@ jobs:
   # `matrix.shard == 'quarantine'`; GitHub renders the name `E2E (quarantine)`.
   e2e-quarantine:
     name: E2E
-    if: inputs.run-e2e && inputs.e2e-quarantine-args != '' && needs.e2e-plan.outputs.skipped != 'true'
+    # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
+    if: "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && inputs.run-e2e && inputs.e2e-quarantine-args != '' && needs.e2e-plan.outputs.skipped != 'true'"
     needs: [build, e2e-plan]
     runs-on: ${{ fromJSON(inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
@@ -3203,8 +3466,10 @@ jobs:
   # default.
   preview:
     name: Preview
+    # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
     if: >-
-      inputs.preview-checks != 'none'
+      !cancelled() && needs.build.result == 'success'
+      && inputs.preview-checks != 'none'
       && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
     needs: build
     runs-on: ${{ fromJSON(contains(inputs.preview-checks, 'e2e-subset') && (inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) || (github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')))) }}
@@ -3760,7 +4025,8 @@ jobs:
 
   deploy-dry-run:
     name: Deploy dry run
-    if: inputs.wrangler-dry-run
+    # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
+    if: "!cancelled() && needs.build.result == 'success' && inputs.wrangler-dry-run"
     needs: build
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
@@ -4140,17 +4406,527 @@ jobs:
           print(f"\ncaller-lint: {len(files)} file(s) checked, {len(findings)} finding(s)")
           sys.exit(1 if findings else 0)
           PYEOF_AUDIT
+  # ci / Fast (`fast-scripts`, P3-C1, O-velocity D2). The one check a T1
+  # repository requires before merge: the caller's own lint/type/unit scripts on
+  # affected code, no build and no e2e, targeting 3 minutes or less at p90. The
+  # full gate still runs beside it as the asynchronous net, and a green full PR
+  # run is what `required-reuse-pr-results` later reuses on the push.
+  #
+  # NAMING IS THE GATE. GitHub reports a SKIPPED job as a passing check, so a
+  # job named `Fast` must never be skipped while a ruleset could be relying on
+  # it. The name is therefore computed, and it evaluates to `Fast` only when
+  # this job runs and is the one doing the work; it is `Fast lanes
+  # (escalated)` when a protected path hands the `Fast` name to
+  # `fast-escalated` below. GitHub does NOT evaluate the `name:` of a job it
+  # skips (community discussions #13261 and #152293): a skipped job's check
+  # shows this raw `${{ ... }}` template, which is never exactly `Fast`. So a
+  # default caller (input off), a reused tree and journey-smoke mode all show
+  # a skipped check with the raw template as its name, never a skipped `Fast`.
+  # The `Fast (not run)` branch keeps that true if GitHub ever starts
+  # evaluating skipped names. scripts/test_fast_path.py checks both. `always()`
+  # rather than `!cancelled()` for the same reason: a cancelled run must not
+  # turn this job into a skipped, and therefore passing, `Fast`.
+  fast:
+    name: ${{ !(inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && 'Fast (not run)' || ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true') && 'Fast lanes (escalated)' || 'Fast' }}
+    needs: [reuse-plan, e2e-plan]
+    if: always() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'
+    # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+    # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      # Escalation is only as good as the `E2E plan` decision it reads. When
+      # the caller configured `e2e-full-paths` and that plan did not succeed,
+      # whether this PR touches a protected path is unknown: fail closed. That
+      # includes `run-e2e: false`, where `E2E plan` never runs, so protected
+      # paths could never escalate and `Fast` would pass on lint/unit alone.
+      - name: Resolve protected-path escalation
+        working-directory: ${{ github.workspace }}
+        env:
+          RUN_E2E: ${{ inputs.run-e2e }}
+          FULL_PATHS: ${{ inputs.e2e-full-paths }}
+          E2E_PLAN_RESULT: ${{ needs.e2e-plan.result }}
+          ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
+        run: |
+          set -euo pipefail
+          if [ -n "$FULL_PATHS" ] && [ "$RUN_E2E" != true ]; then
+            echo "::error::e2e-full-paths is set but run-e2e is false: E2E plan never runs, so protected-path escalation cannot be decided; set run-e2e: true or clear e2e-full-paths"
+            exit 1
+          fi
+          if [ -n "$FULL_PATHS" ] && [ "$E2E_PLAN_RESULT" != success ]; then
+            echo "::error::E2E plan reported '$E2E_PLAN_RESULT', so protected-path escalation is unknown; failing closed"
+            exit 1
+          fi
+          if [ "$ESCALATED" = true ]; then
+            echo "A changed file matches e2e-full-paths: these lanes still run, and the check named Fast waits for the full gate."
+          else
+            echo "No protected-path escalation: this job is ci / Fast."
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+          # Depth 2: on a pull request HEAD^1 is the merge commit's base parent.
+          fetch-depth: 2
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # node-version and node-version-file are mutually exclusive on
+          # setup-node (passing both is rejected), so resolve them as two
+          # exclusive expressions: node-version-file wins when the caller
+          # sets it, and node-version otherwise reproduces prior behaviour.
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          package-manager-cache: false
+      # Restore-only dependency cache: same key and guard as `build` (see the
+      # SELF-HOSTED RUNNERS DO NOT CACHE DEPENDENCIES block there). `build` owns
+      # the default-branch save; a second writer here would only race it.
+      - name: Resolve dependency cache directory
+        id: dep-cache-dir
+        if: runner.environment == 'github-hosted'
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm config set store-dir "$GITHUB_WORKSPACE/.cache/pnpm-store"
+            echo "path=.cache/pnpm-store" >> "$GITHUB_OUTPUT"
+          else
+            npm config set cache "$GITHUB_WORKSPACE/.cache/npm"
+            echo "path=.cache/npm" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: dep-cache
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.dep-cache-dir.outputs.path }}
+          key: node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ hashFiles(format('{0}/pnpm-lock.yaml', inputs.working-directory), format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
+      - name: Configure package registry auth
+        if: inputs.install-script == ''
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: *configure_package_registry_auth
+
+      - name: Point pnpm at a workspace-local store (self-hosted)
+        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
+        run: |
+          set -euo pipefail
+          mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
+          if [ "$mount_point" != "/" ] && [ -d "$mount_point/pnpm-store" ] && [ -w "$mount_point/pnpm-store" ]; then
+            echo "npm_config_store_dir=$mount_point/pnpm-store" >> "$GITHUB_ENV"
+          fi
+      - name: Install dependencies (pnpm)
+        if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      - name: Install dependencies (npm)
+        if: inputs.install-script == '' && inputs.package-manager == 'npm'
+        run: npm ci
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      # Exact-path cleanup only: persistent self-hosted workspaces must not keep
+      # registry credentials after install (success, failure, or cancel).
+      - name: Remove package auth materialization
+        if: always() && inputs.install-script == ''
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
+      - name: Install dependencies (caller script)
+        if: inputs.install-script != ''
+        env:
+          INSTALL_SCRIPT: ${{ inputs.install-script }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
+          # org package-read secret to GH_PACKAGES_READ (workflows#98).
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          PM: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$INSTALL_SCRIPT" in
+            ''|*[!A-Za-z0-9:_-]*)
+              echo "::error::install-script must be one package.json script name"
+              exit 1
+              ;;
+          esac
+          raw=$(npm pkg get "scripts.$INSTALL_SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            echo "::error::install-script names \"$INSTALL_SCRIPT\" but no such script exists"
+            exit 1
+          fi
+          "$PM" run "$INSTALL_SCRIPT"
+
+      - name: Run fast scripts
+        env:
+          SCRIPTS: ${{ inputs.fast-scripts }}
+          PM: ${{ inputs.package-manager }}
+          FAST_BASE_REF: ${{ github.event_name == 'pull_request' && 'HEAD^1' || '' }}
+        run: |
+          set -euo pipefail
+          # Every named script must exist: `fast-scripts` is the caller
+          # asserting these lanes are the gate, so a missing one is a failure,
+          # never a green no-op.
+          export FAST_BASE_REF
+          total_start=$(date +%s)
+          summary=""
+          for SCRIPT in $SCRIPTS; do
+            raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+            present=$(printf '%s' "$raw" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+            if [ "$present" != "yes" ]; then
+              echo "::error::fast-scripts names \"$SCRIPT\" but no such script exists"
+              exit 1
+            fi
+            start=$(date +%s)
+            if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+            summary="${summary}| \`${SCRIPT}\` | $(( $(date +%s) - start ))s |"$'\n'
+          done
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              printf '### Fast lanes\n\nbase ref: %s\n\n| script | wall |\n|---|---|\n' "${FAST_BASE_REF:-(full selection)}"
+              printf '%s' "$summary"
+              printf '\nscripts total: %ss (target: the whole job at 3 min or less, p90)\n' "$(( $(date +%s) - total_start ))"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  # POST-DEPLOY JOURNEY SMOKE (`journey-smoke-url`, P3-C1, O-velocity D5/D6).
+  # A caller's promote or deploy workflow calls this callable a second time,
+  # after the deploy, with only the production URL (and optionally a rollback
+  # hook). Every CI lane is skipped in that mode and this job runs the
+  # `@smoke` journeys under a hard 90-second budget with one retry. The browser
+  # route and isolated-pool toolchain contract are the `E2E` job's, through the
+  # same anchored guard, assertion and installer steps.
+  #
+  # ROLLBACK ONLY ON A PROVEN JOURNEY FAILURE. The Playwright JSON report
+  # classifies the run: `passed`, `journey-failed` (a journey failed after its
+  # retry, which is the only verdict that runs the rollback hook), or
+  # `inconclusive` (no smoke test matched, no report, a global error, or the
+  # budget ran out). An inconclusive run fails the job without touching
+  # production, so a misconfigured or slow smoke can never roll a healthy
+  # deploy back.
+  journey-smoke:
+    name: Journey smoke
+    if: inputs.journey-smoke-url != ''
+    runs-on: ${{ fromJSON(inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.expected-candidate-sha }}
+
+      - name: Verify exact validation candidate
+        if: inputs.expected-candidate-sha != ''
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        env:
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
+             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
+            echo '::error::Checked-out source differs from the requested validation candidate.'
+            exit 1
+          fi
+      - name: Validate journey smoke configuration
+        working-directory: ${{ github.workspace }}
+        env:
+          SMOKE_URL: ${{ inputs.journey-smoke-url }}
+          SMOKE_ARGS: ${{ inputs.journey-smoke-args }}
+          SCRIPT: ${{ inputs.e2e-script }}
+          ROLLBACK_SCRIPT: ${{ inputs.journey-smoke-rollback-script }}
+          ROLLBACK_TO: ${{ inputs.journey-smoke-rollback-to }}
+        run: |
+          set -euo pipefail
+          status=0
+          if ! [[ "$SMOKE_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[^[:space:]]*)?$ ]]; then
+            echo "::error::journey-smoke-url must be one https:// URL (got '$SMOKE_URL')"
+            status=1
+          fi
+          case "$SMOKE_ARGS" in
+            *$'\n'*|*$'\r'*) echo "::error::journey-smoke-args must be a single line"; status=1 ;;
+          esac
+          if [ -z "$SMOKE_ARGS" ]; then
+            echo "::error::journey-smoke-args is empty; a smoke must select its journeys (default --grep=@smoke --retries=1)"
+            status=1
+          fi
+          if [ -z "$SCRIPT" ]; then
+            echo "::error::journey smoke needs e2e-script"
+            status=1
+          fi
+          case "$ROLLBACK_SCRIPT" in
+            *[!A-Za-z0-9:_-]*) echo "::error::journey-smoke-rollback-script must be one package.json script name"; status=1 ;;
+          esac
+          case "$ROLLBACK_TO" in
+            *[!A-Za-z0-9._-]*) echo "::error::journey-smoke-rollback-to must be a version identifier"; status=1 ;;
+          esac
+          exit "$status"
+      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+        if: inputs.package-manager == 'pnpm'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # node-version and node-version-file are mutually exclusive on
+          # setup-node (passing both is rejected), so resolve them as two
+          # exclusive expressions: node-version-file wins when the caller
+          # sets it, and node-version otherwise reproduces prior behaviour.
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          package-manager-cache: false
+      - name: Guard isolated Playwright route
+        env:
+          BROWSERS_OVERRIDE: ${{ inputs.e2e-browsers-path }}
+          INSTALL_BROWSERS: ${{ inputs.e2e-install-browsers }}
+          ROUTE: ${{ inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner }}
+        run: *guard_isolated_playwright_route
+
+      - name: Set Playwright browsers path
+        if: inputs.e2e-browsers-path != ''
+        run: echo "PLAYWRIGHT_BROWSERS_PATH=${{ inputs.e2e-browsers-path }}" >> "$GITHUB_ENV"
+
+      - name: Configure package registry auth
+        if: inputs.install-script == ''
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: *configure_package_registry_auth
+
+      - name: Point pnpm at a workspace-local store (self-hosted)
+        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
+        run: |
+          set -euo pipefail
+          mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
+          if [ "$mount_point" != "/" ] && [ -d "$mount_point/pnpm-store" ] && [ -w "$mount_point/pnpm-store" ]; then
+            echo "npm_config_store_dir=$mount_point/pnpm-store" >> "$GITHUB_ENV"
+          fi
+      - name: Install dependencies (pnpm)
+        if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      - name: Install dependencies (npm)
+        if: inputs.install-script == '' && inputs.package-manager == 'npm'
+        run: npm ci
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      # Exact-path cleanup only: persistent self-hosted workspaces must not keep
+      # registry credentials after install (success, failure, or cancel).
+      - name: Remove package auth materialization
+        if: always() && inputs.install-script == ''
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
+      - name: Install dependencies (caller script)
+        if: inputs.install-script != ''
+        env:
+          INSTALL_SCRIPT: ${{ inputs.install-script }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
+          # org package-read secret to GH_PACKAGES_READ (workflows#98).
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          PM: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$INSTALL_SCRIPT" in
+            ''|*[!A-Za-z0-9:_-]*)
+              echo "::error::install-script must be one package.json script name"
+              exit 1
+              ;;
+          esac
+          raw=$(npm pkg get "scripts.$INSTALL_SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            echo "::error::install-script names \"$INSTALL_SCRIPT\" but no such script exists"
+            exit 1
+          fi
+          "$PM" run "$INSTALL_SCRIPT"
+
+      - name: Assert isolated Playwright toolchain
+        if: >-
+          contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'playwright-isolated')
+          || contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'proxmox-playwright-x64')
+        env:
+          PLAYWRIGHT_ALLOWED_BROWSER_PREFIX: /opt
+          PLAYWRIGHT_TOOLCHAIN_OWNER_UID: "0"
+          PLAYWRIGHT_TOOLCHAIN_ROOT: /opt/playwright-ci
+          REQUIRED_BROWSERS: ${{ inputs.e2e-browsers }}
+        run: *assert_isolated_playwright_toolchain
+
+      - name: Install Playwright browsers
+        if: >-
+          inputs.e2e-install-browsers
+          && !contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'playwright-isolated')
+          && !contains(inputs.e2e-runner != '' && inputs.e2e-runner || inputs.runner, 'proxmox-playwright-x64')
+        run: *install_playwright_browsers
+
+      - name: Run journey smoke
+        id: smoke
+        env:
+          GATE: Run journey smoke
+          SCRIPT: ${{ inputs.e2e-script }}
+          PM: ${{ inputs.package-manager }}
+          SMOKE_ARGS: ${{ inputs.journey-smoke-args }}
+          PLAYWRIGHT_BASE_URL: ${{ inputs.journey-smoke-url }}
+          BUDGET_SECONDS: "90"
+        run: |
+          set -euo pipefail
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            echo "verdict=inconclusive" >> "$GITHUB_OUTPUT"
+            echo "::error::$GATE is enabled but no \"$SCRIPT\" script exists"
+            exit 1
+          fi
+          report="${RUNNER_TEMP:-/tmp}/journey-smoke-report.json"
+          rm -f "$report"
+          export PLAYWRIGHT_JSON_OUTPUT_FILE="$report"
+          export PLAYWRIGHT_JSON_OUTPUT_NAME="$report"
+          ARGS=()
+          # Deliberate word splitting: journey-smoke-args is an argument list.
+          # shellcheck disable=SC2206
+          ARGS+=(${SMOKE_ARGS})
+          ARGS+=("--reporter=line,json")
+          echo "journey smoke against PLAYWRIGHT_BASE_URL=$PLAYWRIGHT_BASE_URL (budget ${BUDGET_SECONDS}s)"
+          start=$(date +%s)
+          set +e
+          if [ "$PM" = "pnpm" ]; then
+            timeout --kill-after=10 "$BUDGET_SECONDS" pnpm run "$SCRIPT" "${ARGS[@]}"
+          else
+            timeout --kill-after=10 "$BUDGET_SECONDS" npm run "$SCRIPT" -- "${ARGS[@]}"
+          fi
+          rc=$?
+          set -e
+          elapsed=$(( $(date +%s) - start ))
+          verdict=$(RC="$rc" REPORT="$report" node -e '
+            const fs = require("node:fs");
+            const rc = Number(process.env.RC);
+            if (rc === 124 || rc === 137) { console.log("inconclusive:the 90-second budget ran out"); process.exit(0); }
+            let report;
+            try { report = JSON.parse(fs.readFileSync(process.env.REPORT, "utf8")); }
+            catch { console.log("inconclusive:no readable Playwright JSON report"); process.exit(0); }
+            const stats = report.stats || {};
+            const unexpected = Number(stats.unexpected || 0);
+            const ran = Number(stats.expected || 0) + Number(stats.flaky || 0) + unexpected;
+            if (unexpected > 0) { console.log("journey-failed:" + unexpected + " journey(s) failed after retry"); process.exit(0); }
+            if ((report.errors || []).length > 0) { console.log("inconclusive:Playwright reported a global error"); process.exit(0); }
+            if (ran === 0) { console.log("inconclusive:no smoke test matched journey-smoke-args"); process.exit(0); }
+            if (rc !== 0) { console.log("inconclusive:runner exited " + rc + " with no failed journey"); process.exit(0); }
+            console.log("passed:" + ran + " journey(s) passed");
+          ')
+          kind="${verdict%%:*}"
+          detail="${verdict#*:}"
+          echo "verdict=$kind" >> "$GITHUB_OUTPUT"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '### Journey smoke\n\n%s: %s (%ss of a %ss budget) against %s\n' \
+              "$kind" "$detail" "$elapsed" "$BUDGET_SECONDS" "$PLAYWRIGHT_BASE_URL" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "$kind" != passed ]; then
+            echo "::error::journey smoke $kind: $detail"
+            exit 1
+          fi
+          echo "journey smoke passed: $detail in ${elapsed}s"
+
+      - name: Roll back (journey failed)
+        if: failure() && steps.smoke.outputs.verdict == 'journey-failed' && inputs.journey-smoke-rollback-script != ''
+        env:
+          SCRIPT: ${{ inputs.journey-smoke-rollback-script }}
+          PM: ${{ inputs.package-manager }}
+          ROLLBACK_TO_VERSION: ${{ inputs.journey-smoke-rollback-to }}
+          JOURNEY_SMOKE_URL: ${{ inputs.journey-smoke-url }}
+          ROLLBACK_TOKEN: ${{ secrets.JOURNEY_SMOKE_ROLLBACK_TOKEN }}
+        run: |
+          set -euo pipefail
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            echo "::error::journey-smoke-rollback-script names \"$SCRIPT\" but no such script exists; NOT rolled back"
+            exit 1
+          fi
+          echo "::warning::journey smoke failed after retry: running rollback hook \"$SCRIPT\" (to '${ROLLBACK_TO_VERSION:-script default}')"
+          "$PM" run "$SCRIPT"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '\nRolled back with the %s script (to %s). The job stays red.\n' "$SCRIPT" "${ROLLBACK_TO_VERSION:-the script default}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload journey smoke evidence
+        if: always() && steps.smoke.outcome != 'skipped'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: journey-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/journey-smoke-report.json
+            ${{ inputs.working-directory }}/test-results
+          if-no-files-found: ignore
+          retention-days: 14
+
   required:
     name: Required
     if: always()
-    needs: [build, checks, extra-gate, e2e-plan, e2e, e2e-report, preview, deploy-dry-run, caller-lint]
+    needs: [reuse-plan, build, checks, extra-gate, e2e-plan, e2e, e2e-report, preview, deploy-dry-run, caller-lint, fast, fast-escalated, journey-smoke]
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     timeout-minutes: 20
     permissions:
       contents: read
     steps:
-      - name: Require enabled gates to succeed and disabled gates to skip
+      # Anchored: `fast-escalated` (the `Fast` check on a protected-path pull
+      # request) runs this exact step, not a copy of it.
+      - &required_gate_step
+        name: Require enabled gates to succeed and disabled gates to skip
         env:
           BUILD_RESULT: ${{ needs.build.result }}
           CHECKS_RESULT: ${{ needs.checks.result }}
@@ -4176,6 +4952,9 @@ jobs:
           E2E_PLAN_SKIPPED: ${{ needs.e2e-plan.outputs.skipped }}
           EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
           RUN_DEPLOY_DRY_RUN: ${{ inputs.wrangler-dry-run }}
+          # P3-C1: `Reuse plan` proved this tree, or this is journey-smoke mode.
+          REUSED: ${{ needs.reuse-plan.outputs.reused }}
+          JOURNEY_SMOKE_URL: ${{ inputs.journey-smoke-url }}
         run: |
           set -euo pipefail
           status=0
@@ -4192,6 +4971,19 @@ jobs:
               status=1
             fi
           }
+          # P3-C1: when `Reuse plan` proved this exact tree (or this call is a
+          # journey smoke), every CI lane must be SKIPPED -- a lane that ran
+          # anyway, or failed, still fails the gate. Unset (the default) falls
+          # through to the unchanged checks below.
+          if [ "${REUSED:-}" = true ] || [ -n "${JOURNEY_SMOKE_URL:-}" ]; then
+            for lane in build:"$BUILD_RESULT" checks:"$CHECKS_RESULT" extra-gate:"$EXTRA_GATE_RESULT" \
+                e2e-plan:"$E2E_PLAN_RESULT" e2e:"$E2E_RESULT" e2e-report:"$E2E_REPORT_RESULT" \
+                preview:"$PREVIEW_RESULT" deploy-dry-run:"$DEPLOY_DRY_RUN_RESULT"; do
+              require_skipped "${lane%%:*}" "${lane#*:}"
+            done
+            require_success caller-lint "$CALLER_LINT_RESULT"
+            exit "$status"
+          fi
           if [ -n "${EXPECTED_CANDIDATE:-}" ] && [ "$E2E_PLAN_SKIPPED" = true ]; then
             echo '::error::Explicit candidate validation cannot skip configured browser coverage.'
             status=1
@@ -4265,6 +5057,93 @@ jobs:
             require_skipped deploy-dry-run "$DEPLOY_DRY_RUN_RESULT"
           fi
           exit "$status"
+      - name: Require fast-path and journey-smoke lanes
+        env:
+          REUSE_APPLIES: ${{ inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          REUSE_PLAN_RESULT: ${{ needs.reuse-plan.result }}
+          REUSED: ${{ needs.reuse-plan.outputs.reused }}
+          FAST_SCRIPTS: ${{ inputs.fast-scripts }}
+          FAST_RESULT: ${{ needs.fast.result }}
+          ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
+          FAST_ESCALATED_RESULT: ${{ needs.fast-escalated.result }}
+          JOURNEY_SMOKE_URL: ${{ inputs.journey-smoke-url }}
+          JOURNEY_SMOKE_RESULT: ${{ needs.journey-smoke.result }}
+        run: |
+          set -euo pipefail
+          status=0
+          require_success() {
+            if [ "$2" != "success" ]; then
+              echo "::error::$1 job reported '$2' (must succeed)"
+              status=1
+            fi
+          }
+          require_skipped() {
+            if [ "$2" != "skipped" ]; then
+              echo "::error::$1 job reported '$2' while disabled (must be skipped)"
+              status=1
+            fi
+          }
+          if [ "$REUSE_APPLIES" = true ]; then
+            require_success reuse-plan "$REUSE_PLAN_RESULT"
+          else
+            require_skipped reuse-plan "$REUSE_PLAN_RESULT"
+          fi
+          if [ -n "$FAST_SCRIPTS" ] && [ -z "$JOURNEY_SMOKE_URL" ] && [ "${REUSED:-}" != true ]; then
+            require_success fast "$FAST_RESULT"
+            if [ "$ESCALATED" = true ]; then
+              require_success fast-escalated "$FAST_ESCALATED_RESULT"
+            else
+              require_skipped fast-escalated "$FAST_ESCALATED_RESULT"
+            fi
+          else
+            require_skipped fast "$FAST_RESULT"
+            require_skipped fast-escalated "$FAST_ESCALATED_RESULT"
+          fi
+          if [ -n "$JOURNEY_SMOKE_URL" ]; then
+            require_success journey-smoke "$JOURNEY_SMOKE_RESULT"
+          else
+            require_skipped journey-smoke "$JOURNEY_SMOKE_RESULT"
+          fi
+          exit "$status"
+      # `required-reuse-pr-results` proof: minted only on a same-repository
+      # pull request whose Required passed with every enabled lane RUN, and
+      # E2E (when enabled) at its full configuration -- never a path skip, the
+      # PR subset or `--only-changed`. The key is computed by the same anchored
+      # script `Reuse plan` runs on the push.
+      - name: Compute Required proof key
+        id: required-key
+        if: >-
+          success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == ''
+          && github.event_name == 'pull_request'
+          && github.event.pull_request.head.repo.full_name == github.repository
+          && needs.build.result == 'success' && needs.checks.result == 'success'
+          && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards))
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          PROOF_INPUTS: ${{ toJSON(inputs) }}
+        with:
+          script: *required_proof_script
+      - name: Write Required proof
+        id: required-proof
+        if: success() && steps.required-key.outputs.key != ''
+        env:
+          PROOF_KEY: ${{ steps.required-key.outputs.key }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof_file=$(mktemp "$RUNNER_TEMP/required-proof.XXXXXX")
+          printf '%s\n' "$PROOF_KEY" > "$proof_file"
+          echo "path=$proof_file" >> "$GITHUB_OUTPUT"
+      - name: Publish Required proof
+        if: success() && steps.required-proof.outputs.path != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.required-key.outputs.key }}
+          path: ${{ steps.required-proof.outputs.path }}
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
       # Proof is published only after Required passed and the real full suite
       # ran. A path skip, PR subset, fork or failed shard cannot mint proof.
       - name: Write full E2E proof
@@ -4287,3 +5166,35 @@ jobs:
           if-no-files-found: error
           retention-days: 7
           overwrite: true
+
+  # Placed after `Required` on purpose: its last step is a YAML alias of
+  # `Required`'s gate step, and an alias must follow its anchor.
+  # The `Fast` check for a pull request that touches a protected path
+  # (`e2e-full-paths`). It needs every lane the full gate needs and applies the
+  # IDENTICAL `Required` gate step (a YAML alias of it, not a copy), so on those
+  # PRs `ci / Fast` means "the full gate passed". Skipped everywhere else,
+  # where its check shows the raw name template (GitHub does not evaluate a
+  # skipped job's name; see NAMING IS THE GATE at `fast`), or `Fast
+  # (escalation not needed)` if GitHub ever does. A job waiting on its needs has
+  # no check run yet, so the `Fast` context stays pending, which blocks the
+  # merge, until the full gate has finished.
+  fast-escalated:
+    name: ${{ (inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true') && 'Fast' || 'Fast (escalation not needed)' }}
+    needs: [reuse-plan, fast, build, checks, extra-gate, e2e-plan, e2e, e2e-report, preview, deploy-dry-run, caller-lint]
+    if: always() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true'
+    # Organization-wide lightweight route; unset preserves the caller fallback.
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Require the fast lanes to succeed
+        env:
+          FAST_RESULT: ${{ needs.fast.result }}
+        run: |
+          set -euo pipefail
+          if [ "$FAST_RESULT" != success ]; then
+            echo "::error::fast job reported '$FAST_RESULT' (must succeed)"
+            exit 1
+          fi
+      - *required_gate_step

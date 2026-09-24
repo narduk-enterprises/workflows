@@ -80,7 +80,12 @@ def check_job_wiring() -> None:
     assert not any("/pulls/" in call for call in api_calls), api_calls
 
     e2e = jobs["e2e"]
-    assert e2e["if"] == "inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'"
+    # The leading status guard replaces the implicit success() that a skipped
+    # `Reuse plan` ancestor would turn false (scripts/test_fast_path.py).
+    assert e2e["if"] == (
+        "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' "
+        "&& inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'"
+    )
     assert "e2e-plan" in e2e["needs"]
 
     report = jobs["e2e-report"]

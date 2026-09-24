@@ -61,6 +61,10 @@ AUTH_JOBS = (
     "e2e-quarantine",
     "preview",
     "deploy-dry-run",
+    # P3-C1 fast-path jobs: each installs the caller's dependencies with the
+    # same materialize-then-remove block as `checks`.
+    "fast",
+    "journey-smoke",
 )
 
 AUTH_PATH_EXPR = (
