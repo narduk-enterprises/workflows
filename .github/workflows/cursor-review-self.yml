@@ -37,7 +37,7 @@ permissions:
 
 jobs:
   cursor-review:
-    uses: narduk-enterprises/workflows/.github/workflows/cursor-review.yml@2de521b1460baf390af7288122700fe7fa86112d # workflows#139; on-demand reviews
+    uses: narduk-enterprises/workflows/.github/workflows/cursor-review.yml@94a3ba46994dd99e2b4b2ccdbf8b019cbe302745 # workflows#145; review-ordinary-code defaults off (O-D7)
     permissions:
       contents: read
       pull-requests: write
