@@ -123,8 +123,12 @@ def main():
     if m and method == "PATCH":
         number = int(m.group(1))
         for issue in state["issues"]:
-            if issue["number"] == number and "state" in fields:
+            if issue["number"] != number:
+                continue
+            if "state" in fields:
                 issue["state"] = fields["state"]
+            if "body" in fields:
+                issue["body"] = fields["body"]
         save(state)
         print(json.dumps({}))
         return 0
@@ -264,10 +268,14 @@ def main() -> int:
         if not check("second consecutive failure comments instead", len(commented) >= 1, out):
             failures += 1
 
-        # 3. A green run closes the open issue.
+        # 3. A green run closes the open issue. Filter on `state=closed`
+        # specifically, not merely "-X PATCH": the second consecutive
+        # failure above also PATCHes the open issue's body (to keep its
+        # tracked run_number/completed_at current for the ordering guard),
+        # and that refresh PATCH carries no `state=` field at all.
         rc, out, output = h.run(script, CONCLUSION="success")
         total += 1
-        closed = [c for c in h.calls() if len(c) >= 4 and "-X" in c and c[c.index("-X") + 1] == "PATCH"]
+        closed = [c for c in h.calls() if "-f" in c and "state=closed" in c]
         if not check("green run closes the open issue", rc == 0 and len(closed) == 1, out):
             failures += 1
         total += 1
@@ -290,6 +298,86 @@ def main() -> int:
             total += 1
             if not check(f"conclusion '{conclusion}' makes zero gh calls", rc == 0 and h2.calls() == [], out):
                 failures += 1
+
+    # 6. Ordering (PR #142 review, third round, LOW finding): a queued
+    # verdict must not be dropped, and a slower run that finishes after a
+    # faster, later run must not flip state backwards. `run-number` (with
+    # `run-completed-at` as its tie-breaker) is how the caller says which
+    # run is actually newest; a caller that omits both keeps today's
+    # unordered behaviour unchanged.
+    with tempfile.TemporaryDirectory() as tmp_str:
+        tmp = Path(tmp_str)
+        h = Harness(tmp)
+
+        # A newer failure (run_number=10) opens the issue.
+        rc, out, output = h.run(script, CONCLUSION="failure", RUN_NUMBER="10", RUN_ID="10")
+        total += 1
+        if not check("ordering: newer failure (run 10) opens the issue", rc == 0 and '"state": "open"' in output, out):
+            failures += 1
+
+        # A SLOWER run that started earlier (run_number=8) finishes late and
+        # reports success. Applied naively this would close the issue a
+        # newer failure already reopened -- it must be skipped as stale.
+        # The listing GET still runs (it is how staleness gets decided), but
+        # no follow-up call (a comment POST or a state-changing PATCH) may
+        # happen after it.
+        calls_before = len(h.calls())
+        rc, out, output = h.run(script, CONCLUSION="success", RUN_NUMBER="8", RUN_ID="8")
+        total += 1
+        if not check("ordering: an out-of-order older success is skipped, not applied", rc == 0 and output.strip() == "payload<<PAYLOAD_EOF\n\nPAYLOAD_EOF", out):
+            failures += 1
+        total += 1
+        new_calls = h.calls()[calls_before:]
+        only_the_listing_get = new_calls == [["api", "repos/narduk-enterprises/example/issues", "-X", "GET", "-f", "state=all", "-f", "labels=red-main", "-f", "per_page=100"]]
+        if not check("ordering: the stale success makes no follow-up gh API call", only_the_listing_get, str(new_calls)):
+            failures += 1
+
+        # The issue must still be open -- the stale success never touched it.
+        rc, out, output = h.run(script, CONCLUSION="failure", RUN_NUMBER="10", RUN_ID="10b")
+        opened_total = [c for c in h.calls() if c[:2] == ["api", "repos/narduk-enterprises/example/issues"] and "-X" not in c]
+        total += 1
+        if not check("ordering: issue was never wrongly closed (still exactly one ever opened)", len(opened_total) == 1, out):
+            failures += 1
+
+        # A genuinely newer success (run_number=11) DOES close it.
+        rc, out, output = h.run(script, CONCLUSION="success", RUN_NUMBER="11", RUN_ID="11")
+        total += 1
+        if not check("ordering: a genuinely newer success (run 11) closes the issue", rc == 0 and '"state": "closed"' in output, out):
+            failures += 1
+
+        # Tie-break on run-completed-at when run-number matches: a same-
+        # numbered event with an earlier completion timestamp than the one
+        # already recorded is stale and skipped.
+        rc, out, output = h.run(script, CONCLUSION="failure", RUN_NUMBER="20", RUN_ID="20", RUN_COMPLETED_AT="2026-09-24T12:00:00Z")
+        total += 1
+        if not check("ordering: run 20 (12:00) opens the issue", rc == 0 and '"state": "open"' in output, out):
+            failures += 1
+        calls_before = len(h.calls())
+        rc, out, output = h.run(script, CONCLUSION="success", RUN_NUMBER="20", RUN_ID="20b", RUN_COMPLETED_AT="2026-09-24T11:59:00Z")
+        total += 1
+        new_calls = h.calls()[calls_before:]
+        only_the_listing_get = new_calls == [["api", "repos/narduk-enterprises/example/issues", "-X", "GET", "-f", "state=all", "-f", "labels=red-main", "-f", "per_page=100"]]
+        if not check("ordering: same run-number, earlier completed_at is stale and skipped", rc == 0 and only_the_listing_get, str(new_calls)):
+            failures += 1
+        rc, out, output = h.run(script, CONCLUSION="success", RUN_NUMBER="20", RUN_ID="20c", RUN_COMPLETED_AT="2026-09-24T12:00:01Z")
+        total += 1
+        if not check("ordering: same run-number, later completed_at closes the issue", rc == 0 and '"state": "closed"' in output, out):
+            failures += 1
+
+    # 7. Backward compatibility: a caller that never sends run-number (the
+    # default, empty string) gets today's unordered behaviour unchanged --
+    # the ordering guard must not newly block or require it.
+    with tempfile.TemporaryDirectory() as tmp_str:
+        tmp = Path(tmp_str)
+        h = Harness(tmp)
+        rc, out, output = h.run(script, CONCLUSION="failure")
+        total += 1
+        if not check("no run-number: failure still opens the issue", rc == 0 and '"state": "open"' in output, out):
+            failures += 1
+        rc, out, output = h.run(script, CONCLUSION="success")
+        total += 1
+        if not check("no run-number: success still closes the issue", rc == 0 and '"state": "closed"' in output, out):
+            failures += 1
 
     print(f"\ntest_red_main_listener: {total} case(s), {failures} failure(s)")
     return 1 if failures else 0

@@ -53,8 +53,26 @@ name: Reusable Red-Main Listener
 #         workflow-name: ${{ github.event.workflow_run.name }}
 #         conclusion: ${{ github.event.workflow_run.conclusion }}
 #         run-id: ${{ github.event.workflow_run.id }}
+#         run-number: ${{ github.event.workflow_run.run_number }}
 #         run-url: ${{ github.event.workflow_run.html_url }}
+#         run-completed-at: ${{ github.event.workflow_run.updated_at }}
 #         head-sha: ${{ github.event.workflow_run.head_sha }}
+#
+# ORDERING (PR #142 review, third round, low finding). `cancel-in-progress:
+# false` below keeps at most one reconcile job PENDING per repo+workflow: a
+# third event arriving while a second is still queued cancels that second
+# job, and GitHub Actions never drops the newest pending one, so the true
+# latest run is always eventually reconciled. The real gap was different --
+# completions can arrive out of run order (a slower run that started earlier
+# can finish, and fire its `workflow_run` event, after a faster later run),
+# so a stale reconcile could run AFTER a newer one and flip state backwards
+# (reopening an issue a newer green run already closed, for example).
+# `run-number` (and `run-completed-at` as its tie-breaker) close that gap:
+# every issue body carries the run that produced it, and an incoming event
+# older than what is already recorded is skipped rather than applied. Both
+# inputs are OPTIONAL and empty by default -- a caller that has not been
+# updated to pass them keeps today's un-ordered behaviour rather than being
+# newly blocked by it.
 #
 # A DEVELOPMENT-MODE `development validate` run is the development-mode
 # equivalent of `main` CI (O §3.5) and routes here the same way, under
@@ -102,10 +120,27 @@ on:
         description: "Pass `github.event.workflow_run.id`."
         required: true
         type: string
+      run-number:
+        description: >-
+          Pass `github.event.workflow_run.run_number`. Optional; orders
+          reconcile events so a slower run's completion arriving after a
+          faster, later run's cannot flip state backwards (see the ORDERING
+          header note). Empty (the default) disables that guard for this
+          event, matching this callable's pre-existing behaviour.
+        required: false
+        type: string
+        default: ""
       run-url:
         description: "Pass `github.event.workflow_run.html_url`."
         required: true
         type: string
+      run-completed-at:
+        description: >-
+          Pass `github.event.workflow_run.updated_at`. Optional tie-breaker
+          used only when `run-number` is absent or identical on both sides.
+        required: false
+        type: string
+        default: ""
       head-sha:
         description: "Pass `github.event.workflow_run.head_sha`. Optional; only used in the issue body."
         required: false
@@ -165,7 +200,9 @@ jobs:
           WORKFLOW_NAME: ${{ inputs.workflow-name }}
           CONCLUSION: ${{ inputs.conclusion }}
           RUN_ID: ${{ inputs.run-id }}
+          RUN_NUMBER: ${{ inputs.run-number }}
           RUN_URL: ${{ inputs.run-url }}
+          RUN_COMPLETED_AT: ${{ inputs.run-completed-at }}
           HEAD_SHA: ${{ inputs.head-sha }}
           LABEL: ${{ inputs.label }}
         run: |
@@ -173,6 +210,7 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import re
           import subprocess
           import sys
           from datetime import datetime, timezone
@@ -186,6 +224,13 @@ jobs:
           label = os.environ["LABEL"]
           title = f"main is red: {workflow_name}"
           now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          # See the ORDERING header note. Both are optional: an un-updated
+          # caller sends neither, `run_number` stays None, and the guard
+          # below is skipped entirely -- today's behaviour, unchanged.
+          run_number_raw = os.environ.get("RUN_NUMBER", "").strip()
+          run_number = int(run_number_raw) if run_number_raw.isdigit() else None
+          run_completed_at = os.environ.get("RUN_COMPLETED_AT", "").strip()
 
           def gh_api(args):
               result = subprocess.run(["gh", "api"] + args, capture_output=True, text=True)
@@ -203,26 +248,81 @@ jobs:
                   fh.write(value + "\n")
                   fh.write("PAYLOAD_EOF\n")
 
+          def last_json_block(text):
+              """The last ```json fenced block in an issue body, or None. Every
+              mutation below rewrites the body with a fresh block, so this is
+              always the most recently reconciled run's own record."""
+              blocks = re.findall(r"```json\n(.*?)\n```", text or "", re.S)
+              if not blocks:
+                  return None
+              try:
+                  return json.loads(blocks[-1])
+              except ValueError:
+                  return None
+
+          def verdict_json(state):
+              return {
+                  "schema": "red-main.v1", "repo": repo, "workflow": workflow_name,
+                  "run_id": run_id, "run_number": run_number, "run_url": run_url,
+                  "head_sha": head_sha, "state": state, "at": now,
+                  "completed_at": run_completed_at or None,
+              }
+
           if conclusion not in ("success", "failure"):
               print(f"conclusion '{conclusion}' is not a verdict on the tree; no-op")
               payload_out("")
               sys.exit(0)
 
+          # state=all (not just open): the ordering guard below needs the
+          # newest issue of this title regardless of open/closed, so a late
+          # event for an already-superseded run cannot reopen or duplicate
+          # an issue that a newer run already settled.
           listing = gh_api([
               f"repos/{repo}/issues", "-X", "GET",
-              "-f", "state=open", "-f", f"labels={label}", "-f", "per_page=100",
+              "-f", "state=all", "-f", f"labels={label}", "-f", "per_page=100",
           ])
-          issues = json.loads(listing)
-          existing = next(
-              (i for i in issues if "pull_request" not in i and i.get("title") == title),
-              None,
-          )
+          issues = [
+              i for i in json.loads(listing)
+              if "pull_request" not in i and i.get("title") == title
+          ]
+          existing = next((i for i in issues if i.get("state") == "open"), None)
+          reference = max(issues, key=lambda i: i.get("number", 0), default=None)
+
+          if run_number is not None and reference is not None:
+              prev = last_json_block(reference.get("body", "")) or {}
+              prev_run_number = prev.get("run_number")
+              prev_completed_at = prev.get("completed_at")
+              stale = False
+              if isinstance(prev_run_number, int):
+                  if run_number < prev_run_number:
+                      stale = True
+                  elif run_number == prev_run_number and prev_completed_at and run_completed_at:
+                      stale = run_completed_at < prev_completed_at
+              if stale:
+                  print(
+                      f"::notice::run {run_id} (run_number={run_number}) is older than "
+                      f"the already-reconciled run_number={prev_run_number} on issue "
+                      f"#{reference['number']}; skipping so a late, out-of-order event "
+                      "cannot overwrite the newest verdict"
+                  )
+                  payload_out("")
+                  sys.exit(0)
 
           if conclusion == "failure":
               if existing:
                   number = existing["number"]
                   print(f"red-main issue #{number} already open for '{workflow_name}'; leaving it open")
                   gh_api([f"repos/{repo}/issues/{number}/comments", "-f", f"body=Still red: {run_url} ({now})"])
+                  refreshed_body = (
+                      f"main is red for **{workflow_name}** on `{repo}`.\n\n"
+                      f"Run: {run_url}\nHead: `{head_sha}`\nUpdated: {now}\n\n"
+                      "This issue closes automatically on the next green run of "
+                      "the same workflow (narduk-reboot O-D8). No automatic "
+                      "revert is filed for this.\n\n```json\n"
+                      + json.dumps(verdict_json("open"))
+                      + "\n```\n"
+                  )
+                  gh_api([f"repos/{repo}/issues/{number}", "-X", "PATCH", "-f", f"body={refreshed_body}"])
                   state = "open"
               else:
                   body = (
@@ -231,12 +331,7 @@ jobs:
                       "This issue closes automatically on the next green run of "
                       "the same workflow (narduk-reboot O-D8). No automatic "
                       "revert is filed for this.\n\n```json\n"
-                      + json.dumps({
-                          "schema": "red-main.v1", "repo": repo,
-                          "workflow": workflow_name, "run_id": run_id,
-                          "run_url": run_url, "head_sha": head_sha,
-                          "state": "open", "opened_at": now,
-                      })
+                      + json.dumps(verdict_json("open"))
                       + "\n```\n"
                   )
                   created = json.loads(gh_api([
@@ -256,24 +351,19 @@ jobs:
               number = existing["number"]
               close_body = (
                   f"Green: {run_url} ({now})\n\n```json\n"
-                  + json.dumps({
-                      "schema": "red-main.v1", "repo": repo,
-                      "workflow": workflow_name, "run_id": run_id,
-                      "run_url": run_url, "head_sha": head_sha,
-                      "state": "closed", "closed_at": now,
-                  })
+                  + json.dumps(verdict_json("closed"))
                   + "\n```\n"
               )
               gh_api([f"repos/{repo}/issues/{number}/comments", "-f", f"body={close_body}"])
-              gh_api([f"repos/{repo}/issues/{number}", "-X", "PATCH", "-f", "state=closed", "-f", "state_reason=completed"])
+              gh_api([
+                  f"repos/{repo}/issues/{number}", "-X", "PATCH",
+                  "-f", "state=closed", "-f", "state_reason=completed",
+                  "-f", f"body={close_body}",
+              ])
               print(f"closed red-main issue #{number} for '{workflow_name}'")
               state = "closed"
 
-          payload = json.dumps({
-              "schema": "red-main.v1", "repo": repo, "workflow": workflow_name,
-              "run_id": run_id, "run_url": run_url, "head_sha": head_sha,
-              "state": state, "issue_number": number, "at": now,
-          })
+          payload = json.dumps({**verdict_json(state), "issue_number": number})
           payload_out(payload)
           PY
 

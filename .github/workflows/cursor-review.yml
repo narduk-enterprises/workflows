@@ -55,6 +55,22 @@ name: Reusable Cursor Review
 # `cursor-review-telemetry {...}` JSON line per run, because the Cursor API
 # exposes no token counts and the 2026-09-20 analysis had to model them.
 #
+# NO-PUSH PATHS (narduk-reboot wave 4, P3-C2 fix round). A wave-2 lane
+# merged narduk-libs#830, and the reviewer used the writable branch that
+# launch gave it to push a test-loosening "autofix" commit (b73f49) onto
+# narduk-libs#837 -- a SECURITY fix PR -- which then shipped. The brief's own
+# "do not push" HARD RULE existed the whole time (7cf053b) and did not stop
+# it: a prompt is not a control once untrusted diff/comment content is in
+# play. cursor_review.py's `is_no_push_sensitive()` now names the diffs
+# where that risk is unacceptable -- `.github/workflows/**`, any
+# `**/*.test.*` file, `scripts/ci-runner-routing*`, or a T2-sensitive path
+# (auth, session, payments, the credential table) -- and `launch()` responds
+# at the API level, not just in prose: `workOnCurrentBranch` goes `False`,
+# so the agent has no branch it can push a commit onto that lands on the
+# reviewed pull request. It may still read, run checks, and post its
+# findings as a comment/review exactly as before; only its ability to write
+# back onto THIS pull request's branch is removed.
+#
 # SKIPS exit 0 with a `::notice::`: no pull request on this event, a draft PR,
 # the `no-ai-review` label, a FORK head (same-repo heads only: a fork must not
 # steer estate Cursor capacity, and a public caller's fork PR has no secret

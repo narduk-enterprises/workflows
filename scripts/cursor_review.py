@@ -96,12 +96,23 @@ ALWAYS_REVIEW_PREFIXES = (".github/workflows/", ".github/actions/")
 # and a `cursor_review_brief.md` edit is the reviewer editing its own brief.
 ALWAYS_REVIEW_NAMES = ("decisions.md", "cursor_review_brief.md")
 # T2-sensitive application code (narduk-reboot P3-C2, PLAN.md row P3-C2 /
-# O-D7; O-velocity.md §3.2/§3.7: the T2 tier -- nvault, auth/payment/
-# credential code, D1 schema changes, the credential registry -- and its
-# path escalation -- auth, session, payments, wrangler binding changes,
-# migrations, the credential table): a T2-sensitive path always gets a
-# review, the same as ALWAYS_REVIEW_PREFIXES, regardless of label, author or
-# size.
+# O-D7). Scope is EXACTLY O-velocity's path-escalation list for a T0/T1
+# repo (O-velocity.md §3.2 "Path escalation", PLAN.md row 365,
+# sections/infrastructure.md I1-A "Contents:"): auth, session, payments and
+# the credential table -- neither broader nor narrower (PR #142 review,
+# third round, MEDIUM finding: a round-2 fix widened this past that list --
+# `nvault`, `migration`, `wrangler` and a bare `schema` root -- which forced
+# P0 on JSON Schema config, SEO-schema composables and logging-schema files
+# that have nothing to do with a D1 migration). Those three other
+# categories are real, but they are NOT this matcher's job:
+#   - nvault is a whole repo/tier classification (the T2 "who" row), not a
+#     path inside an arbitrary caller repo.
+#   - migrations and wrangler binding changes are "guarded by the deploy
+#     tool, not by rulesets" (infrastructure.md I1-A) -- narduk-app-tools'
+#     own 12.9 expand-only check and binding diff, not this reviewer.
+# "oauth" stays as its own root: it is the same auth category by another
+# name (OAuth IS an authentication mechanism), not a fifth category, so
+# including it does not broaden scope beyond "auth".
 #
 # Matched by path-segment WORD, not a bare substring anywhere in the path
 # (PR #142 review, first round, cursor_review.py:644 blocking finding). A
@@ -122,8 +133,12 @@ ALWAYS_REVIEW_NAMES = ("decisions.md", "cursor_review_brief.md")
 # `useAuth.ts`, `authStore.ts`, `SessionStore.swift`, `sessionGrant.ts` and
 # similar compound identifiers, because casefold()-then-split can never
 # recover a case boundary once it is gone -- the split happens on the raw
-# path, before casefolding). A word matches when it STARTS WITH a root below
-# (so "session" also catches "sessions", "sessioned", "authentication" and
+# path, before casefolding) AND on an acronym-to-word boundary (PR #142
+# review, third round, LOW finding: the lower-to-upper split alone never
+# separates an all-caps prefix from the capitalised word after it, so
+# `HTTPAuth.ts`, `SSOAuth.ts` and `JWTSession.ts` fell through as a single
+# unsplit word). A word matches when it STARTS WITH a root below (so
+# "session" also catches "sessions", "sessioned", "authentication" and
 # "authorization" catch themselves under the "auth" root, etc.) and is not
 # in the exclusion list. Fail open toward reviewing, never toward skipping:
 # a false positive here still costs one extra review, and a false negative
@@ -131,18 +146,8 @@ ALWAYS_REVIEW_NAMES = ("decisions.md", "cursor_review_brief.md")
 # ordinary English word collide (auth/author, payment/repayment), the
 # collision is closed by naming the ordinary word, never by narrowing the
 # root.
-#
-# Known gap, not closed here: an ORM's own default output-directory name
-# (e.g. `drizzle/0003_add_users.sql`) is a D1-migration path this list does
-# not catch generically, because that word is also an ordinary English
-# weather term ("drizzle") that appears in this estate's own marine/weather
-# apps (buoys, riverstatus, lakestat-us) -- adding it as a root would revive
-# the exact author/repayment false-positive class this design exists to
-# avoid. The generic "migration(s)" root still catches a literal
-# `migrations/` directory, the common non-ORM-specific convention.
 T2_SENSITIVE_ROOTS = (
     "auth", "oauth", "session", "payment", "credential",
-    "nvault", "migration", "wrangler", "schema",
 )
 T2_FALSE_POSITIVE_WORDS = frozenset({
     "author", "authors", "authored", "authoring", "authorship",
@@ -151,6 +156,10 @@ T2_FALSE_POSITIVE_WORDS = frozenset({
 })
 _TOKEN_SPLIT = re.compile(r"[^A-Za-z0-9]+")
 _CAMEL_SPLIT = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+# Acronym-prefix boundary: splits "HTTP" from "Auth" in "HTTPAuth", or "SSO"
+# from "Auth" in "SSOAuth" -- a run of capitals followed by a capital+lower
+# is the start of a new capitalised word, not part of the acronym.
+_ACRONYM_SPLIT = re.compile(r"(?<=[A-Z])(?=[A-Z][a-z])")
 # Policy prose: NOT P0 any more (so the size gate, round cap, delta gate and
 # daily cap all apply to it), but explicitly NOT metadata either.
 #
@@ -684,15 +693,20 @@ def is_always_review(path: str) -> bool:
 
 
 def _path_words(path: str) -> list[str]:
-    """Path segments, further split on camelCase/PascalCase boundaries,
-    each casefolded. Case-boundary splitting must happen BEFORE casefold():
-    `"useAuth".casefold()` is `"useauth"`, and no regex can split that back
-    into `["use", "auth"]` once the case information is gone."""
+    """Path segments, further split on camelCase/PascalCase boundaries and
+    on an acronym-to-word boundary, each casefolded. Case-boundary
+    splitting must happen BEFORE casefold(): `"useAuth".casefold()` is
+    `"useauth"`, and no regex can split that back into `["use", "auth"]`
+    once the case information is gone. `"HTTPAuth"` needs the acronym split
+    too: the plain lower-to-upper boundary never fires inside a run of
+    capitals, so `_CAMEL_SPLIT` alone leaves it as one word."""
     words: list[str] = []
     for raw in _TOKEN_SPLIT.split(path):
         if not raw:
             continue
-        words.extend(w for w in _CAMEL_SPLIT.split(raw) if w)
+        for chunk in _CAMEL_SPLIT.split(raw):
+            if chunk:
+                words.extend(w for w in _ACRONYM_SPLIT.split(chunk) if w)
     return [w.casefold() for w in words]
 
 
@@ -703,6 +717,38 @@ def is_t2_sensitive(path: str) -> bool:
         if any(word.startswith(root) for root in T2_SENSITIVE_ROOTS):
             return True
     return False
+
+
+# NO-PUSH paths (narduk-reboot wave 4, P3-C2 fix round). A wave-2 lane merged
+# narduk-libs#830, which gave the Cursor reviewer's launch a live PR branch
+# it could commit straight onto; the reviewer used that to push a
+# test-loosening "autofix" commit (b73f49) onto narduk-libs#837, a SECURITY
+# fix PR, and it shipped -- because nothing but the brief's own prose (HARD
+# RULES: "Do not commit, push...", present since the very first commit of
+# this callable, 7cf053b) stood between the agent and a writable branch. A
+# prompt is not a control: a model that ignores it, or is steered by
+# untrusted diff/comment content it was told to treat as data, still has the
+# write access if the launch payload grants it. is_no_push_sensitive() names
+# the diffs where that is unacceptable regardless of what the model does --
+# CI/workflow definitions, test files (a loosened assertion is exactly the
+# b73f49 shape), the runner-routing script (misroute a job onto the wrong
+# trust boundary), and any T2-sensitive path (auth/session/payments/
+# credential-table) -- and launch() responds by refusing to give the agent a
+# branch it can push commits onto for those diffs: `workOnCurrentBranch` goes
+# False, so any change the agent makes (in violation of its own brief) lands
+# on a throwaway branch of the agent's own, never on the reviewed PR. The
+# review itself is unaffected either way: findings come back from the
+# agent's final JSON message, never from its git state.
+NO_PUSH_PREFIXES = (".github/workflows/", "scripts/ci-runner-routing")
+_TEST_FILE = re.compile(r"(^|/)[^/]*\.test\.[^/]+$")
+
+
+def is_no_push_sensitive(path: str) -> bool:
+    return path.startswith(NO_PUSH_PREFIXES) or bool(_TEST_FILE.search(path)) or is_t2_sensitive(path)
+
+
+def no_push_reasons(paths: list[str] | None) -> list[str]:
+    return [path for path in (paths or []) if is_no_push_sensitive(path)]
 
 
 def is_policy(path: str) -> bool:
@@ -1095,7 +1141,7 @@ def upsert_marker(github: GitHub, number: str, marker: dict[str, Any] | None, bo
     return github.call("POST", f"issues/{number}/comments", {"body": body})
 
 
-def launch(cursor: Cursor, env: dict[str, str], brief: str, repository: str, repos: list[str], *, deep: bool = False) -> dict[str, Any]:
+def launch(cursor: Cursor, env: dict[str, str], brief: str, repository: str, repos: list[str], *, deep: bool = False, no_push: bool = False) -> dict[str, Any]:
     model, params, _effort, _fast = select_model(env, deep=deep)
     body = {
         "prompt": {"text": brief},
@@ -1103,7 +1149,14 @@ def launch(cursor: Cursor, env: dict[str, str], brief: str, repository: str, rep
         + [{"url": f"https://github.com/{name}"} for name in repos],
         "model": {"id": model, "params": params},
         "name": f"review {repository}#{env['PR_NUMBER']} @{env['PR_HEAD_SHA'][:7]}",
-        "workOnCurrentBranch": True,
+        # `no_push` (a diff touching .github/workflows/**, **/*.test.*,
+        # scripts/ci-runner-routing* or a T2-sensitive path -- see
+        # is_no_push_sensitive()) turns this OFF. False here means any commit
+        # the agent makes lands on a throwaway branch of its own, never on
+        # `PR_HEAD_REF` itself -- a code-level control the b73f49 incident
+        # showed the brief's own "do not push" prose cannot be trusted alone
+        # to enforce.
+        "workOnCurrentBranch": not no_push,
     }
     value = cursor.call("POST", "/v1/agents", body)
     # Verified live 2026-09-18: POST /v1/agents answers 201 with the agent
@@ -1215,8 +1268,9 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
     cursor = Cursor(env["CURSOR_CLOUD_AGENTS_API_KEY"], transport, env.get("CURSOR_API_URL") or CURSOR_API, sleep=sleep)
     rows = changed_files(github, number)
     lines = changed_lines(rows)
+    paths = paths_from_rows(rows)
     try:
-        priority, why = review_class(env, paths_from_rows(rows))
+        priority, why = review_class(env, paths)
     except Skip as skip:
         # Job concurrency already killed this pull request's in-flight WAITER;
         # the agent it was waiting on keeps burning the pool and posts nothing.
@@ -1231,10 +1285,31 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
         notice(f"review skipped: {skip}")
         return 0
     notice(f"review class {priority} ({why})")
+    # UNKNOWN (paths is None, e.g. the diff-listing API call failed) fails
+    # CLOSED here, same direction as review_class's own UNKNOWN handling: a
+    # diff this reviewer cannot enumerate might touch a no-push path, so it
+    # is treated as if it did.
+    no_push_hits = no_push_reasons(paths)
+    no_push = paths is None or bool(no_push_hits)
+    if no_push:
+        notice(f"no-push mode: {'diff list unavailable' if paths is None else f'touches {no_push_hits[0]}'}")
     repos = context_repos(env, repository)
     if brief_template is None:
         with open(env["BRIEF_PATH"], encoding="utf-8") as handle:
             brief_template = handle.read()
+    no_push_notice = (
+        (
+            "\nNO-PUSH MODE (this pull request touches a workflow, test, "
+            "ci-runner-routing or T2-sensitive path): you have been launched "
+            "WITHOUT write access to this branch. Even if you believe a fix "
+            "is trivial and safe, do not attempt to commit or push it -- you "
+            "cannot land it on this pull request, and doing so elsewhere is "
+            "still a HARD RULES violation. Report every finding in your "
+            "json block instead.\n"
+        )
+        if no_push
+        else ""
+    )
     brief = render_brief(
         brief_template,
         {
@@ -1247,6 +1322,7 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
             "base_sha": env["PR_BASE_SHA"],
             "base_ref": env["PR_BASE_REF"],
             "context_repos": ", ".join(repos) or "none",
+            "no_push_notice": no_push_notice,
         },
     )
 
@@ -1275,7 +1351,7 @@ def run(env: dict[str, str], transport: Transport, *, sleep: Callable[[float], N
             return 0
     cancel_previous(cursor, marker, env["PR_HEAD_SHA"])
     started = clock()
-    agent = launch(cursor, env, brief, repository, repos, deep=deep)
+    agent = launch(cursor, env, brief, repository, repos, deep=deep, no_push=no_push)
     agent_id = agent["id"]
     agent_url = agent.get("url") or f"https://cursor.com/agents/{agent_id}"
     print(f"launched Cursor agent {agent_id} for {repository}#{number} @ {env['PR_HEAD_SHA'][:12]}")
