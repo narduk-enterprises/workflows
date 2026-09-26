@@ -17,14 +17,12 @@ Two things have to hold, and only one of them is about speed:
    change to what ten repositories test on every pull request.
 
 2. **The effective values are resolved ONCE.** `e2e` builds
-   `--shard=<n>/<total>`, `e2e-report` decides whether there is anything to
-   merge, and `required` decides whether to demand that report. All three read
-   the plan job's outputs. If any of them went back to reading
-   `inputs.e2e-shards` directly, a pull-request override would make them
-   disagree: Playwright told it is shard 1 of 3 while one lane exists runs a
-   third of the suite and reports success, and `Required` demands a report job
-   that was never fanned out. Those are a false green and a false red on a
-   correct run, so the wiring is asserted structurally, not just behaviourally.
+   `--shard=<n>/<total>` and `required` checks the shard count, and both read
+   the plan job's outputs. If either went back to reading `inputs.e2e-shards`
+   directly, a pull-request override would make them disagree: Playwright told
+   it is shard 1 of 3 while one lane exists runs a third of the suite and
+   reports success. That is a false green on a correct-looking run, so the
+   wiring is asserted structurally, not just behaviourally.
 
 Same discipline as the sibling tests: assert the shipped source, then execute
 the shipped `run:` text against fixtures.
@@ -111,14 +109,9 @@ def check_single_resolution_point() -> None:
         "e2e must not read inputs.e2e-shards directly"
     )
 
-    report_if = str(jobs["e2e-report"].get("if", ""))
-    assert "needs.e2e-plan.outputs.shard-total" in report_if, (
-        "e2e-report's if: must gate on the plan job's shard-total"
-    )
-    assert "inputs.e2e-shards" not in report_if, (
-        "e2e-report must not gate on inputs.e2e-shards — with a pull-request "
-        "override it would demand a merge of a single unsharded lane"
-    )
+    # `E2E report` was removed with the evidence uploads (2026-09-26, org
+    # artifact storage); nothing may still depend on it.
+    assert "e2e-report" not in jobs, "e2e-report job was removed; do not reintroduce it"
 
     required_env = named_step(
         jobs["required"], "Require enabled gates to succeed and disabled gates to skip"
@@ -127,7 +120,7 @@ def check_single_resolution_point() -> None:
     assert "needs.e2e-plan.outputs.shard-total" in shards_expr, (
         "required must aggregate on the plan job's shard-total"
     )
-    print("PASS  e2e / e2e-report / required all read the plan job's effective values")
+    print("PASS  e2e / required both read the plan job's effective values")
 
 
 # --------------------------------------------------------------------------
@@ -384,7 +377,6 @@ def run_required(**env_overrides) -> subprocess.CompletedProcess:
             "E2E_PLAN_RESULT": "success",
             "E2E_PLAN_SKIPPED": "false",
             "E2E_RESULT": "success",
-            "E2E_REPORT_RESULT": "skipped",
             "E2E_SHARDS": "1",
             "RUN_E2E": "true",
             "RUN_DEPLOY_DRY_RUN": "false",
@@ -470,33 +462,23 @@ def check_required_still_gates() -> None:
     )
     # The green shape the gonogo canary actually produced.
     case(
-        "subset active + e2e green + report skipped -> Required GREEN",
+        "subset active + e2e green -> Required GREEN",
         expect_rc=0,
         E2E_SHARDS="1",
         E2E_RESULT="success",
-        E2E_REPORT_RESULT="skipped",
     )
-    # One lane must NOT expect a merged report; if one ran, the plan and the
-    # matrix disagreed and that disagreement is the bug this PR exists to stop.
+    # Sharded: the e2e matrix result alone gates; there is no report job.
     case(
-        "subset active + report ran anyway -> Required RED",
-        expect_rc=1,
-        E2E_SHARDS="1",
-        E2E_RESULT="success",
-        E2E_REPORT_RESULT="success",
-    )
-    # Unset overrides: the full-suite shape still demands the report.
-    case(
-        "no override (3 shards) + report skipped -> Required RED",
-        expect_rc=1,
-        E2E_SHARDS="3",
-        E2E_REPORT_RESULT="skipped",
-    )
-    case(
-        "no override (3 shards) + report green -> Required GREEN",
+        "no override (3 shards) + e2e green -> Required GREEN",
         expect_rc=0,
         E2E_SHARDS="3",
-        E2E_REPORT_RESULT="success",
+        E2E_RESULT="success",
+    )
+    case(
+        "no override (3 shards) + e2e failed -> Required RED",
+        expect_rc=1,
+        E2E_SHARDS="3",
+        E2E_RESULT="failure",
     )
     # The numeric guard: a non-count must name itself rather than aborting
     # wordlessly on `-gt` under `set -e`.

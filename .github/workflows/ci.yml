@@ -221,8 +221,16 @@ jobs:
       - name: web-foundation conformance gate behaviour tests
         run: python3 scripts/test_foundation_check.py
 
-      - name: prebuilt E2E artifact fail-closed tests
+      - name: prebuilt E2E application fail-closed tests
         run: python3 scripts/test_e2e_build_artifact.py
+
+      # The CI artifact store (R2) that replaced GitHub artifacts after the
+      # org artifact storage quota turned CI red on 2026-09-26: the client
+      # nuxt-cloudflare.yml installs, run against AWS's SigV4 examples and a
+      # local S3 double, plus the rule that the callable never touches GitHub
+      # artifact storage again.
+      - name: CI artifact store client tests
+        run: python3 scripts/test_ci_artifact_store.py
 
       # R12's fail-capable proof. A callable job that requests a permission
       # its caller did not grant kills the caller's ENTIRE run at startup --
@@ -247,14 +255,11 @@ jobs:
       - name: Fast-path contract tests
         run: python3 scripts/test_fast_path.py
 
-      - name: E2E report minimal-install tests
-        run: python3 scripts/test_e2e_report_minimal_install.py
-
       # The pull-request E2E subset (`e2e-pr-shards`/`e2e-pr-args`). Two
       # halves: that leaving both unset is byte-for-byte today's behaviour on
-      # every event — every pinned adopter passes neither — and that `e2e`,
-      # `e2e-report` and `Required` all resolve the effective shard count from
-      # the ONE place that computes it. Three copies of that conditional is
+      # every event — every pinned adopter passes neither — and that `e2e`
+      # and `Required` both resolve the effective shard count from
+      # the ONE place that computes it. Two copies of that conditional is
       # how `--shard=<n>/<total>` and the `Required` aggregation drift into a
       # suite that silently runs a third of its tests and reports success.
       - name: Exact candidate validation tests

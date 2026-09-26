@@ -4,8 +4,8 @@
 (workflows#49) Adds a callable input so a caller can declare path globs that
 never need the browser suite. When `run-e2e` is true, the event is a pull
 request, and EVERY changed file matches at least one glob, `E2E plan` must
-emit an empty shard list and `skipped=true`; the `E2E` and `E2E report` jobs
-then skip via their own `if:`, and `Required` still gates them (skipped is
+emit an empty shard list and `skipped=true`; the `E2E` job then skips via
+its own `if:`, and `Required` still gates it (skipped is
 the required outcome, not an absent check).
 
 This is a pure source contract over the shipped YAML: extract and execute
@@ -88,16 +88,11 @@ def check_job_wiring() -> None:
     )
     assert "e2e-plan" in e2e["needs"]
 
-    report = jobs["e2e-report"]
-    assert "needs.e2e-plan.result == 'success'" in report["if"]
-    assert "needs.e2e-plan.outputs.skipped != 'true'" in report["if"]
-    assert "e2e-plan" in report["needs"]
-
     required = jobs["required"]
     step = required["steps"][0]
     assert step["env"]["E2E_PLAN_SKIPPED"] == "${{ needs.e2e-plan.outputs.skipped }}"
     assert "E2E_PLAN_SKIPPED" in step["run"]
-    print("PASS  E2E / E2E report / Required all gate on e2e-plan's skipped output")
+    print("PASS  E2E / Required both gate on e2e-plan's skipped output")
 
 
 def skip_step_script() -> str:
