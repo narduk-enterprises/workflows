@@ -13,8 +13,8 @@ in the workflow's structure and in the linter:
   gate's fail-closed Playwright setup;
 - the quarantine leg runs ONLY the caller's quarantine arguments, unsharded,
   and the gate's shards are unchanged;
-- its artifact name stays outside `E2E report`'s `playwright-evidence-*`
-  merge pattern;
+- no job uploads Playwright evidence any more (dropped 2026-09-26, org
+  artifact storage), so the quarantine report lives in its job log;
 - `lint_callables.py` accepts exactly this shape and rejects each way of
   weakening it (the NON_GATING_JOBS exemption is fail-capable).
 
@@ -79,16 +79,14 @@ def check_job_shape() -> None:
     print("PASS  e2e-quarantine: continue-on-error, never needed, e2e's exact steps and route")
 
 
-def check_artifact_name() -> None:
+def check_no_evidence_upload() -> None:
     doc = load()
-    step = named_step(doc["jobs"]["e2e"], "Upload Playwright evidence")
-    expr = step["with"]["name"]
-    assert "'playwright-quarantine'" in expr, expr
-    assert not fnmatch.fnmatch("playwright-quarantine", "playwright-evidence-*")
-    report = doc["jobs"]["e2e-report"]
-    patterns = [s["with"]["pattern"] for s in report["steps"] if "pattern" in (s.get("with") or {})]
-    assert patterns == ["playwright-evidence-*"], patterns
-    print("PASS  quarantine artifact stays outside E2E report's merge pattern")
+    for jid, job in doc["jobs"].items():
+        for step in job.get("steps") or []:
+            name = str(step.get("name", ""))
+            assert "Playwright evidence" not in name, f"{jid}: {name} is back"
+    assert "e2e-report" not in doc["jobs"]
+    print("PASS  no Playwright evidence upload and no E2E report job")
 
 
 def run_suite_step(shard: str, total: str, extra: str, quarantine: str) -> list[str]:
@@ -127,9 +125,9 @@ def check_arguments() -> None:
     q = "--project=quarantine --retries=0"
     argv = run_suite_step("quarantine", "3", "--project=web", q)
     assert argv == ["run", "test:e2e", "--project=quarantine", "--retries=0"], argv
-    print("PASS  quarantine leg: only the quarantine args, unsharded, no blob reporter")
+    print("PASS  quarantine leg: only the quarantine args, unsharded")
     argv = run_suite_step("2", "3", "--project=web", q)
-    assert argv == ["run", "test:e2e", "--shard=2/3", "--reporter=blob", "--project=web"], argv
+    assert argv == ["run", "test:e2e", "--shard=2/3", "--project=web"], argv
     print("PASS  gate shard: unchanged by e2e-quarantine-args")
 
 
@@ -154,7 +152,7 @@ def check_linter() -> None:
         "continue-on-error removed": lambda j: j["e2e-quarantine"].pop("continue-on-error"),
         "continue-on-error false": lambda j: j["e2e-quarantine"].__setitem__("continue-on-error", False),
         "Required needs it": lambda j: j["required"]["needs"].append("e2e-quarantine"),
-        "another job needs it": lambda j: j["e2e-report"]["needs"].append("e2e-quarantine"),
+        "another job needs it": lambda j: j["fast-escalated"]["needs"].append("e2e-quarantine"),
         "undeclared job with continue-on-error": lambda j: j["e2e"].__setitem__("continue-on-error", True),
         "undeclared job outside Required": lambda j: j.__setitem__("stray", {"steps": []}),
     }
@@ -167,7 +165,7 @@ def check_linter() -> None:
 def main() -> None:
     check_input()
     check_job_shape()
-    check_artifact_name()
+    check_no_evidence_upload()
     check_arguments()
     check_linter()
     print("\ne2e quarantine lane contract passed")

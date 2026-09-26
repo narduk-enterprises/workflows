@@ -138,7 +138,7 @@ def graph_tokens(src: str) -> tuple:
 
 class GraphEvaluator(Evaluator):
     """Job-level evaluation: status functions over the job's ANCESTORS
-    (ctx["__job_status"]) plus the numeric comparison `E2E report` uses."""
+    (ctx["__job_status"]) plus numeric comparisons in `if:` expressions."""
 
     def run(self, src: str):
         self.toks, self.i = list(graph_tokens(src)), 0
@@ -259,17 +259,15 @@ OLD_GRAPH = {
             "if": "inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'"},
     "e2e-quarantine": {"needs": ["build", "e2e-plan"],
                        "if": "inputs.run-e2e && inputs.e2e-quarantine-args != '' && needs.e2e-plan.outputs.skipped != 'true'"},
-    "e2e-report": {"needs": ["e2e-plan", "e2e"],
-                   "if": "!cancelled() && inputs.run-e2e && needs.e2e-plan.outputs.shard-total > 1 && needs.e2e-plan.result == 'success' && needs.e2e-plan.outputs.skipped != 'true'"},
     "preview": {"needs": "build",
                 "if": "inputs.preview-checks != 'none' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')"},
     "deploy-dry-run": {"needs": "build", "if": "inputs.wrangler-dry-run"},
     "caller-lint": {},
-    "required": {"needs": ["build", "checks", "extra-gate", "e2e-plan", "e2e", "e2e-report", "preview",
+    "required": {"needs": ["build", "checks", "extra-gate", "e2e-plan", "e2e", "preview",
                            "deploy-dry-run", "caller-lint"], "if": "always()"},
 }
 NEW_JOBS = {"reuse-plan", "fast", "fast-escalated", "journey-smoke"}
-CI_LANES = ["build", "checks", "extra-gate", "e2e-plan", "e2e", "e2e-quarantine", "e2e-report",
+CI_LANES = ["build", "checks", "extra-gate", "e2e-plan", "e2e", "e2e-quarantine",
             "preview", "deploy-dry-run"]
 
 
@@ -436,12 +434,12 @@ def gate_script() -> str:
 GATE_BASE = {
     "BUILD_RESULT": "success", "CHECKS_RESULT": "success", "CALLER_LINT_RESULT": "success",
     "EXTRA_GATE_RESULT": "skipped", "E2E_PLAN_RESULT": "success", "E2E_RESULT": "success",
-    "E2E_REPORT_RESULT": "skipped", "DEPLOY_DRY_RUN_RESULT": "skipped", "PREVIEW_RESULT": "skipped",
+    "DEPLOY_DRY_RUN_RESULT": "skipped", "PREVIEW_RESULT": "skipped",
     "PREVIEW_CHECKS": "none", "EVENT_NAME": "push", "RUN_E2E": "true", "E2E_SHARDS": "1",
     "E2E_PLAN_SKIPPED": "false", "RUN_DEPLOY_DRY_RUN": "false", "EXPECTED_CANDIDATE": "",
 }
 LANES = ["BUILD_RESULT", "CHECKS_RESULT", "EXTRA_GATE_RESULT", "E2E_PLAN_RESULT", "E2E_RESULT",
-         "E2E_REPORT_RESULT", "PREVIEW_RESULT", "DEPLOY_DRY_RUN_RESULT"]
+         "PREVIEW_RESULT", "DEPLOY_DRY_RUN_RESULT"]
 
 
 def test_required_gate_reuse_and_smoke_branches() -> None:

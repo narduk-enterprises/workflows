@@ -425,7 +425,6 @@ def check_required(doc: dict) -> None:
         "CALLER_LINT_RESULT": "success",
         "E2E_PLAN_RESULT": "skipped",
         "E2E_RESULT": "skipped",
-        "E2E_REPORT_RESULT": "skipped",
         "E2E_SHARDS": "1",
         "E2E_PLAN_SKIPPED": "false",
         "RUN_E2E": "false",

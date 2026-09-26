@@ -426,8 +426,9 @@ on:
           Number of Playwright shards. 1 (the default) runs the suite as a
           single job, unchanged. Greater than 1 fans the e2e job out over that
           many parallel lanes, appending
-          `--shard=<n>/<total> --reporter=blob` to the e2e script, and adds an
-          `E2E report` job that merges the blob reports into one HTML report.
+          `--shard=<n>/<total>` to the e2e script. Each shard reports in its
+          own job log with the caller's configured reporter; no report
+          artifact is uploaded (org artifact storage, 2026-09-26).
           Generalizes the status-apps (2 shards) / operator-portal /
           earthdata-viewer (3 shards) pattern.
         required: false
@@ -510,7 +511,7 @@ on:
           the repository root. When `run-e2e` is true, every changed path in
           a pull request or push event matches at least one pattern, and there is at
           least one changed path, the `E2E plan` job emits an empty shard
-          list and every browser job (`E2E`, `E2E report`) is skipped —
+          list and every browser job (`E2E`) is skipped —
           `Required` still gates, expecting them `skipped` rather than
           absent. Defaults to documentation and repository metadata; an
           explicitly empty value disables path skipping. Unknown or incomplete
@@ -1293,7 +1294,7 @@ jobs:
           "$PM" run "$INSTALL_SCRIPT"
 
       # Only the default branch writes, and only this job and `e2e` write at
-      # all. `e2e-report` and `deploy-dry-run` share `inputs.runner` with this
+      # all. `deploy-dry-run` shares `inputs.runner` with this
       # job, so by the time they install, the entry this step wrote is an
       # exact-key hit for them — adding a save there would only race for a key
       # that already exists. `e2e` is separate because it may be routed to a
@@ -1689,15 +1690,6 @@ jobs:
                 narduk-app foundation:check --json > foundation-check.json || true
             fi
           fi
-
-      - name: Upload web-foundation conformance check artifact
-        if: always() && inputs.foundation-check
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: foundation-check
-          path: ${{ inputs.working-directory }}/foundation-check.json
-          if-no-files-found: warn
-          retention-days: 14
 
       # No warning tier (D-WEBFOUND-2 Q9 (a)): FAIL and UNKNOWN both block,
       # and an unreadable/missing artefact is treated the same as UNKNOWN —
@@ -2287,13 +2279,10 @@ jobs:
       # configuration; consumed only by the shard-list step below.
       full: ${{ steps.skip.outputs.full }}
       # The EFFECTIVE shard count and e2e arguments for this event, resolved
-      # exactly once here (workflows#83). `e2e`, `e2e-report` and `required`
-      # all read these rather than re-deriving the pull-request/push split
-      # from `inputs.*` — three copies of one conditional is how the shard
-      # total in `--shard=<n>/<total>`, the `E2E report` gate and the
-      # `Required` aggregation drift apart, and a `Required` that expects a
-      # report job the plan never fanned out for is a red gate on a correct
-      # run.
+      # exactly once here (workflows#83). `e2e` and `required` both read
+      # these rather than re-deriving the pull-request/push split from
+      # `inputs.*` — two copies of one conditional is how the shard total in
+      # `--shard=<n>/<total>` and the `Required` aggregation drift apart.
       shard-total: ${{ steps.plan.outputs.shard-total }}
       e2e-args: ${{ steps.plan.outputs.e2e-args }}
     steps:
@@ -3205,11 +3194,13 @@ jobs:
             EXTRA_ARGS="$QUARANTINE_ARGS"
           fi
           ARGS=()
-          # A single lane runs the suite exactly as before — no --shard, no
-          # blob reporter, so a caller that never asked for sharding sees no
-          # change in what runs or what it reports.
+          # A single lane runs the suite exactly as before — no --shard, so a
+          # caller that never asked for sharding sees no change in what runs.
+          # A sharded lane keeps the caller's own reporter: with no report
+          # merge (evidence uploads dropped 2026-09-26), a blob reporter would
+          # leave a failing shard readable nowhere.
           if [ "$TOTAL" -gt 1 ]; then
-            ARGS+=("--shard=${SHARD}/${TOTAL}" "--reporter=blob")
+            ARGS+=("--shard=${SHARD}/${TOTAL}")
           fi
           # Deliberate word splitting: e2e-args is a caller-supplied argument
           # list, not a single argument.
@@ -3240,28 +3231,6 @@ jobs:
             fi
           fi
 
-      # STEP-level `always()` is deliberate and stays: capturing evidence is
-      # the whole point of this step, and a step-level upload costs seconds, not
-      # a runner slot. Do not "fix" it to `!cancelled()` by analogy with the
-      # job-level change above — a job killed by `timeout-minutes` needs this to
-      # run, and that is precisely the case where the evidence matters most.
-      - name: Upload Playwright evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          # Per-shard name: upload-artifact v4+ rejects a duplicate artifact
-          # name, so a fixed name would fail the moment a caller shards. The
-          # quarantine leg's name must NOT match `E2E report`'s
-          # `playwright-evidence-*` pattern, or its results would be merged
-          # into the gate's report.
-          name: ${{ matrix.shard == 'quarantine' && 'playwright-quarantine' || format('playwright-evidence-{0}', matrix.shard) }}
-          path: |
-            ${{ inputs.working-directory }}/blob-report
-            ${{ inputs.working-directory }}/playwright-report
-            ${{ inputs.working-directory }}/test-results
-          if-no-files-found: ignore
-          retention-days: 7
-
       - name: Record quarantine result
         if: always() && matrix.shard == 'quarantine'
         env:
@@ -3272,7 +3241,7 @@ jobs:
             echo "### E2E quarantine (non-blocking)"
             echo
             echo "Result: **${STATUS}**, running \`${ARGS}\`. This lane never affects \`Required\`;"
-            echo "the \`playwright-quarantine\` artifact holds the report."
+            echo "its job log holds the report."
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$STATUS" != success ]; then
             echo "::warning::E2E quarantine lane: ${STATUS} (non-blocking)"
@@ -3306,184 +3275,6 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
     steps: *e2e_steps
 
-  # Sharded runs produce N partial blob reports and no readable result. This
-  # job is what turns them back into one HTML report — the merge step
-  # status-apps, operator-portal and earthdata-viewer each hand-rolled.
-  #
-  # `!cancelled()` rather than `always()`, and the difference matters. The
-  # intent is "still produce the report that explains WHY a shard failed", and
-  # `!cancelled()` keeps exactly that — it is true on failure. What it drops is
-  # the case `always()` also covered and nobody wanted: a run the user
-  # CANCELLED, where this job would still claim a `linux-ci` slot to merge blob
-  # reports from shards that were killed mid-suite. That is the job-level
-  # `if: always()` waste pattern found on nvault (a diagnostic browser job held
-  # a scarce pool slot after `Verify` had already failed, producing a result
-  # that could not gate anything) — job-level `always()` is easy to miss because
-  # gates that check for it usually look at steps.
-  #
-  # Safe for `ci / Required`: on a cancelled run this job reports `skipped`, and
-  # `Required` (which must keep `always()`, or a cancelled run would leave the
-  # required check permanently "Expected" — the company-hq#146 deadlock) already
-  # treats `skipped` as acceptable for this job.
-  e2e-report:
-    name: E2E report
-    # `shard-total`, not `inputs.e2e-shards`: with a pull-request shard
-    # override there may be exactly one lane and therefore nothing to merge,
-    # and `Required` below reads the same output, so the two agree by
-    # construction rather than by two conditionals staying in step
-    # (workflows#83). An unset/skipped plan leaves this empty, and an empty
-    # string compares false against 1 — report skipped, which is what
-    # `Required` then demands.
-    if: "!cancelled() && inputs.run-e2e && needs.e2e-plan.outputs.shard-total > 1 && needs.e2e-plan.result == 'success' && needs.e2e-plan.outputs.skipped != 'true'"
-    needs: [e2e-plan, e2e]
-    # Merging is pure Node work with no browser — keep it off the scarce
-    # isolated browser pool.
-    # CI lightweight route (company-hq CI policy); caller override takes precedence.
-    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      packages: read
-    defaults:
-      run:
-        working-directory: ${{ inputs.working-directory }}
-    steps:
-      # This job never runs the app's own dependency tree — merge-reports is
-      # pure `@playwright/test` tooling. `actions/checkout` is only here to
-      # read the caller's pinned version out of package.json; there is no
-      # `npm ci`/`pnpm install` in this job at all (workflows#49). Measured
-      # before this change (operator-portal run 33887424724, cff1ff8b):
-      # setup-node 22s + `npm ci` 23s to run a 1s merge, 57s job total.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ inputs.expected-candidate-sha }}
-
-      - name: Verify exact validation candidate
-        if: inputs.expected-candidate-sha != ''
-        working-directory: ${{ github.workspace }}
-        shell: bash
-        env:
-          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
-          EVENT_SHA: ${{ github.sha }}
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_REF: ${{ github.ref }}
-        run: |
-          set -euo pipefail
-          if ! [[ "$EXPECTED_CANDIDATE" =~ ^[0-9a-f]{40}$ ]] ||
-             [[ "$EVENT_NAME" != push || "$EVENT_REF" != "refs/heads/narduk-validation/$EXPECTED_CANDIDATE/"* || "$EVENT_SHA" != "$EXPECTED_CANDIDATE" ]]; then
-            echo '::error::Exact validation requires a full SHA matching its explicit validation ref and push event.'
-            exit 1
-          fi
-          if [[ "$(git rev-parse HEAD)" != "$EXPECTED_CANDIDATE" ]]; then
-            echo '::error::Checked-out source differs from the requested validation candidate.'
-            exit 1
-          fi
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          # node-version and node-version-file are mutually exclusive on
-          # setup-node (passing both is rejected), so resolve them as two
-          # exclusive expressions: node-version-file wins when the caller
-          # sets it, and node-version otherwise reproduces prior behaviour.
-          node-version-file: ${{ inputs.node-version-file }}
-          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
-
-      - name: Resolve pinned @playwright/test version
-        id: playwright-version
-        run: |
-          set -euo pipefail
-          version=$(node -e '
-            const pkg = require("./package.json")
-            const version = (pkg.devDependencies && pkg.devDependencies["@playwright/test"])
-              || (pkg.dependencies && pkg.dependencies["@playwright/test"])
-              || ""
-            process.stdout.write(version)
-          ')
-          if [ -z "$version" ]; then
-            echo "::error::package.json has no @playwright/test dependency to pin merge-reports to"
-            exit 1
-          fi
-          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
-            echo "::error::@playwright/test must be pinned to an exact version for E2E report (found \"$version\")"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - name: Download shard evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          path: ${{ inputs.working-directory }}/all-blob-reports
-          pattern: playwright-evidence-*
-          merge-multiple: true
-
-      - name: Merge blob reports
-        env:
-          PLAYWRIGHT_VERSION: ${{ steps.playwright-version.outputs.version }}
-        run: |
-          set -euo pipefail
-          if [ ! -d all-blob-reports/blob-report ]; then
-            echo "::warning::no blob reports found to merge"
-            exit 0
-          fi
-          # --package pulls only @playwright/test (and its transitive deps)
-          # at the caller's exact pin — not the app's dependency tree — and
-          # --yes skips npx's interactive install prompt in CI.
-          npx --yes --package "@playwright/test@${PLAYWRIGHT_VERSION}" \
-            playwright merge-reports --reporter html all-blob-reports/blob-report
-
-      # STEP-level `always()` is deliberate and stays: capturing evidence is
-      # the whole point of this step, and a step-level upload costs seconds, not
-      # a runner slot. Do not "fix" it to `!cancelled()` by analogy with the
-      # job-level change above — a job killed by `timeout-minutes` needs this to
-      # run, and that is precisely the case where the evidence matters most.
-      - name: Upload merged report
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: playwright-report-merged
-          path: ${{ inputs.working-directory }}/playwright-report
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # PREVIEW (V1; Logan, askme round 2026-09-17, "Post URL + run the PR subset
-  # on it (Recommended)"; company-hq#745, company-hq D-ORG-1 (g), 2026-09-02).
-  #
-  # WHAT CLOUDFLARE ACTUALLY EXPOSES. Workers Builds' GitHub App creates check
-  # runs, commit statuses and a pull request comment, and "a preview URL will
-  # be provided for any builds which perform `wrangler versions upload`"
-  # (developers.cloudflare.com/workers/ci-cd/builds/git-integration/github-integration/).
-  # It does NOT create a GitHub Deployment -- that is the Pages integration's
-  # shape -- so there is no `environment_url` to read and this job does not
-  # pretend there is. The two sources it offers are the comment Cloudflare
-  # posts, and a caller-supplied URL template that needs no GitHub read at all.
-  #
-  # THE URL IS NOT THE PROOF. A preview URL appearing in a comment says a build
-  # was attempted, not that the PR's head commit is what is actually serving.
-  # So the wait below is not satisfied until the URL itself answers and its
-  # `x-build-version` header is a prefix of the PR head SHA. That header is the
-  # estate's existing live-proof convention (buoys docs/workers-builds.md, which
-  # records `x-build-version: a84fa2163903` for commit a84fa216390321...), and it
-  # is compared BY PREFIX because Cloudflare emits a 12-character short SHA
-  # while `git rev-parse --short` defaults to 7 -- a fixed-width comparison
-  # would be a gate that never passes or, worse, one somebody "fixes" by
-  # deleting it.
-  #
-  # FAIL CLOSED. A preview that never appears inside the bound is a FAILURE,
-  # not a skip. "The preview never showed up" is the single most common way a
-  # Workers Builds connection silently breaks, and it is indistinguishable from
-  # "this repo does not use previews" only if you refuse to make the caller say
-  # which it is -- which is what `preview-checks: none` is for.
-  #
-  # RUNNER CLASS. Lightweight (the `caller-lint` / `E2E plan` route) unless the
-  # caller selected `e2e-subset`, which needs a browser guest and therefore the
-  # `e2e-runner` route. The isolated-pool preflight it runs there is the SAME
-  # YAML node as the `e2e` job's, via anchors, not a second copy: an
-  # image-equality gate that exists twice is an image-equality gate that drifts.
-  # Callers should note that with `e2e-subset` selected the bounded wait holds a
-  # `playwright-isolated` slot (three effective slots across ~ten repos), which
-  # is why `preview-timeout-minutes` is a caller input and why `og` is the
-  # default.
   preview:
     name: Preview
     # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
@@ -4959,21 +4750,10 @@ jobs:
             printf '\nRolled back with the %s script (to %s). The job stays red.\n' "$SCRIPT" "${ROLLBACK_TO_VERSION:-the script default}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      - name: Upload journey smoke evidence
-        if: always() && steps.smoke.outcome != 'skipped'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: journey-smoke-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/journey-smoke-report.json
-            ${{ inputs.working-directory }}/test-results
-          if-no-files-found: ignore
-          retention-days: 14
-
   required:
     name: Required
     if: always()
-    needs: [reuse-plan, build, checks, extra-gate, e2e-plan, e2e, e2e-report, preview, deploy-dry-run, caller-lint, fast, fast-escalated, journey-smoke]
+    needs: [reuse-plan, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run, caller-lint, fast, fast-escalated, journey-smoke]
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     timeout-minutes: 20
@@ -4989,7 +4769,6 @@ jobs:
           CHECKS_RESULT: ${{ needs.checks.result }}
           E2E_PLAN_RESULT: ${{ needs.e2e-plan.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
-          E2E_REPORT_RESULT: ${{ needs.e2e-report.result }}
           DEPLOY_DRY_RUN_RESULT: ${{ needs.deploy-dry-run.result }}
           EXTRA_GATE_RESULT: ${{ needs.extra-gate.result }}
           CALLER_LINT_RESULT: ${{ needs.caller-lint.result }}
@@ -5034,7 +4813,7 @@ jobs:
           # through to the unchanged checks below.
           if [ "${REUSED:-}" = true ] || [ -n "${JOURNEY_SMOKE_URL:-}" ]; then
             for lane in build:"$BUILD_RESULT" checks:"$CHECKS_RESULT" extra-gate:"$EXTRA_GATE_RESULT" \
-                e2e-plan:"$E2E_PLAN_RESULT" e2e:"$E2E_RESULT" e2e-report:"$E2E_REPORT_RESULT" \
+                e2e-plan:"$E2E_PLAN_RESULT" e2e:"$E2E_RESULT" \
                 preview:"$PREVIEW_RESULT" deploy-dry-run:"$DEPLOY_DRY_RUN_RESULT"; do
               require_skipped "${lane%%:*}" "${lane#*:}"
             done
@@ -5062,36 +4841,24 @@ jobs:
             require_success e2e-plan "$E2E_PLAN_RESULT"
             # e2e-skip-paths (workflows#49): the plan job itself must still
             # succeed — it made the skip decision — but a docs-only diff
-            # that the plan skipped must show E2E and E2E report as
-            # `skipped`, not absent, so `Required` still gates them.
+            # that the plan skipped must show E2E as `skipped`, not absent,
+            # so `Required` still gates it.
             if [ "$E2E_PLAN_SKIPPED" = "true" ]; then
               require_skipped e2e "$E2E_RESULT"
-              require_skipped e2e-report "$E2E_REPORT_RESULT"
             else
               require_success e2e "$E2E_RESULT"
-              # Fail closed on a shard count that is not a count. `set -e`
-              # does NOT rescue this: it is disabled inside an `if`
-              # condition, so `[ "" -gt 1 ]` prints "integer expected" to
-              # stderr, returns 2, and takes the `else` branch -- which
-              # expects `e2e-report` to be SKIPPED, finds it skipped, and
-              # exits 0. Proven by deleting these four lines: the empty,
-              # '0' and 'abc' cases in scripts/test_e2e_pr_subset.py all
-              # go rc=0. That is a false GREEN on an unresolved shard
-              # count, not a noisy abort.
+              # Fail closed on a shard count that is not a count: an empty,
+              # '0' or 'abc' shard total means the plan resolved nothing, and
+              # a gate that cannot see the count cannot pass
+              # (scripts/test_e2e_pr_subset.py).
               if ! [ "$E2E_SHARDS" -ge 1 ] 2>/dev/null; then
                 echo "::error::effective e2e shard count is not a positive integer (got '$E2E_SHARDS')"
                 exit 1
-              fi
-              if [ "$E2E_SHARDS" -gt 1 ]; then
-                require_success e2e-report "$E2E_REPORT_RESULT"
-              else
-                require_skipped e2e-report "$E2E_REPORT_RESULT"
               fi
             fi
           else
             require_skipped e2e-plan "$E2E_PLAN_RESULT"
             require_skipped e2e "$E2E_RESULT"
-            require_skipped e2e-report "$E2E_REPORT_RESULT"
           fi
           # PREVIEW (V1). Three states, and the middle one is the point:
           #   preview-checks: none              -> must be skipped
@@ -5238,7 +5005,7 @@ jobs:
   # merge, until the full gate has finished.
   fast-escalated:
     name: ${{ (inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true') && 'Fast' || 'Fast (escalation not needed)' }}
-    needs: [reuse-plan, fast, build, checks, extra-gate, e2e-plan, e2e, e2e-report, preview, deploy-dry-run, caller-lint]
+    needs: [reuse-plan, fast, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run, caller-lint]
     if: always() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true'
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}

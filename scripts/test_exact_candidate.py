@@ -73,7 +73,7 @@ class ExactCandidate(unittest.TestCase):
         script = gate['run'].replace('${{ inputs.extra-gate-scripts }}', '')
         base = dict(os.environ, BUILD_RESULT='success', CHECKS_RESULT='success',
                     CALLER_LINT_RESULT='success', EXTRA_GATE_RESULT='skipped',
-                    E2E_PLAN_RESULT='skipped', E2E_RESULT='skipped', E2E_REPORT_RESULT='skipped',
+                    E2E_PLAN_RESULT='skipped', E2E_RESULT='skipped',
                     DEPLOY_DRY_RUN_RESULT='skipped', PREVIEW_RESULT='skipped',
                     PREVIEW_CHECKS='none', EVENT_NAME='workflow_dispatch', RUN_E2E='false',
                     E2E_SHARDS='1', E2E_PLAN_SKIPPED='', RUN_DEPLOY_DRY_RUN='false')

@@ -45,9 +45,8 @@ INSTALL_STEPS = (
 
 # Jobs in nuxt-cloudflare.yml that can materialise .npmrc.auth via the
 # package-registry auth bootstrap (token present + consumer auth script).
-# `e2e-report` is deliberately absent (workflows#49): it no longer installs
-# the caller's dependency tree at all, so it never runs the auth bootstrap or
-# needs the paired cleanup — see scripts/test_e2e_report_minimal_install.py.
+# The former `e2e-report` job was removed with the evidence uploads
+# (2026-09-26); it never ran the auth bootstrap (workflows#49).
 # `preview` (V1) joins them: its checks run the CALLER's own toolchain -- the
 # caller's pinned narduk-app-tools for `og:check` and the caller's Playwright
 # suite for the subset -- so it installs the dependency tree and is bound by the

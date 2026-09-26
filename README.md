@@ -577,7 +577,7 @@ Which gates each callable exposes this way:
 
 | Callable | Caller-gatable | Always runs |
 |---|---|---|
-| `nuxt-cloudflare.yml` | `run-e2e` (`e2e`, `e2e-plan`, `e2e-report`), `wrangler-dry-run`, `run-tests` | `build`, `checks` |
+| `nuxt-cloudflare.yml` | `run-e2e` (`e2e`, `e2e-plan`), `wrangler-dry-run`, `run-tests` | `build`, `checks` |
 | `apple.yml` | `run-swiftlint` / `linux-checks` (`lint`), `run-build`, `run-tests` | `xcode` |
 | `python-data.yml` | `run-ruff` (`lint`), `run-tests`, `run-pyright` | `test` |
 | `reusable-browser-tests.yml` | `run-webkit` (`webkit`) | `validate`, `chromium`, `report` |
@@ -751,7 +751,7 @@ Notes:
 
 ### Central lightweight-job routing
 
-`nuxt-cloudflare.lightweight-runner` routes E2E plan, E2E report and Required
+`nuxt-cloudflare.lightweight-runner` routes E2E plan and Required
 independently of the build. Selection is explicit input, then
 `CI_LIGHTWEIGHT_RUNNER`, then the existing build/Blacksmith route. Public
 callers always use `ubuntu-latest` for these three jobs. An unset override is
@@ -1437,9 +1437,7 @@ The rules, all of which fail toward running **more**:
   subset in your own `playwright.config` (a project) or with `--grep`.
 
 `Required` is unaffected as a gate: it still demands `E2E` succeed, and it
-derives "was there more than one shard, so must `E2E report` have run?" from
-the same single resolved value `E2E` sharded on, so a one-lane pull request
-correctly expects `E2E report` to be `skipped` rather than absent.
+checks the same single resolved shard count `E2E` sharded on.
 
 **A subset is a smaller gate, not a weaker one.** Whatever a pull request
 stops running, the default-branch push still runs — but it runs it *after* the
@@ -1525,9 +1523,8 @@ these arguments, on every event E2E runs on:
 - **It is the gate's setup.** It runs `E2E`'s own steps through a YAML alias:
   the same prebuilt artifact, runner route, toolchain checks and auth cleanup.
   Only the arguments differ. It is unsharded.
-- **Its evidence is separate.** It uploads `playwright-quarantine`, which is
-  outside `E2E report`'s `playwright-evidence-*` merge, so quarantined results
-  never enter the gate's report.
+- **Its evidence is separate.** Its report is in its own job log, apart from
+  the gate's shards.
 - **It skips with E2E.** A docs-only PR skipped by `e2e-skip-paths` runs
   neither.
 
@@ -1982,7 +1979,7 @@ unmeasured. Do not read the numbers above onto them:
 
 | Callable | Job | Timeout | Why nothing ran |
 |---|---|---|---|
-| `nuxt-cloudflare.yml` | `E2E`, `E2E plan`, `E2E report` | 30 / 5 / 15 | **never executed on any adopter.** hydrogen and software-delivery set `run-e2e: false`; marketing-web and vtraceroute leave it at the default. 35 skipped instances, 0 runs |
+| `nuxt-cloudflare.yml` | `E2E`, `E2E plan` | 30 / 5 | **never executed on any adopter.** hydrogen and software-delivery set `run-e2e: false`; marketing-web and vtraceroute leave it at the default. 35 skipped instances, 0 runs |
 | `python-data.yml` | `lint` | 10 | narduk-data leaves `run-ruff` false — skipped in every run |
 
 **Nothing was changed as a result.** Every measured timeout sits between 6.2×
@@ -2024,3 +2021,18 @@ per job, never extrapolated from a run count.
   callable to `scripts/test_runner_default.py`).
 - Estate conventions live in the `ci-workflow-author` skill
   (agent-infrastructure repo); consult it before adding workflows here.
+
+## No evidence artifacts (2026-09-26)
+
+`nuxt-cloudflare.yml` uploads no evidence artifacts. On 2026-09-26 the org's
+Actions artifact storage passed its included allowance with a $0 budget, and
+every job that uploaded evidence went red. The owner chose to drop the
+evidence uploads rather than carry that storage. So:
+
+- the Playwright evidence upload, the `E2E report` merge job, the journey-smoke
+  evidence upload and the foundation-check artifact are gone;
+- a sharded E2E lane reports with the caller's own reporter in its job log
+  (no `--reporter=blob`, which only existed to be merged);
+- the small proof artifacts `Required` and full E2E publish, and the prebuilt
+  E2E application the shards share, stay.
+
