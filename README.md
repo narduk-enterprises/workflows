@@ -2150,6 +2150,14 @@ The E2E jobs, including those on the isolated browser pool, get only the two
 IDs. They read the prebuilt application through a presigned GET that Build
 signed for that one object, valid for 24 hours.
 
+That signature is not a secret, and it appears in the logs. It travels as a
+job output, and GitHub drops any job output that carries a secret, so each E2E
+job prints it in the fetch step's environment. GitHub masks the account ID and
+the access key ID, but they are identifiers, not keys. So anyone who can read
+that run's logs can fetch that one tarball until the link expires. That is
+the same audience, for the same day, that could download the GitHub artifact
+it replaces.
+
 ### Trust
 
 One token serves the whole estate, so nothing is trusted just because it is in
