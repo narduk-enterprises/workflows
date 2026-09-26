@@ -221,8 +221,16 @@ jobs:
       - name: web-foundation conformance gate behaviour tests
         run: python3 scripts/test_foundation_check.py
 
-      - name: prebuilt E2E artifact fail-closed tests
+      - name: prebuilt E2E application fail-closed tests
         run: python3 scripts/test_e2e_build_artifact.py
+
+      # The CI artifact store (R2) that replaced GitHub artifacts after the
+      # org artifact storage quota turned CI red on 2026-09-26: the client
+      # nuxt-cloudflare.yml installs, run against AWS's SigV4 examples and a
+      # local S3 double, plus the rule that the callable never touches GitHub
+      # artifact storage again.
+      - name: CI artifact store client tests
+        run: python3 scripts/test_ci_artifact_store.py
 
       # R12's fail-capable proof. A callable job that requests a permission
       # its caller did not grant kills the caller's ENTIRE run at startup --

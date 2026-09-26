@@ -24,7 +24,6 @@ Run: python3 scripts/test_e2e_quarantine.py
 from __future__ import annotations
 
 import copy
-import fnmatch
 import os
 import pathlib
 import stat

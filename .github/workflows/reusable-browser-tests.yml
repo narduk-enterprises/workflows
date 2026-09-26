@@ -29,8 +29,11 @@ name: Reusable Browser Tests
 #   success; enabled shard results are mandatory in Required.
 #
 # Chromium is three shards by default. WebKit is opt-in and starts only after
-# Chromium succeeds, also with three shards and max-parallel three. Reports
-# merge on ordinary Linux CI, never on the scarce browser pool.
+# Chromium succeeds, also with three shards and max-parallel three. Each shard
+# reports with the caller's own Playwright reporter in its job log. There is
+# no blob upload, report merge or HTML report artifact: the estate dropped
+# evidence uploads on 2026-09-26, when the organization's Actions artifact
+# storage quota turned CI red.
 #
 # Concurrency belongs in the caller. A called workflow evaluates concurrency
 # in the caller's context and can accidentally cancel its own caller; the
@@ -44,9 +47,9 @@ on:
     inputs:
       linux-runner:
         description: >-
-          Required JSON runsOn object for build-artifact validation, report
-          merge, and Required. Resolve workload linux-ci from the fleet
-          manifest and paste runsOn verbatim.
+          Required JSON runsOn object for build-artifact validation.
+          Resolve workload linux-ci from the fleet manifest and paste runsOn
+          verbatim.
         required: true
         type: string
       browser-runner:
@@ -106,12 +109,12 @@ on:
         type: string
         default: "test:e2e"
       chromium-args:
-        description: "Arguments added to Chromium shards before --shard and --reporter"
+        description: "Arguments added to Chromium shards before --shard"
         required: false
         type: string
         default: "--project=chromium --workers=1"
       webkit-args:
-        description: "Arguments added to WebKit shards before --shard and --reporter"
+        description: "Arguments added to WebKit shards before --shard"
         required: false
         type: string
         default: "--project=webkit --workers=1"
@@ -131,7 +134,10 @@ on:
         type: number
         default: 45
       report-timeout-minutes:
-        description: "Timeout for the ordinary-Linux report merge"
+        description: >-
+          Deprecated and unused. The report merge job went with the evidence
+          uploads on 2026-09-26; the input stays so callers that still pass
+          it keep validating.
         required: false
         type: number
         default: 15
@@ -139,9 +145,6 @@ on:
       build-artifact:
         description: "Same-run build artifact consumed by every shard"
         value: ${{ jobs.contract.outputs.build-artifact }}
-      report-artifact:
-        description: "Merged HTML report artifact retained for 14 days"
-        value: ${{ jobs.report.outputs.report-artifact }}
       playwright-version:
         description: "Exact Playwright version validated against the pool image"
         value: ${{ jobs.contract.outputs.playwright-version }}
@@ -624,7 +627,10 @@ jobs:
           fi
           # shellcheck disable=SC2206
           args=(${ENGINE_ARGS})
-          args+=("--shard=${SHARD}/${TOTAL}" "--reporter=blob")
+          # The shard keeps the caller's own reporter so a failure reads in
+          # this job's log. There is no report merge (evidence uploads were
+          # dropped 2026-09-26), so a blob reporter would leave it nowhere.
+          args+=("--shard=${SHARD}/${TOTAL}")
           if [ "$PACKAGE_MANAGER" = "pnpm" ]; then
             pnpm run "$SCRIPT" "${args[@]}"
           elif [ "$PACKAGE_MANAGER" = "npm" ]; then
@@ -633,17 +639,6 @@ jobs:
             echo "::error::package-manager must be pnpm or npm"
             exit 1
           fi
-
-      - name: Upload Chromium blob report
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: playwright-blob-${{ github.run_id }}-${{ github.run_attempt }}-chromium-${{ matrix.shard }}
-          path: |
-            ${{ inputs.working-directory }}/blob-report
-            ${{ inputs.working-directory }}/test-results
-          if-no-files-found: ignore
-          retention-days: 1
 
   webkit:
     name: WebKit
@@ -761,7 +756,10 @@ jobs:
           fi
           # shellcheck disable=SC2206
           args=(${ENGINE_ARGS})
-          args+=("--shard=${SHARD}/${TOTAL}" "--reporter=blob")
+          # The shard keeps the caller's own reporter so a failure reads in
+          # this job's log. There is no report merge (evidence uploads were
+          # dropped 2026-09-26), so a blob reporter would leave it nowhere.
+          args+=("--shard=${SHARD}/${TOTAL}")
           if [ "$PACKAGE_MANAGER" = "pnpm" ]; then
             pnpm run "$SCRIPT" "${args[@]}"
           elif [ "$PACKAGE_MANAGER" = "npm" ]; then
@@ -771,119 +769,10 @@ jobs:
             exit 1
           fi
 
-      - name: Upload WebKit blob report
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: playwright-blob-${{ github.run_id }}-${{ github.run_attempt }}-webkit-${{ matrix.shard }}
-          path: |
-            ${{ inputs.working-directory }}/blob-report
-            ${{ inputs.working-directory }}/test-results
-          if-no-files-found: ignore
-          retention-days: 1
-
-  report:
-    name: Browser report
-    if: ${{ !cancelled() && needs.contract.result == 'success' && needs.validate.result == 'success' }}
-    needs: [contract, validate, chromium, webkit]
-    runs-on: ${{ fromJSON(inputs.linux-runner) }}
-    timeout-minutes: ${{ inputs.report-timeout-minutes }}
-    permissions:
-      contents: read
-      packages: read
-      actions: read
-    outputs:
-      report-artifact: ${{ steps.meta.outputs.name }}
-    defaults:
-      run:
-        working-directory: ${{ inputs.working-directory }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
-        if: inputs.package-manager == 'pnpm'
-
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: ${{ inputs.node-version }}
-          package-manager-cache: false
-
-      - name: Configure package registry auth
-        env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-        run: *configure_package_registry_auth
-
-      - name: Point pnpm at a workspace-local store (self-hosted)
-        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
-        run: *place_pnpm_store
-
-      - name: Install dependencies (pnpm)
-        if: inputs.package-manager == 'pnpm'
-        run: pnpm install --frozen-lockfile
-        env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
-          NPM_CONFIG_GLOBALCONFIG: /dev/null
-
-      - name: Install dependencies (npm)
-        env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
-          NPM_CONFIG_GLOBALCONFIG: /dev/null
-        if: inputs.package-manager == 'npm'
-        run: npm ci
-
-      - name: Remove package auth materialization
-        if: always()
-        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
-
-      - name: Download this attempt's blob reports
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: playwright-blob-${{ github.run_id }}-${{ github.run_attempt }}-*
-          path: ${{ inputs.working-directory }}/all-blob-reports
-          merge-multiple: true
-
-      - name: Merge blob reports
-        run: |
-          set -euo pipefail
-          blob_dir=all-blob-reports/blob-report
-          if [ ! -d "$blob_dir" ]; then
-            echo "::error::blob report directory from this run attempt is missing"
-            exit 1
-          fi
-          first_blob=$(find "$blob_dir" -type f -name '*.zip' -print -quit)
-          if [ -z "$first_blob" ]; then
-            echo "::error::no blob report from this run attempt was available to merge"
-            exit 1
-          fi
-          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm exec playwright merge-reports --reporter=html "$blob_dir"
-          else
-            npx playwright merge-reports --reporter=html "$blob_dir"
-          fi
-
-      - name: Name report artifact
-        id: meta
-        run: echo "name=playwright-report-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
-
-      - name: Upload merged HTML and traces
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: ${{ steps.meta.outputs.name }}
-          path: ${{ inputs.working-directory }}/playwright-report
-          if-no-files-found: error
-          retention-days: 14
-
   required:
     name: Required
     if: always()
-    needs: [contract, validate, chromium, webkit, report]
+    needs: [contract, validate, chromium, webkit]
     # The organization lightweight route is independent of browser inputs.
     # Invalid browser inputs must still produce a visible Required failure.
     runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
@@ -895,7 +784,6 @@ jobs:
         env:
           CHROMIUM_RESULT: ${{ needs.chromium.result }}
           CONTRACT_RESULT: ${{ needs.contract.result }}
-          REPORT_RESULT: ${{ needs.report.result }}
           RUN_WEBKIT: ${{ inputs.run-webkit }}
           VALIDATE_RESULT: ${{ needs.validate.result }}
           WEBKIT_RESULT: ${{ needs.webkit.result }}
@@ -913,7 +801,6 @@ jobs:
           require_success contract "$CONTRACT_RESULT"
           require_success validate "$VALIDATE_RESULT"
           require_success chromium "$CHROMIUM_RESULT"
-          require_success report "$REPORT_RESULT"
           if [ "$RUN_WEBKIT" = "true" ]; then
             require_success webkit "$WEBKIT_RESULT"
           elif [ "$WEBKIT_RESULT" != "skipped" ]; then

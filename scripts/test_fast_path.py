@@ -641,16 +641,9 @@ def test_skipped_fast_jobs_never_show_fast() -> None:
 
 
 def run_script(script: str, scenario: dict, inputs: dict, env_name: str,
-               workflow: str = "example/app/.github/workflows/ci.yml@refs/heads/main") -> dict:
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        (root / "scenario.json").write_text(json.dumps(scenario))
-        (root / "script.js").write_text(script)
-        result = subprocess.run(
-            ["node", "-e", test_e2e_reuse.HARNESS, str(root / "scenario.json"), str(root / "script.js")],
-            env={**os.environ, "CALLER_WORKFLOW_REF": workflow, env_name: json.dumps(inputs)},
-            capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)
+               workflow: str = "example/app/.github/workflows/ci.yml@refs/heads/main", install: bool = True) -> dict:
+    return test_e2e_reuse.run_github_script(
+        script, scenario, {"CALLER_WORKFLOW_REF": workflow, env_name: json.dumps(inputs)}, install)
 
 
 def test_required_reuse_lookup() -> None:
@@ -662,18 +655,34 @@ def test_required_reuse_lookup() -> None:
     assert pushed["outputs"]["reused"] == "true"
     key = pushed["outputs"]["key"]
     assert key.startswith("required-proof-v1-") and len(key) == len("required-proof-v1-") + 64
+    assert pushed["calls"] == [
+        {"r2": f"GET proof/example/app/{key}.json"}, {"getWorkflowRun": 123}, {"listJobs": [123, 1]}]
+    # The pull request only computes the key: it never reads the store, so it
+    # needs no client (Required's copy of this text runs with none).
     pr = run_script(script, {"event": "pull_request"}, inputs, "PROOF_INPUTS",
-                    workflow="example/app/.github/workflows/ci.yml@refs/pull/1/merge")
+                    workflow="example/app/.github/workflows/ci.yml@refs/pull/1/merge", install=False)
     assert pr["outputs"] == {"reused": "false", "key": key} and pr["calls"] == []
     for name, scenario in {
         "missing proof": {"missing": True}, "failed source run": {"run": {"conclusion": "failure"}},
         "in-progress source run": {"run": {"status": "in_progress"}},
         "push source run": {"run": {"event": "push"}}, "fork proof": {"run": {"head_repository": {"id": 43}}},
-        "merged tree changed": {"tree": "c" * 40, "proofKey": key}, "unreadable API": {"apiError": True},
+        "merged tree changed": {"tree": "c" * 40, "storedKey": key}, "unreadable store": {"r2Status": 500},
+        "no store credentials": {"noCreds": True}, "rerun after the pointer": {"run": {"run_attempt": 2}},
+        "E2E proof step, not the Required one": {"stepName": "Publish full E2E proof {KEY}"},
+        "Required proof step skipped": {"stepConclusion": "skipped"},
+        "pointer of the other proof kind": {"pointer": {"kind": "e2e"}},
     }.items():
         assert run_script(script, scenario, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "false", name
-    changed = run_script(script, {"proofKey": key}, {**inputs, "e2e-args": "--project=other"}, "PROOF_INPUTS")
+    changed = run_script(script, {"storedKey": key}, {**inputs, "e2e-args": "--project=other"}, "PROOF_INPUTS")
     assert changed["outputs"]["reused"] == "false"
+    # The publish step carries the key in its NAME (the attestation the push
+    # checks) and runs only when the key was minted.
+    publish = step("required", "Publish Required proof ${{ steps.required-key.outputs.key }}")
+    assert publish["if"] == "success() && steps.required-key.outputs.key != ''"
+    assert publish["env"]["PROOF_KEY"] == "${{ steps.required-key.outputs.key }}"
+    assert "store.publishProofStep({ core, context, kind: 'required' })" in publish["with"]["script"]
+    names = [s.get("name") for s in JOBS["required"]["steps"]]
+    assert names.index("Compute Required proof key") < names.index("Install CI artifact store client") < names.index(publish["name"])
     # Proof is minted only from a full, same-repository PR run.
     mint_if = " ".join(step("required", "Compute Required proof key")["if"].split())
     for guard in ("success()", "inputs.required-reuse-pr-results", "github.event_name == 'pull_request'",

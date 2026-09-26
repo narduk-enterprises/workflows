@@ -64,9 +64,12 @@ def validate_structure(document: dict) -> None:
         assert call["inputs"][name]["required"] is True
     assert call["inputs"]["shards"]["default"] == 3
     assert call["inputs"]["run-webkit"]["default"] is False
+    # The report merge went with the evidence uploads (2026-09-26). The
+    # input stays, unused, so callers that still pass it keep validating.
+    assert call["inputs"]["report-timeout-minutes"]["required"] is False
+    assert "unused" in call["inputs"]["report-timeout-minutes"]["description"]
     assert set(call["outputs"]) == {
         "build-artifact",
-        "report-artifact",
         "playwright-version",
     }
 
@@ -78,7 +81,7 @@ def validate_structure(document: dict) -> None:
     assert jobs["chromium"]["runs-on"] == "${{ fromJSON(inputs.browser-runner) }}"
     assert jobs["webkit"]["runs-on"] == "${{ fromJSON(inputs.browser-runner) }}"
     assert jobs["validate"]["runs-on"] == "${{ fromJSON(inputs.linux-runner) }}"
-    assert jobs["report"]["runs-on"] == "${{ fromJSON(inputs.linux-runner) }}"
+    assert "report" not in jobs
     assert jobs["required"]["runs-on"] == "${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || " + visibility_route + ") }}"
     assert jobs["validate"]["needs"] == "contract"
     assert jobs["chromium"]["needs"] == ["contract", "validate"]
@@ -92,7 +95,6 @@ def validate_structure(document: dict) -> None:
         "validate",
         "chromium",
         "webkit",
-        "report",
     ]
 
     for job in ('validate', 'chromium', 'webkit'):
@@ -123,35 +125,30 @@ def validate_structure(document: dict) -> None:
     assert "proxmox-playwright-x64" in text
     assert "playwright-isolated" in text
 
+    # No evidence uploads: no blob report, no merged HTML report. Shards
+    # keep the caller's own reporter so a failure reads in the job log. The
+    # only artifact action left is the caller's same-run build download.
+    assert "actions/upload-artifact" not in text
+    assert "--reporter=blob" not in text
+    assert "merge-reports" not in text
     for job in ("chromium", "webkit"):
-        upload = step(
-            document,
-            job,
-            f"Upload {'Chromium' if job == 'chromium' else 'WebKit'} blob report",
-        )
-        assert upload["if"] == "always()"
-        assert upload["with"]["retention-days"] == 1
-        assert "${{ github.run_id }}" in upload["with"]["name"]
-        assert "${{ github.run_attempt }}" in upload["with"]["name"]
+        shard = step(document, job, "Run Playwright shard")["run"]
+        assert 'args+=("--shard=${SHARD}/${TOTAL}")' in shard
+        assert "--reporter" not in shard
 
-    for job in ("chromium", "webkit", "report"):
+    for job in ("chromium", "webkit"):
         auth_env = step(document, job, "Configure package registry auth")["env"]
         assert auth_env["NARDUK_PLATFORM_GH_PACKAGES_READ"] == (
             "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}"
         )
 
-    report_upload = step(document, "report", "Upload merged HTML and traces")
-    assert report_upload["with"]["retention-days"] == 14
-    assert report_upload["with"]["if-no-files-found"] == "error"
-    merge = step(document, "report", "Merge blob reports")["run"]
-    assert "exit 1" in merge
-    assert "no blob report" in merge
-
     required = step(document, "required", "Require every enabled browser gate")[
         "run"
     ]
-    for name in ("validate", "chromium", "report", "webkit"):
+    for name in ("validate", "chromium", "webkit"):
         assert name in required
+    assert "require_success report" not in required
+    assert "REPORT_RESULT" not in required
     assert "require_success chromium" in required
     assert "require_success webkit" in required
 

@@ -51,9 +51,10 @@ gap look like an adoption backlog. Both now exist and both have a real adopter
 sibling for push-to-main deploys with real Cloudflare secrets.
 
 The standalone **browser / Playwright gap** named by company-hq#197 is now
-`reusable-browser-tests.yml`. It consumes a same-run production build, fans
+`reusable-browser-tests.yml`. It consumes a same-run production build and fans
 Chromium (and opt-in WebKit) into three shards on the manifest-routed isolated
-pool, and merges reports back on ordinary Linux CI. The older browser inputs in
+pool. Each shard reports in its own job log; no report is uploaded or merged
+(see "The CI artifact store (2026-09-26)" below). The older browser inputs in
 `nuxt-cloudflare.yml` remain for backward compatibility; adopters that separate
 browser CI use the dedicated callable instead of re-embedding the pool contract
 in their app-class workflow.
@@ -64,10 +65,10 @@ in their app-class workflow.
 |----------|---------|
 | `apple.yml` | CI gate for Apple repos (Swift packages, iOS/macOS apps): SwiftLint (official Linux binary) and boundary/plist checks on a Linux runner, `swift build` / `swift test` / `xcodebuild` on the repo-scoped Mac. **Two separately-routed runner inputs — that split is the point.** Release/signing stays per-repo |
 | `python-data.yml` | CI gate for Python / data-pipeline repos: explicit `uv` or Python provisioning, pytest, opt-in exact-version Ruff and **Pyright** (real static checking, not `py_compile`), plus an `extra-checks` hook |
-| `reusable-browser-tests.yml` | Private-repo browser CI: validates the exact manifest browser-group object before any shard is scheduled, consumes a same-run production build, asserts the immutable Playwright package/browser image and real launch, runs three Chromium shards plus opt-in WebKit, then merges 14-day HTML/trace evidence on Linux CI |
+| `reusable-browser-tests.yml` | Private-repo browser CI: validates the exact manifest browser-group object before any shard is scheduled, consumes a same-run production build, asserts the immutable Playwright package/browser image and real launch, runs three Chromium shards plus opt-in WebKit, each reporting in its own job log (no report upload or merge) |
 | `docs-governance.yml` | Thin generic gate for docs/handbook-shaped repos: checkout, optionally provision Python/Node, run one repo-provided check command. Generalizes company-hq's `handbook-spine-check.yml` / `untangle-project-sync.yml` shape |
 | `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: script-probed lint/typecheck/test/build, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern |
-| `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional web-foundation conformance check, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool, with blob-report merge** — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
+| `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional web-foundation conformance check, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool**, the prebuilt application reaching each shard through the R2 CI artifact store — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8): zero live callers estate-wide, re-verified via `gh search code` / `gh api search/code` across narduk-enterprises, narduk-incubator and narduk-enterprises-clients. `node-library.yml` was always the richer, preferred surface — see workflows#14/#16 |
 | `code-review.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8, extending the 2026-09-19 advisory retirement below): zero live pool adopters, file deleted. Current review uses `cursor-review.yml` |
 | `cursor-review.yml` | **Default-off PR reviewer, not a CI gate.** Reviews a pull request with one Cursor Cloud agent (`composer-2.5`, `fast: false`; explicit `review-deep` uses Grok 4.6 xhigh) that has the caller checked out at the PR head plus read-only context repos (estate manual, coding standards, decisions), then posts a REAL pull-request review on the reviewed head — APPROVE / COMMENT / REQUEST_CHANGES with inline comments — using the job's own `GITHUB_TOKEN`. Skips (draft, fork, `no-ai-review`, no secret) exit SUCCESS; a reviewer error fails the job. A REQUEST_CHANGES review blocks merge under the repo's pull-request rule. The P0/P1/P2 class rule now also treats an auth/session/payments/credential-table (T2) path as always-reviewed (narduk-reboot P3-C2 / O-D7). See [Cursor review](#cursor-review) (agent-infrastructure#1564) |
@@ -110,8 +111,8 @@ with a job named **exactly** `Required`. That job `needs:` every other job the
 workflow defines, runs with `if: always()`, and explicitly checks each
 `needs.<job>.result` — a job that's enabled must report `success`; it may
 report `skipped` only when its controlling input is off. In particular,
-`run-e2e: true` makes the plan, every E2E shard, and (when sharded) the report
-merge mandatory. A skipped enabled job is failure, not an acceptable
+`run-e2e: true` makes the plan and every E2E shard mandatory. A skipped
+enabled job is failure, not an acceptable
 substitute for a toolchain check that never ran. `if: always()` jobs succeed by
 default if you don't check anything explicitly — these don't skip that check.
 
@@ -580,7 +581,7 @@ Which gates each callable exposes this way:
 | `nuxt-cloudflare.yml` | `run-e2e` (`e2e`, `e2e-plan`), `wrangler-dry-run`, `run-tests` | `build`, `checks` |
 | `apple.yml` | `run-swiftlint` / `linux-checks` (`lint`), `run-build`, `run-tests` | `xcode` |
 | `python-data.yml` | `run-ruff` (`lint`), `run-tests`, `run-pyright` | `test` |
-| `reusable-browser-tests.yml` | `run-webkit` (`webkit`) | `validate`, `chromium`, `report` |
+| `reusable-browser-tests.yml` | `run-webkit` (`webkit`) | `validate`, `chromium` |
 | `node-library.yml` | `run-lint`, `run-typecheck`, `run-tests`, `run-build` | `package` |
 | `reusable-weekly-drift-check.yml` | all three jobs | — |
 | `docs-governance.yml` | — | the single job |
@@ -754,9 +755,8 @@ Notes:
 `nuxt-cloudflare.lightweight-runner` routes E2E plan and Required
 independently of the build. Selection is explicit input, then
 `CI_LIGHTWEIGHT_RUNNER`, then the existing build/Blacksmith route. Public
-callers always use `ubuntu-latest` for these three jobs. An unset override is
+callers always use `ubuntu-latest` for these jobs. An unset override is
 backward compatible; required check names and failure/skip semantics are unchanged.
-Report merging still installs only the pinned Playwright tooling (workflows#49).
 
 
 `CI_LIGHTWEIGHT_RUNNER` is an organization Actions variable containing a JSON
@@ -941,6 +941,12 @@ jobs:
       NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
       # Caller-owned install scripts receive the service token separately.
       NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
+      # The CI artifact store (see "The CI artifact store (2026-09-26)").
+      # Optional: without them each E2E job builds its own application and no
+      # reuse proof is published or honoured.
+      CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+      CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
+      CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
 ```
 
 `install-script` is for repositories whose install wrapper exchanges an nVault
@@ -1223,23 +1229,29 @@ would report every colon-bearing script as missing.
 #### Browser shards and the isolated pool
 
 New browser adopters separate application CI from browser execution. The
-application-class callable produces one same-run build artifact; the standalone
+caller's own build job uploads one same-run build artifact; the standalone
 browser callable consumes it without rebuilding:
 
 ```yaml
 jobs:
-  ci:
-    uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@<sha-of-v2> # v2
-    with:
-      runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
-      working-directory: apps/web
-      run-e2e: false
-      e2e-build-artifact-path: .output
+  build:
+    # ...checkout, install and build the application, then:
+    outputs:
+      build-artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - id: upload
+        uses: actions/upload-artifact@<sha> # v7
+        with:
+          name: e2e-build-${{ github.run_id }}-${{ github.run_attempt }}
+          path: apps/web/.output
+          include-hidden-files: true
+          retention-days: 1
 
   browser:
-    needs: ci
+    needs: build
     uses: narduk-enterprises/workflows/.github/workflows/reusable-browser-tests.yml@<sha-of-v2> # v2
     with:
+      build-artifact-id: ${{ needs.build.outputs.build-artifact-id }}
       linux-runner: '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
       browser-runner: '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}'
       working-directory: apps/web
@@ -1251,6 +1263,13 @@ jobs:
       shards: 3
 ```
 
+That handoff is still a GitHub artifact, so it counts against the
+organization's Actions artifact storage. `nuxt-cloudflare.yml` can no longer
+produce it. Its prebuilt application now goes to the R2 CI artifact store for
+its own E2E jobs. Before that, the per-call name suffix added in workflows#146
+had already stopped matching this callable's default name. Moving this
+handoff to the CI artifact store is workflows#150.
+
 The two route inputs are not suggestions. Resolve both from the fleet manifest
 and copy each `runsOn` object verbatim. A hosted `contract` job checks the exact
 group and ordered labels before any caller-controlled self-hosted route is
@@ -1261,10 +1280,9 @@ visible failing gate instead of scheduling the failure aggregator on that bad
 route.
 
 Chromium and opt-in WebKit are the only jobs on
-`proxmox-playwright-x64`. Production-build validation and report merging run on
-`linux-ci`. The browser jobs declare no secrets and receive only GitHub's
-short-lived token for checkout, same-run artifact transfer, and optional
-package reads. The caller must provide workflow-level concurrency because
+`proxmox-playwright-x64`. Production-build validation runs on `linux-ci`.
+The browser jobs declare no secrets and receive only GitHub's short-lived
+token for checkout, same-run artifact transfer, and optional package reads. The caller must provide workflow-level concurrency because
 overlapping runs share fixed runner paths; the callable deliberately declares
 none.
 
@@ -1301,23 +1319,35 @@ name their output explicitly:
       e2e-build-artifact-path: apps/web/.output
 ```
 
-The build job uploads that relative path only after its gates pass. Every E2E
-shard downloads it to the same path and receives
-`E2E_PREBUILT_ARTIFACT=1`. The consumer's launcher must treat that variable as
-an assertion: validate the expected entry points and fail when any are absent,
-rather than silently rebuilding. A missing upload already fails through
-`if-no-files-found: error`. Hidden files are included because Nuxt's canonical
+The build job publishes that relative path to the CI artifact store (see "The
+CI artifact store (2026-09-26)") only after its gates pass. It uploads one gzip
+tarball and hands its object key, SHA-256 and size to the E2E jobs as a job
+output, with the signature of a presigned GET for that one object. A missing
+build output fails Build. Hidden files are included because Nuxt's canonical
 output directory is `.output`; the input is an explicit caller-selected path,
-not a repository-wide artifact sweep.
+not a repository-wide sweep.
 
-The artifact name includes `github.run_id` and `github.run_attempt`. Embedded
-E2E shards download the exact artifact ID exported by their successful build
-job, so rerunning failed shards can reuse that build even when the attempt
-number advances. Retention is one day. The default `auto` produces no artifact
-when E2E is disabled; an explicit path also supports the standalone browser
-callable. Set an explicitly empty path only for suites that do not test a
-built application. Launchers must honor `E2E_PREBUILT_ARTIFACT=1`: the workflow
-cannot suppress a build hardcoded inside an application script.
+Every E2E shard fetches the tarball through that presigned GET. The shard
+checks the SHA-256 and size against Build's output, unpacks it to the same path
+and receives `E2E_PREBUILT_ARTIFACT=1`. The consumer's launcher must treat that
+variable as an assertion: validate the expected entry points and fail when any
+are absent, rather than silently rebuilding. A tarball that does not match
+Build's digest fails the job and is never unpacked.
+
+Any other miss makes the shard run `build-script` itself to produce the same
+path. Misses include a run without the store's credentials (a fork, Dependabot,
+a caller that does not pass them), an expired link and a storage outage. The
+shard then fails if the script is missing or leaves no output there, so the
+suite still tests a built application.
+
+The object key includes the repository, `github.run_id`, `github.run_attempt`
+and a per-call scope (`artifact-scope`). The reference travels as a job output,
+so rerunning failed shards within the link's 24 hours reuses the original
+build even when the attempt number advances. After that they rebuild in-job.
+The default `auto` publishes nothing when E2E is disabled. Set an explicitly
+empty path only for suites that do not test a built application. Launchers
+must honor `E2E_PREBUILT_ARTIFACT=1`: the workflow cannot suppress a build
+hardcoded inside an application script.
 
 #### Skipping irrelevant changes (`e2e-skip-paths`)
 
@@ -1349,20 +1379,36 @@ caller workflow path and callable inputs**. This handles squash and merge
 commits whose SHA differs but whose tested contents are identical. Other CI
 checks and production delivery still run normally.
 
-`Required` publishes a seven-day proof artifact only after every required gate
-passed and the actual E2E arguments and shard count matched the full suite.
-A PR subset, docs-only skip, failed shard or fork cannot publish proof. Reuse
-requires a completed successful `pull_request` run from the same repository
-and workflow, and a proof from its current run attempt. The lookup checks at
-most five matching artifacts and fails toward running E2E on absent, expired,
-changed or unreadable evidence. Scheduled/manual runs always run; set
+`Required` publishes a proof to the CI artifact store only after every required
+gate passed and the actual E2E arguments and shard count matched the full
+suite. A PR subset, docs-only skip, failed shard or fork cannot publish proof.
+The proof is a small pointer, `proof/<owner>/<repo>/<key>.json`. It names the
+PR run and attempt that wrote it. The key digests the tested tree, the caller
+workflow path and the callable inputs.
+
+The push does not trust the pointer on its own. It reuses the proof only after
+GitHub's API confirms three things:
+
+- the run is a completed, successful `pull_request` run of the same caller
+  workflow;
+- the run's head repository is this repository;
+- the named attempt has a successful `Required` job whose
+  `Publish full E2E proof <key>` step, carrying this exact key, succeeded.
+
+An absent, expired (30-day lifecycle), changed or unreadable proof, or one
+GitHub does not confirm, runs E2E, as does a run without the store's
+credentials. Scheduled and manual runs always run. Set
 `e2e-reuse-pr-results: false` for tests with intentionally different PR/push
 behavior or external state that must be rechecked after merge.
+`required-reuse-pr-results` reuses the whole gate the same way, from the
+`Publish Required proof <key>` step.
 
 **Permission migration:** adopting this revision requires `actions: read` on
 all Nuxt callable `ci` jobs, even if E2E is disabled. GitHub validates the
 permission ceiling before evaluating job conditions. The proof lookup needs
-only read access to Actions results; it gains no write permission. Add this
+only read access to Actions results to confirm the run a proof names; it gains
+no write permission. The proof itself lives in the CI artifact store, so pass
+the three `CI_ARTIFACTS_R2_*` secrets as well (see the example above). Add this
 alongside the existing `contents: read`, `packages: read`, and
 `pull-requests: write` grants before or with the SHA bump. Existing pinned
 callers do not change. This is a breaking permission change: do not advance
@@ -1521,7 +1567,7 @@ these arguments, on every event E2E runs on:
   or the caller's run red. `lint_callables.py` enforces this through its
   `NON_GATING_JOBS` exemption, which is the only job allowed outside R5.
 - **It is the gate's setup.** It runs `E2E`'s own steps through a YAML alias:
-  the same prebuilt artifact, runner route, toolchain checks and auth cleanup.
+  the same prebuilt application, runner route, toolchain checks and auth cleanup.
   Only the arguments differ. It is unsharded.
 - **Its evidence is separate.** Its report is in its own job log, apart from
   the gate's shards.
@@ -2022,17 +2068,143 @@ per job, never extrapolated from a run count.
 - Estate conventions live in the `ci-workflow-author` skill
   (agent-infrastructure repo); consult it before adding workflows here.
 
-## No evidence artifacts (2026-09-26)
+## The CI artifact store (2026-09-26)
 
-`nuxt-cloudflare.yml` uploads no evidence artifacts. On 2026-09-26 the org's
-Actions artifact storage passed its included allowance with a $0 budget, and
-every job that uploaded evidence went red. The owner chose to drop the
-evidence uploads rather than carry that storage. So:
+`nuxt-cloudflare.yml` neither uploads nor downloads a GitHub artifact, and
+`reusable-browser-tests.yml` uploads none. On 2026-09-26 the org's Actions
+artifact storage passed its included allowance with a $0 budget, GitHub
+refused every artifact upload estate-wide, and CI went red. The owner first
+dropped the evidence uploads, then chose to move the handoffs CI actually
+needs to a Cloudflare R2 bucket the estate owns.
 
-- the Playwright evidence upload, the `E2E report` merge job, the journey-smoke
-  evidence upload and the foundation-check artifact are gone;
-- a sharded E2E lane reports with the caller's own reporter in its job log
-  (no `--reporter=blob`, which only existed to be merged);
-- the small proof artifacts `Required` and full E2E publish, and the prebuilt
-  E2E application the shards share, stay.
+**Dropped (evidence only; nothing gated on it):**
 
+- `nuxt-cloudflare.yml` no longer has:
+  - the Playwright evidence upload;
+  - the `E2E report` merge job;
+  - the journey-smoke evidence upload;
+  - the foundation-check artifact.
+
+  `Evaluate web-foundation conformance check` now prints
+  `foundation-check.json` in its own log.
+- `reusable-browser-tests.yml` no longer has:
+  - the Chromium and WebKit blob-report uploads;
+  - the `report` merge job, with its HTML report artifact and its
+    `report-artifact` output.
+
+  `report-timeout-minutes` stays as a deprecated, unused input so callers that
+  pass it keep validating. Moving these to R2 would have put a bucket write
+  credential on the isolated Playwright pool for evidence nobody gates on, so
+  they were dropped, not moved.
+- Every shard reports with the caller's own Playwright reporter in its job
+  log. There is no `--reporter=blob`, which only existed to be merged.
+
+**Moved to R2:**
+
+- the prebuilt E2E application Build hands to every E2E job;
+- the `Required` proof (`required-reuse-pr-results`);
+- the full E2E proof (`e2e-reuse-pr-results`).
+
+**Not moved yet:** `reusable-browser-tests.yml` still takes its build as a
+same-run GitHub artifact the caller uploads (workflows#150).
+
+### Bucket, keys and lifecycle
+
+| | |
+|---|---|
+| Bucket | `narduk-ci-artifacts`, in the narduk-enterprises Cloudflare account (location WNAM) |
+| Prebuilt application | `prebuilt/<owner>/<repo>/<run>-<attempt>-<scope>.tar.gz`, expires after 7 days |
+| Reuse proof | `proof/<owner>/<repo>/<proof key>.json`, expires after 30 days |
+| Credential probe | `probe/<owner>/<repo>/<name>`, expires after 1 day |
+| Incomplete multipart upload | aborted after 7 days |
+
+Every key is scoped by `github.repository` and shape-checked before use.
+
+### Credentials
+
+The workflow uses three org Actions secrets with private-repo visibility. All
+three are declared `required: false` on the callable:
+
+| Secret | Value |
+|---|---|
+| `CI_ARTIFACTS_R2_ACCOUNT_ID` | the Cloudflare account ID |
+| `CI_ARTIFACTS_R2_ACCESS_KEY_ID` | the R2 token's ID |
+| `CI_ARTIFACTS_R2_SECRET_ACCESS_KEY` | the SHA-256 of the token value |
+
+The token has Object Read and Write on this one bucket and nothing else. It
+expires on 2027-09-26. Its source is nvault
+`cloudflare/prd/narduk-enterprises-ci-artifacts` (`CI_ARTIFACTS_R2_TOKEN`,
+`CI_ARTIFACTS_R2_ACCOUNT_ID`), persona
+`cloudflare-narduk-enterprises-ci-artifacts`.
+
+A reusable workflow sees only the secrets its caller passes, so a caller adds
+the three lines shown in the main example above, or uses `secrets: inherit`.
+
+**Who holds the secret access key:**
+
+- Build, to publish the prebuilt application;
+- `Required`, on a pull request, to publish proofs;
+- `Reuse plan` and `E2E plan`, which read proofs on a default-branch push.
+
+The E2E jobs, including those on the isolated browser pool, get only the two
+IDs. They read the prebuilt application through a presigned GET that Build
+signed for that one object, valid for 24 hours.
+
+### Trust
+
+One token serves the whole estate, so nothing is trusted just because it is in
+the bucket.
+
+**Prebuilt application.** E2E unpacks the tarball only when its SHA-256 and
+size equal what its own run's Build reported through job outputs. A mismatch
+fails the job before anything is unpacked.
+
+**Proof.** A proof object is only a pointer to a run. It is honoured only when
+all of the following hold:
+
+- GitHub's API reports that run as a completed, successful `pull_request` run
+  of the same caller workflow;
+- the run's repository and head repository are both this repository;
+- the run attempt is the one that wrote the pointer;
+- that attempt's `Required` job succeeded;
+- that job has a successful step named `Publish Required proof <key>` or
+  `Publish full E2E proof <key>`, with this exact key.
+
+The key is unchanged from the artifact era: the digest of the tested Git tree,
+the caller workflow and every callable input.
+
+### Without credentials, and on failure
+
+The store can cost time but never coverage, and it never passes a gate falsely.
+A run has no store credentials when it is a fork pull request, a Dependabot run
+(Dependabot sees only Dependabot secrets), a public caller, or a caller that
+does not pass the secrets. Then:
+
+- **Build** publishes nothing.
+- **Each E2E job** runs `build-script` itself and fails if it cannot produce
+  the output.
+- **Proofs.** No proof is published or honoured, so the default-branch push
+  runs the full gate.
+
+A storage error or an expired link does the same, with a warning.
+
+Only two things turn a job red:
+
+- a prebuilt application that fails its digest check;
+- an in-job fallback build that fails.
+
+### Tests
+
+`scripts/test_ci_artifact_store.py` runs the client exactly as the workflow
+installs it. It checks:
+
+- AWS's published Signature V4 examples;
+- a round trip and tampering against a local S3 double that authenticates
+  every request with an independent signer;
+- the fallbacks;
+- proof publish and lookup;
+- the rule that no GitHub artifact action or artifact API appears in
+  `nuxt-cloudflare.yml`.
+
+`test_e2e_build_artifact.py`, `test_e2e_reuse.py` and `test_fast_path.py`
+cover the wiring and the proof lookups job by job.

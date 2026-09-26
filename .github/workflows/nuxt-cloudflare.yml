@@ -13,8 +13,8 @@ name: Reusable Nuxt + Cloudflare CI
 # above shipped as a single job on the SAME runner as the build, which is not
 # the shape any real browser adopter in the estate uses: status-apps,
 # operator-portal, earthdata-viewer, narduk-libs and nvault all shard
-# Playwright across a DEDICATED isolated pool and merge blob reports
-# afterwards. Because the callable could not express that, five repos
+# Playwright across a DEDICATED isolated pool. Because the callable could not
+# express that, five repos
 # hand-rolled it and a sixth (been-sober-for) hand-rolled it WRONG — chromium
 # installed per run on the general linux-ci guest, the runner-class violation
 # company-hq#276 is about. A gate shape the shared workflow cannot express is
@@ -197,7 +197,7 @@ on:
         default: ''
       lightweight-runner:
         description: >-
-          Optional JSON runsOn for E2E planning, report merge, and Required.
+          Optional JSON runsOn for Reuse plan, E2E planning, and Required.
           Overrides CI_LIGHTWEIGHT_RUNNER; unset preserves the build route.
           Resolve private self-hosted routes from fleet. Public callers always
           use ubuntu-latest for these jobs, regardless of this override.
@@ -365,27 +365,32 @@ on:
       e2e-build-artifact-path:
         description: >-
           Relative path, under working-directory, to build output that the
-          build job must upload and every E2E shard must download before the
-          suite runs. The default auto detects .output or apps/web/.output when
+          build job publishes to the CI artifact store (R2, see THE CI
+          ARTIFACT STORE at `reuse-plan`) and every E2E shard fetches, checks
+          against the SHA-256 Build reported, and unpacks before the suite
+          runs. The default auto detects .output or apps/web/.output when
           run-e2e is enabled. Empty explicitly disables the handoff.
           When set, a missing output is a hard failure and the suite receives
           E2E_PREBUILT_ARTIFACT=1 so its launcher can require and reuse the
-          downloaded output instead of rebuilding it.
+          prebuilt output instead of rebuilding it. When the run has no CI
+          artifact store credentials (a fork, Dependabot, a public caller) or
+          the object cannot be read, each E2E job runs `build-script` itself
+          to produce the same path first, and fails if it cannot.
         required: false
         type: string
         default: "auto"
       artifact-scope:
         description: >-
-          Optional caller-scoped disambiguator folded into the internal E2E
-          build artifact's name. GitHub only guarantees artifact-name
-          uniqueness within a whole workflow RUN, not within one call of this
-          reusable workflow, so calling it more than once in a single run
-          (e.g. two `uses:` jobs) without this set risks GitHub folding both
-          uploads into one artifact and failing the losing caller's download
-          with "None of the provided artifact IDs were found" (workflows#144).
-          Give each concurrent call a distinct value, such as its own job id.
-          Leave unset for a single call per run; the workflow then falls back
-          to a random per-call token so it never collides either.
+          Optional caller-scoped disambiguator folded into the prebuilt E2E
+          application's CI artifact store key,
+          `prebuilt/<owner>/<repo>/<run>-<attempt>-<scope>.tar.gz`. Two `uses:`
+          calls of this workflow in one run share the run ID and attempt, so
+          each call needs its own scope or the second upload replaces the
+          first (the GitHub-artifact form of this collision was
+          workflows#144). Give each concurrent call a distinct value, such as
+          its own job id. Leave unset for a single call per run; the workflow
+          then falls back to a random per-call token so it never collides
+          either.
         required: false
         type: string
         default: ""
@@ -527,7 +532,11 @@ on:
           On a default-branch push, reuse a successful same-repository PR run
           of the full E2E suite only when its tested Git tree, caller workflow
           and all callable inputs match. Missing, expired or unreadable proof
-          runs E2E. Requires actions: read on the caller's ci job. Disable for
+          runs E2E. The proof is a pointer in the CI artifact store (see THE
+          CI ARTIFACT STORE at `reuse-plan`), so it needs the
+          CI_ARTIFACTS_R2_* secrets on both the pull request and the push;
+          without them no proof is published or honoured and E2E runs.
+          Requires actions: read on the caller's ci job. Disable for
           suites whose behavior intentionally differs between PR and push.
         required: false
         type: boolean
@@ -560,7 +569,7 @@ on:
           `--project=quarantine --retries=0`). When set, a separate,
           NON-BLOCKING `E2E (quarantine)` job runs `e2e-script` with exactly
           these arguments on every event E2E runs on. The job's
-          prebuilt artifact, runner and setup are the same as E2E's. It is
+          prebuilt application, runner and setup are the same as E2E's. It is
           `continue-on-error` and `Required` never lists it, so a quarantined
           test can fail or flake without affecting the gate. Its history is
           the evidence a test needs to leave quarantine. Unsharded. Empty
@@ -687,9 +696,10 @@ on:
           multi-wave migration (D-WEBFOUND-2 Q4/Q10), so most fleet apps do not
           conform yet, and a moving `v1` major tag must never hand an existing
           adopter a brand-new red gate it never asked for. The JSON artefact
-          is uploaded as `foundation-check` regardless of the result (a
-          failing run's artefact is the one the rollup most wants), and a
-          short summary is written to the job summary either way.
+          is printed to the Evaluate step's log regardless of the result (a
+          failing run's artefact is the one the rollup most wants; no GitHub
+          artifact is uploaded since the org artifact quota of 2026-09-26),
+          and a short summary is written to the job summary either way.
         required: false
         type: boolean
         default: false
@@ -773,7 +783,12 @@ on:
           successfully, `Build`, `Checks`, `Extra gate`, `E2E plan` and
           `Fast` are skipped and `Required` passes on the proof (`Caller lint`
           still runs). Missing, expired, unreadable or mismatched proof runs
-          the full gate. Requires `actions: read` on the caller's `ci` job.
+          the full gate. The proof is a pointer in the CI artifact store (see
+          THE CI ARTIFACT STORE at `reuse-plan`), honoured only after GitHub
+          confirms the run it names, so the CI_ARTIFACTS_R2_* secrets must
+          reach both the pull request and the push; without them the push
+          runs the full gate. Requires `actions: read` on the caller's `ci`
+          job.
         required: false
         type: boolean
         default: false
@@ -861,6 +876,22 @@ on:
       # a CI lane.
       JOURNEY_SMOKE_ROLLBACK_TOKEN:
         required: false
+      # The CI artifact store (R2 bucket `narduk-ci-artifacts`; see THE CI
+      # ARTIFACT STORE at `reuse-plan`). Org Actions secrets with private-repo
+      # visibility, sourced from nvault cloudflare/prd/
+      # narduk-enterprises-ci-artifacts: the Cloudflare account ID, the R2
+      # token's ID as the S3 access key ID, and the SHA-256 of the token as
+      # the S3 secret access key. All optional. Without them (a fork,
+      # Dependabot, a public caller, or a caller that does not pass them)
+      # nothing is stored or read: each E2E job builds its own application,
+      # and no reuse proof is published or honoured, so the gate runs in full.
+      # E2E jobs receive only the two IDs, never the secret access key.
+      CI_ARTIFACTS_R2_ACCOUNT_ID:
+        required: false
+      CI_ARTIFACTS_R2_ACCESS_KEY_ID:
+        required: false
+      CI_ARTIFACTS_R2_SECRET_ACCESS_KEY:
+        required: false
 
 env:
   NUXT_TELEMETRY_DISABLED: 1
@@ -901,12 +932,520 @@ jobs:
     outputs:
       reused: ${{ steps.proof.outputs.reused }}
     steps:
+      # THE CI ARTIFACT STORE (org artifact storage quota, 2026-09-26: GitHub
+      # refused every artifact upload estate-wide and CI went red; the owner
+      # chose to move CI handoffs to an R2 bucket the estate owns). This
+      # workflow neither uploads nor downloads a GitHub artifact. What used to
+      # be artifacts are objects in the R2 bucket `narduk-ci-artifacts`:
+      #   - `prebuilt/<owner>/<repo>/<run>-<attempt>-<scope>.tar.gz`, the
+      #     application Build hands to every E2E job (lifecycle: 7 days);
+      #   - `proof/<owner>/<repo>/<proof key>.json`, the reuse proofs Required
+      #     publishes on a pull request and `Reuse plan` / `E2E plan` read on
+      #     the default-branch push (lifecycle: 30 days).
+      # The client is the heredoc below: AWS Signature V4 over Node's fetch,
+      # no third-party action and no dependency, written from this file's own
+      # text and loaded by github-script, which runs the runner's own Node and
+      # so needs no setup-node. It is anchored here only because this is the
+      # first job; every job that talks to the bucket runs this exact text.
+      # scripts/test_ci_artifact_store.py executes it against AWS's published
+      # SigV4 vectors and a local S3 double.
+      #
+      # TRUST. One token serves the whole estate, so an object proves nothing
+      # about who wrote it, and nothing is trusted for being in the bucket:
+      #   - E2E unpacks a prebuilt application only when its SHA-256 and size
+      #     equal what its own run's Build reported through job outputs; a
+      #     mismatch fails the job. E2E reads through a presigned GET that
+      #     Build signed, so browser guests never hold the secret access key.
+      #   - A proof object is only a pointer to a run. It is honoured only when
+      #     GitHub's API reports that run as this repository's completed,
+      #     successful pull-request run of the same caller workflow, on the
+      #     attempt that wrote the pointer, whose Required job ran the publish
+      #     step carrying this exact key in its NAME. The key is unchanged:
+      #     the digest of the tested Git tree, the caller workflow and every
+      #     callable input.
+      #
+      # NO CREDENTIALS, NO REUSE. The CI_ARTIFACTS_R2_* secrets are optional.
+      # A run without them (a fork, Dependabot, a public caller) publishes and
+      # honours no proof, so the gate runs in full, and each E2E job builds its
+      # own application from the same checkout. A storage error does the same
+      # with a warning: the store can cost time, never coverage, and it never
+      # turns a job red on its own (only a prebuilt that fails its SHA-256
+      # check does).
+      - name: Install CI artifact store client
+        run: &install_ci_artifact_store |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ci-artifact-store.cjs" <<'CI_ARTIFACT_STORE'
+          'use strict';
+          // CI ARTIFACT STORE CLIENT. GitHub's org artifact storage quota turned estate
+          // CI red on 2026-09-26, and the owner chose to move CI handoffs to an R2
+          // bucket the estate owns. This file is the whole client: AWS Signature V4
+          // over Node's fetch, no dependencies, loaded by github-script steps with
+          // require(). The `Install CI artifact store client` step writes it from the
+          // workflow's own text, so a caller cannot substitute it.
+          //
+          // One bucket, lifecycle rules by prefix, every key scoped by the calling
+          // repository:
+          //   prebuilt/<owner>/<repo>/<run>-<attempt>-<scope>.tar.gz   E2E handoff, 7 days
+          //   proof/<owner>/<repo>/<proof key>.json                    reuse pointers, 30 days
+          //   probe/<owner>/<repo>/<name>                              credential probes, 1 day
+          //
+          // TRUST. The bucket credential is one token for the whole estate, so an
+          // object proves nothing about who wrote it. Each reader checks what it reads
+          // against something GitHub vouches for instead:
+          //   - a prebuilt application must match the SHA-256 and size that its own
+          //     run's Build job reported through job outputs, or the E2E job fails;
+          //   - a proof object is only a POINTER to a run. It is honoured only when
+          //     GitHub reports that run as this repository's successful pull-request
+          //     run of the same caller workflow, whose Required job ran the publish
+          //     step carrying this exact key in its name.
+          // A missing, unreadable or unconfirmed object means "run it": the gate runs
+          // in full and E2E builds its own application. Nothing here can turn a check
+          // green on its own.
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { execFileSync } = require('node:child_process');
+
+          const BUCKET = 'narduk-ci-artifacts';
+          const REGION = 'auto';
+          const SERVICE = 's3';
+          // Long enough to outlast queueing on the browser pool and a same-day rerun of
+          // failed E2E jobs. Past it, E2E builds its own application.
+          const PRESIGN_SECONDS = 24 * 60 * 60;
+          const POINTER_SCHEMA = 'narduk-ci-proof-pointer-v1';
+          const PROOF_STEP = { required: 'Publish Required proof', e2e: 'Publish full E2E proof' };
+          const PROOF_KEY = { required: /^required-proof-v1-[0-9a-f]{64}$/, e2e: /^e2e-proof-v1-[0-9a-f]{64}$/ };
+          const SEGMENT = /^[A-Za-z0-9._-]+$/;
+          const HEX32 = /^[0-9a-f]{32}$/;
+          const HEX64 = /^[0-9a-f]{64}$/;
+
+          class IntegrityError extends Error {}
+
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const sha256Hex = data => crypto.createHash('sha256').update(data).digest('hex');
+          const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest();
+
+          // RFC 3986 encoding, as SigV4 requires: encodeURIComponent leaves !'()* alone.
+          function encode(value) {
+            return encodeURIComponent(value).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+          }
+
+          function canonicalUri(bucket, key) {
+            return `/${bucket}/${key.split('/').map(encode).join('/')}`;
+          }
+
+          function amzDate(date) {
+            return date.toISOString().replace(/\.\d{3}Z$/, 'Z').replace(/[-:]/g, '');
+          }
+
+          function canonicalQuery(query) {
+            return Object.entries(query)
+              .map(([name, value]) => [encode(name), encode(String(value))])
+              .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+              .map(([name, value]) => `${name}=${value}`)
+              .join('&');
+          }
+
+          function scopeOf(stamp, region = REGION, service = SERVICE) {
+            return `${stamp.slice(0, 8)}/${region}/${service}/aws4_request`;
+          }
+
+          // `uri` is the canonical (already encoded) path; the request uses the same text.
+          function sign({ method, uri, query = {}, headers, payloadHash, secretAccessKey, stamp, region = REGION, service = SERVICE }) {
+            const normalized = Object.fromEntries(Object.entries(headers)
+              .map(([name, value]) => [name.toLowerCase(), String(value).trim().replace(/ +/g, ' ')]));
+            const names = Object.keys(normalized).sort();
+            const canonicalRequest = [
+              method, uri, canonicalQuery(query),
+              names.map(name => `${name}:${normalized[name]}\n`).join(''),
+              names.join(';'), payloadHash,
+            ].join('\n');
+            const scope = scopeOf(stamp, region, service);
+            const stringToSign = ['AWS4-HMAC-SHA256', stamp, scope, sha256Hex(canonicalRequest)].join('\n');
+            let key = hmac(`AWS4${secretAccessKey}`, stamp.slice(0, 8));
+            for (const part of [region, service, 'aws4_request']) key = hmac(key, part);
+            const signature = crypto.createHmac('sha256', key).update(stringToSign).digest('hex');
+            return { signature, scope, signedHeaders: names.join(';') };
+          }
+
+          function presignQuery({ accessKeyId, stamp, expires, region = REGION, service = SERVICE }) {
+            return {
+              'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+              'X-Amz-Credential': `${accessKeyId}/${scopeOf(stamp, region, service)}`,
+              'X-Amz-Date': stamp,
+              'X-Amz-Expires': String(expires),
+              'X-Amz-SignedHeaders': 'host',
+            };
+          }
+
+          function presign({ host, uri, accessKeyId, secretAccessKey, stamp, expires = PRESIGN_SECONDS, region = REGION, service = SERVICE }) {
+            const query = presignQuery({ accessKeyId, stamp, expires, region, service });
+            return sign({ method: 'GET', uri, query, headers: { host }, payloadHash: 'UNSIGNED-PAYLOAD', secretAccessKey, stamp, region, service }).signature;
+          }
+
+          // Rebuilds a presigned URL from its parts. The Build job hands E2E only the
+          // parts that are not secrets (GitHub drops a job output that contains a
+          // secret's value, and the URL carries the account and access key IDs).
+          function presignedUrl({ origin, uri, accessKeyId, stamp, expires, signature, region = REGION, service = SERVICE }) {
+            const query = presignQuery({ accessKeyId, stamp, expires, region, service });
+            return `${origin}${uri}?${canonicalQuery(query)}&X-Amz-Signature=${signature}`;
+          }
+
+          function endpoint(accountId) {
+            if (!HEX32.test(accountId)) throw new Error('CI artifact store account ID is malformed (expected 32 hex characters)');
+            const host = `${accountId}.r2.cloudflarestorage.com`;
+            return { origin: `https://${host}`, host };
+          }
+
+          // null when the run has no credentials (fork, Dependabot, public repository,
+          // or a caller that does not pass them). Never echoes a value.
+          function storeConfig(env = process.env) {
+            const accountId = (env.CI_ARTIFACTS_R2_ACCOUNT_ID || '').trim();
+            const accessKeyId = (env.CI_ARTIFACTS_R2_ACCESS_KEY_ID || '').trim();
+            const secretAccessKey = (env.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY || '').trim();
+            if (!accountId || !accessKeyId || !secretAccessKey) return null;
+            if (!HEX32.test(accountId) || !HEX32.test(accessKeyId) || !HEX64.test(secretAccessKey)) {
+              throw new Error('CI artifact store credentials are malformed: expected a 32-hex account ID, a 32-hex access key ID and a 64-hex secret access key');
+            }
+            return { ...endpoint(accountId), bucket: BUCKET, accessKeyId, secretAccessKey };
+          }
+
+          function repositoryOf(value) {
+            const parts = String(value || '').split('/');
+            if (parts.length !== 2 || !parts.every(part => SEGMENT.test(part) && part !== '.' && part !== '..')) {
+              throw new Error(`not an owner/name repository: ${JSON.stringify(value)}`);
+            }
+            return parts.join('/');
+          }
+
+          function assertKey(key) {
+            const parts = String(key).split('/');
+            if (parts.length !== 4 || !['prebuilt', 'proof', 'probe'].includes(parts[0])
+                || !parts.every(part => SEGMENT.test(part) && part !== '.' && part !== '..')) {
+              throw new Error(`refusing CI artifact store key ${JSON.stringify(key)}`);
+            }
+            return key;
+          }
+
+          function prebuiltKey(repository, runId, runAttempt, scope) {
+            if (!/^\d+$/.test(String(runId)) || !/^\d+$/.test(String(runAttempt))) throw new Error('run ID and attempt must be numbers');
+            return assertKey(`prebuilt/${repositoryOf(repository)}/${runId}-${runAttempt}-${scope}.tar.gz`);
+          }
+
+          function proofObjectKey(repository, kind, key) {
+            if (!PROOF_KEY[kind] || !PROOF_KEY[kind].test(String(key))) throw new Error(`not a ${kind} proof key: ${JSON.stringify(key)}`);
+            return assertKey(`proof/${repositoryOf(repository)}/${key}.json`);
+          }
+
+          function describe(error) {
+            const cause = error && error.cause ? ` (${error.cause.code || error.cause.message})` : '';
+            return `${error && error.message ? error.message : error}${cause}`;
+          }
+
+          function s3Code(body) {
+            const match = /<Code>([^<]{1,64})<\/Code>/.exec(body.toString('utf8'));
+            return match ? ` ${match[1]}` : '';
+          }
+
+          // Retries network errors, 5xx and 429. `retryAuthMs` also retries 401/403 for
+          // that long: a freshly minted R2 token is refused for a few seconds.
+          async function attempt(url, init, { timeoutMs, attempts, retryAuthMs = 0 }) {
+            const started = Date.now();
+            for (let n = 1; ; n += 1) {
+              let failure;
+              try {
+                const response = await fetch(url, { ...init(), signal: AbortSignal.timeout(timeoutMs) });
+                const body = Buffer.from(await response.arrayBuffer());
+                const auth = (response.status === 401 || response.status === 403) && Date.now() - started < retryAuthMs;
+                if (!(response.status >= 500 || response.status === 429 || auth)) return { status: response.status, body };
+                failure = `HTTP ${response.status}${s3Code(body)}`;
+              } catch (error) {
+                failure = describe(error);
+              }
+              if (n >= attempts) throw new Error(`${failure} after ${n} attempt(s)`);
+              await sleep(Math.min(1000 * 2 ** n, 15000));
+            }
+          }
+
+          async function request(cfg, method, key, { body, contentType, timeoutMs = 30000, attempts = 4, retryAuthMs = 0 } = {}) {
+            const uri = canonicalUri(cfg.bucket, assertKey(key));
+            const payload = body === undefined ? Buffer.alloc(0) : body;
+            const payloadHash = sha256Hex(payload);
+            return attempt(`${cfg.origin}${uri}`, () => {
+              const stamp = amzDate(new Date());
+              const headers = { host: cfg.host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': stamp };
+              if (contentType) headers['content-type'] = contentType;
+              const { signature, scope, signedHeaders } = sign({ method, uri, headers, payloadHash, secretAccessKey: cfg.secretAccessKey, stamp });
+              const { host, ...sent } = headers;
+              return {
+                method,
+                headers: {
+                  ...sent,
+                  'accept-encoding': 'identity',
+                  authorization: `AWS4-HMAC-SHA256 Credential=${cfg.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+                },
+                body: method === 'PUT' ? payload : undefined,
+              };
+            }, { timeoutMs, attempts, retryAuthMs });
+          }
+
+          async function putObject(cfg, key, body, options = {}) {
+            const response = await request(cfg, 'PUT', key, { ...options, body });
+            if (response.status !== 200) throw new Error(`R2 put ${key}: HTTP ${response.status}${s3Code(response.body)}`);
+          }
+
+          async function getObject(cfg, key, options = {}) {
+            const response = await request(cfg, 'GET', key, options);
+            if (response.status === 404) return null;
+            if (response.status !== 200) throw new Error(`R2 get ${key}: HTTP ${response.status}${s3Code(response.body)}`);
+            return response.body;
+          }
+
+          async function deleteObject(cfg, key, options = {}) {
+            const response = await request(cfg, 'DELETE', key, options);
+            if (![200, 204, 404].includes(response.status)) throw new Error(`R2 delete ${key}: HTTP ${response.status}${s3Code(response.body)}`);
+          }
+
+          function tar(args) {
+            execFileSync('tar', args, { stdio: ['ignore', 'ignore', 'inherit'] });
+          }
+
+          // ---- Prebuilt E2E application (Build -> E2E) -------------------------------
+
+          async function publishPrebuilt({ cfg, sourceDir, key, tmpDir, now = new Date(), expires = PRESIGN_SECONDS }) {
+            if (!fs.statSync(sourceDir).isDirectory()) throw new Error(`${sourceDir} is not a directory`);
+            const tarball = path.join(tmpDir, `ci-artifact-${crypto.randomBytes(6).toString('hex')}.tar.gz`);
+            try {
+              tar(['-czf', tarball, '-C', sourceDir, '.']);
+              const body = fs.readFileSync(tarball);
+              const sha256 = sha256Hex(body);
+              await putObject(cfg, key, body, { contentType: 'application/gzip', timeoutMs: 600000, attempts: 3 });
+              const date = amzDate(now);
+              const signature = presign({ host: cfg.host, uri: canonicalUri(cfg.bucket, key), accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey, stamp: date, expires });
+              return { key, sha256, bytes: body.length, date, expires, signature };
+            } finally {
+              fs.rmSync(tarball, { force: true });
+            }
+          }
+
+          function parsePrebuilt(text) {
+            let object;
+            try {
+              object = JSON.parse(text);
+            } catch {
+              throw new Error('the prebuilt application reference is not JSON');
+            }
+            const valid = object && typeof object === 'object'
+              && typeof object.key === 'string' && object.key.startsWith('prebuilt/')
+              && HEX64.test(String(object.sha256)) && Number.isSafeInteger(object.bytes) && object.bytes > 0
+              && /^\d{8}T\d{6}Z$/.test(String(object.date))
+              && Number.isSafeInteger(object.expires) && object.expires > 0 && object.expires <= 604800
+              && HEX64.test(String(object.signature));
+            if (!valid) throw new Error('the prebuilt application reference is malformed');
+            assertKey(object.key);
+            return object;
+          }
+
+          async function fetchPrebuilt({ object, accountId, accessKeyId, destDir, tmpDir, origin, timeoutMs = 600000 }) {
+            if (!HEX32.test(accessKeyId)) throw new Error('CI artifact store access key ID is malformed (expected 32 hex characters)');
+            const base = origin || endpoint(accountId).origin;
+            const url = presignedUrl({ origin: base, uri: canonicalUri(BUCKET, object.key), accessKeyId, stamp: object.date, expires: object.expires, signature: object.signature });
+            const response = await attempt(url, () => ({ method: 'GET', headers: { 'accept-encoding': 'identity' } }), { timeoutMs, attempts: 3 });
+            if (response.status !== 200) return { ok: false, reason: `HTTP ${response.status}${s3Code(response.body)}` };
+            if (response.body.length !== object.bytes || sha256Hex(response.body) !== object.sha256) {
+              throw new IntegrityError(`R2 object ${object.key} does not match the SHA-256 and size its Build job reported (${response.body.length} bytes read, ${object.bytes} expected); refusing to test it`);
+            }
+            const tarball = path.join(tmpDir, `ci-artifact-${crypto.randomBytes(6).toString('hex')}.tar.gz`);
+            try {
+              fs.writeFileSync(tarball, response.body);
+              fs.rmSync(destDir, { recursive: true, force: true });
+              fs.mkdirSync(destDir, { recursive: true });
+              tar(['-xzf', tarball, '-C', destDir]);
+            } finally {
+              fs.rmSync(tarball, { force: true });
+            }
+            return { ok: true, bytes: response.body.length };
+          }
+
+          // github-script glue for the Build job. Never fails the job: without a
+          // published object each E2E job builds its own application.
+          async function publishPrebuiltStep({ core, env = process.env }) {
+            core.setOutput('object', '');
+            let cfg;
+            try {
+              cfg = storeConfig(env);
+            } catch (error) {
+              core.warning(`${error.message}; each E2E job builds its own application instead`);
+              return;
+            }
+            if (!cfg) {
+              core.notice('No CI artifact store credentials in this run (fork, Dependabot, public repository, or a caller that does not pass them); each E2E job builds its own application instead.');
+              return;
+            }
+            try {
+              const key = prebuiltKey(env.GITHUB_REPOSITORY, env.GITHUB_RUN_ID, env.GITHUB_RUN_ATTEMPT, env.BUILD_SCOPE);
+              const object = await publishPrebuilt({ cfg, sourceDir: env.BUILD_DIR, key, tmpDir: env.RUNNER_TEMP });
+              core.info(`R2 put ${object.key}: ${object.bytes} bytes, sha256 ${object.sha256}`);
+              core.setOutput('object', JSON.stringify(object));
+            } catch (error) {
+              core.warning(`Could not publish the prebuilt E2E application to the CI artifact store; each E2E job builds its own instead: ${describe(error)}`);
+            }
+          }
+
+          function buildDir(env) {
+            const relative = String(env.BUILD_PATH || '');
+            const root = path.resolve(env.GITHUB_WORKSPACE || '.', env.WORKING_DIRECTORY || '.');
+            const target = path.resolve(root, relative);
+            if (!relative || path.isAbsolute(relative) || relative.split(/[\\/]/).includes('..') || !target.startsWith(root + path.sep)) {
+              throw new Error('the prebuilt application path must be a relative directory inside working-directory');
+            }
+            return target;
+          }
+
+          // github-script glue for each E2E job. Output `mode`: `r2` when the verified
+          // application is in place, `build` when this job must build its own. Only a
+          // SHA-256 or size mismatch fails the job.
+          async function fetchPrebuiltStep({ core, env = process.env }) {
+            core.setOutput('mode', 'build');
+            const destDir = buildDir(env);
+            if (!env.PREBUILT_OBJECT) {
+              core.notice('Build published no prebuilt application to the CI artifact store; this job builds its own.');
+              return;
+            }
+            let object;
+            try {
+              object = parsePrebuilt(env.PREBUILT_OBJECT);
+            } catch (error) {
+              core.warning(`${error.message}; this job builds its own application`);
+              return;
+            }
+            const accountId = (env.CI_ARTIFACTS_R2_ACCOUNT_ID || '').trim();
+            const accessKeyId = (env.CI_ARTIFACTS_R2_ACCESS_KEY_ID || '').trim();
+            if (!accountId || !accessKeyId) {
+              core.warning('CI artifact store identifiers are not available to this job; it builds its own application');
+              return;
+            }
+            try {
+              const result = await fetchPrebuilt({ object, accountId, accessKeyId, destDir, tmpDir: env.RUNNER_TEMP });
+              if (!result.ok) {
+                core.warning(`R2 get ${object.key} failed (${result.reason}); this job builds its own application`);
+                return;
+              }
+              core.info(`R2 get ${object.key}: ${result.bytes} bytes, sha256 ${object.sha256} verified; extracted into ${env.BUILD_PATH}`);
+              core.setOutput('mode', 'r2');
+            } catch (error) {
+              if (error instanceof IntegrityError) {
+                core.setFailed(error.message);
+                return;
+              }
+              core.warning(`R2 get ${object.key} failed (${describe(error)}); this job builds its own application`);
+            }
+          }
+
+          // ---- Reuse proofs (Required on a pull request -> the default-branch push) --
+
+          async function publishProof({ cfg, kind, key, context, env = process.env }) {
+            const repository = repositoryOf(`${context.repo.owner}/${context.repo.repo}`);
+            const objectKey = proofObjectKey(repository, kind, key);
+            const pointer = {
+              schema: POINTER_SCHEMA,
+              kind,
+              key,
+              repository,
+              repository_id: context.payload.repository.id,
+              run_id: Number(env.GITHUB_RUN_ID),
+              run_attempt: Number(env.GITHUB_RUN_ATTEMPT),
+              sha: context.sha,
+              written_at: new Date().toISOString(),
+            };
+            if (!Number.isSafeInteger(pointer.run_id) || !Number.isSafeInteger(pointer.run_attempt)) throw new Error('GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT must be numbers');
+            const body = Buffer.from(`${JSON.stringify(pointer)}\n`);
+            await putObject(cfg, objectKey, body, { contentType: 'application/json', timeoutMs: 15000, attempts: 3 });
+            const back = await getObject(cfg, objectKey, { timeoutMs: 15000, attempts: 3 });
+            if (!back || !back.equals(body)) throw new Error(`R2 get ${objectKey}: the read-back does not match what was written`);
+            return { objectKey, pointer };
+          }
+
+          // github-script glue for Required. Never fails the job: an unpublished proof
+          // only means the default-branch push runs the work again.
+          async function publishProofStep({ core, context, kind, env = process.env }) {
+            let cfg;
+            try {
+              cfg = storeConfig(env);
+            } catch (error) {
+              core.warning(`${error.message}; no ${kind} proof published, so the default-branch push runs it in full`);
+              return;
+            }
+            if (!cfg) {
+              core.notice(`No CI artifact store credentials in this run; no ${kind} proof published, so the default-branch push runs it in full.`);
+              return;
+            }
+            try {
+              const { objectKey, pointer } = await publishProof({ cfg, kind, key: env.PROOF_KEY, context, env });
+              core.info(`R2 put ${objectKey}: pointer to run ${pointer.run_id} attempt ${pointer.run_attempt}`);
+              core.info(`R2 get ${objectKey}: read-back matches`);
+            } catch (error) {
+              core.warning(`Could not publish the ${kind} proof to the CI artifact store; the default-branch push runs it in full: ${describe(error)}`);
+            }
+          }
+
+          // Returns { found: true, run } only when GitHub itself confirms the pointer.
+          async function findProof({ github, context, kind, key, workflowPath, env = process.env }) {
+            const cfg = storeConfig(env);
+            if (!cfg) return { found: false, reason: 'no CI artifact store credentials in this run' };
+            const repositoryId = context.payload.repository.id;
+            const objectKey = proofObjectKey(`${context.repo.owner}/${context.repo.repo}`, kind, key);
+            const raw = await getObject(cfg, objectKey, { timeoutMs: 10000, attempts: 2 });
+            if (!raw) return { found: false, reason: `no pointer at ${objectKey}` };
+            let pointer;
+            try {
+              pointer = JSON.parse(raw.toString('utf8'));
+            } catch {
+              return { found: false, reason: `${objectKey} is not JSON` };
+            }
+            if (!pointer || pointer.schema !== POINTER_SCHEMA || pointer.kind !== kind || pointer.key !== key
+                || pointer.repository_id !== repositoryId
+                || !Number.isSafeInteger(pointer.run_id) || pointer.run_id <= 0
+                || !Number.isSafeInteger(pointer.run_attempt) || pointer.run_attempt <= 0) {
+              return { found: false, reason: `${objectKey} does not describe this key and repository` };
+            }
+            const { data: run } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: pointer.run_id, request: { timeout: 10000 } });
+            if (run.id !== pointer.run_id || run.event !== 'pull_request' || run.status !== 'completed' || run.conclusion !== 'success'
+                || run.path !== workflowPath || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) {
+              return { found: false, reason: `run ${pointer.run_id} is not a successful same-repository pull-request run of ${workflowPath}` };
+            }
+            // A rerun must publish fresh proof, not inherit an older attempt's.
+            if (run.run_attempt !== pointer.run_attempt) {
+              return { found: false, reason: `run ${run.id} is on attempt ${run.run_attempt}, but attempt ${pointer.run_attempt} published the pointer` };
+            }
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+              ...context.repo, run_id: run.id, attempt_number: pointer.run_attempt, per_page: 100, request: { timeout: 10000 },
+            });
+            const stepName = `${PROOF_STEP[kind]} ${key}`;
+            const attested = jobs.some(job => /(^| \/ )Required$/.test(String(job.name)) && job.conclusion === 'success'
+              && (job.steps || []).some(step => step.name === stepName && step.conclusion === 'success'));
+            if (!attested) return { found: false, reason: `run ${run.html_url} shows no successful "${stepName}" step in a Required job` };
+            return { found: true, run };
+          }
+
+          module.exports = {
+            BUCKET, PRESIGN_SECONDS, PROOF_STEP, IntegrityError,
+            sha256Hex, amzDate, canonicalUri, canonicalQuery, sign, presign, presignedUrl,
+            storeConfig, endpoint, repositoryOf, assertKey, prebuiltKey, proofObjectKey,
+            putObject, getObject, deleteObject,
+            publishPrebuilt, parsePrebuilt, fetchPrebuilt, publishPrebuiltStep, fetchPrebuiltStep, buildDir,
+            publishProof, publishProofStep, findProof,
+          };
+          CI_ARTIFACT_STORE
       - name: Find equivalent successful PR Required proof
         id: proof
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
           PROOF_INPUTS: ${{ toJSON(inputs) }}
+          CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+          CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
+          CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
         with:
           # Anchored: `Required` computes the SAME key with this SAME text on
           # the pull request that mints the proof, so the two can never drift.
@@ -917,7 +1456,6 @@ jobs:
             core.setOutput('reused', 'false');
             try {
               const repo = context.repo;
-              const repositoryId = context.payload.repository.id;
               const workflow = process.env.CALLER_WORKFLOW_REF.split('@')[0];
               const workflowPath = workflow.slice(`${repo.owner}/${repo.repo}/`.length);
               const inputs = JSON.parse(process.env.PROOF_INPUTS);
@@ -929,23 +1467,18 @@ jobs:
               const key = `required-proof-v1-${digest}`;
               core.setOutput('key', key);
               if (context.eventName !== 'push') return;
-              // Bound the lookup. An absent proof costs a run, never coverage.
-              const { data } = await github.rest.actions.listArtifactsForRepo({ ...repo, name: key, per_page: 5, request: { timeout: 10000 } });
-              const candidates = data.artifacts.slice(0, 5).filter(artifact => artifact.name === key && !artifact.expired && artifact.workflow_run?.repository_id === repositoryId && artifact.workflow_run?.head_repository_id === repositoryId);
-              const proofs = await Promise.all(candidates.map(async artifact => {
-                const { data: run } = await github.rest.actions.getWorkflowRun({ ...repo, run_id: artifact.workflow_run.id, request: { timeout: 10000 } });
-                return { artifact, run };
-              }));
-              for (const { artifact, run } of proofs) {
-                if (run.event !== 'pull_request' || run.status !== 'completed' || run.conclusion !== 'success' || run.path !== workflowPath || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) continue;
-                // A rerun must publish fresh proof, not inherit an older attempt.
-                if (!(Date.parse(artifact.created_at) >= Date.parse(run.run_started_at))) continue;
-                core.setOutput('reused', 'true');
-                core.notice(`Reusing the full Required result from ${run.html_url} for Git tree ${tree}`);
-                await core.summary.addRaw(`The full Required gate already passed for this Git tree and configuration: ${run.html_url}\n`).write();
+              // A pointer in the CI artifact store, honoured only once GitHub
+              // confirms the run it names (THE CI ARTIFACT STORE, above).
+              // Bounded; an absent proof costs a run, never coverage.
+              const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
+              const proof = await store.findProof({ github, context, kind: 'required', key, workflowPath });
+              if (!proof.found) {
+                core.info(`No equivalent successful PR Required proof (${proof.reason}); running the full gate.`);
                 return;
               }
-              core.info('No equivalent successful PR Required proof; running the full gate.');
+              core.setOutput('reused', 'true');
+              core.notice(`Reusing the full Required result from ${proof.run.html_url} for Git tree ${tree}`);
+              await core.summary.addRaw(`The full Required gate already passed for this Git tree and configuration: ${proof.run.html_url}\n`).write();
             } catch (error) {
               core.warning(`Required proof unavailable; running the full gate: ${error.message}`);
             }
@@ -959,7 +1492,11 @@ jobs:
     if: "!cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     outputs:
       e2e-build-path: ${{ steps.e2e-build-path.outputs.path }}
-      e2e-build-id: ${{ steps.e2e-build-upload.outputs.artifact-id }}
+      # JSON naming the CI artifact store object with its SHA-256, size and
+      # presigned-GET signature (never a secret: GitHub drops an output that
+      # contains one). Empty when nothing was published, in which case each
+      # E2E job builds its own application.
+      e2e-build-object: ${{ steps.e2e-build-publish.outputs.object }}
     # ---------------------------------------------------------------------
     # Blacksmith overflow (D-CI-CAP-1 (c), extends D-BLACKSMITH-2; company-hq
     # DECISIONS.md, fleet#337). Manual, kill-switched overflow for the
@@ -1574,8 +2111,9 @@ jobs:
       #
       # The command itself never fails the step (`|| true`): per spec §5 the
       # JSON artefact from a FAILING run is the one the rollup most wants, so
-      # it must always be produced and uploaded. "Evaluate web-foundation
-      # conformance check" below applies the decided blocking rule.
+      # it must always be produced. "Evaluate web-foundation conformance
+      # check" below prints it to the log and applies the decided blocking
+      # rule.
       - name: Run web-foundation conformance check
         if: inputs.foundation-check
         env:
@@ -1585,8 +2123,8 @@ jobs:
           NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
         run: |
           set -uo pipefail
-          # A failed credential resolve still leaves an artifact for the
-          # always-upload/evaluate steps. Never reuse a prior run's output.
+          # A failed credential resolve still leaves a file for the always()
+          # Evaluate step to read. Never reuse a prior run's output.
           : > foundation-check.json
           # workflows#109: a caller whose committed project .npmrc routes the
           # @narduk-enterprises scope to the anonymous npm.nard.uk mirror
@@ -1705,6 +2243,13 @@ jobs:
             echo "::error::foundation:check produced no output — treating as UNKNOWN, which blocks (company-hq docs/WEB-FOUNDATION-CHECK.md §5)"
             exit 1
           fi
+          # The whole artefact goes to this step's log: no GitHub artifact is
+          # uploaded (org artifact quota, 2026-09-26), and the failing items
+          # must be readable from the run itself.
+          echo "::group::foundation-check.json"
+          cat foundation-check.json
+          echo
+          echo "::endgroup::"
           result=$(node -e '
             let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
               let v;try{v=JSON.parse(s)}catch{return process.stdout.write("PARSE_ERROR")}
@@ -1720,7 +2265,7 @@ jobs:
               echo "- :white_check_mark: **PASS** — every applicable web-foundation item passed" >> "$GITHUB_STEP_SUMMARY"
               ;;
             FAIL|UNKNOWN)
-              echo "- :x: **$result** — see the uploaded \`foundation-check\` artifact for the failing/undecided items" >> "$GITHUB_STEP_SUMMARY"
+              echo "- :x: **$result** — the failing/undecided items are in \`foundation-check.json\`, printed in this step's log" >> "$GITHUB_STEP_SUMMARY"
               echo "::error::web-foundation conformance check reported $result — blocking (D-WEBFOUND-2 Q9 (a), company-hq docs/WEB-FOUNDATION-CHECK.md §5)"
               exit 1
               ;;
@@ -1811,7 +2356,9 @@ jobs:
           done
 
       # Resolve only known Nuxt outputs. An ambiguous or absent build is an
-      # error, never permission for each shard to compile its own application.
+      # error here, never a reason to drop the handoff. E2E compiles its own
+      # copy only when the CI artifact store cannot supply this one (see
+      # `Build E2E application in this job`).
       - name: Resolve prebuilt E2E application
         id: e2e-build-path
         env:
@@ -1842,35 +2389,46 @@ jobs:
           if (!resolved.startsWith(fs.realpathSync('.') + path.sep) || !fs.statSync(resolved).isDirectory()) {
             throw new Error('Build output must be a directory inside working-directory')
           }
-          // The upload below is only unique within THIS job; GitHub scopes
-          // artifact-name uniqueness to the whole workflow RUN. Two `uses:`
-          // calls of this reusable workflow in one run share
-          // github.run_id/run_attempt, so an unscoped name collides and
-          // GitHub's list-artifacts-by-run response folds both uploads into
-          // one -- whichever caller captured the OTHER upload's numeric ID
-          // then fails download with "None of the provided artifact IDs were
-          // found" (workflows#144; reproduced in development-deploy-proof PR
-          // #5, run 36004204360, case_b_nomatch / E2E (1)). `artifact-scope`
-          // lets a caller give each concurrent call a stable, readable name;
-          // left unset -- including by a caller that does not yet know it
-          // calls this workflow twice in one run -- it falls back to a
-          // random per-call token so it never collides either.
+          // The object key below carries github.run_id/run_attempt, which two
+          // `uses:` calls of this reusable workflow in one run share, so an
+          // unscoped key would let the second call's upload replace the
+          // first's (the GitHub-artifact form of this collision was
+          // workflows#144, reproduced in development-deploy-proof PR #5, run
+          // 36004204360). `artifact-scope` lets a caller give each concurrent
+          // call a stable, readable key; left unset -- including by a caller
+          // that does not yet know it calls this workflow twice in one run --
+          // it falls back to a random per-call token so it never collides
+          // either.
           const sanitizedScope = (process.env.ARTIFACT_SCOPE || '').replace(/[^A-Za-z0-9._-]/g, '-')
           const scope = sanitizedScope || crypto.randomBytes(6).toString('hex')
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `path=${output}\n`)
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `scope=${scope}\n`)
           NODE
 
-      - name: Upload prebuilt E2E application
-        id: e2e-build-upload
+      - name: Install CI artifact store client
         if: steps.e2e-build-path.outputs.path != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        run: *install_ci_artifact_store
+
+      # To the CI artifact store (see THE CI ARTIFACT STORE at `reuse-plan`),
+      # never as a GitHub artifact: a tar.gz of the whole directory, hidden
+      # files included, plus a presigned GET that E2E rebuilds from the
+      # output. Never fails Build: without a published object each E2E job
+      # builds its own application, so a storage problem costs time, never
+      # coverage and never a red gate.
+      - name: Publish prebuilt E2E application
+        id: e2e-build-publish
+        if: steps.e2e-build-path.outputs.path != ''
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          BUILD_DIR: ${{ github.workspace }}/${{ inputs.working-directory }}/${{ steps.e2e-build-path.outputs.path }}
+          BUILD_SCOPE: ${{ steps.e2e-build-path.outputs.scope }}
+          CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+          CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
+          CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
         with:
-          name: e2e-build-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.e2e-build-path.outputs.scope }}
-          path: ${{ inputs.working-directory }}/${{ steps.e2e-build-path.outputs.path }}
-          if-no-files-found: error
-          include-hidden-files: true
-          retention-days: 1
+          script: |
+            const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
+            await store.publishPrebuiltStep({ core });
 
   # Typecheck and unit tests run beside `build`, not inside it (workflows row 19,
   # CI critical path). Nothing downstream consumes their output, but while they
@@ -2266,7 +2824,8 @@ jobs:
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
     # Callers adopting this revision must grant actions: read as well as
-    # contents: read. It reads prior PR proof artifacts; it cannot write runs.
+    # contents: read. It reads the runs and jobs that prior PR proofs point
+    # to; it cannot write runs.
     # Do not advance an existing major tag across this permission migration.
     permissions:
       contents: read
@@ -2286,6 +2845,11 @@ jobs:
       shard-total: ${{ steps.plan.outputs.shard-total }}
       e2e-args: ${{ steps.plan.outputs.e2e-args }}
     steps:
+      # Only the default-branch push reads the store; a pull request only
+      # computes the key that Required publishes under.
+      - name: Install CI artifact store client
+        if: inputs.e2e-reuse-pr-results && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        run: *install_ci_artifact_store
       - name: Find equivalent successful PR E2E proof
         id: proof
         if: inputs.e2e-reuse-pr-results && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)))
@@ -2293,13 +2857,15 @@ jobs:
         env:
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
           E2E_INPUTS: ${{ toJSON(inputs) }}
+          CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+          CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
+          CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
         with:
           script: |
             const { createHash } = require('node:crypto');
             core.setOutput('reused', 'false');
             try {
               const repo = context.repo;
-              const repositoryId = context.payload.repository.id;
               const workflow = process.env.CALLER_WORKFLOW_REF.split('@')[0];
               const workflowPath = workflow.slice(`${repo.owner}/${repo.repo}/`.length);
               const inputs = JSON.parse(process.env.E2E_INPUTS);
@@ -2317,23 +2883,19 @@ jobs:
               const key = `e2e-proof-v1-${digest}`;
               core.setOutput('key', key);
               if (context.eventName !== 'push') return;
-              // Bound the lookup. An absent proof costs a run, never coverage.
-              const { data } = await github.rest.actions.listArtifactsForRepo({ ...repo, name: key, per_page: 5, request: { timeout: 10000 } });
-              const candidates = data.artifacts.slice(0, 5).filter(artifact => artifact.name === key && !artifact.expired && artifact.workflow_run?.repository_id === repositoryId && artifact.workflow_run?.head_repository_id === repositoryId);
-              const proofs = await Promise.all(candidates.map(async artifact => {
-                const { data: run } = await github.rest.actions.getWorkflowRun({ ...repo, run_id: artifact.workflow_run.id, request: { timeout: 10000 } });
-                return { artifact, run };
-              }));
-              for (const { artifact, run } of proofs) {
-                if (run.event !== 'pull_request' || run.status !== 'completed' || run.conclusion !== 'success' || run.path !== workflowPath || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) continue;
-                // A rerun must publish fresh proof, not inherit an older attempt.
-                if (!(Date.parse(artifact.created_at) >= Date.parse(run.run_started_at))) continue;
-                core.setOutput('reused', 'true');
-                core.notice(`Reusing full E2E proof from ${run.html_url} for Git tree ${tree}`);
-                await core.summary.addRaw(`Full E2E already passed for this Git tree and configuration: ${run.html_url}\n`).write();
+              // A pointer in the CI artifact store, honoured only once GitHub
+              // confirms the run it names (THE CI ARTIFACT STORE at
+              // `reuse-plan`). Bounded; an absent proof costs a run, never
+              // coverage.
+              const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
+              const proof = await store.findProof({ github, context, kind: 'e2e', key, workflowPath });
+              if (!proof.found) {
+                core.info(`No equivalent successful PR E2E proof (${proof.reason}); evaluating changed paths.`);
                 return;
               }
-              core.info('No equivalent successful PR E2E proof; evaluating changed paths.');
+              core.setOutput('reused', 'true');
+              core.notice(`Reusing full E2E proof from ${proof.run.html_url} for Git tree ${tree}`);
+              await core.summary.addRaw(`Full E2E already passed for this Git tree and configuration: ${proof.run.html_url}\n`).write();
             } catch (error) {
               core.warning(`E2E proof unavailable; running normal E2E selection: ${error.message}`);
             }
@@ -2678,7 +3240,7 @@ jobs:
     # Anchored: `e2e-quarantine` below runs these exact steps as its one
     # `quarantine` leg, so the non-blocking lane can never drift from the
     # gate's setup. Steps branch on `matrix.shard == 'quarantine'` only for
-    # the arguments, the artifact name and the summary line.
+    # the arguments and the summary line.
     steps: &e2e_steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -2709,26 +3271,34 @@ jobs:
             exit 1
           fi
 
-      # The producing job's artifact ID survives 'rerun failed jobs': the
-      # successful build may belong to an earlier attempt of this same run.
-      - name: Require prebuilt E2E artifact identity
+      # The prebuilt application comes from the CI artifact store (see THE CI
+      # ARTIFACT STORE at `reuse-plan`) through the presigned GET Build signed.
+      # This job gets only the account and access key IDs needed to rebuild
+      # that URL, never the secret access key, so a browser guest that runs
+      # pull-request code holds no bucket credential. The object must match
+      # the SHA-256 and size Build reported, or the job fails. Anything else
+      # (no object, no credentials, an expired or unreachable URL) leaves
+      # `mode=build`, and `Build E2E application in this job` builds it here
+      # from the same checkout. Build's outputs survive 'rerun failed jobs',
+      # so a rerun inside the URL's 24 hours reads the same object.
+      - name: Install CI artifact store client
         if: needs.build.outputs.e2e-build-path != ''
-        env:
-          ARTIFACT_ID: ${{ needs.build.outputs.e2e-build-id }}
-        run: |
-          set -euo pipefail
-          if [[ ! "$ARTIFACT_ID" =~ ^[0-9]+$ ]]; then
-            echo "::error::successful build did not export its E2E artifact ID"
-            exit 1
-          fi
+        run: *install_ci_artifact_store
 
-      - name: Download prebuilt E2E application
+      - name: Fetch prebuilt E2E application
+        id: e2e-build-fetch
         if: needs.build.outputs.e2e-build-path != ''
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          PREBUILT_OBJECT: ${{ needs.build.outputs.e2e-build-object }}
+          BUILD_PATH: ${{ needs.build.outputs.e2e-build-path }}
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+          CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
         with:
-          artifact-ids: ${{ needs.build.outputs.e2e-build-id }}
-          merge-multiple: true
-          path: ${{ inputs.working-directory }}/${{ needs.build.outputs.e2e-build-path }}
+          script: |
+            const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
+            await store.fetchPrebuiltStep({ core });
 
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
@@ -3152,6 +3722,46 @@ jobs:
             npx playwright install --with-deps ${{ inputs.e2e-browsers }}
           fi
 
+      # Only when `Fetch prebuilt E2E application` left `mode=build`: no
+      # object (no CI artifact store credentials in this run, or Build could
+      # not publish), or one this job could not read. The same script and
+      # checkout as Build, so the suite still gets E2E_PREBUILT_ARTIFACT=1
+      # and an application at the same path. Fails closed: an empty or
+      # missing build script, or a build that leaves no output, is a red E2E,
+      # never a suite pointed at nothing (`require-scripts` does not apply).
+      - name: Build E2E application in this job
+        if: needs.build.outputs.e2e-build-path != '' && steps.e2e-build-fetch.outputs.mode != 'r2'
+        env:
+          SCRIPT: ${{ inputs.build-script }}
+          PM: ${{ inputs.package-manager }}
+          BUILD_PATH: ${{ needs.build.outputs.e2e-build-path }}
+        run: |
+          set -euo pipefail
+          case "$BUILD_PATH" in
+            ''|/*|*..*)
+              echo "::error::the prebuilt application path must be a relative directory inside working-directory"
+              exit 1
+              ;;
+          esac
+          if [ -z "$SCRIPT" ]; then
+            echo "::error::E2E needs the prebuilt application at $BUILD_PATH, the CI artifact store had none for this job, and build-script is empty"
+            exit 1
+          fi
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            echo "::error::E2E needs the prebuilt application at $BUILD_PATH and no \"$SCRIPT\" script exists to build it"
+            exit 1
+          fi
+          rm -rf -- "$BUILD_PATH"
+          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+          if [ ! -d "$BUILD_PATH" ] || [ -z "$(ls -A -- "$BUILD_PATH")" ]; then
+            echo "::error::build-script \"$SCRIPT\" left no application at $BUILD_PATH"
+            exit 1
+          fi
+          echo "Built $BUILD_PATH in this job: the CI artifact store had no prebuilt application for it."
+
       - name: Run e2e suite
         env:
           GATE: Run e2e suite
@@ -3275,6 +3885,44 @@ jobs:
         working-directory: ${{ inputs.working-directory }}
     steps: *e2e_steps
 
+  # PREVIEW (V1; Logan, askme round 2026-09-17, "Post URL + run the PR subset
+  # on it (Recommended)"; company-hq#745, company-hq D-ORG-1 (g), 2026-09-02).
+  #
+  # WHAT CLOUDFLARE ACTUALLY EXPOSES. Workers Builds' GitHub App creates check
+  # runs, commit statuses and a pull request comment, and "a preview URL will
+  # be provided for any builds which perform `wrangler versions upload`"
+  # (developers.cloudflare.com/workers/ci-cd/builds/git-integration/github-integration/).
+  # It does NOT create a GitHub Deployment -- that is the Pages integration's
+  # shape -- so there is no `environment_url` to read and this job does not
+  # pretend there is. The two sources it offers are the comment Cloudflare
+  # posts, and a caller-supplied URL template that needs no GitHub read at all.
+  #
+  # THE URL IS NOT THE PROOF. A preview URL appearing in a comment says a build
+  # was attempted, not that the PR's head commit is what is actually serving.
+  # So the wait below is not satisfied until the URL itself answers and its
+  # `x-build-version` header is a prefix of the PR head SHA. That header is the
+  # estate's existing live-proof convention (buoys docs/workers-builds.md, which
+  # records `x-build-version: a84fa2163903` for commit a84fa216390321...), and it
+  # is compared BY PREFIX because Cloudflare emits a 12-character short SHA
+  # while `git rev-parse --short` defaults to 7 -- a fixed-width comparison
+  # would be a gate that never passes or, worse, one somebody "fixes" by
+  # deleting it.
+  #
+  # FAIL CLOSED. A preview that never appears inside the bound is a FAILURE,
+  # not a skip. "The preview never showed up" is the single most common way a
+  # Workers Builds connection silently breaks, and it is indistinguishable from
+  # "this repo does not use previews" only if you refuse to make the caller say
+  # which it is -- which is what `preview-checks: none` is for.
+  #
+  # RUNNER CLASS. Lightweight (the `caller-lint` / `E2E plan` route) unless the
+  # caller selected `e2e-subset`, which needs a browser guest and therefore the
+  # `e2e-runner` route. The isolated-pool preflight it runs there is the SAME
+  # YAML node as the `e2e` job's, via anchors, not a second copy: an
+  # image-equality gate that exists twice is an image-equality gate that drifts.
+  # Callers should note that with `e2e-subset` selected the bounded wait holds a
+  # `playwright-isolated` slot (three effective slots across ~ten repos), which
+  # is why `preview-timeout-minutes` is a caller input and why `og` is the
+  # default.
   preview:
     name: Preview
     # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
@@ -4948,48 +5596,44 @@ jobs:
           PROOF_INPUTS: ${{ toJSON(inputs) }}
         with:
           script: *required_proof_script
-      - name: Write Required proof
-        id: required-proof
+      # Both proofs below are pointers in the CI artifact store (see THE CI
+      # ARTIFACT STORE at `reuse-plan`), written only on a pull request.
+      - name: Install CI artifact store client
+        if: success() && github.event_name == 'pull_request'
+        run: *install_ci_artifact_store
+      # The step NAME carries the key on purpose. GitHub's jobs API reports
+      # it, and the push honours a stored pointer only when the run it names
+      # shows this step, under this exact name, succeeded in its Required
+      # job. Never fails Required: an unpublished proof only costs the push a
+      # full run.
+      - name: Publish Required proof ${{ steps.required-key.outputs.key }}
         if: success() && steps.required-key.outputs.key != ''
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           PROOF_KEY: ${{ steps.required-key.outputs.key }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          proof_file=$(mktemp "$RUNNER_TEMP/required-proof.XXXXXX")
-          printf '%s\n' "$PROOF_KEY" > "$proof_file"
-          echo "path=$proof_file" >> "$GITHUB_OUTPUT"
-      - name: Publish Required proof
-        if: success() && steps.required-proof.outputs.path != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+          CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+          CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
+          CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
         with:
-          name: ${{ steps.required-key.outputs.key }}
-          path: ${{ steps.required-proof.outputs.path }}
-          if-no-files-found: error
-          retention-days: 7
-          overwrite: true
+          script: |
+            const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
+            await store.publishProofStep({ core, context, kind: 'required' });
       # Proof is published only after Required passed and the real full suite
       # ran. A path skip, PR subset, fork or failed shard cannot mint proof.
-      - name: Write full E2E proof
+      # Named with its key for the same reason as the Required proof above.
+      - name: Publish full E2E proof ${{ needs.e2e-plan.outputs.proof-key }}
         id: e2e-proof
         if: success() && inputs.e2e-reuse-pr-results && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.e2e.result == 'success' && needs.e2e-plan.outputs.proof-key != '' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           PROOF_KEY: ${{ needs.e2e-plan.outputs.proof-key }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          proof_file=$(mktemp "$RUNNER_TEMP/e2e-proof.XXXXXX")
-          printf '%s\n' "$PROOF_KEY" > "$proof_file"
-          echo "path=$proof_file" >> "$GITHUB_OUTPUT"
-      - name: Publish full E2E proof
-        if: success() && steps.e2e-proof.outputs.path != ''
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+          CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+          CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
+          CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
         with:
-          name: ${{ needs.e2e-plan.outputs.proof-key }}
-          path: ${{ steps.e2e-proof.outputs.path }}
-          if-no-files-found: error
-          retention-days: 7
-          overwrite: true
+          script: |
+            const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
+            await store.publishProofStep({ core, context, kind: 'e2e' });
 
   # Placed after `Required` on purpose: it runs a YAML alias of `Required`'s
   # gate step, and an alias must follow its anchor. The escalation summary
