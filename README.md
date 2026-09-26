@@ -2122,8 +2122,9 @@ Every key is scoped by `github.repository` and shape-checked before use.
 
 ### Credentials
 
-The workflow uses three org Actions secrets with private-repo visibility. All
-three are declared `required: false` on the callable:
+The workflow uses three org Actions secrets with `selected` visibility: only
+the repositories on each secret's repository list receive them. All three are
+declared `required: false` on the callable:
 
 | Secret | Value |
 |---|---|
@@ -2139,6 +2140,21 @@ expires on 2027-09-26. Its source is nvault
 
 A reusable workflow sees only the secrets its caller passes, so a caller adds
 the three lines shown in the main example above, or uses `secrets: inherit`.
+
+**A caller that repins onto a commit with the store must also be added to the
+repository list of all three secrets.** Until it is, GitHub hands it empty
+values, and its runs fall back as described under "Without credentials, and on
+failure". An org owner adds a repository without touching any value:
+
+```sh
+repo_id=$(gh api repos/narduk-enterprises/<repo> --jq .id)
+for name in CI_ARTIFACTS_R2_ACCOUNT_ID CI_ARTIFACTS_R2_ACCESS_KEY_ID CI_ARTIFACTS_R2_SECRET_ACCESS_KEY; do
+  gh api -X PUT "orgs/narduk-enterprises/actions/secrets/$name/repositories/$repo_id"
+done
+# Read the list back:
+gh api orgs/narduk-enterprises/actions/secrets/CI_ARTIFACTS_R2_SECRET_ACCESS_KEY/repositories \
+  --jq '.repositories[].full_name'
+```
 
 **Who holds the secret access key:**
 
@@ -2185,8 +2201,8 @@ the caller workflow and every callable input.
 
 The store can cost time but never coverage, and it never passes a gate falsely.
 A run has no store credentials when it is a fork pull request, a Dependabot run
-(Dependabot sees only Dependabot secrets), a public caller, or a caller that
-does not pass the secrets. Then:
+(Dependabot sees only Dependabot secrets), a public caller, a caller that does
+not pass the secrets, or a caller missing from their repository list. Then:
 
 - **Build** publishes nothing.
 - **Each E2E job** runs `build-script` itself and fails if it cannot produce
@@ -2194,7 +2210,10 @@ does not pass the secrets. Then:
 - **Proofs.** No proof is published or honoured, so the default-branch push
   runs the full gate.
 
-A storage error or an expired link does the same, with a warning.
+A storage error, an expired link or a stalled transfer does the same, with a
+warning. A tarball transfer gives up after 3 attempts of 120 s. That is about
+6 minutes in the worst case, well inside the 30-minute job limit, so Build
+still finishes and each E2E job still has time to build its own application.
 
 Only two things turn a job red:
 

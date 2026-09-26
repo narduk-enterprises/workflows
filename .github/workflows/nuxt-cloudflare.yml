@@ -877,8 +877,9 @@ on:
       JOURNEY_SMOKE_ROLLBACK_TOKEN:
         required: false
       # The CI artifact store (R2 bucket `narduk-ci-artifacts`; see THE CI
-      # ARTIFACT STORE at `reuse-plan`). Org Actions secrets with private-repo
-      # visibility, sourced from nvault cloudflare/prd/
+      # ARTIFACT STORE at `reuse-plan`). Org Actions secrets with `selected`
+      # visibility (a caller that repins onto the store is added to each
+      # secret's repository list), sourced from nvault cloudflare/prd/
       # narduk-enterprises-ci-artifacts: the Cloudflare account ID, the R2
       # token's ID as the S3 access key ID, and the SHA-256 of the token as
       # the S3 secret access key. All optional. Without them (a fork,
@@ -1012,6 +1013,11 @@ jobs:
           // Long enough to outlast queueing on the browser pool and a same-day rerun of
           // failed E2E jobs. Past it, E2E builds its own application.
           const PRESIGN_SECONDS = 24 * 60 * 60;
+          // A stalled tarball transfer must give up well inside the 30-minute job
+          // limit, so Build still finishes and each E2E job still has time to build
+          // its own application: 3 attempts of 120 s plus backoff is about 6 minutes.
+          const TRANSFER_TIMEOUT_MS = 120 * 1000;
+          const TRANSFER_ATTEMPTS = 3;
           const POINTER_SCHEMA = 'narduk-ci-proof-pointer-v1';
           const PROOF_STEP = { required: 'Publish Required proof', e2e: 'Publish full E2E proof' };
           const PROOF_KEY = { required: /^required-proof-v1-[0-9a-f]{64}$/, e2e: /^e2e-proof-v1-[0-9a-f]{64}$/ };
@@ -1212,14 +1218,14 @@ jobs:
 
           // ---- Prebuilt E2E application (Build -> E2E) -------------------------------
 
-          async function publishPrebuilt({ cfg, sourceDir, key, tmpDir, now = new Date(), expires = PRESIGN_SECONDS }) {
+          async function publishPrebuilt({ cfg, sourceDir, key, tmpDir, now = new Date(), expires = PRESIGN_SECONDS, timeoutMs = TRANSFER_TIMEOUT_MS }) {
             if (!fs.statSync(sourceDir).isDirectory()) throw new Error(`${sourceDir} is not a directory`);
             const tarball = path.join(tmpDir, `ci-artifact-${crypto.randomBytes(6).toString('hex')}.tar.gz`);
             try {
               tar(['-czf', tarball, '-C', sourceDir, '.']);
               const body = fs.readFileSync(tarball);
               const sha256 = sha256Hex(body);
-              await putObject(cfg, key, body, { contentType: 'application/gzip', timeoutMs: 600000, attempts: 3 });
+              await putObject(cfg, key, body, { contentType: 'application/gzip', timeoutMs, attempts: TRANSFER_ATTEMPTS });
               const date = amzDate(now);
               const signature = presign({ host: cfg.host, uri: canonicalUri(cfg.bucket, key), accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey, stamp: date, expires });
               return { key, sha256, bytes: body.length, date, expires, signature };
@@ -1246,11 +1252,11 @@ jobs:
             return object;
           }
 
-          async function fetchPrebuilt({ object, accountId, accessKeyId, destDir, tmpDir, origin, timeoutMs = 600000 }) {
+          async function fetchPrebuilt({ object, accountId, accessKeyId, destDir, tmpDir, origin, timeoutMs = TRANSFER_TIMEOUT_MS }) {
             if (!HEX32.test(accessKeyId)) throw new Error('CI artifact store access key ID is malformed (expected 32 hex characters)');
             const base = origin || endpoint(accountId).origin;
             const url = presignedUrl({ origin: base, uri: canonicalUri(BUCKET, object.key), accessKeyId, stamp: object.date, expires: object.expires, signature: object.signature });
-            const response = await attempt(url, () => ({ method: 'GET', headers: { 'accept-encoding': 'identity' } }), { timeoutMs, attempts: 3 });
+            const response = await attempt(url, () => ({ method: 'GET', headers: { 'accept-encoding': 'identity' } }), { timeoutMs, attempts: TRANSFER_ATTEMPTS });
             if (response.status !== 200) return { ok: false, reason: `HTTP ${response.status}${s3Code(response.body)}` };
             if (response.body.length !== object.bytes || sha256Hex(response.body) !== object.sha256) {
               throw new IntegrityError(`R2 object ${object.key} does not match the SHA-256 and size its Build job reported (${response.body.length} bytes read, ${object.bytes} expected); refusing to test it`);
@@ -1429,7 +1435,7 @@ jobs:
           }
 
           module.exports = {
-            BUCKET, PRESIGN_SECONDS, PROOF_STEP, IntegrityError,
+            BUCKET, PRESIGN_SECONDS, TRANSFER_TIMEOUT_MS, TRANSFER_ATTEMPTS, PROOF_STEP, IntegrityError,
             sha256Hex, amzDate, canonicalUri, canonicalQuery, sign, presign, presignedUrl,
             storeConfig, endpoint, repositoryOf, assertKey, prebuiltKey, proofObjectKey,
             putObject, getObject, deleteObject,
@@ -2846,7 +2852,8 @@ jobs:
       e2e-args: ${{ steps.plan.outputs.e2e-args }}
     steps:
       # Only the default-branch push reads the store; a pull request only
-      # computes the key that Required publishes under.
+      # computes the key that Required publishes under, so the secret key is
+      # passed on a push only.
       - name: Install CI artifact store client
         if: inputs.e2e-reuse-pr-results && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
         run: *install_ci_artifact_store
@@ -2859,7 +2866,7 @@ jobs:
           E2E_INPUTS: ${{ toJSON(inputs) }}
           CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
           CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
-          CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
+          CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ github.event_name == 'push' && secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY || '' }}
         with:
           script: |
             const { createHash } = require('node:crypto');

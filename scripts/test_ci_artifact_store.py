@@ -35,6 +35,7 @@ import stat
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.parse
 
 import yaml
@@ -92,6 +93,10 @@ class Double:
         self.objects: dict[str, bytes] = {}
         self.read_override: dict[str, bytes] = {}
         self.fail: list[int] = []
+        # "reply": take the request and never answer. "body": send the headers
+        # and half of the object, then go quiet. Held until `unstall` is set.
+        self.stall: list[str] = []
+        self.unstall = threading.Event()
         self.log: list[tuple[str, str, str]] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.server.daemon_threads = True
@@ -102,6 +107,8 @@ class Double:
         self.objects.clear()
         self.read_override.clear()
         self.fail.clear()
+        self.stall.clear()
+        self.unstall.clear()
         self.log.clear()
 
     def authenticate(self, method: str, raw_path: str, raw_query: str, headers, body: bytes) -> str:
@@ -158,6 +165,19 @@ class Double:
             def error(self, status: int, code: str) -> None:
                 self.reply(status, f"<?xml version=\"1.0\"?><Error><Code>{code}</Code></Error>".encode())
 
+            def hang(self, mode: str, data: bytes) -> None:
+                self.close_connection = True
+                try:
+                    if mode == "body":
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data[: len(data) // 2])
+                        self.wfile.flush()
+                    double.unstall.wait(30)
+                except OSError:
+                    pass  # the client gave up and closed the connection
+
             def serve(self) -> None:
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b""
@@ -169,6 +189,8 @@ class Double:
                 double.log.append((self.command, key, auth))
                 if auth not in ("header", "presigned"):
                     return self.error(403, auth)
+                if double.stall:
+                    return self.hang(double.stall.pop(0), double.objects.get(key, b""))
                 if double.fail:
                     return self.error(double.fail.pop(0), "InternalError")
                 if self.command == "PUT":
@@ -306,6 +328,13 @@ def test_workflow_wiring() -> None:
         ("required", "Publish Required proof ${{ steps.required-key.outputs.key }}"),
         ("required", "Publish full E2E proof ${{ needs.e2e-plan.outputs.proof-key }}"),
     }, secret_bindings
+    # E2E plan reads the store on a default-branch push only; on a pull request
+    # it computes the key and returns, so it gets no secret key there.
+    e2e_proof = next(step for step in document["jobs"]["e2e-plan"]["steps"]
+                     if step.get("name") == "Find equivalent successful PR E2E proof")
+    assert e2e_proof["env"]["CI_ARTIFACTS_R2_SECRET_ACCESS_KEY"] == (
+        "${{ github.event_name == 'push' && secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY || '' }}"), e2e_proof["env"]
+    assert "if (context.eventName !== 'push') return;" in e2e_proof["with"]["script"]
     # The attestation the lookup checks is the publish step's evaluated NAME,
     # so the names in the workflow and the prefixes in the client must agree.
     assert "const PROOF_STEP = { required: 'Publish Required proof', e2e: 'Publish full E2E proof' };" in body
@@ -544,6 +573,74 @@ def test_prebuilt(client: Client, root: Path) -> None:
     print("PASS  Build never fails on the store: no credentials, bad credentials or an outage publish nothing")
 
 
+ATTEMPT = '''
+  try {
+    return { ok: true, value: await (async () => { %s })() };
+  } catch (error) {
+    return { ok: false, integrity: error instanceof store.IntegrityError, message: String(error && error.message) };
+  }
+'''
+
+
+def test_stalled_transfer(client: Client, root: Path) -> None:
+    """A tarball transfer that stalls gives up well inside the job's limit, so the job can fall back."""
+    document = yaml.safe_load(WORKFLOW.read_text())
+    install = next(s for s in document["jobs"]["build"]["steps"] if s.get("name") == INSTALL)["run"]
+    for function in ("publishPrebuilt", "fetchPrebuilt"):
+        signature = re.search(rf"async function {function}\(\{{([^}}]*)\}}\)", install)
+        assert signature and "timeoutMs = TRANSFER_TIMEOUT_MS" in signature.group(1), function
+    assert install.count("attempts: TRANSFER_ATTEMPTS") == 2 and "600000" not in install
+    budget = client.run("return { timeoutMs: store.TRANSFER_TIMEOUT_MS, attempts: store.TRANSFER_ATTEMPTS };")["result"]
+    # attempt() backs off min(2^n s, 15 s) between tries.
+    worst = (budget["attempts"] * budget["timeoutMs"]
+             + sum(min(1000 * 2 ** n, 15000) for n in range(1, budget["attempts"]))) / 1000
+    limit = min(int(document["jobs"][job_id]["timeout-minutes"]) for job_id in ("build", "e2e", "e2e-quarantine")) * 60
+    assert worst <= limit / 4, f"a stalled transfer can hold a job for {worst:.0f} s of its {limit} s limit"
+
+    double = client.double
+    double.reset()
+    source = root / "stall-src"
+    make_tree(source)
+    key = "prebuilt/example/app/88-1-stall.tar.gz"
+    publish = ATTEMPT % ("return await store.publishPrebuilt({ cfg: store.storeConfig(vars.creds), "
+                         "sourceDir: vars.source, key: vars.key, tmpDir: vars.tmp, timeoutMs: vars.timeoutMs });")
+    variables = {"creds": CREDS, "source": str(source), "key": key, "tmp": str(client.runner_temp)}
+    try:
+        double.stall[:] = ["reply"] * budget["attempts"]
+        started = time.monotonic()
+        put = client.run(publish, timeoutMs=300, **variables)["result"]
+        put_seconds = time.monotonic() - started
+        assert put["ok"] is False and not put["integrity"], put
+        assert f"after {budget['attempts']} attempt(s)" in put["message"] and "timeout" in put["message"], put
+        assert double.log == [("PUT", key, "header")] * budget["attempts"] and key not in double.objects, double.log
+
+        reference = client.run(publish, timeoutMs=30000, **variables)["result"]["value"]
+        target = root / "stall-ws" / "apps/web/.output"
+        target.mkdir(parents=True)
+        (target / "sentinel.txt").write_text("untouched")
+        double.log.clear()
+        double.stall[:] = ["body"] * budget["attempts"]
+        started = time.monotonic()
+        get = client.run(ATTEMPT % (
+            "return await store.fetchPrebuilt({ object: store.parsePrebuilt(JSON.stringify(vars.reference)), "
+            "accountId: vars.account, accessKeyId: vars.access, destDir: vars.dest, tmpDir: vars.tmp, timeoutMs: 300 });"),
+            reference=reference, account=ACCOUNT, access=ACCESS, dest=str(target), tmp=str(client.runner_temp))["result"]
+        get_seconds = time.monotonic() - started
+        # Not an IntegrityError, so fetchPrebuiltStep warns and sets mode=build
+        # (the outage case in test_prebuilt runs that path).
+        assert get["ok"] is False and not get["integrity"], get
+        assert f"after {budget['attempts']} attempt(s)" in get["message"] and "timeout" in get["message"], get
+        assert double.log == [("GET", key, "presigned")] * budget["attempts"], double.log
+        assert list(snapshot(target)) == ["sentinel.txt"] and (target / "sentinel.txt").read_text() == "untouched", (
+            "a stalled read touched the target")
+    finally:
+        double.unstall.set()
+    assert put_seconds < 15 and get_seconds < 15, (put_seconds, get_seconds)
+    print(f"PASS  a stalled transfer gives up after {budget['attempts']} x {budget['timeoutMs'] // 1000} s "
+          f"(worst {worst:.0f} s of a {limit // 60}-minute job), mid-body stalls included; "
+          f"the job falls back instead of timing out")
+
+
 # ---- Reuse proofs ---------------------------------------------------------
 
 FIND = '''
@@ -623,6 +720,7 @@ def main() -> None:
             test_sigv4_vectors(client)
             test_config_and_keys(client)
             test_prebuilt(client, root)
+            test_stalled_transfer(client, root)
             test_proofs(client)
     finally:
         double.server.shutdown()

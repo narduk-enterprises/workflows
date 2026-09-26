@@ -172,8 +172,12 @@ def main() -> None:
     assert 'github.event.repository.default_branch' in lookup['if']
     assert 'github.event_name == \'pull_request\'' in lookup['if']
     assert 'pull_request_target' not in lookup['if']
-    for name in STORE_SECRETS:
+    # A pull request only computes the key here, so the secret access key is
+    # passed on a push only; the two IDs are identifiers, not keys.
+    for name in STORE_SECRETS[:2]:
         assert lookup['env'][name] == '${{ secrets.%s }}' % name, name
+    assert lookup['env'][STORE_SECRETS[2]] == (
+        "${{ github.event_name == 'push' && secrets.%s || '' }}" % STORE_SECRETS[2]), lookup['env']
     # Only the push reads the store, so only the push installs the client, and
     # it installs it before the lookup that requires it.
     install = next(step for step in plan['steps'] if step.get('name') == INSTALL_STEP)
