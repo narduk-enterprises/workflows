@@ -48,8 +48,10 @@ name: Reusable Design Ledger
 #
 # PERMISSIONS. GitHub checks every job's `permissions:` in a called workflow
 # against the caller's grant when the run starts, skipped jobs included, so
-# the grant must cover the `flag` job even in a check-only call (README,
-# "Design ledger"). `check` itself runs with `contents: read`.
+# the grant must cover the `flag` job even in a check-only call. Proven on
+# workflows#155: a `mode: check` caller granting only `contents: read` ended
+# in `startup_failure` with no jobs. `check` itself still runs with
+# `contents: read`.
 #
 # The checker runs from THIS repository at `job.workflow_sha`, the exact
 # commit the caller pinned, never from the caller's tree, so a pull request

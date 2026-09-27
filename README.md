@@ -75,9 +75,10 @@ in their app-class workflow.
 | `closing-syntax-check.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8): zero adopters, file deleted. `narduk-enterprises/agent-infrastructure` keeps its own local, canonical invocation of the same (commit-scanning) checker (agent-infrastructure#837, #1085) |
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 | `red-main-listener.yml` | **New 2026-09-24** (narduk-reboot P3-C2 / O-D8). Opens or refreshes ONE "main is red: `<workflow-name>`" issue, labelled `red-main`, per repo per listened workflow, the first time that workflow goes red on the default branch; closes it on the next green run. **Prerequisite: the adopting repo must already have the `red-main` label** (`gh label create red-main --color B60205 --description "Main default-branch CI is failing"`) — opening the first issue passes `labels[]=red-main` and GitHub 422s a repo without it, so an adopter that skips this step fails closed on its first real red run (PR #142 review, second round). Optional fail-open portal-mirror POST hook. No automatic revert or rollback — that stays in the app's own deploy tooling |
+| `design-ledger.yml` | **New 2026-09-27** (agent-infrastructure#1804). **Advisory, never required.** Runs the design ledger checker (`scripts/dc_ledger.py`, a byte copy of agent-infrastructure's canonical file) against a product's `design/<canvas>/ledger.json`. `mode: check` goes red while a canvas screen and its code have drifted and writes the table to the job summary; `mode: flag` keeps one `Design drift: <canvas>` issue. See [Design ledger](#design-ledgeryml) |
 | `flake-digest.yml` | **New 2026-09-24** (narduk-reboot P3-C2). Weekly, advisory: scans a caller's completed runs of one workflow, counts failures in jobs matching `quarantine-job-pattern` (nuxt-cloudflare.yml's `e2e-quarantine` by default), and files or refreshes one digest issue per ISO week. Never gates `main`, never opens `red-main` |
 
-All nine shipped callables are `on: workflow_call` only — none of them declare their own
+All ten shipped callables are `on: workflow_call` only — none of them declare their own
 triggers, and none declare `concurrency:` (see "How to consume" below for why).
 
 ### Adopters
@@ -101,6 +102,7 @@ branch, read back from the API — not that the caller parses.
 | `reusable-weekly-drift-check.yml` | retired — zero live callers verified across `narduk-enterprises` and `narduk-incubator` | — |
 | `red-main-listener.yml` | `narduk-enterprises/workflows` itself (`red-main-self.yml`, listening to this repo's own `CI`) | not yet |
 | `flake-digest.yml` | none yet — no adopter here has a quarantine lane of its own; `nuxt-cloudflare.yml` adopters with `e2e-quarantine-args` set are the natural first callers | not yet |
+| `design-ledger.yml` | `narduk-enterprises/mybo-at-v2` (planned) | never — advisory by design (Logan, 2026-09-27: "Red check + drift issue (Recommended)") |
 
 ## The `ci / Required` convention
 
@@ -1786,6 +1788,61 @@ caller today, but shares its shape):
         python3 -m pip install --disable-pip-version-check --no-cache-dir "pyyaml==6.*"
         python3 untangle/sync-to-project.py --project-number 1 --dry-run
 ```
+
+### `design-ledger.yml`
+
+A product keeps one design ledger beside each Claude Design canvas
+(`design/<canvas>/ledger.json`, agent-infrastructure#1804). It maps each canvas
+screen to the code it specifies and records when the two last matched. This
+callable reads drift in both directions: `not-built` (the canvas moved),
+`design-stale` (the code moved) and `diverged` (both moved).
+
+- **`mode: check`** runs `dc_ledger.py status <ledger> --check --github-summary`.
+  It exits 1 while any entry is flagged, prints one fix line per entry, and
+  appends the table to the job summary.
+- **`mode: flag`** runs `dc_ledger.py flag <ledger>` with the caller's
+  `github.token`. It opens, edits, reopens or closes one
+  `Design drift: <canvas>` issue on the caller's repo, whose labels must exist.
+- **Advisory.** There is no `Required` job, so never add `<job> / check` to
+  branch protection, and do not name the calling job `ci`.
+- **Grant `contents: read` and `issues: write` in both modes.** GitHub checks
+  the skipped `flag` job's permissions too, so a check-only caller that grants
+  only `contents: read` ends in `startup_failure` (proven on workflows#155).
+  The `check` job itself runs with `contents: read`.
+- **The checker comes from this repo** at `job.workflow_sha`, the commit the
+  caller pinned, via a sparse checkout without credentials. A pull request
+  cannot change the code that judges it, and the ledger's `build` command is
+  never run.
+- **`scripts/dc_ledger.py` is a byte copy.** The canonical file is
+  agent-infrastructure's `skills/claude-design-ops/scripts/dc_ledger.py`, and
+  its `scripts/check-dc-ledger-parity` fails when the two differ. Change it
+  there first, land the copy here, then move agent-infrastructure's pin.
+
+```yaml
+name: design-ledger
+
+on:
+  pull_request:
+    paths: [design/<canvas>/**, apps/web/app/**]   # the ledger's mapped paths
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  design-ledger:
+    uses: narduk-enterprises/workflows/.github/workflows/design-ledger.yml@<sha-of-v2.1.0> # v2.1.0
+    permissions:
+      contents: read
+      issues: write
+    with:
+      ledger: design/<canvas>/ledger.json
+      mode: ${{ github.event_name == 'push' && 'flag' || 'check' }}
+```
+
+`runs-on` follows the [Default route](#default-route-empty-runner): leave it
+empty and a private caller lands on `linux-ci`.
 
 ### Weekly drift check (retired 2026-07-26)
 
