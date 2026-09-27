@@ -726,12 +726,10 @@ on:
       # ---------------------------------------------------------------------
       # FAST-PATH DELIVERY INPUTS (narduk reboot P3-C1, O-velocity §3.4-§3.6).
       # Every input below defaults OFF. With all of them at their defaults the
-      # pre-existing jobs run exactly as before: the jobs added for them
-      # (`Reuse plan`, `Fast`, `Fast (escalated)`, `Journey smoke`) are skipped
-      # at job level without a runner, and `Required` reads them as skipped.
-      # Two of those four skipped checks show a raw `${{ ... }}` name, because
-      # GitHub does not evaluate a skipped job's computed name (see NAMING IS
-      # THE GATE at `fast`). The lanes that sit below the skipped `Reuse plan`
+      # pre-existing jobs run exactly as before. `Reuse plan` and `Journey
+      # smoke` skip without a runner; the two Fast jobs start but skip every
+      # step, so GitHub resolves their readable names (see NAMING IS THE GATE
+      # at `fast`). Neither disabled job is named `Fast`. Lanes below `Reuse plan`
       # carry explicit status guards so the skip does not propagate (see SKIP
       # PROPAGATION at `reuse-plan`).
       # They also stay out of the E2E proof key while at their defaults, so
@@ -740,8 +738,8 @@ on:
       fast-scripts:
         description: >-
           Space-separated package.json scripts for the `Fast` job, run in
-          order (for example `lint typecheck test:changed`). Non-empty turns
-          the job on; empty (the default) leaves it off. The job adds no e2e
+          order (for example `lint typecheck test:changed`). Non-empty enables
+          the scripts; empty (the default) disables all job steps. The job adds no e2e
           and no build, and targets 3 minutes or less at p90, so it can be the
           one required check (`ci / Fast`) for a repository whose full
           `ci / Required` runs as an asynchronous net. On `pull_request`
@@ -4878,20 +4876,14 @@ jobs:
   # full gate still runs beside it as the asynchronous net, and a green full PR
   # run is what `required-reuse-pr-results` later reuses on the push.
   #
-  # NAMING IS THE GATE. GitHub reports a SKIPPED job as a passing check, so a
-  # job named `Fast` must never be skipped while a ruleset could be relying on
-  # it. The name is therefore computed, and it evaluates to `Fast` only when
-  # this job runs and is the one doing the work; it is `Fast lanes
-  # (escalated)` when a protected path hands the `Fast` name to
-  # `fast-escalated` below. GitHub does NOT evaluate the `name:` of a job it
-  # skips (community discussions #13261 and #152293): a skipped job's check
-  # shows this raw `${{ ... }}` template, which is never exactly `Fast`. So a
-  # default caller (input off), a reused tree and journey-smoke mode all show
-  # a skipped check with the raw template as its name, never a skipped `Fast`.
-  # The `Fast (not run)` branch keeps that true if GitHub ever starts
-  # evaluating skipped names. scripts/test_fast_path.py checks both. `always()`
-  # rather than `!cancelled()` for the same reason: a cancelled run must not
-  # turn this job into a skipped, and therefore passing, `Fast`.
+  # NAMING IS THE GATE. Only the job doing the applicable work is named
+  # `Fast`; escalation moves that name to `fast-escalated`. GitHub displays
+  # a skipped job's name expression verbatim (community discussion #13261),
+  # so both jobs use always() and gate their steps with FAST_ENABLED instead.
+  # Disabled jobs finish as no-ops with readable names, never as `Fast`.
+  # Required requires both job results to succeed, including the no-ops.
+  # Keeping always() also prevents an ordinary cancellation from turning a
+  # required Fast job into a skipped, and therefore passing, check.
   #
   # The check NAME stays `Fast` when this run escalates too: the name moves
   # onto `fast-escalated`, and this job reports as `Fast lanes (escalated)`.
@@ -4901,7 +4893,9 @@ jobs:
   fast:
     name: ${{ !(inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && 'Fast (not run)' || ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true') && 'Fast lanes (escalated)' || 'Fast' }}
     needs: [reuse-plan, e2e-plan]
-    if: always() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'
+    if: always()
+    env:
+      FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' }}
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
@@ -4919,6 +4913,7 @@ jobs:
       # includes `run-e2e: false`, where `E2E plan` never runs, so protected
       # paths could never escalate and `Fast` would pass on lint/unit alone.
       - name: Resolve protected-path escalation
+        if: env.FAST_ENABLED == 'true'
         working-directory: ${{ github.workspace }}
         env:
           RUN_E2E: ${{ inputs.run-e2e }}
@@ -4941,6 +4936,7 @@ jobs:
             echo "No protected-path escalation: this job is ci / Fast."
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: env.FAST_ENABLED == 'true'
         with:
           persist-credentials: false
           ref: ${{ inputs.expected-candidate-sha }}
@@ -4948,7 +4944,7 @@ jobs:
           fetch-depth: 2
 
       - name: Verify exact validation candidate
-        if: inputs.expected-candidate-sha != ''
+        if: env.FAST_ENABLED == 'true' && (inputs.expected-candidate-sha != '')
         working-directory: ${{ github.workspace }}
         shell: bash
         env:
@@ -4968,8 +4964,9 @@ jobs:
             exit 1
           fi
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
-        if: inputs.package-manager == 'pnpm'
+        if: env.FAST_ENABLED == 'true' && (inputs.package-manager == 'pnpm')
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        if: env.FAST_ENABLED == 'true'
         with:
           # node-version and node-version-file are mutually exclusive on
           # setup-node (passing both is rejected), so resolve them as two
@@ -4983,7 +4980,7 @@ jobs:
       # the default-branch save; a second writer here would only race it.
       - name: Resolve dependency cache directory
         id: dep-cache-dir
-        if: runner.environment == 'github-hosted'
+        if: env.FAST_ENABLED == 'true' && (runner.environment == 'github-hosted')
         run: |
           set -euo pipefail
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
@@ -4996,7 +4993,7 @@ jobs:
 
       - name: Restore dependency cache
         id: dep-cache
-        if: runner.environment == 'github-hosted'
+        if: env.FAST_ENABLED == 'true' && (runner.environment == 'github-hosted')
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.dep-cache-dir.outputs.path }}
@@ -5004,14 +5001,14 @@ jobs:
           restore-keys: |
             node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
       - name: Configure package registry auth
-        if: inputs.install-script == ''
+        if: env.FAST_ENABLED == 'true' && (inputs.install-script == '')
         env:
           GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
           NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
         run: *configure_package_registry_auth
 
       - name: Point pnpm at a workspace-local store (self-hosted)
-        if: runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'
+        if: env.FAST_ENABLED == 'true' && (runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm')
         run: |
           set -euo pipefail
           mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
@@ -5019,7 +5016,7 @@ jobs:
             echo "npm_config_store_dir=$mount_point/pnpm-store" >> "$GITHUB_ENV"
           fi
       - name: Install dependencies (pnpm)
-        if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
+        if: env.FAST_ENABLED == 'true' && (inputs.install-script == '' && inputs.package-manager == 'pnpm')
         run: pnpm install --frozen-lockfile
         env:
           GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
@@ -5027,7 +5024,7 @@ jobs:
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       - name: Install dependencies (npm)
-        if: inputs.install-script == '' && inputs.package-manager == 'npm'
+        if: env.FAST_ENABLED == 'true' && (inputs.install-script == '' && inputs.package-manager == 'npm')
         run: npm ci
         env:
           GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
@@ -5037,10 +5034,10 @@ jobs:
       # Exact-path cleanup only: persistent self-hosted workspaces must not keep
       # registry credentials after install (success, failure, or cancel).
       - name: Remove package auth materialization
-        if: always() && inputs.install-script == ''
+        if: always() && inputs.install-script == '' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'
         run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
       - name: Install dependencies (caller script)
-        if: inputs.install-script != ''
+        if: env.FAST_ENABLED == 'true' && (inputs.install-script != '')
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
           NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
@@ -5065,6 +5062,7 @@ jobs:
           "$PM" run "$INSTALL_SCRIPT"
 
       - name: Run fast scripts
+        if: env.FAST_ENABLED == 'true'
         env:
           SCRIPTS: ${{ inputs.fast-scripts }}
           PM: ${{ inputs.package-manager }}
@@ -5102,7 +5100,7 @@ jobs:
       # `fast-escalated` runs this same script when it holds the name `Fast`,
       # after the full gate.
       - name: Publish Fast escalation
-        if: success()
+        if: env.FAST_ENABLED == 'true' && (success())
         working-directory: ${{ github.workspace }}
         env:
           ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
@@ -5417,9 +5415,8 @@ jobs:
     steps:
       # Anchored: `fast-escalated` (the `Fast` check on a protected-path pull
       # request) runs this exact step, not a copy of it.
-      - &required_gate_step
-        name: Require enabled gates to succeed and disabled gates to skip
-        env:
+      - name: Require enabled gates to succeed and disabled gates to skip
+        env: &required_gate_env
           BUILD_RESULT: ${{ needs.build.result }}
           CHECKS_RESULT: ${{ needs.checks.result }}
           E2E_PLAN_RESULT: ${{ needs.e2e-plan.result }}
@@ -5446,7 +5443,7 @@ jobs:
           # P3-C1: `Reuse plan` proved this tree, or this is journey-smoke mode.
           REUSED: ${{ needs.reuse-plan.outputs.reused }}
           JOURNEY_SMOKE_URL: ${{ inputs.journey-smoke-url }}
-        run: |
+        run: &required_gate_script |
           set -euo pipefail
           status=0
           # build has no `if:` — it must always report success.
@@ -5540,10 +5537,7 @@ jobs:
         env:
           REUSE_APPLIES: ${{ inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
           REUSE_PLAN_RESULT: ${{ needs.reuse-plan.result }}
-          REUSED: ${{ needs.reuse-plan.outputs.reused }}
-          FAST_SCRIPTS: ${{ inputs.fast-scripts }}
           FAST_RESULT: ${{ needs.fast.result }}
-          ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
           FAST_ESCALATED_RESULT: ${{ needs.fast-escalated.result }}
           JOURNEY_SMOKE_URL: ${{ inputs.journey-smoke-url }}
           JOURNEY_SMOKE_RESULT: ${{ needs.journey-smoke.result }}
@@ -5567,17 +5561,8 @@ jobs:
           else
             require_skipped reuse-plan "$REUSE_PLAN_RESULT"
           fi
-          if [ -n "$FAST_SCRIPTS" ] && [ -z "$JOURNEY_SMOKE_URL" ] && [ "${REUSED:-}" != true ]; then
-            require_success fast "$FAST_RESULT"
-            if [ "$ESCALATED" = true ]; then
-              require_success fast-escalated "$FAST_ESCALATED_RESULT"
-            else
-              require_skipped fast-escalated "$FAST_ESCALATED_RESULT"
-            fi
-          else
-            require_skipped fast "$FAST_RESULT"
-            require_skipped fast-escalated "$FAST_ESCALATED_RESULT"
-          fi
+          require_success fast "$FAST_RESULT"
+          require_success fast-escalated "$FAST_ESCALATED_RESULT"
           if [ -n "$JOURNEY_SMOKE_URL" ]; then
             require_success journey-smoke "$JOURNEY_SMOKE_RESULT"
           else
@@ -5642,22 +5627,23 @@ jobs:
             const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
             await store.publishProofStep({ core, context, kind: 'e2e' });
 
-  # Placed after `Required` on purpose: it runs a YAML alias of `Required`'s
-  # gate step, and an alias must follow its anchor. The escalation summary
+  # Placed after `Required` on purpose: it aliases `Required`'s gate
+  # environment and script, and aliases must follow their anchors. The escalation summary
   # follows that gate and never fails, so it cannot skip or redden the proof.
   # The `Fast` check for a pull request that touches a protected path
   # (`e2e-full-paths`). It needs every lane the full gate needs and applies the
-  # IDENTICAL `Required` gate step (a YAML alias of it, not a copy), so on those
-  # PRs `ci / Fast` means "the full gate passed". Skipped everywhere else,
-  # where its check shows the raw name template (GitHub does not evaluate a
-  # skipped job's name; see NAMING IS THE GATE at `fast`), or `Fast
-  # (escalation not needed)` if GitHub ever does. A job waiting on its needs has
-  # no check run yet, so the `Fast` context stays pending, which blocks the
+  # IDENTICAL `Required` gate environment and script (YAML aliases), so on those
+  # PRs `ci / Fast` means "the full gate passed". Everywhere else its steps
+  # skip and the job finishes as `Fast (escalation not needed)`. Starting the
+  # job lets GitHub resolve that name (see NAMING IS THE GATE at `fast`).
+  # A job waiting on its needs has no check run yet, so the `Fast` context stays pending, which blocks the
   # merge, until the full gate has finished.
   fast-escalated:
     name: ${{ (inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true') && 'Fast' || 'Fast (escalation not needed)' }}
     needs: [reuse-plan, fast, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run, caller-lint]
-    if: always() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true'
+    if: always()
+    env:
+      FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     timeout-minutes: 20
@@ -5665,6 +5651,7 @@ jobs:
       contents: read
     steps:
       - name: Require the fast lanes to succeed
+        if: env.FAST_ENABLED == 'true'
         env:
           FAST_RESULT: ${{ needs.fast.result }}
         run: |
@@ -5673,9 +5660,12 @@ jobs:
             echo "::error::fast job reported '$FAST_RESULT' (must succeed)"
             exit 1
           fi
-      - *required_gate_step
+      - name: Require enabled gates to succeed and disabled gates to skip
+        if: env.FAST_ENABLED == 'true'
+        env: *required_gate_env
+        run: *required_gate_script
       - name: Publish Fast escalation
-        if: success()
+        if: env.FAST_ENABLED == 'true' && (success())
         env:
           ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
         run: *fast_escalation_publish
