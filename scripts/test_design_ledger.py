@@ -16,7 +16,13 @@ Properties worth locking down:
   * `check` goes red while an entry is flagged, with a fix line per entry and
     the table appended to `$GITHUB_STEP_SUMMARY`, and green once it agrees.
   * An unknown `mode` fails loudly instead of skipping both jobs green.
-  * `flag` opens the ledger's one issue through `gh` with the caller's token.
+  * `flag` runs only on push, schedule or workflow_dispatch: on a pull request
+    the `flag` job is skipped and `check` fails loudly, exactly one job runs.
+  * `flag` opens the ledger's one issue through `gh` with the caller's token,
+    passes the body on stdin (a committed symlink in the checkout is never
+    written through), refuses a ledger whose `issue.repo` is not the caller,
+    and shows gh's own stderr when gh fails.
+  * A malformed ledger is an error; ledger text cannot start a workflow command.
   * `scripts/dc_ledger.py` runs alone: stdlib only, nothing beside it.
 
 Run: python3 scripts/test_design_ledger.py
@@ -26,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -40,6 +47,7 @@ WORKFLOW = ROOT / ".github" / "workflows" / "design-ledger.yml"
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 CHECKER = ROOT / "scripts" / "dc_ledger.py"
 TOOL_DIR = ".design-ledger-workflows"
+FLAG_EVENTS = ["push", "schedule", "workflow_dispatch"]
 
 BOARD = ('<div class="dc-app"><sc-if value="{{is.home}}" hint-placeholder-val="{{true}}"><div class="dc-app-body">'
          '<h1>Home</h1></div></sc-if><sc-if value="{{is.hosts}}" hint-placeholder-val="{{false}}">'
@@ -51,8 +59,12 @@ GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
 GH_STUB = '''#!/usr/bin/env python3
 import json, os, sys
 argv = sys.argv[1:]
+body = sys.stdin.read() if "--body-file" in argv and argv[argv.index("--body-file") + 1] == "-" else None
 with open(os.environ["GH_STUB_LOG"], "a", encoding="utf-8") as f:
-    f.write(json.dumps({"argv": argv, "token": os.environ.get("GH_TOKEN", "")}) + "\\n")
+    f.write(json.dumps({"argv": argv, "token": os.environ.get("GH_TOKEN", ""), "body": body}) + "\\n")
+if os.environ.get("GH_STUB_FAIL"):
+    sys.stderr.write(os.environ["GH_STUB_FAIL"] + "\\n")
+    sys.exit(1)
 if argv[:2] == ["issue", "list"]:
     print("[]")
 elif argv[:2] == ["issue", "create"]:
@@ -113,8 +125,21 @@ def check_shape() -> None:
     check("check job runs with contents: read only", jobs["check"]["permissions"] == {"contents": "read"})
     check("flag job adds issues: write and nothing else",
           jobs["flag"]["permissions"] == {"contents": "read", "issues": "write"})
-    check("check job runs unless mode is flag", jobs["check"]["if"].strip() == "inputs.mode != 'flag'")
-    check("flag job runs only for mode flag", jobs["flag"]["if"].strip() == "inputs.mode == 'flag'")
+    allowed = json.dumps(FLAG_EVENTS, separators=(",", ":"))
+    check("check job runs unless mode is flag on an allowed event (then it fails loudly)",
+          jobs["check"]["if"].strip()
+          == f"inputs.mode != 'flag' || !contains(fromJSON('{allowed}'), github.event_name)", jobs["check"]["if"])
+    check("flag job runs only for mode flag on push, schedule or workflow_dispatch",
+          jobs["flag"]["if"].strip()
+          == f"inputs.mode == 'flag' && contains(fromJSON('{allowed}'), github.event_name)", jobs["flag"]["if"])
+    for mode in ("check", "flag", "flagg"):
+        for event in ("pull_request", "pull_request_target", "push", "schedule", "workflow_dispatch", "merge_group"):
+            ran = [jid for jid in ("check", "flag") if evaluate_if(jobs[jid]["if"], mode, event)]
+            want = ["flag"] if mode == "flag" and event in FLAG_EVENTS else ["check"]
+            check(f"mode {mode} on {event}: exactly the {want[0]} job runs", ran == want, str(ran))
+    for jid, name in (("check", "Check the design ledger"), ("flag", "Keep the design drift issue")):
+        check(f"{jid}: the step sees the event name",
+              step(jid, name).get("env", {}).get("EVENT_NAME") == "${{ github.event_name }}")
 
     pin = ci_checkout_pin()
     for jid in ("check", "flag"):
@@ -137,6 +162,16 @@ def check_shape() -> None:
     flag_env = step("flag", "Keep the design drift issue").get("env", {})
     check("flag passes the caller's own github.token", flag_env.get("GH_TOKEN") == "${{ github.token }}", str(flag_env))
     check("check step gets no token", "GH_TOKEN" not in step("check", "Check the design ledger").get("env", {}))
+
+
+def evaluate_if(expr: str, mode: str, event: str) -> bool:
+    """The job `if:` with the inputs substituted, run as Python. It covers only the
+    operators these two expressions use; anything else fails the translation."""
+    py = expr.replace("inputs.mode", repr(mode)).replace("github.event_name", repr(event))
+    py = py.replace("!=", " __NE__ ").replace("!", " not ").replace(" __NE__ ", " != ")
+    py = py.replace("||", " or ").replace("&&", " and ").replace("fromJSON(", "json.loads(")
+    py = re.sub(r"contains\(", "_contains(", py)
+    return bool(eval(py, {"json": json, "_contains": lambda seq, item: item in seq}))
 
 
 def git(repo: Path, *args: str) -> None:
@@ -224,13 +259,62 @@ def check_behaviour() -> None:
         rc, out = p.run(check_run, MODE="flagg")
         check("check: an unknown mode fails loudly", rc == 1 and "mode must be 'check' or 'flag'" in out, out)
 
-        rc, out = p.run(flag_run, GH_TOKEN="caller-token")
+        rc, out = p.run(check_run, MODE="flag", EVENT_NAME="pull_request")
+        check("check: mode flag on a pull request fails loudly",
+              rc == 1 and "mode 'flag' runs only on push, schedule or workflow_dispatch (got 'pull_request')" in out, out)
+        rc, out = p.run(flag_run, GH_TOKEN="caller-token", EVENT_NAME="pull_request", GITHUB_REPOSITORY="example/seed")
+        check("flag: the step itself refuses a pull_request event, before any gh call",
+              rc == 1 and "flag refuses event 'pull_request'" in out and p.gh_calls() == [], out)
+
+        rc, out = p.run(flag_run, GH_TOKEN="caller-token", EVENT_NAME="push", GITHUB_REPOSITORY="example/other")
+        check("flag: an issue.repo that is not the caller is an error, before any gh call",
+              rc == 2 and "`issue.repo` is example/seed but this run is in example/other" in out
+              and p.gh_calls() == [], out)
+
+        rc, out = p.run(flag_run, GH_TOKEN="caller-token", EVENT_NAME="push", GITHUB_REPOSITORY="example/seed",
+                        GH_STUB_FAIL="HTTP 403: Resource not accessible by integration")
+        check("flag: gh's own stderr reaches the log",
+              rc == 2 and "gh issue list failed (exit 1): HTTP 403: Resource not accessible by integration" in out, out)
+        p.gh_log.write_text("")
+
+        victim = Path(t) / "victim.txt"
+        victim.write_text("precious\n")
+        link = p.root / "design/canvas/.dc-ledger-issue.md"
+        link.symlink_to(victim)
+        rc, out = p.run(flag_run, GH_TOKEN="caller-token", EVENT_NAME="push", GITHUB_REPOSITORY="example/seed")
         calls = p.gh_calls()
         created = [c for c in calls if c["argv"][:2] == ["issue", "create"]]
         check("flag: opens the ledger's one issue on the ledger's repo", rc == 0 and len(created) == 1
               and "example/seed" in created[0]["argv"] and "Design drift: Seed" in created[0]["argv"], out + str(calls))
         check("flag: every gh call carries the caller's token", calls and all(c["token"] == "caller-token" for c in calls))
         check("flag: prints the action", "opened #7" in out, out)
+        check("flag: the body goes to gh on stdin",
+              created and created[0]["argv"][created[0]["argv"].index("--body-file") + 1] == "-"
+              and "<!-- dc-ledger: Seed -->" in (created[0]["body"] or ""), str(created))
+        check("flag: a committed symlink at the old body path is left untouched",
+              victim.read_text() == "precious\n" and link.is_symlink(), victim.read_text())
+
+        ledger = p.root / p.ledger
+        good = ledger.read_text()
+        doc = json.loads(good)
+        doc["entries"][0]["code"] = "pages/index.vue"
+        ledger.write_text(json.dumps(doc))
+        rc, out = p.run(check_run, MODE="check")
+        check("check: a string `code` is an error naming the entry",
+              rc == 2 and "entry 'home': `code` must be a list of paths" in out, out)
+        doc["entries"][0]["code"] = ["pages/index.vue"]
+        doc["gate"] = {"state": "clear"}
+        ledger.write_text(json.dumps(doc))
+        rc, out = p.run(check_run, MODE="check")
+        check("check: a gate typo is an error, not an open gate", rc == 2 and "`gate.state` must be" in out, out)
+        doc["gate"] = {"state": "cleared"}
+        doc["canvas"] = "::error::pwned\n::warning::x"
+        doc["entries"][0]["id"] = "home\n::set-env name=A::b"
+        ledger.write_text(json.dumps(doc))
+        rc, out = p.run(check_run, MODE="check")
+        check("check: ledger text cannot start a workflow command",
+              rc == 1 and not any(ln.lstrip().startswith("::") for ln in out.splitlines()) and "::" not in out, out)
+        ledger.write_text(good)
 
 
 def check_standalone() -> None:
