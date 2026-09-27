@@ -2,3 +2,11 @@ self-hosted-runner:
   labels:
     - proxmox
     - linux-ci
+paths:
+  # `job.workflow_sha` is the reusable workflow's own commit (GitHub Docs,
+  # "Contexts reference", job context); `github.job_workflow_sha` reads empty
+  # in a called job (actions/runner#2417). actionlint 1.7.12 predates the
+  # property, so ignore exactly that message, only in this file.
+  .github/workflows/design-ledger.yml:
+    ignore:
+      - 'property "workflow_sha" is not defined in object type \{check_run_id'

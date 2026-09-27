@@ -1,0 +1,162 @@
+name: Reusable Design Ledger
+
+# agent-infrastructure#1804. A product keeps a design ledger beside each Claude
+# Design canvas (`design/<canvas>/ledger.json`): which canvas screen specifies
+# which code, and the design and code hashes from when the build last matched
+# the canvas. `scripts/dc_ledger.py` reads drift in both directions:
+#
+#   not-built      the design changed; the code has not followed
+#   design-stale   the code changed; the canvas was not amended
+#   diverged       both moved
+#
+# This callable runs that checker in a caller's CI with no token and no
+# checkout of private agent-infrastructure. `scripts/dc_ledger.py` here is a
+# byte copy of agent-infrastructure's `skills/claude-design-ops/scripts/
+# dc_ledger.py`; agent-infrastructure's `scripts/check-dc-ledger-parity` fails
+# when the two differ. Change the canonical file there, then copy it here.
+#
+# ADVISORY. Logan, 2026-09-27: "Red check + drift issue (Recommended)". The
+# `check` job goes red on a flagged entry, but it is NEVER a required check:
+# there is no `Required` job here on purpose, and a caller must not add
+# `<job> / check` to branch protection. A caller must not name its calling job
+# `ci` either, or the composed context would sit beside `ci / Required`.
+#
+# MODES
+#   check  `status --check --github-summary`: exit 1 while any entry is
+#          flagged, one fix line per entry in the log, the table in the job
+#          summary. Needs `contents: read` only.
+#   flag   `flag`: open, update, reopen or close the ledger's one
+#          `Design drift: <canvas>` issue on the caller's repo, with the
+#          caller's own `github.token`. Needs `issues: write`.
+#
+# ADOPTION (a private caller; the ledger's mapped paths in `paths:`):
+#
+#   on:
+#     pull_request:
+#       paths: ["design/<canvas>/**", "apps/web/app/**"]
+#     push:
+#       branches: [main]
+#   jobs:
+#     design-ledger:
+#       uses: narduk-enterprises/workflows/.github/workflows/design-ledger.yml@<sha> # v2.1.0
+#       permissions:
+#         contents: read
+#         issues: write   # see "PERMISSIONS" below
+#       with:
+#         ledger: design/<canvas>/ledger.json
+#         mode: ${{ github.event_name == 'push' && 'flag' || 'check' }}
+#
+# PERMISSIONS. GitHub checks every job's `permissions:` in a called workflow
+# against the caller's grant when the run starts, skipped jobs included, so
+# the grant must cover the `flag` job even in a check-only call. Proven on
+# workflows#155: a `mode: check` caller granting only `contents: read` ended
+# in `startup_failure` with no jobs. `check` itself still runs with
+# `contents: read`.
+#
+# The checker runs from THIS repository at `job.workflow_sha`, the exact
+# commit the caller pinned, never from the caller's tree, so a pull request
+# cannot change the code that judges it. It never runs the ledger's `build`
+# command.
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      ledger:
+        description: "Path to the ledger JSON, relative to the caller's repository root."
+        required: true
+        type: string
+      mode:
+        description: >-
+          `check` (default): fail while any entry is flagged and write the job
+          summary. `flag`: keep the ledger's one drift issue on the caller's
+          repository. Any other value fails the `check` job.
+        required: false
+        type: string
+        default: "check"
+      runs-on:
+        description: >-
+          JSON-encoded runner for this job: a plain string ("ubuntu-latest"),
+          a JSON array, or a JSON object matching the runner-fleet manifest's
+          `runsOn` shape. Decoded with fromJSON(). Empty (the default) routes
+          a PRIVATE caller to the fleet manifest's linux-ci organization-group
+          route and a public or visibility-unknown caller to GitHub-hosted
+          ubuntu-latest; an explicit value always wins. A PUBLIC (or
+          possibly-future-public) CALLER MUST NEVER PASS A SELF-HOSTED LABEL.
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  check:
+    name: check
+    if: inputs.mode != 'flag'
+    runs-on: ${{ fromJSON(inputs.runs-on || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the caller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the ledger checker
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: narduk-enterprises/workflows
+          ref: ${{ job.workflow_sha }}
+          path: .design-ledger-workflows
+          persist-credentials: false
+          sparse-checkout: scripts/dc_ledger.py
+          sparse-checkout-cone-mode: false
+
+      - name: Check the design ledger
+        env:
+          LEDGER: ${{ inputs.ledger }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" != "check" ]; then
+            echo "::error::design-ledger: mode must be 'check' or 'flag' (got '$MODE')"
+            exit 1
+          fi
+          python3 .design-ledger-workflows/scripts/dc_ledger.py status "$LEDGER" --check --github-summary
+
+  flag:
+    name: flag
+    if: inputs.mode == 'flag'
+    runs-on: ${{ fromJSON(inputs.runs-on || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    # One reconcile at a time per repo and ledger, so two pushes landing
+    # together cannot both open the issue.
+    concurrency:
+      group: design-ledger-${{ github.repository }}-${{ inputs.ledger }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out the caller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the ledger checker
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: narduk-enterprises/workflows
+          ref: ${{ job.workflow_sha }}
+          path: .design-ledger-workflows
+          persist-credentials: false
+          sparse-checkout: scripts/dc_ledger.py
+          sparse-checkout-cone-mode: false
+
+      - name: Keep the design drift issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LEDGER: ${{ inputs.ledger }}
+        run: |
+          set -euo pipefail
+          python3 .design-ledger-workflows/scripts/dc_ledger.py flag "$LEDGER"

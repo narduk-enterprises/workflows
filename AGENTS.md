@@ -2,12 +2,12 @@
 
 workflows holds the shared reusable GitHub Actions workflows that the rest of
 the `narduk-enterprises` estate calls instead of blob-copying YAML — fix CI in
-one place, not in a hundred repos. Nine callables live in
+one place, not in a hundred repos. Ten callables live in
 [`.github/workflows/`](./.github/workflows/), all `on: workflow_call` only
 (`apple.yml`, `cursor-review.yml`,
 `docs-governance.yml`, `node-library.yml`, `nuxt-cloudflare.yml`,
 `python-data.yml`, `reusable-browser-tests.yml`, `red-main-listener.yml`,
-`flake-digest.yml`); `closing-syntax-check.yml`, `code-review.yml` and
+`flake-digest.yml`, `design-ledger.yml`); `closing-syntax-check.yml`, `code-review.yml` and
 `reusable-node-ci.yml` were retired (narduk-reboot P3-C2 / O-D8, zero live
 callers/adopters re-verified, see README's Catalog and Adopters tables).
 `ci.yml`, `cursor-review-self.yml` and `red-main-self.yml` are the three

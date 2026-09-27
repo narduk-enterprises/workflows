@@ -187,6 +187,9 @@ jobs:
       - name: Weekly flake digest behaviour tests
         run: python3 scripts/test_flake_digest.py
 
+      - name: Design ledger shape and behaviour tests
+        run: python3 scripts/test_design_ledger.py
+
       # The reviewer launcher's suite was never wired in here. It shipped
       # 2026-09-20 with 98 tests -- the four spend limits, the daily-cap
       # ledger-shape fixture, the YAML-to-Python label allow-list binding --
