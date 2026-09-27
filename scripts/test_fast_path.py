@@ -11,7 +11,7 @@ interpreter in test_runner_default.py, and every `run:`/`script:` block is
 extracted and executed against fixtures.
 
 The first group is the backward-compatibility contract: with every new input
-at its default, no new job runs, no job is named `Fast`, every pre-existing
+at its default, no Fast step runs, no job is named `Fast`, every pre-existing
 lane keeps its old run condition, and `Required` reads exactly as before.
 
 Run: python3 scripts/test_fast_path.py
@@ -235,16 +235,21 @@ def simulate(jobs: dict, inputs: dict, event: str, ref: str = "refs/heads/main",
 
 
 def run_gates(job_id: str, state: dict) -> list:
-    """Run every unconditional `run:` step of `job_id` (the Required gate
-    steps) with env rendered from the simulated `needs`; [(name, rc, out)]."""
-    ctx = state[job_id]["ctx"]
+    """Execute the shipped gate steps with their job env and step conditions."""
+    ctx = {**state[job_id]["ctx"], "__status": "success"}
+    ctx["env"] = {key: gh_str(render(value, ctx))
+                  for key, value in JOBS[job_id].get("env", {}).items()}
     ran = []
     for s in JOBS[job_id]["steps"]:
-        if "run" not in s or "if" in s:
+        if s.get("name") not in (GATE_STEP, FAST_STEP, "Require the fast lanes to succeed"):
+            continue
+        if not ev(job_condition(s), ctx):
             continue
         env = {key: gh_str(render(value, ctx)) for key, value in (s.get("env") or {}).items()}
         result = run_bash(render(s["run"], ctx), env)
         ran.append((s["name"], result.returncode, result.stdout + result.stderr))
+        if result.returncode:
+            ctx["__status"] = "failure"
     return ran
 
 
@@ -288,7 +293,7 @@ def test_simulator_models_skip_propagation() -> None:
 def test_default_graph_matches_origin_main() -> None:
     """Every fast-path input at its default: each pre-existing job must run,
     skip or fail exactly as on origin/main, for every event, lane input, one
-    failing lane and a cancelled run; every new job must be skipped."""
+    failing lane and a cancelled run; disabled Fast jobs are successful no-ops."""
     assert set(JOBS) == set(OLD_GRAPH) | NEW_JOBS, set(JOBS) ^ (set(OLD_GRAPH) | NEW_JOBS)
     faults = [(None, False), (None, True)] + [
         (job, False) for job in ("build", "checks", "extra-gate", "e2e-plan", "e2e", "preview", "caller-lint")]
@@ -307,7 +312,8 @@ def test_default_graph_matches_origin_main() -> None:
                 assert new[job]["result"] == old[job]["result"], (
                     job, new[job]["result"], old[job]["result"], event, inputs, skipped, shards, failing, cancelled)
             for job in NEW_JOBS:
-                assert new[job]["result"] == "skipped", (job, event, inputs)
+                expected = "success" if job in ("fast", "fast-escalated") else "skipped"
+                assert new[job]["result"] == expected, (job, event, inputs)
             cases += 1
     print(f"PASS  defaults: every pre-existing job runs/skips as on origin/main with skip propagation ({cases} runs)")
 
@@ -349,24 +355,27 @@ def test_enabled_modes_on_the_real_graph() -> None:
     # Required reuse on a default-branch push: a proven tree skips every lane.
     reuse = {**full, "required-reuse-pr-results": True}
     state = simulate(JOBS, reuse, "push", "refs/heads/main", {"reuse-plan": {"reused": "true"}, **plan_outputs("false", "2")})
-    assert {j: state[j]["result"] for j in CI_LANES + ["fast", "fast-escalated", "journey-smoke"]} == dict.fromkeys(
-        CI_LANES + ["fast", "fast-escalated", "journey-smoke"], "skipped")
+    assert {j: state[j]["result"] for j in CI_LANES + ["journey-smoke"]} == dict.fromkeys(
+        CI_LANES + ["journey-smoke"], "skipped")
+    assert run_gates("fast-escalated", state) == []
     assert state["reuse-plan"]["result"] == state["caller-lint"]["result"] == "success"
     green("required", state)
     # No proof: the full gate runs, as before.
     state = simulate(JOBS, reuse, "push", "refs/heads/main", {"reuse-plan": {"reused": "false"}, **plan_outputs("false", "2")})
     ran = {j for j in JOBS if state[j]["result"] == "success"}
-    assert ran == set(CI_LANES) - {"preview"} | {"reuse-plan", "caller-lint", "fast", "required"}, ran
+    assert ran == set(CI_LANES) - {"preview"} | {"reuse-plan", "caller-lint", "fast", "fast-escalated", "required"}, ran
     green("required", state)
     # Journey-smoke mode: every CI lane skipped, the smoke runs.
     smoke = {**full, "journey-smoke-url": "https://app.example"}
     state = simulate(JOBS, smoke, "workflow_dispatch", "refs/heads/main", plan_outputs())
     ran = {j for j in JOBS if state[j]["result"] == "success"}
-    assert ran == {"journey-smoke", "caller-lint", "required"}, ran
+    assert ran == {"journey-smoke", "caller-lint", "required", "fast", "fast-escalated"}, ran
+    assert run_gates("fast-escalated", state) == []
     green("required", state)
     # ci / Fast on a pull request without a protected path.
     state = simulate(JOBS, full, "pull_request", "refs/pull/1/merge", plan_outputs("false", "2", "false"))
-    assert state["fast"]["result"] == "success" and state["fast-escalated"]["result"] == "skipped"
+    assert state["fast"]["result"] == state["fast-escalated"]["result"] == "success"
+    assert run_gates("fast-escalated", state) == []
     assert render(JOBS["fast"]["name"], state["fast"]["ctx"]) == "Fast"
     assert all(state[j]["result"] == "success" for j in CI_LANES), state
     green("required", state)
@@ -407,11 +416,11 @@ def test_defaults_leave_every_lane_as_before() -> None:
             assert bool(ev(JOBS[job]["if"], ctx)) == expected, (job, event, status)
         needs = dict(SKIPPED_REUSE, **{"e2e-plan": {"result": "success", "outputs": {"full": "true"}}})
         ctx["needs"] = needs
-        assert ev(JOBS["fast"]["if"], ctx) is False
-        # GitHub shows a skipped job's raw name template today; this is the
-        # name if it ever evaluates it (test_skipped_fast_jobs_never_show_fast).
+        assert ev(JOBS["fast"]["if"], ctx) is True
+        assert ev(JOBS["fast"]["env"]["FAST_ENABLED"], ctx) is False
         assert ev(JOBS["fast"]["name"], ctx) == "Fast (not run)"
-        assert ev(JOBS["fast-escalated"]["if"], ctx) is False
+        assert ev(JOBS["fast-escalated"]["if"], ctx) is True
+        assert ev(JOBS["fast-escalated"]["env"]["FAST_ENABLED"], ctx) is False
         assert ev(JOBS["fast-escalated"]["name"], ctx) != "Fast"
         assert ev(JOBS["journey-smoke"]["if"], ctx) is False
         key_step = step("required", "Compute Required proof key")
@@ -419,7 +428,7 @@ def test_defaults_leave_every_lane_as_before() -> None:
     checkout = JOBS["e2e"]["steps"][0]
     for event, ref in EVENTS:
         assert ev(checkout["with"]["fetch-depth"], context(event, ref)) == 1
-    print("PASS  defaults: new jobs skip, no job is named Fast, old lanes keep their conditions")
+    print("PASS  defaults: Fast steps are disabled, no job is named Fast, old lanes keep their conditions")
 
 
 def run_bash(script: str, env: dict, cwd: str | None = None) -> subprocess.CompletedProcess:
@@ -463,33 +472,21 @@ def test_required_gate_reuse_and_smoke_branches() -> None:
 
 def test_required_fast_path_step() -> None:
     script = step("required", FAST_STEP)["run"]
-    base = {"REUSE_APPLIES": "false", "REUSE_PLAN_RESULT": "skipped", "REUSED": "",
-            "FAST_SCRIPTS": "", "FAST_RESULT": "skipped", "ESCALATED": "false",
-            "FAST_ESCALATED_RESULT": "skipped", "JOURNEY_SMOKE_URL": "", "JOURNEY_SMOKE_RESULT": "skipped"}
+    base = {"REUSE_APPLIES": "false", "REUSE_PLAN_RESULT": "skipped",
+            "FAST_RESULT": "success", "FAST_ESCALATED_RESULT": "success",
+            "JOURNEY_SMOKE_URL": "", "JOURNEY_SMOKE_RESULT": "skipped"}
     cases = [
         ({}, 0),
-        ({"FAST_RESULT": "success"}, 1),
         ({"JOURNEY_SMOKE_RESULT": "success"}, 1),
         ({"REUSE_PLAN_RESULT": "success"}, 1),
-        ({"FAST_SCRIPTS": "lint", "FAST_RESULT": "success"}, 0),
-        ({"FAST_SCRIPTS": "lint", "FAST_RESULT": "failure"}, 1),
-        ({"FAST_SCRIPTS": "lint", "FAST_RESULT": "skipped"}, 1),
-        ({"FAST_SCRIPTS": "lint", "FAST_RESULT": "success", "ESCALATED": "true",
-          "FAST_ESCALATED_RESULT": "success"}, 0),
-        ({"FAST_SCRIPTS": "lint", "FAST_RESULT": "success", "ESCALATED": "true",
-          "FAST_ESCALATED_RESULT": "failure"}, 1),
-        ({"FAST_SCRIPTS": "lint", "FAST_RESULT": "success", "ESCALATED": "true",
-          "FAST_ESCALATED_RESULT": "skipped"}, 1),
-        ({"FAST_SCRIPTS": "lint", "FAST_RESULT": "success", "FAST_ESCALATED_RESULT": "success"}, 1),
         ({"REUSE_APPLIES": "true", "REUSE_PLAN_RESULT": "success"}, 0),
         ({"REUSE_APPLIES": "true", "REUSE_PLAN_RESULT": "failure"}, 1),
-        ({"REUSE_APPLIES": "true", "REUSE_PLAN_RESULT": "success", "REUSED": "true",
-          "FAST_SCRIPTS": "lint", "FAST_RESULT": "skipped"}, 0),
         ({"JOURNEY_SMOKE_URL": "https://app.example", "JOURNEY_SMOKE_RESULT": "success"}, 0),
         ({"JOURNEY_SMOKE_URL": "https://app.example", "JOURNEY_SMOKE_RESULT": "failure"}, 1),
-        ({"JOURNEY_SMOKE_URL": "https://app.example", "JOURNEY_SMOKE_RESULT": "success",
-          "FAST_SCRIPTS": "lint", "FAST_RESULT": "skipped"}, 0),
     ]
+    for key, outcome in itertools.product(
+            ("FAST_RESULT", "FAST_ESCALATED_RESULT"), ("failure", "cancelled", "skipped", "")):
+        cases.append(({key: outcome}, 1))
     for overrides, expected in cases:
         result = run_bash(script, {**base, **overrides})
         assert result.returncode == expected, (overrides, result.stdout, result.stderr)
@@ -513,6 +510,7 @@ def test_fast_naming_never_skips_a_fast_check() -> None:
             name = ev(JOBS[job]["name"], ctx)
             if name == "Fast":
                 assert ev(JOBS[job]["if"], ctx) is True, (job, event, scripts, smoke, reused, full)
+                assert ev(JOBS[job]["env"]["FAST_ENABLED"], ctx) is True, (job, ctx)
                 named_fast.append(job)
         runs_fast = bool(scripts) and not smoke and reused != "true"
         assert len(named_fast) == (1 if runs_fast else 0), (named_fast, event, scripts, smoke, reused, full)
@@ -530,7 +528,8 @@ def test_fast_escalated_reuses_the_required_gate() -> None:
     # failure cannot skip the full-suite proof. The gate step itself is the
     # Required step, not a copy.
     gate = job["steps"][-2]
-    assert gate == step("required", GATE_STEP), "escalated Fast must run the Required gate step"
+    assert {k: v for k, v in gate.items() if k != "if"} == step("required", GATE_STEP), \
+        "escalated Fast must run the Required gate environment and script"
     assert job["steps"][-1].get("name") == "Publish Fast escalation"
     referenced = set(re.findall(r"needs\.([a-z0-9-]+)\.", json.dumps(gate)))
     assert referenced <= set(job["needs"]), referenced - set(job["needs"])
@@ -576,7 +575,7 @@ def test_fast_escalation_is_published_on_the_check_named_fast() -> None:
         assert "checks" not in JOBS[job]["permissions"], job
         assert "outputs" not in JOBS[job], job
         publish = step(job, "Publish Fast escalation")
-        assert publish["if"] == "success()"
+        assert publish["if"] == "env.FAST_ENABLED == 'true' && (success())"
         assert set(publish["env"]) == {"ESCALATED"}, publish["env"]
     assert step("fast", "Publish Fast escalation")["run"] == step("fast-escalated", "Publish Fast escalation")["run"]
     # The name expressions carry the flag: escalation moves `Fast` and names
@@ -624,20 +623,44 @@ def test_escalation_fails_closed_on_unknown_plan() -> None:
     print("PASS  escalation fails closed when e2e-full-paths is set and the plan did not succeed or cannot run")
 
 
-def test_skipped_fast_jobs_never_show_fast() -> None:
-    """GitHub does not evaluate the `name:` of a job it skips (community
-    discussions #13261 and #152293): the check shows the raw template. So the
-    two computed names must never BE `Fast` as raw text, and every other job
-    name must be static and not `Fast`. test_fast_naming_never_skips_a_fast_check
-    covers the other case, a GitHub that does evaluate skipped names."""
-    for job in ("fast", "fast-escalated"):
-        raw = JOBS[job]["name"].strip()
-        assert raw.startswith("${{") and raw.endswith("}}") and raw != "Fast", (job, raw)
+def test_fast_jobs_have_readable_names_and_disabled_steps() -> None:
+    """Jobs must start for GitHub to resolve names; disabled steps do no work."""
+    cases = 0
+    for (event, ref), scripts, smoke, reused, full, status in itertools.product(
+            EVENTS, ["", "lint"], ["", "https://app.example"], ["", "true", "false"],
+            ["", "true", "false"], ["success", "failure", "cancelled"]):
+        ctx = context(event, ref, {"fast-scripts": scripts, "journey-smoke-url": smoke},
+                      {"reuse-plan": {"outputs": {"reused": reused}},
+                       "e2e-plan": {"outputs": {"full": full}}}, status)
+        ctx["runner"] = {"environment": "github-hosted"}
+        fast_enabled = bool(scripts) and not smoke and reused != "true"
+        escalated = event in ("pull_request", "pull_request_target") and full == "true"
+        for job_id in ("fast", "fast-escalated"):
+            job = JOBS[job_id]
+            assert ev(job["if"], ctx) is True, (job_id, ctx)
+            enabled = fast_enabled and (job_id == "fast" or escalated)
+            actual = ev(job["env"]["FAST_ENABLED"], ctx)
+            assert actual == enabled, (job_id, ctx)
+            ctx["env"] = {"FAST_ENABLED": gh_str(actual)}
+            name = ev(job["name"], ctx)
+            assert name in {"Fast", "Fast (not run)", "Fast lanes (escalated)",
+                            "Fast (escalation not needed)"}, (job_id, name)
+            if not enabled:
+                assert name != "Fast", (job_id, ctx)
+                for item in job["steps"]:
+                    assert not ev(job_condition(item), ctx), (job_id, item, ctx)
+            if job_id == "fast":
+                assert ev(job_condition(step(job_id, "Run fast scripts")), ctx) == (
+                    enabled and status == "success"), ctx
+                # Cleanup must still run on failure/cancellation when enabled.
+                # Caller scripts may write GITHUB_ENV; cleanup uses immutable inputs.
+                ctx["env"]["FAST_ENABLED"] = "false"
+                assert ev(job_condition(step(job_id, "Remove package auth materialization")), ctx) == enabled, ctx
+        cases += 1
     for job_id, job in JOBS.items():
-        if job_id in ("fast", "fast-escalated"):
-            continue
-        assert "${{" not in job["name"] and job["name"] != "Fast", (job_id, job["name"])
-    print("PASS  a skipped fast job shows its raw template, never `Fast`; no other job can be named Fast")
+        if job_id not in ("fast", "fast-escalated"):
+            assert "${{" not in job["name"] and job["name"] != "Fast", (job_id, job["name"])
+    print(f"PASS  readable Fast names, disabled steps do no work, enabled cleanup survives cancellation ({cases} cases)")
 
 
 def run_script(script: str, scenario: dict, inputs: dict, env_name: str,
@@ -846,7 +869,7 @@ def main() -> None:
     test_default_graph_matches_origin_main()
     test_default_callers_required_passes_on_the_real_graph()
     test_enabled_modes_on_the_real_graph()
-    test_skipped_fast_jobs_never_show_fast()
+    test_fast_jobs_have_readable_names_and_disabled_steps()
     test_required_gate_reuse_and_smoke_branches()
     test_required_fast_path_step()
     test_fast_naming_never_skips_a_fast_check()

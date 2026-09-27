@@ -120,6 +120,8 @@ def auth_jobs(document: dict) -> dict[str, dict]:
 
 
 def validate_cleanup_step(job_id: str, step: dict, condition: str = "always() && inputs.install-script == ''") -> None:
+    if job_id == "fast":
+        condition += " && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     assert step.get("if") == condition, (
         f"{job_id}: cleanup must always run for the legacy materialization path, "
         f"got {step.get('if')!r}"
@@ -140,6 +142,15 @@ def validate_cleanup_step(job_id: str, step: dict, condition: str = "always() &&
         )
 
 
+def install_condition(job_id: str, step: dict) -> str:
+    condition = step.get("if", "")
+    if job_id == "fast":
+        prefix = "env.FAST_ENABLED == 'true' && ("
+        assert condition.startswith(prefix) and condition.endswith(")"), condition
+        return condition[len(prefix):-1]
+    return condition
+
+
 def validate_job(job_id: str, job: dict) -> None:
     names = step_names(job)
     auth = named_steps(job, AUTH_STEP)
@@ -153,7 +164,7 @@ def validate_job(job_id: str, job: dict) -> None:
     auth_i = names.index(AUTH_STEP)
     cleanup_i = names.index(CLEANUP_STEP)
     assert auth_i < cleanup_i, f"{job_id}: cleanup must follow auth configuration"
-    assert auth[0].get("if") == "inputs.install-script == ''", (
+    assert install_condition(job_id, auth[0]) == "inputs.install-script == ''", (
         f"{job_id}: legacy auth must be disabled when caller-owned install is selected"
     )
 
@@ -168,7 +179,7 @@ def validate_job(job_id: str, job: dict) -> None:
             f"(auth={auth_i}, install={install_i}, cleanup={cleanup_i})"
         )
         install_step = named_steps(job, install_name)[0]
-        assert install_step.get("if", "").startswith("inputs.install-script == '' &&"), (
+        assert install_condition(job_id, install_step).startswith("inputs.install-script == '' &&"), (
             f"{job_id}/{install_name}: legacy install must be disabled for caller-owned install"
         )
         env = install_step.get("env") or {}
@@ -183,7 +194,7 @@ def validate_job(job_id: str, job: dict) -> None:
         f"{job_id}: expected one caller-owned install step, found {len(caller_install)}"
     )
     caller = caller_install[0]
-    assert caller.get("if") == "inputs.install-script != ''"
+    assert install_condition(job_id, caller) == "inputs.install-script != ''"
     caller_env = caller.get("env") or {}
     assert caller_env.get("NVAULT_TOKEN") == CALLER_NVAULT_EXPR
     assert "NARDUK_PLATFORM_GH_PACKAGES_READ" not in caller_env

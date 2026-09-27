@@ -30,7 +30,10 @@ class ExactCandidate(unittest.TestCase):
                     self.assertEqual(step['with']['ref'], '${{ inputs.expected-candidate-sha }}', name)
                     guard = steps[index + 1]
                     self.assertEqual(guard['name'], 'Verify exact validation candidate', name)
-                    self.assertEqual(guard['if'], "inputs.expected-candidate-sha != ''", name)
+                    condition = "inputs.expected-candidate-sha != ''"
+                    if name == 'fast':
+                        condition = f"env.FAST_ENABLED == 'true' && ({condition})"
+                    self.assertEqual(guard['if'], condition, name)
                     self.assertEqual(guard['working-directory'], '${{ github.workspace }}')
         self.assertGreaterEqual(checked, 8)
 

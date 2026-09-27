@@ -1535,7 +1535,7 @@ workflow run:
 
 | Run | Check named `Fast` | Other Fast checks |
 | --- | --- | --- |
-| Plain | the `fast` job (lint and unit scripts) | `fast-escalated` is skipped |
+| Plain | the `fast` job (lint and unit scripts) | `Fast (escalation not needed)` (no-op) |
 | Escalated | the `fast-escalated` job (the full `Required` gate) | `Fast lanes (escalated)` (the lint and unit scripts) |
 
 So a readiness check that needs to know whether a `ci / Fast` run over 180
@@ -1544,7 +1544,13 @@ in the same check suite. Reading check-run names needs no extra permission,
 so callers grant nothing new for this. For people reading the run, the job
 holding `Fast` also writes a `### Fast escalation` step-summary section with
 the line `escalated: true` or `escalated: false`; that step never fails the
-job. Callers that leave `fast-scripts` empty still skip both jobs.
+job. Callers that leave `fast-scripts` empty skip every step in both Fast jobs;
+the jobs finish as `Fast (not run)` and `Fast (escalation not needed)`. Reused
+runs and journey-smoke mode use these same no-op names. Both jobs start so
+GitHub evaluates their names instead of displaying a raw expression for a
+skipped job. This costs two brief runner allocations when Fast is disabled,
+but does not check out code, install dependencies, or run scripts. Neither
+no-op job is named `Fast`, so it cannot satisfy a required `ci / Fast` check.
 
 #### A non-blocking quarantine lane (`e2e-quarantine-args`)
 
