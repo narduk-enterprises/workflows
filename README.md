@@ -1802,7 +1802,24 @@ callable reads drift in both directions: `not-built` (the canvas moved),
   appends the table to the job summary.
 - **`mode: flag`** runs `dc_ledger.py flag <ledger>` with the caller's
   `github.token`. It opens, edits, reopens or closes one
-  `Design drift: <canvas>` issue on the caller's repo, whose labels must exist.
+  `Design drift: <canvas>` issue on the ledger's `issue.repo`, whose labels
+  must exist. `issue.repo` must be the calling repository: the token can
+  write no other, so the checker errors when it differs from
+  `GITHUB_REPOSITORY`, and when `issue.repo` is missing.
+- **`flag` never runs on a pull request.** It runs only on `push`,
+  `schedule` or `workflow_dispatch` (v2.1.1). On any other event the `flag`
+  job is skipped and the `check` job fails the run with an error, so a
+  pull request's code never writes issues.
+- **Commit the boards.** The callable never runs the ledger's `build`
+  command, so the canvas boards the ledger's `project` points at must be in
+  git. A gitignored, generated `project` reads every entry as "board or
+  screen missing", which stays red once anything is built. `status` prints a
+  hint when `project` is absent from the checkout.
+- **A malformed ledger is an error** (exit 2, naming the entry): `code` must
+  be a list of paths, `gate.state` exactly `open` or `cleared`, `built` null
+  or all three hashes. Ledger text is treated as untrusted: it cannot start a
+  workflow command in the log, break a summary or issue table, or mention
+  anyone.
 - **Advisory.** There is no `Required` job, so never add `<job> / check` to
   branch protection, and do not name the calling job `ci`.
 - **Grant `contents: read` and `issues: write` in both modes.** GitHub checks
@@ -1815,8 +1832,11 @@ callable reads drift in both directions: `not-built` (the canvas moved),
   never run.
 - **`scripts/dc_ledger.py` is a byte copy.** The canonical file is
   agent-infrastructure's `skills/claude-design-ops/scripts/dc_ledger.py`, and
-  its `scripts/check-dc-ledger-parity` fails when the two differ. Change it
-  there first, land the copy here, then move agent-infrastructure's pin.
+  its `scripts/check-dc-ledger-parity` fails when the two differ. To change
+  it: open the PR here with the new copy; land the canonical change in
+  agent-infrastructure first, its pin at this PR's head commit (the Cursor
+  review here reads agent-infrastructure main as the canonical); merge this
+  PR and tag it; then move agent-infrastructure's pin to the merge commit.
 
 ```yaml
 name: design-ledger
@@ -1832,7 +1852,7 @@ permissions:
 
 jobs:
   design-ledger:
-    uses: narduk-enterprises/workflows/.github/workflows/design-ledger.yml@<sha-of-v2.1.0> # v2.1.0
+    uses: narduk-enterprises/workflows/.github/workflows/design-ledger.yml@<sha-of-v2.1.1> # v2.1.1
     permissions:
       contents: read
       issues: write

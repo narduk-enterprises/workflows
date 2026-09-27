@@ -36,6 +36,14 @@ closed when everything agrees.
 
 `status --check` exits 1 while any entry is flagged, printing how to fix each one; CI runs it
 on pull requests. `--github-summary` also appends the table to `$GITHUB_STEP_SUMMARY`.
+A malformed ledger (a string `code`, a `gate.state` other than `open` or `cleared`, a
+`built` without its hashes) is an error naming the entry, with exit 2, never a quiet read.
+
+CI never runs `build`, so the boards `project` points at must be committed: a gitignored,
+generated `project` reads every entry as missing, which stays red once anything is built.
+
+Ledger text is untrusted: what reaches the log cannot start a workflow command, and what
+reaches markdown cannot break a table, the issue marker, or mention anyone.
 
 This file is stdlib-only so product CI can run it alone: the reusable `design-ledger`
 workflow in narduk-enterprises/workflows carries a byte copy, and agent-infrastructure's
@@ -51,7 +59,48 @@ import sys
 from pathlib import Path
 
 STATUSES = ("in-sync", "not-built", "design-stale", "diverged")
+GATE_STATES = ("open", "cleared")
 MARK = "<!-- dc-ledger: {canvas} -->"
+
+
+class LedgerError(ValueError):
+    """A malformed ledger, or one `flag` cannot act on. main() reports it and exits 2."""
+
+
+class GhError(RuntimeError):
+    """A failed gh call, carrying gh's own stderr."""
+
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+
+
+def log_safe(text):
+    """Ledger text as one inert log line: control characters and newlines become spaces,
+    and `::` is broken so it can never open a workflow command."""
+    return _CONTROL.sub(" ", str(text)).replace("::", ":\u200b:")
+
+
+def md(text, cell=False):
+    """Ledger text for markdown: one line with `@` mentions broken by a zero-width joiner.
+    A table cell (always a code span here) escapes `|` and replaces backticks so the span
+    holds; running text escapes `<` so it cannot open raw HTML or a comment."""
+    text = _CONTROL.sub(" ", str(text)).replace("@", "@\u200d")
+    return text.replace("|", "\\|").replace("`", "'") if cell else text.replace("<", "&lt;")
+
+
+def marker(canvas):
+    """The hidden issue marker. The canvas name loses anything that could close the
+    comment early or open another, until none is left, and its mentions are broken."""
+    name = _CONTROL.sub(" ", str(canvas)).replace("@", "@\u200d")
+    while True:
+        cut = name.replace("-->", "").replace("--!>", "").replace("<!--", "")
+        if cut == name:
+            return MARK.format(canvas=name)
+        name = cut
+
+
+def issue_title(canvas):
+    return f"Design drift: {_CONTROL.sub(' ', str(canvas))}"
 
 
 # Inlined from dc_canvas.py so this file needs nothing beside it; keep the two in step.
@@ -132,13 +181,76 @@ def status(entry, design, code):
     return "diverged" if d and c else "not-built" if d else "design-stale" if c else "in-sync"
 
 
+def _str_list(value):
+    return isinstance(value, list) and all(isinstance(v, str) for v in value)
+
+
+def _kind(value):
+    return "missing" if value is None else f"a {type(value).__name__}" if not isinstance(value, str) else repr(value)
+
+
+def validate(led, path):
+    """Check the ledger's shape once, at load. A shape that would read wrong (a string
+    `code` hashed a character at a time, a gate typo read as open) is an error."""
+    def bad(msg):
+        raise LedgerError(f"{path}: {msg}")
+    if not isinstance(led, dict):
+        bad("the ledger must be a JSON object")
+    if not isinstance(led.get("canvas"), str) or not led["canvas"].strip():
+        bad("`canvas` must be a non-empty string")
+    for key in ("project", "artifact", "build"):
+        if key in led and not isinstance(led[key], str):
+            bad(f"`{key}` must be a string")
+    if "gate" in led:
+        gate = led["gate"]
+        if not isinstance(gate, dict) or gate.get("state") not in GATE_STATES:
+            bad(f"`gate.state` must be \"open\" or \"cleared\" "
+                f"(got {_kind(gate.get('state') if isinstance(gate, dict) else gate)})")
+    if led.get("issue") is not None:
+        issue = led["issue"]
+        if not isinstance(issue, dict):
+            bad("`issue` must be an object with `repo` (owner/name) and optional `labels`")
+        if "repo" in issue and not (isinstance(issue["repo"], str) and re.fullmatch(r"[\w.-]+/[\w.-]+", issue["repo"])):
+            bad(f"`issue.repo` must be owner/name (got {_kind(issue['repo'])})")
+        if "labels" in issue and not _str_list(issue["labels"]):
+            bad("`issue.labels` must be a list of strings")
+    entries = led.get("entries")
+    if not isinstance(entries, list):
+        bad("`entries` must be a list")
+    seen = set()
+    for n, e in enumerate(entries):
+        if not isinstance(e, dict):
+            bad(f"entry {n} must be an object")
+        if not isinstance(e.get("id"), str) or not e["id"]:
+            bad(f"entry {n}: `id` must be a non-empty string")
+        where = f"entry {e['id']!r}"
+        if e["id"] in seen:
+            bad(f"{where}: entry ids must be distinct")
+        seen.add(e["id"])
+        if not isinstance(e.get("board"), str) or not e["board"]:
+            bad(f"{where}: `board` must be a non-empty string")
+        if e.get("screen") is not None and not isinstance(e["screen"], str):
+            bad(f"{where}: `screen` must be a string or null")
+        if "code" in e and not _str_list(e["code"]):
+            bad(f"{where}: `code` must be a list of paths (got {_kind(e['code'])})")
+        built = e.get("built")
+        if built is not None and not (isinstance(built, dict)
+                                      and all(isinstance(built.get(k), str) for k in ("design", "code", "at"))):
+            bad(f"{where}: `built` must be null or {{design, code, at}} strings; run mark-built again")
+    return led
+
+
 def load(path):
     path = Path(path)
-    led = json.loads(path.read_text())
-    ids = [e["id"] for e in led["entries"]]
-    if len(set(ids)) != len(ids):
-        raise ValueError(f"{path}: entry ids must be distinct")
-    return led
+    try:
+        led = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise LedgerError(f"{path}: not valid JSON: {exc}") from exc
+    return validate(led, path)
+
+
+def project_dir(ledger_path, led):
+    return Path(ledger_path).resolve().parent / led.get("project", "out/project")
 
 
 def repo_root(path):
@@ -153,7 +265,7 @@ def report(ledger_path, ref="HEAD", build=False):
     here = ledger_path.resolve().parent
     if build and led.get("build"):
         subprocess.run(led["build"], shell=True, cwd=here, check=True, stdout=subprocess.DEVNULL)
-    project = here / led.get("project", "out/project")
+    project = project_dir(ledger_path, led)
     repo = repo_root(ledger_path)
     gate_open = led.get("gate", {}).get("state", "open") != "cleared"
     rows = []
@@ -175,12 +287,12 @@ def mark_built(ledger_path, ids, ref="HEAD"):
     by = {r["id"]: r for r in rows}
     unknown = [i for i in ids if i not in by]
     if unknown:
-        raise SystemExit(f"no such entries: {unknown}")
+        raise SystemExit(log_safe(f"no such entries: {unknown}"))
     for e in led["entries"]:
         if e["id"] in ids:
             r = by[e["id"]]
             if r["missing"]:
-                raise SystemExit(f"{e['id']}: the board or screen is missing; build the canvas first")
+                raise SystemExit(log_safe(f"{e['id']}: the board or screen is missing; build the canvas first"))
             e["built"] = {"design": r["design"], "code": r["code"], "at": at}
     ledger_path.write_text(json.dumps(led, indent=2, ensure_ascii=False) + "\n")
     return len(ids)
@@ -200,15 +312,15 @@ def issue_body(led, rows, ref_sha):
     lead = ("The gate is open, so the canvas leads: bring the code to it."
             if gate.get("state", "open") != "cleared" else
             "The gate has cleared, so shipped code leads: build a changed design, or amend the canvas to the shipped code.")
-    lines = [MARK.format(canvas=canvas), "",
-             f"The design ledger for **{canvas}** reads {len(flagged)} screen(s) out of step with the code "
+    lines = [marker(canvas), "",
+             f"The design ledger for **{md(canvas)}** reads {len(flagged)} screen(s) out of step with the code "
              f"at `{ref_sha[:12]}`. {lead}", ""]
     if led.get("artifact"):
-        lines += [f"Canvas: {led['artifact']}", ""]
+        lines += [f"Canvas: {md(led['artifact'])}", ""]
     lines += ["| Entry | Status | What it means | Last matched |", "|---|---|---|---|"]
     for r in flagged:
-        lines.append(f"| `{r['id']}` | {r['status']} | {ACTION[r['status']]} | "
-                     f"{'`' + r['built_at'][:12] + '`' if r['built_at'] else 'never'} |")
+        lines.append(f"| `{md(r['id'], cell=True)}` | {r['status']} | {ACTION[r['status']]} | "
+                     f"{'`' + md(r['built_at'][:12], cell=True) + '`' if r['built_at'] else 'never'} |")
     unbuilt = sum(1 for r in rows if r["status"] == "not-built" and not r["built_at"])
     if unbuilt and gate.get("state", "open") != "cleared":
         lines += ["", f"{unbuilt} more screen(s) were never built; with the gate open that is expected and not flagged."]
@@ -227,8 +339,8 @@ FIX = {
 
 def check_lines(rows):
     """One fix line per flagged entry."""
-    return [f"{r['id']}: {r['status']}: {FIX[r['status']].format(id=r['id'])}"
-            + (" (board or screen missing)" if r["missing"] else "")
+    return [log_safe(f"{r['id']}: {r['status']}: {FIX[r['status']].format(id=r['id'])}"
+                     + (" (board or screen missing)" if r["missing"] else ""))
             for r in rows if r["flagged"]]
 
 
@@ -236,13 +348,13 @@ def summary_markdown(led, rows):
     """The status table as GitHub-flavoured markdown, for $GITHUB_STEP_SUMMARY."""
     gate = led.get("gate", {}).get("state", "open")
     flagged = sum(r["flagged"] for r in rows)
-    lines = [f"### Design ledger: {led['canvas']}", "",
+    lines = [f"### Design ledger: {md(led['canvas'])}", "",
              f"{flagged} flagged of {len(rows)} (gate {gate}).", "",
              "| Entry | Status | Flagged | Last matched |", "|---|---|---|---|"]
     for r in rows:
-        lines.append(f"| `{r['id']}` | {r['status']}{' (board or screen missing)' if r['missing'] else ''} | "
+        lines.append(f"| `{md(r['id'], cell=True)}` | {r['status']}{' (board or screen missing)' if r['missing'] else ''} | "
                      f"{'yes' if r['flagged'] else ''} | "
-                     f"{'`' + r['built_at'][:12] + '`' if r['built_at'] else 'never'} |")
+                     f"{'`' + md(r['built_at'][:12], cell=True) + '`' if r['built_at'] else 'never'} |")
     return "\n".join(lines) + "\n\n"
 
 
@@ -257,25 +369,43 @@ def write_github_summary(led, rows):
 
 
 def _gh(*args, input=None):
-    return subprocess.run(["gh", *args], check=True, capture_output=True, text=True, input=input).stdout
+    r = subprocess.run(["gh", *args], capture_output=True, text=True, input=input)
+    if r.returncode != 0:
+        raise GhError(f"gh {' '.join(args[:2])} failed (exit {r.returncode}): "
+                      f"{r.stderr.strip() or r.stdout.strip() or 'no output'}")
+    return r.stdout
 
 
 def find_issue(repo, canvas):
     """The one issue this ledger keeps, open or closed: newest first, matched by its marker."""
-    title = f"Design drift: {canvas}"
+    title = issue_title(canvas)
     out = json.loads(_gh("issue", "list", "--repo", repo, "--state", "all", "--search", f'"{title}" in:title',
                          "--json", "number,title,state,body", "--limit", "50"))
-    mark = MARK.format(canvas=canvas)
+    mark = marker(canvas)
     hits = sorted((i for i in out if i["title"] == title and mark in (i.get("body") or "")),
                   key=lambda i: -i["number"])
     return hits[0] if hits else None
 
 
+def issue_repo(led, ledger_path):
+    """The repository that keeps the drift issue. In Actions it must be the caller's own:
+    the workflow's token can write no other."""
+    repo = (led.get("issue") or {}).get("repo")
+    if not repo:
+        raise LedgerError(f"{ledger_path}: `issue.repo` is missing; flag needs the owner/name "
+                          "repository that keeps the drift issue")
+    caller = os.environ.get("GITHUB_REPOSITORY")
+    if caller and caller.lower() != repo.lower():
+        raise LedgerError(f"{ledger_path}: `issue.repo` is {repo} but this run is in {caller}, and the "
+                          f"workflow's token can write only {caller}; set `issue.repo` to {caller}")
+    return repo
+
+
 def flag(ledger_path, ref="HEAD", build=False, dry_run=False, gh=None):
     """Open, update, reopen or close the ledger's one issue. Returns (action, number|None)."""
+    repo = issue_repo(load(ledger_path), ledger_path)
     led, rows = report(ledger_path, ref, build)
     cfg = led.get("issue") or {}
-    repo = cfg["repo"]
     canvas = led["canvas"]
     flagged = [r for r in rows if r["flagged"]]
     body = issue_body(led, rows, head(repo_root(ledger_path), ref))
@@ -287,25 +417,22 @@ def flag(ledger_path, ref="HEAD", build=False, dry_run=False, gh=None):
     if not flagged:
         if cur and cur["state"] == "OPEN":
             _gh("issue", "close", str(cur["number"]), "--repo", repo, "--comment",
-                f"Every screen in the {canvas} ledger agrees with the code again.")
+                f"Every screen in the {md(canvas)} ledger agrees with the code again.")
             return ("closed", cur["number"])
         return ("none", cur and cur["number"])
-    tmp = Path(ledger_path).resolve().parent / ".dc-ledger-issue.md"
-    tmp.write_text(body)
-    try:
-        if cur:
-            if cur["state"] != "OPEN":
-                _gh("issue", "reopen", str(cur["number"]), "--repo", repo)
-            if (cur.get("body") or "") != body:
-                _gh("issue", "edit", str(cur["number"]), "--repo", repo, "--body-file", str(tmp))
-            return ("updated", cur["number"])
-        args = ["issue", "create", "--repo", repo, "--title", f"Design drift: {canvas}", "--body-file", str(tmp)]
-        for lab in cfg.get("labels", []):
-            args += ["--label", lab]
-        url = _gh(*args).strip()
-        return ("opened", int(url.rsplit("/", 1)[-1]))
-    finally:
-        tmp.unlink(missing_ok=True)
+    # The body goes to gh on stdin: nothing is written inside the checkout, where a committed
+    # symlink could point the write at any file the runner user owns.
+    if cur:
+        if cur["state"] != "OPEN":
+            _gh("issue", "reopen", str(cur["number"]), "--repo", repo)
+        if (cur.get("body") or "") != body:
+            _gh("issue", "edit", str(cur["number"]), "--repo", repo, "--body-file", "-", input=body)
+        return ("updated", cur["number"])
+    args = ["issue", "create", "--repo", repo, "--title", issue_title(canvas), "--body-file", "-"]
+    for lab in cfg.get("labels", []):
+        args += ["--label", lab]
+    url = _gh(*args, input=body).strip()
+    return ("opened", int(url.rsplit("/", 1)[-1]))
 
 
 def main(argv=None):
@@ -331,19 +458,32 @@ def main(argv=None):
     c = sub.add_parser("screens")
     c.add_argument("board")
     a = ap.parse_args(argv)
+    try:
+        return _run(a)
+    except (LedgerError, GhError) as exc:
+        print(f"dc-ledger: error: {log_safe(exc)}", file=sys.stderr)
+        return 2
+
+
+def _run(a):
     if a.cmd == "screens":
         print("\n".join(screens(Path(a.board).read_text())))
         return 0
     if a.cmd == "status":
         led, rows = report(a.ledger, a.ref, a.build)
+        project = project_dir(a.ledger, led)
+        if not project.is_dir():
+            print(log_safe(f"hint: the ledger's project directory {project} is not in this checkout, so every "
+                           "entry reads missing. CI never runs `build`: commit the canvas boards, not a gitignored "
+                           "build output."), file=sys.stderr)
         if a.json:
             print(json.dumps(rows, indent=2))
         else:
             for r in rows:
-                print(f"{'!' if r['flagged'] else ' '} {r['status']:<13} {r['id']}"
+                print(f"{'!' if r['flagged'] else ' '} {r['status']:<13} {log_safe(r['id'])}"
                       + ("  (board or screen missing)" if r["missing"] else ""))
             counts = {k: sum(1 for r in rows if r["status"] == k) for k in STATUSES}
-            print(f"{led['canvas']}: " + ", ".join(f"{v} {k}" for k, v in counts.items() if v)
+            print(f"{log_safe(led['canvas'])}: " + ", ".join(f"{v} {k}" for k, v in counts.items() if v)
                   + f"; {sum(r['flagged'] for r in rows)} flagged (gate {led.get('gate', {}).get('state', 'open')})")
         if a.github_summary:
             write_github_summary(led, rows)

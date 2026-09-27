@@ -13,7 +13,12 @@ name: Reusable Design Ledger
 # checkout of private agent-infrastructure. `scripts/dc_ledger.py` here is a
 # byte copy of agent-infrastructure's `skills/claude-design-ops/scripts/
 # dc_ledger.py`; agent-infrastructure's `scripts/check-dc-ledger-parity` fails
-# when the two differ. Change the canonical file there, then copy it here.
+# when the two differ. To change it, in this order (the one every gate passes):
+#   1. open the PR here carrying the new byte copy;
+#   2. land agent-infrastructure's canonical change first, its parity pin at
+#      this PR's head commit (Cursor review here reads its main as canonical);
+#   3. merge this PR, tag it, and move agent-infrastructure's pin to the merge
+#      commit.
 #
 # ADVISORY. Logan, 2026-09-27: "Red check + drift issue (Recommended)". The
 # `check` job goes red on a flagged entry, but it is NEVER a required check:
@@ -27,7 +32,18 @@ name: Reusable Design Ledger
 #          summary. Needs `contents: read` only.
 #   flag   `flag`: open, update, reopen or close the ledger's one
 #          `Design drift: <canvas>` issue on the caller's repo, with the
-#          caller's own `github.token`. Needs `issues: write`.
+#          caller's own `github.token`. Needs `issues: write`. Runs only on
+#          `push`, `schedule` or `workflow_dispatch`: on any other event (a
+#          pull request above all) the `flag` job is skipped and the `check`
+#          job fails the run loudly, so PR code never writes issues. The
+#          ledger's `issue.repo` must be the caller's repository; the checker
+#          errors otherwise, because the token can write no other.
+#
+# COMMIT THE BOARDS. This workflow never runs the ledger's `build` command, so
+# the canvas boards the ledger's `project` points at must be committed. A
+# gitignored, generated `project` reads every entry as missing ("board or
+# screen missing"), which stays red once anything is built; `status` prints a
+# hint when `project` is absent from the checkout.
 #
 # ADOPTION (a private caller; the ledger's mapped paths in `paths:`):
 #
@@ -38,7 +54,7 @@ name: Reusable Design Ledger
 #       branches: [main]
 #   jobs:
 #     design-ledger:
-#       uses: narduk-enterprises/workflows/.github/workflows/design-ledger.yml@<sha> # v2.1.0
+#       uses: narduk-enterprises/workflows/.github/workflows/design-ledger.yml@<sha> # v2.1.1
 #       permissions:
 #         contents: read
 #         issues: write   # see "PERMISSIONS" below
@@ -91,7 +107,9 @@ on:
 jobs:
   check:
     name: check
-    if: inputs.mode != 'flag'
+    # Also runs, to fail loudly, when `flag` is asked for on an event that may
+    # not write issues: exactly one of the two jobs runs on every call.
+    if: inputs.mode != 'flag' || !contains(fromJSON('["push","schedule","workflow_dispatch"]'), github.event_name)
     runs-on: ${{ fromJSON(inputs.runs-on || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
     timeout-minutes: 10
     permissions:
@@ -116,8 +134,13 @@ jobs:
         env:
           LEDGER: ${{ inputs.ledger }}
           MODE: ${{ inputs.mode }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          if [ "$MODE" = "flag" ]; then
+            echo "::error::design-ledger: mode 'flag' runs only on push, schedule or workflow_dispatch (got '$EVENT_NAME'); use mode 'check' here"
+            exit 1
+          fi
           if [ "$MODE" != "check" ]; then
             echo "::error::design-ledger: mode must be 'check' or 'flag' (got '$MODE')"
             exit 1
@@ -126,7 +149,7 @@ jobs:
 
   flag:
     name: flag
-    if: inputs.mode == 'flag'
+    if: inputs.mode == 'flag' && contains(fromJSON('["push","schedule","workflow_dispatch"]'), github.event_name)
     runs-on: ${{ fromJSON(inputs.runs-on || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
     timeout-minutes: 10
     permissions:
@@ -157,6 +180,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           LEDGER: ${{ inputs.ledger }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          case "$EVENT_NAME" in
+            push|schedule|workflow_dispatch) ;;
+            *) echo "::error::design-ledger: flag refuses event '$EVENT_NAME'"; exit 1 ;;
+          esac
           python3 .design-ledger-workflows/scripts/dc_ledger.py flag "$LEDGER"
