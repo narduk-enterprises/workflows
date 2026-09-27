@@ -1,0 +1,12 @@
+name: CANARY design-ledger minimal grant (remove before merge)
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  design-ledger:
+    uses: ./.github/workflows/design-ledger.yml
+    permissions:
+      contents: read
+    with:
+      ledger: .canary/design-ledger/ledger.json

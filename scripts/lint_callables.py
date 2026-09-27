@@ -139,6 +139,10 @@ CALLER_GRANTS: dict[str, set[str]] = {
     # need `actions: read` on a private caller (PR #142 review, high finding);
     # every adopter's ADOPTION block permissions must include it.
     "flake-digest.yml": {"contents", "issues", "actions"},
+    # `flag` opens, edits, reopens and closes one `Design drift: <canvas>`
+    # issue. GitHub checks the skipped `flag` job's grant too, so every
+    # caller grants `issues: write`, check-only callers included.
+    "design-ledger.yml": {"contents", "issues"},
 }
 
 # Local composite/local-path uses are exempt from SHA pinning: `./...` and
