@@ -82,7 +82,9 @@ class ExactCandidate(unittest.TestCase):
         lint = [step.get('name') for step in required['steps']]
         self.assertIn("actionlint (caller's own workflows)", lint)
         self.assertIn('Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)', lint)
-        self.assertEqual(required['if'], 'always()')
+        # !cancelled(): runs after any failed or skipped need; a cancelled run
+        # reports it CANCELLED (never passing) without taking a runner.
+        self.assertEqual(required['if'], '!cancelled()')
         # The Caller lint steps must run after a failed gate step (so both
         # show) but never be skipped on a live run: exact conditions pinned.
         caller_lint = ['Check out the caller for Caller lint', 'Ensure PyYAML is available',

@@ -55,6 +55,10 @@ NUXT_CF_GATES = [
     (NUXT_CF, "checks", "Typecheck Worker", "typecheck"),
     (NUXT_CF, "checks", "Typecheck Nuxt", "web:typecheck"),
     (NUXT_CF, "checks", "Unit tests", "test"),
+    # `checks-in-build` runs the same gates as `Build` steps (YAML aliases).
+    (NUXT_CF, "build", "Typecheck Worker", "typecheck"),
+    (NUXT_CF, "build", "Typecheck Nuxt", "web:typecheck"),
+    (NUXT_CF, "build", "Unit tests", "test"),
     (NUXT_CF, "build", "Build", "build"),
 ]
 
