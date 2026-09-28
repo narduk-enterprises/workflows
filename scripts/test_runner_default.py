@@ -352,6 +352,19 @@ def check_browser_tests() -> None:
     print("ok  reusable-browser-tests.yml: contract + required")
 
 
+def check_python_data_required() -> None:
+    # CI reset 2026-09-28: python-data's Required runs on the caller's own
+    # lint/test route, never the org lightweight route, so a caller that runs
+    # lint and test hosted (narduk-data earth-data-ci) takes no linux-ci seat.
+    jobs = yaml.safe_load((WORKFLOWS / "python-data.yml").read_text())["jobs"]
+    ro = jobs["required"]["runs-on"]
+    assert ro == jobs["test"]["runs-on"] == jobs["lint"]["runs-on"], "python-data:required must share test's route"
+    assert "CI_LIGHTWEIGHT_RUNNER" not in ro, "python-data:required must not read CI_LIGHTWEIGHT_RUNNER"
+    got = evaluate(ro, ctx_for(True, "runner", '"ubuntu-24.04"', lightweight=LINUX_CI))
+    assert got == "ubuntu-24.04", f"python-data:required hosted caller -> {got!r}"
+    print("ok  python-data.yml: Required follows the caller route")
+
+
 def check_single_literal() -> None:
     literals = set()
     for f in WORKFLOWS.glob("*.yml"):
@@ -373,6 +386,7 @@ def main() -> int:
     self_test()
     total = sum(check_callable(f, n) for f, n in CALLABLES.items())
     check_browser_tests()
+    check_python_data_required()
     check_single_literal()
     print(f"test_runner_default: all passed ({total} evaluations)")
     return 0

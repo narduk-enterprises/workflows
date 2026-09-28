@@ -799,7 +799,10 @@ backward compatible; required check names and failure/skip semantics are unchang
 
 `CI_LIGHTWEIGHT_RUNNER` is an organization Actions variable containing a JSON
 `runs-on` value, initially `"ubuntu-slim"` for the authorized company gates.
-Every shared `Required` job reads it. Changing this one value changes routing
+Every shared `Required` job reads it except `python-data.yml`'s, which runs on
+the caller's own `lint`/`test` route (CI reset 2026-09-28): its only caller runs
+those jobs GitHub-hosted, so a lightweight `Required` on `linux-ci` was the one
+self-hosted job in each run. Changing this one value changes routing
 for subsequent jobs without changing callable code or repinning callers.
 Package, browser, Apple, and deployment jobs retain their own routes.
 `node-library.required-runner` remains an explicit per-caller override; avoid
