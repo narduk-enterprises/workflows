@@ -48,6 +48,14 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 # asserts the callables agree with each other and with this one value.
 LINUX_CI = '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
 DEFAULT_TAIL = f"github.event.repository.private == true && '{LINUX_CI}' || '\"ubuntu-latest\"'"
+# The ORDINARY private route (nuxt-cloudflare.yml's Build/Checks/Extra gate/
+# Deploy dry run/Fast) also honours a per-repo `vars.CI_LINUX_RUNNER` after an
+# explicit `inputs.runner` and ahead of the linux-ci default (ci-reset W4
+# addendum, 2026-09-28): a controller sets or deletes that repo variable to
+# move one burst repo's ordinary CI. Private callers only; unset is identical
+# to DEFAULT_TAIL, which check_callable proves by evaluating both.
+LINUX_VAR_TAIL = f"github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{LINUX_CI}') || '\"ubuntu-latest\"'"
+LINUX_VAR_SITES = {"nuxt-cloudflare.yml": {"build", "checks", "extra-gate", "deploy-dry-run", "fast"}}
 
 # callable -> the input that carries the caller's route
 CALLABLES = {
@@ -210,14 +218,16 @@ def evaluate(template: str, ctx: dict):
     return Evaluator(ctx).run(m.group(1)) if m else template
 
 
-def ctx_for(private, input_name, value, blacksmith="", lightweight="", extra_inputs=None):
+def ctx_for(private, input_name, value, blacksmith="", lightweight="", extra_inputs=None, linux=""):
     repo = None if private is None else {"private": private}
     inputs = {input_name: value, "required-runner": "", "lightweight-runner": "", "e2e-runner": ""}
     inputs.update(extra_inputs or {})
     # CI_LIGHTWEIGHT_RUNNER has org visibility `private`, so a public caller
     # never sees it; BLACKSMITH_RUNNERS_ENABLED has visibility `all`.
     vars_ = {"BLACKSMITH_RUNNERS_ENABLED": blacksmith,
-             "CI_LIGHTWEIGHT_RUNNER": lightweight if private else ""}
+             "CI_LIGHTWEIGHT_RUNNER": lightweight if private else "",
+             # A repo-level variable: a public caller can hold one too.
+             "CI_LINUX_RUNNER": linux}
     return {"github": {"event": {"repository": repo} if repo else {}},
             "inputs": inputs, "vars": vars_}
 
@@ -240,11 +250,47 @@ def check_callable(fname: str, name: str) -> int:
     assert inp.get("default") == "", f"{fname}: {name} default must be '' (got {inp.get('default')!r})"
     assert inp.get("required") is False, f"{fname}: {name} must stay optional"
 
-    effective = f"(inputs.{name} || {DEFAULT_TAIL})"
+    default_effective = f"(inputs.{name} || {DEFAULT_TAIL})"
+    var_effective = f"(inputs.{name} || {LINUX_VAR_TAIL})"
+    var_sites = LINUX_VAR_SITES.get(fname, set())
     sites = list(runs_on_sites(doc, name))
     assert sites, f"{fname}: no runs-on site reads inputs.{name}"
     checks = 0
+    seen_var_sites = set()
     for jid, ro in sites:
+        if jid in var_sites:
+            assert var_effective in ro and "CI_LINUX_RUNNER" in ro, f"{fname}:{jid}: ordinary route must honour vars.CI_LINUX_RUNNER"
+            seen_var_sites.add(jid)
+            # Unset CI_LINUX_RUNNER: identical to the pre-variable expression.
+            legacy = ro.replace(var_effective, default_effective)
+            assert "CI_LINUX_RUNNER" not in legacy, f"{fname}:{jid}: CI_LINUX_RUNNER outside the effective route"
+            for bs in ("", "false", "true"):
+                for vis in (True, False, None):
+                    for val in ("", '"ubuntu-latest"', LINUX_CI):
+                        c = ctx_for(vis, name, val, blacksmith=bs)
+                        assert evaluate(ro, c) == evaluate(legacy, c), f"{fname}:{jid} unset CI_LINUX_RUNNER changed the route"
+                        checks += 1
+                        # Set: an explicit input still wins; a public caller never uses it.
+                        c = ctx_for(vis, name, val, blacksmith=bs, linux='"blacksmith-4vcpu-ubuntu-2404"')
+                        got = evaluate(ro, c)
+                        if val:
+                            assert got == evaluate(legacy, c), f"{fname}:{jid} CI_LINUX_RUNNER overrode inputs.{name}"
+                        elif vis is not True:
+                            assert is_hosted_ubuntu_latest(got), f"{fname}:{jid} public caller took CI_LINUX_RUNNER -> {got!r}"
+                        elif bs == "true":
+                            # Blacksmith logic unchanged and not widened: a
+                            # non-hosted effective route becomes the Blacksmith label.
+                            assert got == BLACKSMITH_LABEL, f"{fname}:{jid} -> {got!r}"
+                        else:
+                            assert got == "blacksmith-4vcpu-ubuntu-2404", f"{fname}:{jid} private CI_LINUX_RUNNER -> {got!r}"
+                        checks += 1
+            # A hosted value in the variable keeps Blacksmith off, like an explicit hosted input.
+            got = evaluate(ro, ctx_for(True, name, "", blacksmith="true", linux='"ubuntu-latest"'))
+            assert is_hosted_ubuntu_latest(got), f"{fname}:{jid} hosted CI_LINUX_RUNNER + blacksmith -> {got!r}"
+            ro = legacy
+        else:
+            assert "CI_LINUX_RUNNER" not in ro, f"{fname}:{jid}: only the ordinary route reads CI_LINUX_RUNNER"
+        effective = default_effective
         assert effective in ro, f"{fname}:{jid}: runs-on does not use the effective-default expression"
         assert f"inputs.{name}" not in ro.replace(effective, ""), (
             f"{fname}:{jid}: a bare inputs.{name} remains outside the effective-default expression"
@@ -285,6 +331,7 @@ def check_callable(fname: str, name: str) -> int:
         # explicit hosted value on a private caller with Blacksmith on stays hosted.
         got = evaluate(ro, ctx_for(True, name, '"ubuntu-latest"', blacksmith="true"))
         assert is_hosted_ubuntu_latest(got), f"{fname}:{jid} explicit hosted + blacksmith -> {got!r}"
+    assert seen_var_sites == var_sites, f"{fname}: CI_LINUX_RUNNER sites {sorted(seen_var_sites)} != {sorted(var_sites)}"
     print(f"ok  {fname}: {len(sites)} runs-on site(s), {checks} evaluations")
     return checks
 

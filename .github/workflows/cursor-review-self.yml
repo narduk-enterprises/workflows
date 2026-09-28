@@ -19,9 +19,11 @@ name: Cursor review
 # No `synchronize`: a push does not re-review. A lane that wants the new head
 # reviewed adds the `review-now` label, which the callable clears again so the
 # next add is a fresh event. Unrelated label additions skip.
+# Label-only since the CI reset (2026-09-28): the callable starts a review
+# only for a review-request label unless `automatic-reviews: true`.
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review, labeled]
+    types: [labeled]
 
 # This group MIRRORS the callable's job `if:`. A run-level cancel happens
 # before any job condition is evaluated, so an event the callable would skip --

@@ -585,6 +585,13 @@ class WorkflowShapeTests(unittest.TestCase):
         # the script could print a skip.
         self.assertIn("inputs.enabled", self.job["if"])
         self.assertIn("github.event.action == 'opened'", self.job["if"])
+        # Label-only by default (CI reset, 2026-09-28): the automatic events
+        # reach the job only behind `automatic-reviews`, which defaults off,
+        # so an ordinary pull-request event never takes a runner seat.
+        self.assertIs(inputs["automatic-reviews"]["default"], False)
+        self.assertIs(inputs["automatic-reviews"]["required"], False)
+        self.assertIn("(inputs.automatic-reviews && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review'))", self.job["if"])
+        self.assertEqual(1, self.job["if"].count("github.event.action == 'opened'"))
         self.assertNotIn("synchronize", self.job["if"])
         self.assertIn("github.event.pull_request.draft == false", self.job["if"])
         self.assertIn("'no-ai-review'", self.job["if"])
