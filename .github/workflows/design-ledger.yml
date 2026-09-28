@@ -16,7 +16,7 @@ name: Reusable Design Ledger
 # when the two differ. To change it, in this order (the one every gate passes):
 #   1. open the PR here carrying the new byte copy;
 #   2. land agent-infrastructure's canonical change first, its parity pin at
-#      this PR's head commit (Cursor review here reads its main as canonical);
+#      this PR's head commit (a review of this PR reads its main as canonical);
 #   3. merge this PR, tag it, and move agent-infrastructure's pin to the merge
 #      commit.
 #

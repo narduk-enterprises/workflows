@@ -351,9 +351,10 @@ so a private caller that passes nothing is Blacksmith-eligible (it is on the
 
 The `cursor-review.yml` callable, this repository's `cursor-review-self.yml`,
 `scripts/cursor_review.py`, `scripts/test_cursor_review.py` and
-`scripts/cursor_review_brief.md` were deleted in ci-reset W6, and every caller
-in the organization was removed. The callable held a runner seat for the whole
-Cursor wait.
+`scripts/cursor_review_brief.md` were deleted in ci-reset W6 (workflows#166),
+and each repository's caller is removed by its own PR. A caller that still
+exists pins a full SHA, so it keeps working until its removal merges. The
+callable held a runner seat for the whole Cursor wait.
 
 Reviews now come from the PR review bot on CT650:
 - Code: `narduk-enterprises/runners` `scripts/pr_review_bot/`, operator guide
@@ -1892,7 +1893,8 @@ read-only review of a pull request head, via a `repository_dispatch` at
 `agent-infrastructure`; it was never a CI gate and had no `Required` job. The
 pool was retired 2026-09-19 with an empty allowlist, and adoption moved to
 `cursor-review.yml` (Refs `narduk-enterprises/agent-infrastructure#333`,
-D-AGENT-POOL-1). A 2026-09-24 re-verify (`gh search code` / `gh api
+D-AGENT-POOL-1), itself retired 2026-09-28 for the CT650 PR review bot (see
+"Cursor review (retired 2026-09-28)"). A 2026-09-24 re-verify (`gh search code` / `gh api
 search/code` across narduk-enterprises, narduk-incubator and
 narduk-enterprises-clients) found zero live pool adopters, matching the state
 this section already described, so the file was deleted in narduk-reboot
