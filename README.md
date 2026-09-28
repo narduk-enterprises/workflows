@@ -26,6 +26,8 @@ Shared reusable GitHub Actions workflows for the narduk-enterprises estate (CI-5
 > organization-group route, a public (or visibility-unknown) caller gets
 > GitHub-hosted `ubuntu-latest` — see [Default route](#default-route-empty-runner).
 > `apple.yml`'s Mac route is the one input with no default, deliberately.
+> `cursor-review.yml` is the one visibility-blind default: GitHub-hosted
+> `ubuntu-latest` for every caller (CI reset 2026-09-28).
 
 Fix CI in one place, not 100. Application repos call these workflows via
 `workflow_call` instead of blob-copying YAML. This repo replaces the broken
@@ -244,6 +246,12 @@ inputs.runner || github.event.repository.private == true && '{"group":"linux-ci"
 | public, or an event with no `repository` payload, passes nothing | `ubuntu-latest` | `ubuntu-latest` (§3) |
 | any caller, explicit value | that value | that value — unchanged, proven by `scripts/test_runner_default.py` |
 
+**Exception: `cursor-review.yml`.** Its empty `runner` resolves to
+GitHub-hosted `ubuntu-latest` for every caller, private included (CI reset
+2026-09-28, Logan: "Move it off linux-ci"). The job only polls the Cursor API
+for up to `wait-minutes`, and on `linux-ci` that held a seat for up to 30
+minutes. An explicit `runner` still wins.
+
 The comparison is `== true`, so an unknown visibility falls to hosted, the safe
 direction. Because visibility is read at run time, a caller that goes public
 lands on hosted on its next run with no edit. Blacksmith overflow and
@@ -385,10 +393,12 @@ allow-list of a re-request label (plus `opened` / `reopened` /
 `ready_for_review` only when the caller passes `automatic-reviews: true`), so a
 caller that has not yet dropped `synchronize` launches nothing here.
 
-**Label-only by default (CI reset, 2026-09-28).** The job waits on the Cursor
-API for up to `wait-minutes`, and a private caller's job waits on a `linux-ci`
-seat. Starting it automatically on every opened pull request held one of the
-pool's few seats for a review nobody asked for, so `automatic-reviews` now
+**Hosted runner, label-only by default (CI reset, 2026-09-28).** The job waits
+on the Cursor API for up to `wait-minutes`. It now runs on GitHub-hosted
+`ubuntu-latest` for every caller, private included, so a review never holds a
+`linux-ci` seat; an explicit `runner` input still wins. Starting it
+automatically on every opened pull request also spent a runner on a review
+nobody asked for, so `automatic-reviews` now
 defaults to `false`: the job starts only for `review-now`, `review-p0`,
 `review-p1` or `review-deep`, and every other event is skipped before it takes a
 runner. P0 paths are no longer reviewed on open; add `review-p0` (or

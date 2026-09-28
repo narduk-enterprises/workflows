@@ -117,13 +117,12 @@ name: Reusable Cursor Review
 # Use:
 #   cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1","review-deep"]'), github.event.label.name)))) && 'review' || 'other' }}
 #
-# RUNNER ROUTING: the same shape flake-digest.yml and red-main-listener.yml
-# use (code-review.yml, which used to set this pattern, was retired
-# 2026-09-24 -- narduk-reboot P3-C2 / O-D8). The default resolves from the
-# caller's own visibility: a PRIVATE caller lands on the fleet manifest's
-# linux-ci organization-group route, anything else on GitHub-hosted
-# ubuntu-latest. The job is a near-idle poller (30-second GET every cycle), so
-# a self-hosted slot it holds costs almost nothing but the slot itself. A
+# RUNNER ROUTING: GitHub-hosted ubuntu-latest for EVERY caller, private
+# included (CI reset 2026-09-28, Logan: "Move it off linux-ci"). The job is a
+# near-idle poller (a 30-second GET every cycle for up to `wait-minutes`), so
+# on the self-hosted linux-ci pool it held one of a handful of seats for up to
+# 30 minutes doing nothing. It needs only `actions/checkout` and the stdlib
+# `python3` every hosted image ships. An explicit `runner` input still wins; a
 # PUBLIC caller must never pass a self-hosted label.
 
 # Least privilege at the top; R12 lets a job request only what is granted here.
@@ -263,10 +262,10 @@ on:
           a JSON array, or a JSON object ({"group":"linux-ci","labels":[...]})
           matching the runner-fleet manifest's `runsOn` shape. Decoded with
           fromJSON(), so the value must be valid JSON. Empty (the default)
-          routes a PRIVATE caller to the fleet manifest's linux-ci
-          organization-group route and a public or visibility-unknown caller to
-          GitHub-hosted ubuntu-latest; an explicit value always wins. A PUBLIC
-          (or possibly-future-public) CALLER MUST NEVER PASS A SELF-HOSTED LABEL.
+          routes EVERY caller, private included, to GitHub-hosted
+          ubuntu-latest, so a review never waits on a linux-ci seat; an
+          explicit value always wins. A PUBLIC (or possibly-future-public)
+          CALLER MUST NEVER PASS A SELF-HOSTED LABEL.
         required: false
         type: string
         default: ''
@@ -298,13 +297,13 @@ jobs:
     # LABEL-ONLY BY DEFAULT (CI reset, 2026-09-28). `opened`, `reopened` and
     # `ready_for_review` reach the job only when the caller passes
     # `automatic-reviews: true`. This job waits on the Cursor API for up to
-    # `wait-minutes` and, for a private caller, it waits on a linux-ci seat;
-    # an automatic start on every opened pull request held that seat for
-    # nothing the author asked for. A caller that stays label-only should
+    # `wait-minutes`; an automatic start on every opened pull request held a
+    # runner for nothing the author asked for (a linux-ci seat, before the
+    # default moved to GitHub-hosted). A caller that stays label-only should
     # listen on `labeled` alone (the README caller shape), so no other event
     # can share the review bucket of its concurrency group.
     if: ${{ inputs.enabled && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && ((inputs.automatic-reviews && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review')) || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1","review-deep"]'), github.event.label.name))) }}
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || '"ubuntu-latest"')) }}
     timeout-minutes: 45
     permissions:
       contents: read

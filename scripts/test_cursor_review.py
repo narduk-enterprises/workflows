@@ -595,6 +595,14 @@ class WorkflowShapeTests(unittest.TestCase):
         self.assertNotIn("synchronize", self.job["if"])
         self.assertIn("github.event.pull_request.draft == false", self.job["if"])
         self.assertIn("'no-ai-review'", self.job["if"])
+        # Hosted for every caller (CI reset, 2026-09-28, Logan: "Move it off
+        # linux-ci"): the empty-input default is ubuntu-latest regardless of
+        # visibility, never a self-hosted label, and an explicit input wins.
+        runs_on = self.job["runs-on"]
+        self.assertNotIn("linux-ci", runs_on)
+        self.assertNotIn("self-hosted", runs_on)
+        self.assertNotIn("repository.private", runs_on)
+        self.assertEqual(2, runs_on.count("(inputs.runner || '\"ubuntu-latest\"')"))
         # The documented caller group must MIRROR that `if:`, or a run-level
         # cancel lands on a job the `if:` then skips -- cancel-then-skip.
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
