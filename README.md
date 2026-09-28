@@ -70,8 +70,8 @@ in their app-class workflow.
 | `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: script-probed lint/typecheck/test/build, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern |
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional web-foundation conformance check, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool**, the prebuilt application reaching each shard through the R2 CI artifact store — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8): zero live callers estate-wide, re-verified via `gh search code` / `gh api search/code` across narduk-enterprises, narduk-incubator and narduk-enterprises-clients. `node-library.yml` was always the richer, preferred surface — see workflows#14/#16 |
-| `code-review.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8, extending the 2026-09-19 advisory retirement below): zero live pool adopters, file deleted. Current review uses `cursor-review.yml` |
-| `cursor-review.yml` | **Default-off PR reviewer, not a CI gate.** Reviews a pull request with one Cursor Cloud agent (`composer-2.5`, `fast: false`; explicit `review-deep` uses Grok 4.6 xhigh) that has the caller checked out at the PR head plus read-only context repos (estate manual, coding standards, decisions), then posts a REAL pull-request review on the reviewed head — APPROVE / COMMENT / REQUEST_CHANGES with inline comments — using the job's own `GITHUB_TOKEN`. Skips (draft, fork, `no-ai-review`, no secret) exit SUCCESS; a reviewer error fails the job. A REQUEST_CHANGES review blocks merge under the repo's pull-request rule. The P0/P1/P2 class rule now also treats an auth/session/payments/credential-table (T2) path as always-reviewed (narduk-reboot P3-C2 / O-D7). See [Cursor review](#cursor-review) (agent-infrastructure#1564) |
+| `code-review.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8, extending the 2026-09-19 advisory retirement below): zero live pool adopters, file deleted. Current review is the CT650 PR review bot (runners#212) |
+| `cursor-review.yml` | **Retired 2026-09-28 (ci-reset W6)**: replaced by the CT650 PR review bot in `narduk-enterprises/runners` `scripts/pr_review_bot/` (runners#212), which answers `/review` comments and the `review-now` / `review-deep` labels without Actions runner time; file, `cursor-review-self.yml`, `scripts/cursor_review.py`, its tests and brief deleted. The prompt moved verbatim to the bot |
 | `closing-syntax-check.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8): zero adopters, file deleted. `narduk-enterprises/agent-infrastructure` keeps its own local, canonical invocation of the same (commit-scanning) checker (agent-infrastructure#837, #1085) |
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 | `red-main-listener.yml` | **New 2026-09-24** (narduk-reboot P3-C2 / O-D8). Opens or refreshes ONE "main is red: `<workflow-name>`" issue, labelled `red-main`, per repo per listened workflow, the first time that workflow goes red on the default branch; closes it on the next green run. **Prerequisite: the adopting repo must already have the `red-main` label** (`gh label create red-main --color B60205 --description "Main default-branch CI is failing"`) — opening the first issue passes `labels[]=red-main` and GitHub 422s a repo without it, so an adopter that skips this step fails closed on its first real red run (PR #142 review, second round). Optional fail-open portal-mirror POST hook. No automatic revert or rollback — that stays in the app's own deploy tooling |
@@ -97,7 +97,7 @@ branch, read back from the API — not that the caller parses.
 | `node-library.yml` | `narduk-enterprises/narduk-charts` | yes — repo ruleset `require-ci-required` |
 | `nuxt-cloudflare.yml` | `hydrogen` | no — `hydrogen` has no branch protection; it called `@v1` unenforced for months, which is the failure mode this column exists to make visible |
 | `reusable-node-ci.yml` | retired 2026-09-24 — zero live callers estate-wide, file deleted (narduk-reboot P3-C2 / O-D8) | — |
-| `code-review.yml` | retired 2026-09-19, file deleted 2026-09-24 — no live pool adopters | n/a — historical advisory callable; current review uses `cursor-review.yml` |
+| `code-review.yml` | retired 2026-09-19, file deleted 2026-09-24 — no live pool adopters | n/a — historical advisory callable; current review is the CT650 PR review bot (runners#212) |
 | `closing-syntax-check.yml` | retired 2026-09-24 — zero adopters, file deleted (narduk-reboot P3-C2 / O-D8); `narduk-enterprises/agent-infrastructure` stays on its own local, canonical invocation of the same (now commit-scanning) checker | — |
 | `reusable-weekly-drift-check.yml` | retired — zero live callers verified across `narduk-enterprises` and `narduk-incubator` | — |
 | `red-main-listener.yml` | `narduk-enterprises/workflows` itself (`red-main-self.yml`, listening to this repo's own `CI`) | not yet |
@@ -347,165 +347,26 @@ so a private caller that passes nothing is Blacksmith-eligible (it is on the
   get Blacksmith overflow automatically — use the expression above, or it
   silently stays off the overflow route.
 
-## Cursor review
+## Cursor review (retired 2026-09-28)
 
-**On-demand reviews (2026-09-21).** Add `review-now` whenever a review is
-wanted: it uses Composer 2.5 standard and bypasses every spend gate. Daily
-and per-PR round caps default to zero (unlimited). Automatic reviews retain
-the class rule and small-diff floors. Their skip messages recommend
-`review-now`; there is no need to select a more expensive model to get a review.
+The `cursor-review.yml` callable, this repository's `cursor-review-self.yml`,
+`scripts/cursor_review.py`, `scripts/test_cursor_review.py` and
+`scripts/cursor_review_brief.md` were deleted in ci-reset W6, and every caller
+in the organization was removed. The callable held a runner seat for the whole
+Cursor wait.
 
-`review-deep` explicitly requests Grok 4.6 xhigh, with fast mode off. Both
-request labels are cleared before launch, including failed launches, so the
-next add is a fresh request. A later `review-now` stays on Composer even if
-an old deep label remains. Draft, fork, opt-out and credential checks still
-apply. Callers must update their immutable pin to adopt this behavior.
+Reviews now come from the PR review bot on CT650:
+- Code: `narduk-enterprises/runners` `scripts/pr_review_bot/`, operator guide
+  `docs/pr-review-bot.md`, runners#212.
+- Triggers: a PR comment whose first line is `/review` or `/review deep`, or
+  the `review-now` / `review-deep` label, from an organization member with
+  write access.
+- It keeps this callable's prompt (moved verbatim), models (Composer 2.5
+  standard, Grok 4.6 xhigh deep, `fast: false`) and review format, and posts
+  a real review from `narduk-durable-agent-sessions[bot]`.
+- Nothing to adopt: no caller file and no repository secret.
 
-`cursor-review.yml` is the estate's pull-request reviewer (design and decisions:
-[agent-infrastructure#1564](https://github.com/narduk-enterprises/agent-infrastructure/issues/1564)).
-It is default-off and never part of `ci / Required`. Every enrolled repository
-calls it from its own workflow file (`.github/workflows/cursor-review.yml`, the
-shape below) rather than from inside `ci.yml`: the trigger set includes
-`ready_for_review`, which most `ci.yml` files do not carry, and a `ci.yml`
-change in some repos re-runs the full gate. The caller grants exactly
-`contents: read` + `pull-requests: write`. Its workflow-level concurrency group
-MUST NOT reuse the callable's job group name (`cursor-review-<repo>-<pr>`); the
-same name deadlocks the job at scheduling.
-
-**Triggers and the class rule (reviewer untangle, 2026-09-19).** The trigger
-set deliberately omits `synchronize`: on 2026-09-19 push-driven re-reviews took
-the estate to 165 runs over 80 heads and exhausted the Cursor Models pool for
-seven and a half hours. A lane that wants the new head reviewed adds the
-`review-now` label; the callable clears it again so the next add is a fresh
-event. `review-deep` is also consumed; unrelated label additions skip. One ordering matters: the job
-refuses to wake at all while `no-ai-review` is on, and removing that label is
-an `unlabeled` event nothing listens for — so **clear the opt-out first, then
-add `review-now`**, not the other way round. The callable's job `if:` is an
-allow-list of a re-request label (plus `opened` / `reopened` /
-`ready_for_review` only when the caller passes `automatic-reviews: true`), so a
-caller that has not yet dropped `synchronize` launches nothing here.
-
-**Label-only by default (CI reset, 2026-09-28).** The job waits on the Cursor
-API for up to `wait-minutes`, and a private caller's job waits on a `linux-ci`
-seat. Starting it automatically on every opened pull request held one of the
-pool's few seats for a review nobody asked for, so `automatic-reviews` now
-defaults to `false`: the job starts only for `review-now`, `review-p0`,
-`review-p1` or `review-deep`, and every other event is skipped before it takes a
-runner. P0 paths are no longer reviewed on open; add `review-p0` (or
-`review-now`) to ask. A caller that wants the old behaviour passes
-`automatic-reviews: true` and keeps the four-event trigger set. A label-only
-caller should listen on `labeled` alone, as the shape below does: an `opened`,
-`reopened` or `ready_for_review` run would otherwise land in the `review`
-bucket of the caller group and could cancel a live labelled review before the
-job `if:` skipped it.
-
-**A pin-only bump is not safe.** A caller that keeps `synchronize` and a single
-`cancel-in-progress` concurrency group starts a run on the first push, cancels
-the opened review's waiter *before* any job condition is evaluated, and is then
-skipped by the job `if:` — so `cancel_previous` never runs, the Cursor agent
-keeps burning the pool, and the pull request is left unreviewed. Drop
-`synchronize` in the same commit as the pin, or put every non-review action in
-the `other` concurrency bucket first. The caller group below does the latter:
-it mirrors the job `if:` exactly, so `synchronize`, `edited` and an ignored
-label all share one bucket that no live review is ever in. `review-p0` and `review-p1` also
-wake the reviewer, and because waking it cancels any in-flight waiter they beat
-the inferred P2 signals too. Inside that, Logan's answer of
-2026-09-19 governs volume, in his words: *"No numeric cap, only the P0/P1/P2
-class rule"*. P0 (`.github/workflows/**`, `.github/actions/**`, `DECISIONS.md` or
-`cursor_review_brief.md` matched case-insensitively, a T2-sensitive path — auth, session,
-payments or the credential table — or the `review-p0` label) is always
-reviewed; P1 is ordinary code **and policy prose** (`docs/agents/**` and the basenames
-`AGENTS.md`, `CLAUDE.md`, `CODEX.md`, `SKILL.md`, P1 since the 2026-09-20 narrowing),
-reviewed **on request only** (`review-now` or `review-p1`)
-by default since 2026-09-24 (narduk-reboot O-D7; Logan: *"Review on request + sensitive
-paths (Recommended)"*) — a caller passing `review-ordinary-code: true` restores one
-automatic review per open/reopen/ready; P2 — an automation author
-(`dependabot[bot]`, `github-actions[bot]`, `renovate[bot]`), a
-`changeset-release/*` head, a metadata-only diff, or the `review-p2` label —
-never launches an agent, and `review-now` overrides every P2 signal. P0 is
-decided first, so a `review-p2` label or an automation author never lowers a
-workflow change out of review, and metadata means prose only: `CODEOWNERS`,
-`.gitignore` and `.gitattributes` are code, because one can drop required
-reviewers and another can stop ignoring secret material. The title is never a
-signal either — it is author-controlled, and `chore:` on a code change would be
-a free skip of the merge-gating reviewer. An **unknown** file list (a files-API
-failure, or a diff past the page bound) is classified reviewable, never P2. There is no launch counter here on purpose; the
-ledger is `gh run list --repo narduk-enterprises/<repo> --workflow cursor-review.yml`.
-
-Provider failure is reported as provider failure. In particular,
-`usage_limit_exceeded` does not fall back to the retired Proxmox pool and does
-not prove that a usage reset, spending change, or other account mutation
-succeeded; the workflow records the review as unavailable until a later run.
-
-```yaml
-name: Cursor review
-
-# No `synchronize`: a push does not re-review. A lane adds `review-now` to ask
-# for the new head, and the callable clears the label again. Label-only: add
-# opened/reopened/ready_for_review back only with `automatic-reviews: true`.
-on:
-  pull_request:
-    types: [labeled]
-
-# A label addition that is NOT a review re-request must never cancel a live
-# review: a run-level cancel happens before any job condition is evaluated, so
-# the discrimination has to be in the GROUP NAME, not only in the callable.
-concurrency:
-  group: cursor-review-caller-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1","review-deep"]'), github.event.label.name)))) && 'review' || 'other' }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
-jobs:
-  cursor-review:
-    uses: narduk-enterprises/workflows/.github/workflows/cursor-review.yml@<full-sha> # workflows#<pr>; the moving v2 tag predates this callable, keep the SHA
-    permissions:
-      contents: read
-      pull-requests: write
-    with:
-      enabled: true
-      # runner: '"ubuntu-latest"'   # a PUBLIC caller pins GitHub-hosted explicitly
-    secrets:
-      CURSOR_CLOUD_AGENTS_API_KEY: ${{ secrets.CURSOR_CLOUD_AGENTS_API_KEY }}
-```
-
-What happens per pull request head:
-
-1. The job launches one Cursor Cloud agent with the caller repository at the PR
-   head branch and the `context-repos` (default `narduk-enterprises/agent-infrastructure`
-   and `narduk-enterprises/company-hq`) attached read-only. The brief lives in
-   `scripts/cursor_review_brief.md`; the agent reads the target repo's own
-   `AGENTS.md`, the estate coding standards, may run the repo's cheap checks, and
-   answers with one fenced JSON block (`verdict`, `summary`, `findings[]`).
-2. The job polls the run (30 s) up to `wait-minutes` (default 30), reads the run's
-   `result`, and posts a formal review on the reviewed head. Any `blocking`
-   finding requests changes. Each finding whose `path:line` is inside the PR
-   diff becomes an inline comment; the rest are listed in the review body.
-3. A push does NOT re-review: `synchronize` is not in the trigger set. A lane
-   that wants the new head reviewed adds `review-now`, which cancels the
-   in-flight waiter and whatever agent the marker comment still points at —
-   same head or not, because `review-now` is itself the same-head re-request —
-   reviews the new head, and is cleared again so the next add is a fresh event. A non-blocking review dismisses the bot's
-   own stale REQUEST_CHANGES itself, on the new head, with the reason recorded.
-   Enable `required_review_thread_resolution` on the repo's ruleset to make
-   lanes answer every thread. Do **not** enable `dismiss_stale_reviews_on_push`
-   alongside this trigger set: with `synchronize` gone, a push would clear a
-   REQUEST_CHANGES and nothing would launch to replace it, so
-   `scripts/verify-pr-gate.py` would print green on a head no reviewer ever
-   saw. A repository that keeps `dismiss_stale_reviews_on_push` on must treat
-   `review-now` after every push as mandatory rather than optional. **With
-   `dismiss_stale_reviews_on_push` off, the duty is the same**: an APPROVE or
-   COMMENT on head N still satisfies GitHub's `reviewDecision` on head N+1, and
-   `verify-pr-gate.py` reads only that decision — it does not bind the review to
-   `headRefOid`. So under company-hq D-AGENT-REVIEW-2 a lane that pushes after a
-   review adds `review-now`, whichever way the ruleset is set.
-
-The only secret is `CURSOR_CLOUD_AGENTS_API_KEY`, a GitHub Actions repository
-secret delivered from nvault at a workstation (company-hq D-CLOUD-SECRETS-1). No
-GitHub credential enters the Cursor VM. Public callers (`narduk-libs`, this repo)
-wait on `ubuntu-latest`; private callers on the manifest's `linux-ci` route via
-the `runner` default, a near-idle poll.
+Git history holds the deleted callable and its design notes.
 
 ## How to consume
 
