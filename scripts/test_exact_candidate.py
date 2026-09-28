@@ -83,6 +83,18 @@ class ExactCandidate(unittest.TestCase):
         self.assertIn("actionlint (caller's own workflows)", lint)
         self.assertIn('Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)', lint)
         self.assertEqual(required['if'], 'always()')
+        # The Caller lint steps must run after a failed gate step (so both
+        # show) but never be skipped on a live run: exact conditions pinned.
+        caller_lint = ['Check out the caller for Caller lint', 'Ensure PyYAML is available',
+                       'Install actionlint', "actionlint (caller's own workflows)",
+                       'Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)']
+        escalated = self.workflow['jobs']['fast-escalated']
+        for job, expected in [(required, '!cancelled()'),
+                              (escalated, "env.FAST_ENABLED == 'true' && !cancelled()")]:
+            steps = {step.get('name'): step for step in job['steps']}
+            for name in caller_lint:
+                with self.subTest(job=job.get('name'), step=name):
+                    self.assertEqual(steps[name].get('if'), expected)
         gate = next(step for step in required['steps'] if step.get('name') ==
                     'Require enabled gates to succeed and disabled gates to skip')
         script = gate['run'].replace('${{ inputs.extra-gate-scripts }}', '')
