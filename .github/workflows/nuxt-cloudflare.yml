@@ -98,6 +98,19 @@ name: Reusable Nuxt + Cloudflare CI
 # alongside its push/pull_request triggers, with the same `ci:` job. The
 # quarantine lane (`e2e-quarantine-args`) runs there too.
 #
+# THE QUALITY LEVEL (coding-standards deep dive, 2026-09-27). The estate has
+# web quality tools that gate nothing on most apps because each one is an
+# opt-in nobody opted into: the foundation check, the per-route performance
+# budget, and the live security-headers probe. `quality-level: standard`
+# turns all three on at once, each with a reasoned `quality-opt-out`.
+# `legacy` stays the default so the change reaches one app at a time: the app
+# writes the line in its own next change. The axe accessibility ratchet
+# (narduk-testkit `expectAccessible`) is NOT here: it is an assertion inside
+# the app's own Playwright suite, which `run-e2e` already executes. This
+# workflow cannot tell a suite that calls it from one that does not without
+# grepping test sources, which proves presence and not coverage, so the
+# generator and each app's AGENTS.md own that rule instead.
+#
 # RUNNER ROUTING: `runner` is a caller-controlled, JSON-encoded string input —
 # a plain string ("ubuntu-latest"), a JSON array, or a JSON object matching
 # Config/github-runner-fleet.json's `runsOn` shape — decoded with fromJSON()
@@ -700,6 +713,9 @@ on:
           failing run's artefact is the one the rollup most wants; no GitHub
           artifact is uploaded since the org artifact quota of 2026-09-26),
           and a short summary is written to the job summary either way.
+          `quality-level: standard` also turns this check on, unless the caller
+          opts out through `quality-opt-out`; `true` here turns it on at any
+          level.
         required: false
         type: boolean
         default: false
@@ -723,6 +739,76 @@ on:
         required: false
         type: string
         default: "package-token"
+      # ---------------------------------------------------------------------
+      # QUALITY LEVEL (coding-standards deep dive, 2026-09-27). One input moves
+      # an app from today's gate set to the estate's standard web quality
+      # gates, so each app adopts with a single line in its own next change
+      # and nothing reaches an app that did not write that line. See THE
+      # QUALITY LEVEL in the header comment and README "Quality level".
+      # ---------------------------------------------------------------------
+      quality-level:
+        description: >-
+          `legacy` (the default) runs exactly the gates this workflow ran
+          before the input existed. `standard` turns on, by default, the
+          estate web quality gates: `foundation-check` (the web-foundation
+          conformance check), `performance-budget` (`narduk-app
+          performance-budget` over the build output, in the Build job) and
+          `security-headers` (`narduk-app foundation:check:security-headers`
+          probing a deployed origin: the pull request's Cloudflare preview in
+          the Preview job, and `security-headers-url` in journey-smoke mode).
+          Each default-on gate can be turned off only through
+          `quality-opt-out`, with a written reason.
+
+          DEFAULT IS `legacy` ON PURPOSE. Dependabot opens pin bumps for this
+          callable on most adopters, so a default flip on the `v2` line (or a
+          new major) would reach the fleet as a wave of simultaneously red
+          pull requests. An explicit per-app input is the only switch that
+          moves one app at a time. A later major may flip the default once the
+          fleet has adopted.
+        required: false
+        type: string
+        default: "legacy"
+      quality-opt-out:
+        description: >-
+          Comma-separated `check=reason` entries turning off a gate that
+          `quality-level: standard` enables. Checks: `foundation-check`,
+          `performance-budget`, `security-headers`. THE REASON IS REQUIRED:
+          an entry with no reason fails the Build job, and every opt-out is
+          echoed as a `::warning::` carrying its reason plus a job-summary
+          line, on every run, so an opted-out gate stays visible. Reasons
+          cannot contain commas. Same written-reason convention as
+          `audit-ignore`.
+        required: false
+        type: string
+        default: ""
+      performance-budget-args:
+        description: >-
+          Extra arguments for `narduk-app performance-budget`, e.g.
+          `--app-dir apps/web --css-budget-kb 50`. The binary runs from
+          `working-directory` out of the caller's own install. `--json` and
+          `--report-only` are rejected: the workflow owns the report and the
+          gate never downgrades to a warning.
+        required: false
+        type: string
+        default: ""
+      security-headers-paths:
+        description: >-
+          Space-separated paths the security-headers probe reads, each passed
+          as `--path` (for example `/login` on an authenticated app whose root
+          refuses the request). Empty probes the origin root.
+        required: false
+        type: string
+        default: ""
+      security-headers-url:
+        description: >-
+          The production `https://` origin the security-headers probe reads in
+          journey-smoke (post-deploy) mode. Empty falls back to
+          `journey-smoke-url`. Pull requests always probe their own Cloudflare
+          preview, never production: a pull request that fixes the headers
+          must not stay red until it is deployed.
+        required: false
+        type: string
+        default: ""
       # ---------------------------------------------------------------------
       # FAST-PATH DELIVERY INPUTS (narduk reboot P3-C1, O-velocity §3.4-§3.6).
       # Every input below defaults OFF. With all of them at their defaults the
@@ -1564,6 +1650,135 @@ jobs:
             exit 1
           fi
 
+      # THE QUALITY LEVEL. Resolves which estate quality gates this run owes,
+      # and validates every quality input, before a single dependency is
+      # installed. Anchored: the Preview and Journey smoke jobs run this exact
+      # text (CONTEXT tells them apart), so the three jobs can never disagree
+      # about which gates are on. Outputs `foundation-check`,
+      # `performance-budget` and `security-headers` as `true`/`false`.
+      - name: Resolve quality gates
+        id: quality
+        working-directory: ${{ github.workspace }}
+        env:
+          CONTEXT: build
+          LEVEL: ${{ inputs.quality-level }}
+          OPT_OUT: ${{ inputs.quality-opt-out }}
+          EXPLICIT_FOUNDATION: ${{ inputs.foundation-check }}
+          PREVIEW_CHECKS: ${{ inputs.preview-checks }}
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+          PERF_ARGS: ${{ inputs.performance-budget-args }}
+          HEADER_PATHS: ${{ inputs.security-headers-paths }}
+          HEADER_URL: ${{ inputs.security-headers-url }}
+        run: &resolve_quality_gates |
+          set -euo pipefail
+          status=0
+          summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"; printf '%s' "$s"; }
+          for name in OPT_OUT PERF_ARGS HEADER_PATHS HEADER_URL; do
+            case "${!name}" in
+              *$'\n'*|*$'\r'*) echo "::error::quality input $name must be a single line"; exit 1 ;;
+            esac
+          done
+          case "$LEVEL" in
+            legacy) foundation=false; perf=false; headers=false ;;
+            standard) foundation=true; perf=true; headers=true ;;
+            *) echo "::error::quality-level must be 'legacy' or 'standard' (got '$LEVEL')"; exit 1 ;;
+          esac
+          # `read -ra`, never an unquoted `for` over the value: a reason is free
+          # text, and word splitting would also glob-expand a `*` in it.
+          seen=" "
+          IFS=',' read -ra entries <<< "$OPT_OUT"
+          for raw in ${entries[@]+"${entries[@]}"}; do
+            entry="$(trim "$raw")"
+            [ -z "$entry" ] && continue
+            if [[ "$entry" != *=* ]]; then
+              echo "::error::quality-opt-out entry '$entry' has no reason: write it as check=reason"
+              status=1
+              continue
+            fi
+            check="$(trim "${entry%%=*}")"
+            reason="$(trim "${entry#*=}")"
+            case "$check" in
+              foundation-check|performance-budget|security-headers) ;;
+              *)
+                echo "::error::quality-opt-out names unknown check '$check' (known: foundation-check, performance-budget, security-headers)"
+                status=1
+                continue
+                ;;
+            esac
+            if [ -z "$reason" ]; then
+              echo "::error::quality-opt-out entry for '$check' has an empty reason; an opt-out must say why"
+              status=1
+              continue
+            fi
+            if [[ "$seen" == *" $check "* ]]; then
+              echo "::error::quality-opt-out names '$check' more than once"
+              status=1
+              continue
+            fi
+            seen="$seen$check "
+            if [ "$LEVEL" != standard ]; then
+              echo "::warning::quality-opt-out '$check' has no effect at quality-level $LEVEL; remove it"
+              continue
+            fi
+            case "$check" in
+              foundation-check) foundation=false ;;
+              performance-budget) perf=false ;;
+              security-headers) headers=false ;;
+            esac
+            echo "::warning::quality gate '$check' is opted out at quality-level standard: $reason"
+            printf -- '- :warning: quality gate %s opted out: %s\n' "$check" "$reason" >> "$summary"
+          done
+          # The pre-existing explicit input still turns the foundation check on
+          # at any level; opting out of what the caller explicitly asked for is
+          # a contradiction, not a preference.
+          if [ "$EXPLICIT_FOUNDATION" = true ]; then
+            if [[ "$seen" == *" foundation-check "* ]] && [ "$LEVEL" = standard ]; then
+              echo "::error::foundation-check: true contradicts quality-opt-out foundation-check; drop one"
+              status=1
+            fi
+            foundation=true
+          fi
+          read -ra perf_args <<< "$PERF_ARGS"
+          for arg in ${perf_args[@]+"${perf_args[@]}"}; do
+            case "$arg" in
+              --json|--json=*|--report-only)
+                echo "::error::performance-budget-args must not contain $arg: the workflow owns the report, and the gate never downgrades to report-only"
+                status=1
+                ;;
+            esac
+          done
+          read -ra header_paths <<< "$HEADER_PATHS"
+          for path in ${header_paths[@]+"${header_paths[@]}"}; do
+            if ! [[ "$path" =~ ^/[^[:space:]]*$ ]]; then
+              echo "::error::security-headers-paths entries must start with / (got '$path')"
+              status=1
+            fi
+          done
+          if [ -n "$HEADER_URL" ] && ! [[ "$HEADER_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[^[:space:]]*)?$ ]]; then
+            echo "::error::security-headers-url must be one https:// URL (got '$HEADER_URL')"
+            status=1
+          fi
+          # Consistency that only the Build job judges, so a misconfiguration
+          # fails the adoption pull request itself rather than surfacing later.
+          if [ "$CONTEXT" = build ]; then
+            if [ "$headers" = true ] && [ "$PREVIEW_CHECKS" = none ]; then
+              echo "::error::quality-level standard probes security headers on the pull request's Cloudflare preview, but preview-checks is 'none'. Enable a preview check, or opt out: quality-opt-out: security-headers=<reason>"
+              status=1
+            fi
+            if [ "$perf" = true ] && [ -z "$BUILD_SCRIPT" ]; then
+              echo "::error::performance-budget measures the build output, but build-script is empty. Declare a build, or opt out: quality-opt-out: performance-budget=<reason>"
+              status=1
+            fi
+          fi
+          {
+            echo "foundation-check=$foundation"
+            echo "performance-budget=$perf"
+            echo "security-headers=$headers"
+          } >> "${GITHUB_OUTPUT:-/dev/null}"
+          echo "quality-level $LEVEL ($CONTEXT): foundation-check=$foundation performance-budget=$perf security-headers=$headers"
+          exit "$status"
+
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
 
@@ -2119,7 +2334,7 @@ jobs:
       # check" below prints it to the log and applies the decided blocking
       # rule.
       - name: Run web-foundation conformance check
-        if: inputs.foundation-check
+        if: steps.quality.outputs.foundation-check == 'true'
         env:
           PM: ${{ inputs.package-manager }}
           TOOL_VERSION: ${{ inputs.foundation-check-tool-version }}
@@ -2238,7 +2453,7 @@ jobs:
       # a check that cannot see cannot pass (WEB-FOUNDATION-CHECK.md §5, "the
       # app's CI must treat [UNKNOWN] as a failure too").
       - name: Evaluate web-foundation conformance check
-        if: always() && inputs.foundation-check
+        if: always() && steps.quality.outputs.foundation-check == 'true'
         run: |
           set -uo pipefail
           echo "## Web foundation conformance check" >> "$GITHUB_STEP_SUMMARY"
@@ -2358,6 +2573,68 @@ jobs:
             if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
             echo "::endgroup::"
           done
+
+      # PERFORMANCE BUDGET (quality-level standard). Handbook ch02's per-route
+      # budget, enforced by the tool that already encodes it, in the lane that
+      # already has the build output. Fail closed: the tool itself passes
+      # silently when `.output/public` is absent (it walks an empty tree), so
+      # this step refuses a report whose app has no build output, and treats
+      # an unreadable report as a failure rather than as "no violations".
+      - name: Performance budget
+        if: steps.quality.outputs.performance-budget == 'true'
+        env:
+          PM: ${{ inputs.package-manager }}
+          PERF_ARGS: ${{ inputs.performance-budget-args }}
+        run: |
+          set -uo pipefail
+          report="${RUNNER_TEMP:-/tmp}/performance-budget.json"
+          rm -f "$report"
+          ARGS=(--json)
+          read -ra extra <<< "$PERF_ARGS"
+          ARGS+=(${extra[@]+"${extra[@]}"})
+          if [ "$PM" = "pnpm" ]; then
+            pnpm exec narduk-app performance-budget "${ARGS[@]}" > "$report"
+          else
+            npx --no-install narduk-app performance-budget "${ARGS[@]}" > "$report"
+          fi
+          rc=$?
+          # JavaScript template literals, not shell expansions.
+          # shellcheck disable=SC2016
+          RC="$rc" REPORT="$report" node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+            const rc = Number(process.env.RC);
+            const summary = process.env.GITHUB_STEP_SUMMARY;
+            const note = (line) => { if (summary) fs.appendFileSync(summary, line + "\n"); };
+            const fail = (message) => {
+              console.log(`::error::${message}`);
+              note(`- :x: **performance-budget** — ${message}`);
+              process.exit(1);
+            };
+            let report;
+            try { report = JSON.parse(fs.readFileSync(process.env.REPORT, "utf8")); }
+            catch {
+              fail(`narduk-app performance-budget produced no readable report (exit ${rc}). ` +
+                "It runs the @narduk-enterprises/narduk-app-tools installed by this job, which must resolve from working-directory.");
+            }
+            if (!report || typeof report.appDir !== "string" || !Array.isArray(report.violations)) {
+              fail("the performance-budget report is not in the expected shape; treating as a failure");
+            }
+            if (!fs.existsSync(path.join(report.appDir, ".output", "public"))) {
+              fail(`no build output at ${path.join(report.appDir, ".output", "public")}: the budget measured nothing. ` +
+                "Point it at the app with performance-budget-args: --app-dir <dir>.");
+            }
+            for (const warning of report.warnings || []) console.log(`::warning::performance-budget: ${warning}`);
+            const checked = report.checked || {};
+            const counts = `${checked.cssFiles ?? 0} CSS, ${checked.fontFiles ?? 0} font, ${checked.imageFiles ?? 0} image file(s)`;
+            if (report.violations.length > 0) {
+              for (const v of report.violations) console.log(`::error::performance-budget ${v.path}: ${v.message}`);
+              fail(`${report.violations.length} budget violation(s) over ${counts}`);
+            }
+            if (rc !== 0) fail(`narduk-app performance-budget exited ${rc} with no violation in its report`);
+            console.log(`performance budget passed over ${counts}`);
+            note(`- :white_check_mark: **performance-budget** passed over ${counts}`);
+          '
 
       # Resolve only known Nuxt outputs. An ambiguous or absent build is an
       # error here, never a reason to drop the handoff. E2E compiles its own
@@ -2874,9 +3151,10 @@ jobs:
               const workflow = process.env.CALLER_WORKFLOW_REF.split('@')[0];
               const workflowPath = workflow.slice(`${repo.owner}/${repo.repo}/`.length);
               const inputs = JSON.parse(process.env.E2E_INPUTS);
-              // Fast-path inputs (P3-C1) stay out of the key at their defaults,
-              // so proof minted before they existed still matches.
-              const fastPathDefaults = { 'fast-scripts': '', 'required-reuse-pr-results': false, 'e2e-pr-only-changed': false, 'journey-smoke-url': '', 'journey-smoke-args': '--grep=@smoke --retries=1', 'journey-smoke-rollback-script': '', 'journey-smoke-rollback-to': '' };
+              // Fast-path inputs (P3-C1) and the quality-level inputs stay out of
+              // the key at their defaults, so proof minted before they existed
+              // still matches.
+              const fastPathDefaults = { 'fast-scripts': '', 'required-reuse-pr-results': false, 'e2e-pr-only-changed': false, 'journey-smoke-url': '', 'journey-smoke-args': '--grep=@smoke --retries=1', 'journey-smoke-rollback-script': '', 'journey-smoke-rollback-to': '', 'quality-level': 'legacy', 'quality-opt-out': '', 'performance-budget-args': '', 'security-headers-paths': '', 'security-headers-url': '' };
               for (const [name, value] of Object.entries(fastPathDefaults)) {
                 if (inputs[name] === value) delete inputs[name];
               }
@@ -4035,6 +4313,22 @@ jobs:
           esac
           echo "preview checks:$selected; url source: $SOURCE"
 
+      # Same anchored resolver as the Build job (THE QUALITY LEVEL).
+      - name: Resolve quality gates
+        id: quality
+        working-directory: ${{ github.workspace }}
+        env:
+          CONTEXT: preview
+          LEVEL: ${{ inputs.quality-level }}
+          OPT_OUT: ${{ inputs.quality-opt-out }}
+          EXPLICIT_FOUNDATION: ${{ inputs.foundation-check }}
+          PREVIEW_CHECKS: ${{ inputs.preview-checks }}
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+          PERF_ARGS: ${{ inputs.performance-budget-args }}
+          HEADER_PATHS: ${{ inputs.security-headers-paths }}
+          HEADER_URL: ${{ inputs.security-headers-url }}
+        run: *resolve_quality_gates
+
       # BEFORE dependency installation, exactly as in the e2e job: once an
       # install has run, a browser could already have been acquired and the
       # guard would be auditing state it no longer controls. Same anchored text.
@@ -4323,6 +4617,33 @@ jobs:
             npx --no-install narduk-app og:check --live --base-url "$PREVIEW_URL"
           fi
 
+      # SECURITY HEADERS (quality-level standard). The pull request's OWN
+      # deployment, never production: a change that fixes the headers must be
+      # able to go green before it ships. The probe needs no credential; it
+      # reads public response headers (narduk-libs security-headers-check.ts).
+      # Exit 1 (FAIL) and 2 (UNKNOWN: nothing readable) both block. Headers a
+      # Cloudflare zone adds (rather than the app) are absent on workers.dev.
+      - name: Check preview security headers
+        id: security-headers
+        if: ${{ !cancelled() && steps.quality.outputs.security-headers == 'true' && steps.preview.outputs.url != '' }}
+        working-directory: ${{ inputs.preview-working-directory != '' && inputs.preview-working-directory || inputs.working-directory }}
+        env:
+          PM: ${{ inputs.package-manager }}
+          TARGET_URL: ${{ steps.preview.outputs.url }}
+          HEADER_PATHS: ${{ inputs.security-headers-paths }}
+        # Anchored: the post-deploy probe in Journey smoke runs this exact text.
+        run: &probe_security_headers |
+          set -euo pipefail
+          ARGS=(--base-url "$TARGET_URL")
+          read -ra paths <<< "$HEADER_PATHS"
+          for path in ${paths[@]+"${paths[@]}"}; do ARGS+=(--path "$path"); done
+          echo "probing security headers at $TARGET_URL"
+          if [ "$PM" = "pnpm" ]; then
+            pnpm exec narduk-app foundation:check:security-headers "${ARGS[@]}"
+          else
+            npx --no-install narduk-app foundation:check:security-headers "${ARGS[@]}"
+          fi
+
       - name: Run preview e2e subset
         id: preview-e2e
         if: ${{ !cancelled() && contains(inputs.preview-checks, 'e2e-subset') && steps.preview.outputs.url != '' }}
@@ -4383,6 +4704,7 @@ jobs:
           RESOLVE_OUTCOME: ${{ steps.preview.outcome }}
           OG_OUTCOME: ${{ steps.og-check.outcome }}
           E2E_OUTCOME: ${{ steps.preview-e2e.outcome }}
+          HEADERS_OUTCOME: ${{ steps.security-headers.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -4430,6 +4752,7 @@ jobs:
               row("preview ready + `x-build-version`", os.environ.get("RESOLVE_OUTCOME", "")),
               row("`og:check --live`", os.environ.get("OG_OUTCOME", "")),
               row("e2e subset against the preview", os.environ.get("E2E_OUTCOME", "")),
+              row("security headers (`foundation:check:security-headers`)", os.environ.get("HEADERS_OUTCOME", "")),
               "",
               f"[Workflow run]({os.environ['RUN_URL']})",
               "",
@@ -5212,6 +5535,21 @@ jobs:
             *[!A-Za-z0-9._-]*) echo "::error::journey-smoke-rollback-to must be a version identifier"; status=1 ;;
           esac
           exit "$status"
+      # Same anchored resolver as the Build job (THE QUALITY LEVEL).
+      - name: Resolve quality gates
+        id: quality
+        working-directory: ${{ github.workspace }}
+        env:
+          CONTEXT: journey-smoke
+          LEVEL: ${{ inputs.quality-level }}
+          OPT_OUT: ${{ inputs.quality-opt-out }}
+          EXPLICIT_FOUNDATION: ${{ inputs.foundation-check }}
+          PREVIEW_CHECKS: ${{ inputs.preview-checks }}
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+          PERF_ARGS: ${{ inputs.performance-budget-args }}
+          HEADER_PATHS: ${{ inputs.security-headers-paths }}
+          HEADER_URL: ${{ inputs.security-headers-url }}
+        run: *resolve_quality_gates
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
         if: inputs.package-manager == 'pnpm'
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -5402,6 +5740,20 @@ jobs:
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             printf '\nRolled back with the %s script (to %s). The job stays red.\n' "$SCRIPT" "${ROLLBACK_TO_VERSION:-the script default}" >> "$GITHUB_STEP_SUMMARY"
           fi
+
+      # SECURITY HEADERS, POST-DEPLOY (quality-level standard). Production, as
+      # just deployed: `security-headers-url`, else the smoke URL. Runs whether
+      # or not the smoke passed, and never triggers the rollback hook: a header
+      # regression pages rather than reverting a deploy on its own.
+      - name: Check post-deploy security headers
+        id: security-headers
+        if: ${{ !cancelled() && steps.quality.outputs.security-headers == 'true' }}
+        working-directory: ${{ inputs.preview-working-directory != '' && inputs.preview-working-directory || inputs.working-directory }}
+        env:
+          PM: ${{ inputs.package-manager }}
+          TARGET_URL: ${{ inputs.security-headers-url != '' && inputs.security-headers-url || inputs.journey-smoke-url }}
+          HEADER_PATHS: ${{ inputs.security-headers-paths }}
+        run: *probe_security_headers
 
   required:
     name: Required
