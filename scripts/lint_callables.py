@@ -116,10 +116,6 @@ INPUT_EXPR = re.compile(r"^\$\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*\}\}$")
 # every adopter first and only then moving the tag (workflows#59).
 CALLER_GRANTS: dict[str, set[str]] = {
     "apple.yml": {"contents"},
-    # Posts a real pull-request review (APPROVE / COMMENT / REQUEST_CHANGES
-    # with inline comments) and edits one sticky progress comment, so the
-    # caller's `cursor-review:` job must grant `pull-requests: write`.
-    "cursor-review.yml": {"contents", "pull-requests"},
     "docs-governance.yml": {"contents"},
     "node-library.yml": {"contents"},
     # WIDENED for the `preview` job's sticky pull-request comment (V1). This
