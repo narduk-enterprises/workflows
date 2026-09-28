@@ -263,7 +263,10 @@ def check_required_job(path: Path, doc: dict, f: Findings) -> None:
         # start it after a cancellation. It must carry NO `if:` at all: a
         # skipped job counts as passing, so any condition could turn
         # `ci / Required` green without running. An aggregating `Required`
-        # must run even when a needed job failed, so it keeps `always()`.
+        # must run even when a needed job failed, so it keeps `always()` or,
+        # exactly, `!cancelled()`: that also runs after a failed or skipped
+        # need, and a cancelled run reports it CANCELLED (never passing)
+        # without holding a runner (nuxt-cloudflare.yml, CI reset 2026-09-28).
         self_contained = not needs and set(jobs) == {jid}
         if self_contained:
             if cond:
@@ -272,8 +275,12 @@ def check_required_job(path: Path, doc: dict, f: Findings) -> None:
                     f"R5 job '{jid}' is a self-contained Required but has `if:` {cond!r} — "
                     "a skipped Required passes; drop the condition",
                 )
-        elif "always()" not in cond:
-            f.add(path, f"R5 job '{jid}' is named Required but its `if:` is {cond!r} — it must be `always()`")
+        elif "always()" not in cond and cond != "!cancelled()":
+            f.add(
+                path,
+                f"R5 job '{jid}' is named Required but its `if:` is {cond!r} — "
+                "it must be `always()` or exactly `!cancelled()`",
+            )
         missing = sorted(set(jobs) - set(needs) - {jid} - non_gating_jobs(path, doc, f))
         if missing:
             f.add(

@@ -114,13 +114,27 @@ with a job named **exactly** `Required`. (Since the CI reset, 2026-09-28,
 with nothing to aggregate, a second job only cost a runner allocation per
 call. `lint_callables.py` R5 exempts exactly that self-contained shape from
 `always()`.) An aggregating `Required` `needs:` every other job the
-workflow defines, runs with `if: always()`, and explicitly checks each
+workflow defines, runs with `if: always()` (or, in `nuxt-cloudflare.yml`,
+`if: "!cancelled()"`, below), and explicitly checks each
 `needs.<job>.result` — a job that's enabled must report `success`; it may
 report `skipped` only when its controlling input is off. In particular,
 `run-e2e: true` makes the plan and every E2E shard mandatory. A skipped
 enabled job is failure, not an acceptable
 substitute for a toolchain check that never ran. `if: always()` jobs succeed by
 default if you don't check anything explicitly — these don't skip that check.
+
+`nuxt-cloudflare.yml`'s `Required`, `Fast` and escalated `Fast` use
+`!cancelled()` rather than `always()` (CI reset, 2026-09-28). Both run after a
+failed or skipped need; they differ only when the whole run is cancelled.
+`always()` then still started the job, which queued for a runner only to fail,
+and held the caller's concurrency group meanwhile: operator-portal run
+36494070028 kept the next `main` run waiting about 14 minutes. With
+`!cancelled()`, GitHub reports the job `cancelled` without a runner. That
+conclusion never satisfies a required check (only success, neutral and
+skipped do), so a cancelled run still cannot pass. In cancelled runs
+acre-oracle 36490590502 and operator-portal 36494070028, every job whose `if:`
+was false after the cancel reported `cancelled`, never `skipped`.
+`lint_callables.py` R5 accepts exactly `!cancelled()` as the alternative.
 
 This generalizes a pattern narduk-libs already proved in production: its `ci.yml`
 runs a 12-lane package matrix, then a `verify` job that `needs: package-gates`
@@ -478,7 +492,7 @@ Which gates each callable exposes this way:
 
 | Callable | Caller-gatable | Always runs |
 |---|---|---|
-| `nuxt-cloudflare.yml` | `run-e2e` (`e2e`, `e2e-plan`), `wrangler-dry-run`, `run-tests` | `build`, `checks` |
+| `nuxt-cloudflare.yml` | `run-e2e` (`e2e`, `e2e-plan`), `wrangler-dry-run`, `run-tests` | `build`, `checks` (its steps run inside `build` with `checks-in-build`) |
 | `apple.yml` | `run-swiftlint` / `linux-checks` (`lint`), `run-build`, `run-tests` | `xcode` |
 | `python-data.yml` | `run-ruff` (`lint`), `run-tests`, `run-pyright` | `test` |
 | `reusable-browser-tests.yml` | `run-webkit` (`webkit`) | `validate`, `chromium` |
@@ -1173,7 +1187,12 @@ first case.
 Everything in `build` delays the prebuilt E2E application, and so every E2E
 shard, the preview and the deploy dry run. The typecheck and unit-test lanes
 therefore run in their own parallel `checks` job, and `e2e-plan` no longer
-waits for `build`. An extra script that does **not** need build output belongs
+waits for `build`. A caller whose runner pool, not its critical path, is the
+constraint passes `checks-in-build: true`. The same three steps (YAML
+aliases, not copies) then run in `build` before `build-script`, `checks` is
+skipped, and `Required` demands exactly that. This saves one runner
+allocation, checkout and install per run, and the E2E shards, preview and
+deploy dry run start after the checks instead of beside them. An extra script that does **not** need build output belongs
 in `extra-gate-scripts`, which also runs in parallel. On riverstatus, two
 migration-proof scripts in `extra-scripts` held its E2E back by about 8 minutes.
 

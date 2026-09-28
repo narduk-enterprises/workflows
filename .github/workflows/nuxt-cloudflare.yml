@@ -71,7 +71,7 @@ name: Reusable Nuxt + Cloudflare CI
 #
 # THE "Required" CONVENTION (this is the point of this repo): this workflow's
 # last job is named exactly `Required`, `needs:` every other job, runs with
-# `if: always()`, and fails unless each needed job succeeded or was
+# `if: "!cancelled()"`, and fails unless each needed job succeeded or was
 # intentionally skipped (an opted-out input, never a silent pass). Callers
 # name their calling job id `ci`, so GitHub composes the identical required
 # check context `ci / Required` on every adopting repo regardless of whether
@@ -259,6 +259,20 @@ on:
           a vitest suite could not adopt its own class's callable without
           silently dropping its unit tests. earthdata-viewer (company-hq#278) is
           the adopter that surfaced it.
+        required: false
+        type: boolean
+        default: false
+      checks-in-build:
+        description: >-
+          Run the `Checks` lane's typecheck and unit-test steps inside `Build`
+          instead of in a separate `Checks` job, which is then skipped. One
+          runner allocation, checkout and install fewer per run, paid for in
+          wall clock: `Build` (and so every E2E shard, the preview and the
+          deploy dry run waiting on it) finishes after the checks instead of
+          beside them. For callers whose runner pool, not the critical path,
+          is the constraint. `Required` then requires `Checks` to be skipped
+          and `Build` to succeed, so the gates themselves are unchanged.
+          Default `false` keeps the parallel `Checks` job.
         required: false
         type: boolean
         default: false
@@ -2513,6 +2527,106 @@ jobs:
       # The inputs moved into `env:` in the same change. They used to be
       # interpolated straight into the shell text, which made every script
       # name a command-injection surface from the caller's `with:` block.
+      # `checks-in-build`: the `Checks` lane's own steps, aliased rather than
+      # copied, so the two places cannot drift. Before `build-script`, so a
+      # type error fails the job before the build spends its time.
+      - name: Typecheck Worker
+        if: inputs.checks-in-build
+        env: &checks_tw_env
+          GATE: Typecheck Worker
+          SCRIPT: ${{ inputs.typecheck-worker-script }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
+        run: &checks_tw_script |
+          set -euo pipefail
+          if [ -z "$SCRIPT" ]; then
+            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
+            exit 0
+          fi
+          # `npm pkg get` yields `{}` for a missing script and the bare JSON
+          # value for a present one, so test the VALUE's type — never the
+          # presence of a quote. Verified against real fixtures, including
+          # colon-bearing names like `web:typecheck`, by
+          # scripts/test_script_gates.py.
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+      - name: Typecheck Nuxt
+        if: inputs.checks-in-build
+        env: &checks_tn_env
+          GATE: Typecheck Nuxt
+          SCRIPT: ${{ inputs.typecheck-web-script }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
+        run: &checks_tn_script |
+          set -euo pipefail
+          if [ -z "$SCRIPT" ]; then
+            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
+            exit 0
+          fi
+          # `npm pkg get` yields `{}` for a missing script and the bare JSON
+          # value for a present one, so test the VALUE's type — never the
+          # presence of a quote. Verified against real fixtures, including
+          # colon-bearing names like `web:typecheck`, by
+          # scripts/test_script_gates.py.
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+      - name: Unit tests
+        if: inputs.checks-in-build && inputs.run-tests
+        env: &checks_ut_env
+          GATE: Unit tests
+          SCRIPT: ${{ inputs.test-script }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
+        run: &checks_ut_script |
+          set -euo pipefail
+          if [ -z "$SCRIPT" ]; then
+            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
+            exit 0
+          fi
+          # `npm pkg get` yields `{}` for a missing script and the bare JSON
+          # value for a present one, so test the VALUE's type — never the
+          # presence of a quote. Verified against real fixtures, including
+          # colon-bearing names like `web:typecheck`, by
+          # scripts/test_script_gates.py.
+          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e \
+            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$REQUIRE" = "true" ]; then
+              echo "::error::$msg (require-scripts is on)"
+              exit 1
+            fi
+            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
+            exit 0
+          fi
+          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+
       - name: Build
         env:
           GATE: Build
@@ -2729,9 +2843,10 @@ jobs:
   # belong in `extra-gate-scripts`, which already runs in parallel.
   checks:
     name: Checks
-    # P3-C1: same reuse/smoke gating as `Build`.
+    # P3-C1: same reuse/smoke gating as `Build`. `checks-in-build` runs these
+    # steps in `Build` instead, and this job is skipped.
     needs: [reuse-plan]
-    if: "!cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
+    if: "!cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !inputs.checks-in-build"
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"')) }}
     timeout-minutes: 30
@@ -2868,101 +2983,17 @@ jobs:
       # Every gate probes before it runs; see the EVERY GATE BELOW PROBES
       # comment in `build` for the contract.
       - name: Typecheck Worker
-        env:
-          GATE: Typecheck Worker
-          SCRIPT: ${{ inputs.typecheck-worker-script }}
-          PM: ${{ inputs.package-manager }}
-          REQUIRE: ${{ inputs.require-scripts }}
-        run: |
-          set -euo pipefail
-          if [ -z "$SCRIPT" ]; then
-            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
-            exit 0
-          fi
-          # `npm pkg get` yields `{}` for a missing script and the bare JSON
-          # value for a present one, so test the VALUE's type — never the
-          # presence of a quote. Verified against real fixtures, including
-          # colon-bearing names like `web:typecheck`, by
-          # scripts/test_script_gates.py.
-          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
-          present=$(printf '%s' "$raw" | node -e \
-            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
-          if [ "$present" != "yes" ]; then
-            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
-            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
-            if [ "$REQUIRE" = "true" ]; then
-              echo "::error::$msg (require-scripts is on)"
-              exit 1
-            fi
-            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
-            exit 0
-          fi
-          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+        env: *checks_tw_env
+        run: *checks_tw_script
 
       - name: Typecheck Nuxt
-        env:
-          GATE: Typecheck Nuxt
-          SCRIPT: ${{ inputs.typecheck-web-script }}
-          PM: ${{ inputs.package-manager }}
-          REQUIRE: ${{ inputs.require-scripts }}
-        run: |
-          set -euo pipefail
-          if [ -z "$SCRIPT" ]; then
-            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
-            exit 0
-          fi
-          # `npm pkg get` yields `{}` for a missing script and the bare JSON
-          # value for a present one, so test the VALUE's type — never the
-          # presence of a quote. Verified against real fixtures, including
-          # colon-bearing names like `web:typecheck`, by
-          # scripts/test_script_gates.py.
-          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
-          present=$(printf '%s' "$raw" | node -e \
-            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
-          if [ "$present" != "yes" ]; then
-            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
-            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
-            if [ "$REQUIRE" = "true" ]; then
-              echo "::error::$msg (require-scripts is on)"
-              exit 1
-            fi
-            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
-            exit 0
-          fi
-          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+        env: *checks_tn_env
+        run: *checks_tn_script
 
       - name: Unit tests
         if: inputs.run-tests
-        env:
-          GATE: Unit tests
-          SCRIPT: ${{ inputs.test-script }}
-          PM: ${{ inputs.package-manager }}
-          REQUIRE: ${{ inputs.require-scripts }}
-        run: |
-          set -euo pipefail
-          if [ -z "$SCRIPT" ]; then
-            echo "$GATE: no script name configured — caller declared this lane absent, skipping"
-            exit 0
-          fi
-          # `npm pkg get` yields `{}` for a missing script and the bare JSON
-          # value for a present one, so test the VALUE's type — never the
-          # presence of a quote. Verified against real fixtures, including
-          # colon-bearing names like `web:typecheck`, by
-          # scripts/test_script_gates.py.
-          raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
-          present=$(printf '%s' "$raw" | node -e \
-            'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
-          if [ "$present" != "yes" ]; then
-            msg="$GATE is enabled but no \"$SCRIPT\" script exists — this lane ran NOTHING"
-            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
-            if [ "$REQUIRE" = "true" ]; then
-              echo "::error::$msg (require-scripts is on)"
-              exit 1
-            fi
-            echo "::warning::$msg. Set require-scripts: true to make this a hard failure, or pass an empty script name to declare the lane absent."
-            exit 0
-          fi
-          if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+        env: *checks_ut_env
+        run: *checks_ut_script
 
   extra-gate:
     name: Extra gate
@@ -3161,7 +3192,7 @@ jobs:
               // Fast-path inputs (P3-C1) and the quality-level inputs stay out of
               // the key at their defaults, so proof minted before they existed
               // still matches.
-              const fastPathDefaults = { 'fast-scripts': '', 'required-reuse-pr-results': false, 'e2e-pr-only-changed': false, 'journey-smoke-url': '', 'journey-smoke-args': '--grep=@smoke --retries=1', 'journey-smoke-rollback-script': '', 'journey-smoke-rollback-to': '', 'quality-level': 'legacy', 'quality-opt-out': '', 'performance-budget-args': '', 'security-headers-paths': '', 'security-headers-url': '' };
+              const fastPathDefaults = { 'fast-scripts': '', 'required-reuse-pr-results': false, 'e2e-pr-only-changed': false, 'journey-smoke-url': '', 'journey-smoke-args': '--grep=@smoke --retries=1', 'journey-smoke-rollback-script': '', 'journey-smoke-rollback-to': '', 'quality-level': 'legacy', 'quality-opt-out': '', 'performance-budget-args': '', 'security-headers-paths': '', 'security-headers-url': '', 'checks-in-build': false };
               for (const [name, value] of Object.entries(fastPathDefaults)) {
                 if (inputs[name] === value) delete inputs[name];
               }
@@ -5022,9 +5053,14 @@ jobs:
   # do not apply (until the CI reset, 2026-09-28, they started as no-op jobs
   # just to show a readable name, which cost two linux-ci seat allocations on
   # every call). `Required` demands each succeed when it applies and be
-  # skipped when it does not. The job-level always() still prevents an
-  # ordinary cancellation from turning an ENABLED Fast job into a skipped, and
-  # therefore passing, check.
+  # skipped when it does not. The job-level !cancelled() still starts an
+  # ENABLED Fast job after a failed, cancelled or skipped need, so it cannot
+  # become a skipped, and therefore passing, check. When the whole run is
+  # cancelled GitHub reports it CANCELLED, which never passes, without a
+  # runner (re-proved 2026-09-28: in cancelled runs acre-oracle 36490590502
+  # and operator-portal 36494070028 every job whose `if:` was false after the
+  # cancel, `!cancelled() && ...` and `always() && <false>` alike, reported
+  # `cancelled`).
   #
   # The check NAME stays `Fast` when this run escalates too: the name moves
   # onto `fast-escalated`, and this job reports as `Fast lanes (escalated)`.
@@ -5034,10 +5070,14 @@ jobs:
   fast:
     name: ${{ !(inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && 'Fast (not run)' || ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true') && 'Fast lanes (escalated)' || 'Fast' }}
     needs: [reuse-plan, e2e-plan]
-    # always() keeps an ordinary cancellation from turning an enabled Fast job
-    # into a skipped check; the rest is FAST_ENABLED, so a disabled Fast takes
-    # no runner at all (see NAMING IS THE GATE above).
-    if: always() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'
+    # !cancelled() runs Fast after a failed or skipped need, and never after
+    # the run is cancelled: GitHub reports a job whose `if:` is false in a
+    # cancelled run as CANCELLED (not skipped, so never a passing check), and
+    # it takes no runner. `always()` used to start it anyway, holding the
+    # caller's concurrency group while it queued for a seat (operator-portal
+    # run 36494070028, ~14 min). The rest is FAST_ENABLED, so a disabled Fast
+    # takes no runner at all (see NAMING IS THE GATE above).
+    if: "!cancelled() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     env:
       FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' }}
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
@@ -5578,7 +5618,11 @@ jobs:
 
   required:
     name: Required
-    if: always()
+    # !cancelled(), not always(): it still runs after any failed or skipped
+    # need, and a cancelled run reports it CANCELLED -- a non-passing check --
+    # without queueing for a runner that would hold the caller's concurrency
+    # group (operator-portal run 36494070028 waited ~14 min for one).
+    if: "!cancelled()"
     needs: [reuse-plan, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run, fast, fast-escalated, journey-smoke]
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
@@ -5592,6 +5636,9 @@ jobs:
         env: &required_gate_env
           BUILD_RESULT: ${{ needs.build.result }}
           CHECKS_RESULT: ${{ needs.checks.result }}
+          # `checks-in-build`: the checks ran as `Build` steps, so `Checks`
+          # must be skipped and `Build`'s success covers them.
+          CHECKS_IN_BUILD: ${{ inputs.checks-in-build }}
           E2E_PLAN_RESULT: ${{ needs.e2e-plan.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
           DEPLOY_DRY_RUN_RESULT: ${{ needs.deploy-dry-run.result }}
@@ -5648,7 +5695,11 @@ jobs:
             status=1
           fi
           require_success build "$BUILD_RESULT"
-          require_success checks "$CHECKS_RESULT"
+          if [ "${CHECKS_IN_BUILD:-}" = true ]; then
+            require_skipped checks "$CHECKS_RESULT"
+          else
+            require_success checks "$CHECKS_RESULT"
+          fi
           if [ -n "${{ inputs.extra-gate-scripts }}" ]; then
             require_success extra-gate "$EXTRA_GATE_RESULT"
           elif [ "$EXTRA_GATE_RESULT" != "skipped" ]; then
@@ -5959,7 +6010,8 @@ jobs:
           success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == ''
           && github.event_name == 'pull_request'
           && github.event.pull_request.head.repo.full_name == github.repository
-          && needs.build.result == 'success' && needs.checks.result == 'success'
+          && needs.build.result == 'success'
+          && (needs.checks.result == 'success' || (inputs.checks-in-build && needs.checks.result == 'skipped'))
           && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards))
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
@@ -6022,9 +6074,10 @@ jobs:
     name: ${{ (inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true') && 'Fast' || 'Fast (escalation not needed)' }}
     needs: [reuse-plan, fast, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run]
     # Starts only when this run escalates (the same condition as FAST_ENABLED);
-    # always() keeps a failed or cancelled lane from skipping it, because it is
-    # then the check named `Fast` and must report that failure.
-    if: always() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true'
+    # !cancelled() keeps a failed or skipped lane from skipping it, because it
+    # is then the check named `Fast` and must report that failure. A cancelled
+    # run reports it CANCELLED without a runner (see `fast`).
+    if: "!cancelled() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true'"
     env:
       FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
     # Organization-wide lightweight route; unset preserves the caller fallback.

@@ -48,6 +48,7 @@ NEW_INPUTS = {
     "journey-smoke-args": "--grep=@smoke --retries=1",
     "journey-smoke-rollback-script": "",
     "journey-smoke-rollback-to": "",
+    "checks-in-build": False,
 }
 GATE_STEP = "Require enabled gates to succeed and disabled gates to skip"
 FAST_STEP = "Require fast-path and journey-smoke lanes"
@@ -205,7 +206,10 @@ def simulate(jobs: dict, inputs: dict, event: str, ref: str = "refs/heads/main",
              cancelled: bool = False) -> dict:
     """{job: {"result", "outputs", "ctx"}} for one run of `jobs`. A job whose
     `if:` holds gets results.get(job, "success") and outputs.get(job, {}); any
-    other job is "skipped" with no outputs, exactly as GitHub reports it."""
+    other job is "skipped" with no outputs, exactly as GitHub reports it --
+    except in a cancelled run, where GitHub reports a job whose `if:` is false
+    as "cancelled" (acre-oracle run 36490590502, operator-portal run
+    36494070028: `!cancelled() && ...` and `always() && <false>` jobs alike)."""
     outputs, results = outputs or {}, results or {}
     base = context(event, ref, inputs)
     state: dict = {}
@@ -226,7 +230,8 @@ def simulate(jobs: dict, inputs: dict, event: str, ref: str = "refs/heads/main",
                                "success": not cancelled and all(r == "success" for r in upstream),
                                "failure": any(r == "failure" for r in upstream)}
         runs = truthy(GraphEvaluator(ctx).run(job_condition(job)))
-        state[job_id] = {"result": results.get(job_id, "success") if runs else "skipped",
+        idle = "cancelled" if cancelled else "skipped"
+        state[job_id] = {"result": results.get(job_id, "success") if runs else idle,
                          "outputs": dict(outputs.get(job_id, {})) if runs else {}, "ctx": ctx}
 
     for job_id in jobs:
@@ -310,10 +315,18 @@ def test_default_graph_matches_origin_main() -> None:
             new = simulate(JOBS, inputs, event, ref, outs, results, cancelled)
             old = simulate(OLD_GRAPH, inputs, event, ref, outs, results, cancelled)
             for job in OLD_GRAPH:
+                if job == "required" and cancelled:
+                    # The one deliberate change (CI reset, 2026-09-28): origin
+                    # main started `Required` after a cancel (`always()`), only
+                    # for it to fail on a runner; now it reports CANCELLED --
+                    # still not passing -- without one.
+                    assert old[job]["result"] == "success" and new[job]["result"] == "cancelled", (
+                        new[job]["result"], old[job]["result"], event, inputs)
+                    continue
                 assert new[job]["result"] == old[job]["result"], (
                     job, new[job]["result"], old[job]["result"], event, inputs, skipped, shards, failing, cancelled)
             for job in NEW_JOBS:
-                assert new[job]["result"] == "skipped", (job, event, inputs)
+                assert new[job]["result"] == ("cancelled" if cancelled else "skipped"), (job, event, inputs)
             cases += 1
     print(f"PASS  defaults: every pre-existing job runs/skips as on origin/main with skip propagation ({cases} runs)")
 
@@ -391,6 +404,60 @@ def test_enabled_modes_on_the_real_graph() -> None:
     assert state["fast-escalated"]["result"] == "success"
     assert any(code == 1 for _, code, _ in run_gates("fast-escalated", state))
     print("PASS  enabled modes on the simulated graph: reuse, journey smoke, Fast and escalated Fast")
+
+
+def with_need(state: dict, job_id: str, need: str, result: str) -> dict:
+    """`state` with `job_id` seeing `needs.<need>.result == result`."""
+    ctx = state[job_id]["ctx"]
+    needs = {**ctx["needs"], need: {**ctx["needs"][need], "result": result}}
+    return {**state, job_id: {**state[job_id], "ctx": {**ctx, "needs": needs}}}
+
+
+def test_cancelled_run_starts_no_gate_job() -> None:
+    """A cancelled run must not start Required or either Fast job (each would
+    queue for a runner and hold the caller's concurrency group), and none of
+    them may report a passing conclusion (skipped counts as passing)."""
+    full = {"run-e2e": True, "wrangler-dry-run": True, "extra-gate-scripts": "lint",
+            "e2e-shards": 2, "preview-checks": "og", "fast-scripts": "lint"}
+    for (event, ref), escalate in itertools.product(EVENTS, ["false", "true"]):
+        state = simulate(JOBS, full, event, ref, plan_outputs("false", "2", escalate), cancelled=True)
+        for job in ("required", "fast", "fast-escalated"):
+            assert state[job]["result"] == "cancelled", (job, event, state[job]["result"])
+    for job in ("required", "fast", "fast-escalated"):
+        cond = str(JOBS[job]["if"])
+        assert cond.startswith("!cancelled()") and "always()" not in cond, (job, cond)
+    print("PASS  a cancelled run starts no Required or Fast job, and none reports a pass")
+
+
+def test_checks_in_build() -> None:
+    """`checks-in-build`: Checks skips, Build runs the same gate steps, and
+    Required demands exactly that shape."""
+    steps = {s.get("name"): s for s in JOBS["build"]["steps"]}
+    checks = {s.get("name"): s for s in JOBS["checks"]["steps"]}
+    names = ["Typecheck Worker", "Typecheck Nuxt", "Unit tests"]
+    for name in names:
+        assert steps[name]["run"] == checks[name]["run"] and steps[name]["env"] == checks[name]["env"], name
+    assert steps["Typecheck Worker"]["if"] == steps["Typecheck Nuxt"]["if"] == "inputs.checks-in-build"
+    assert steps["Unit tests"]["if"] == "inputs.checks-in-build && inputs.run-tests"
+    assert "if" not in checks["Typecheck Worker"] and checks["Unit tests"]["if"] == "inputs.run-tests"
+    order = [s.get("name") for s in JOBS["build"]["steps"]]
+    assert order.index("Unit tests") < order.index("Build"), order
+    folded = {"run-e2e": True, "wrangler-dry-run": True, "preview-checks": "og", "checks-in-build": True}
+    runs = 0
+    for (event, ref), skipped in itertools.product(EVENTS, ["false", "true"]):
+        state = simulate(JOBS, folded, event, ref, plan_outputs(skipped, "1"))
+        assert state["checks"]["result"] == "skipped" and state["build"]["result"] == "success", state
+        for name, code, out in run_gates("required", state):
+            assert code == 0, (name, event, out)
+        # A Checks job that ran anyway (or a failed Build) fails Required.
+        for job, result in (("checks", "success"), ("build", "failure")):
+            assert run_gates("required", with_need(state, "required", job, result))[0][1] == 1, (job, event)
+        runs += 1
+    # The default keeps the parallel Checks job, and a skipped Checks fails.
+    state = simulate(JOBS, {}, "pull_request", "refs/pull/1/merge", plan_outputs())
+    assert state["checks"]["result"] == "success"
+    assert run_gates("required", with_need(state, "required", "checks", "skipped"))[0][1] == 1
+    print(f"PASS  checks-in-build: Checks skips, Build runs the aliased gates, Required enforces it ({runs} runs)")
 
 
 def test_new_inputs_default_off() -> None:
@@ -502,9 +569,9 @@ def test_required_fast_path_step() -> None:
 
 
 def test_fast_naming_never_skips_a_fast_check() -> None:
-    """A job evaluated to the name `Fast` must always run: GitHub reports a
-    skipped job as a passing check, so a skipped `Fast` would satisfy a ruleset
-    without proving anything."""
+    """A job evaluated to the name `Fast` must always run in a live run: GitHub
+    reports a skipped job as a passing check, so a skipped `Fast` would satisfy
+    a ruleset without proving anything."""
     matrix = itertools.product(
         EVENTS, ["", "lint typecheck"], ["", "https://app.example"], ["", "true", "false"],
         ["true", "false", ""], ["success", "cancelled"])
@@ -517,7 +584,10 @@ def test_fast_naming_never_skips_a_fast_check() -> None:
         for job in ("fast", "fast-escalated"):
             name = ev(JOBS[job]["name"], ctx)
             if name == "Fast":
-                assert ev(JOBS[job]["if"], ctx) is True, (job, event, scripts, smoke, reused, full)
+                # ... except in a cancelled run, where it does not start and
+                # GitHub reports it CANCELLED, which never passes
+                # (test_cancelled_run_starts_no_gate_job).
+                assert ev(JOBS[job]["if"], ctx) is (status != "cancelled"), (job, event, scripts, smoke, reused, full)
                 assert ev(JOBS[job]["env"]["FAST_ENABLED"], ctx) is True, (job, ctx)
                 named_fast.append(job)
         runs_fast = bool(scripts) and not smoke and reused != "true"
@@ -651,7 +721,10 @@ def test_fast_jobs_have_readable_names_and_disabled_steps() -> None:
         for job_id in ("fast", "fast-escalated"):
             job = JOBS[job_id]
             enabled = fast_enabled and (job_id == "fast" or escalated)
-            assert ev(job["if"], ctx) is enabled, (job_id, ctx)
+            # A cancelled run never STARTS a Fast job (GitHub reports it
+            # cancelled, without a runner); `status` still stands for a
+            # cancellation that lands mid-job in the step checks below.
+            assert ev(job["if"], ctx) is (enabled and status != "cancelled"), (job_id, ctx)
             actual = ev(job["env"]["FAST_ENABLED"], ctx)
             assert actual == enabled, (job_id, ctx)
             ctx["env"] = {"FAST_ENABLED": gh_str(actual)}
@@ -877,6 +950,8 @@ def test_journey_smoke_validation() -> None:
 
 def main() -> None:
     test_new_inputs_default_off()
+    test_cancelled_run_starts_no_gate_job()
+    test_checks_in_build()
     test_simulator_models_skip_propagation()
     test_defaults_leave_every_lane_as_before()
     test_default_graph_matches_origin_main()
