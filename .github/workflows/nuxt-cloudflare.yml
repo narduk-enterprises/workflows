@@ -1754,6 +1754,14 @@ jobs:
               echo "::error::security-headers-paths entries must start with / (got '$path')"
               status=1
             fi
+            # URL resolution reads //host and /\host as another origin; the
+            # probe must stay on the preview or the declared URL.
+            case "$path" in
+              //*|/\\*)
+                echo "::error::security-headers-paths entries must be same-origin paths, not //host or /\\host (got '$path')"
+                status=1
+                ;;
+            esac
           done
           if [ -n "$HEADER_URL" ] && ! [[ "$HEADER_URL" =~ ^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[^[:space:]]*)?$ ]]; then
             echo "::error::security-headers-url must be one https:// URL (got '$HEADER_URL')"

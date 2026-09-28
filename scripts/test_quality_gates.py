@@ -23,7 +23,9 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shutil
 import subprocess
+import sys
 import tempfile
 
 import yaml
@@ -209,6 +211,9 @@ r, _, _ = resolve(HEADER_PATHS="/ /login")
 check(r.returncode == 0, "absolute header paths must pass")
 r, _, _ = resolve(HEADER_PATHS="login")
 check(r.returncode != 0, "a relative header path must fail")
+for escape in ("//evil.example", "/\\evil.example", "/ //evil.example/login"):
+    r, _, _ = resolve(HEADER_PATHS=escape)
+    check(r.returncode != 0, f"header path {escape!r} resolves to another origin and must fail")
 r, _, _ = resolve(HEADER_URL="http://example.com")
 check(r.returncode != 0, "a non-https security-headers-url must fail")
 r, _, _ = resolve(HEADER_URL="https://example.com")
@@ -228,8 +233,14 @@ exit "${STUB_EXIT:-0}"
 """
 
 
+NODE = shutil.which("node")
+if NODE is None:
+    sys.exit("test_quality_gates: node is required on PATH")
+
+
 def run_step(
-    body: dict, pm: str, extra_env: dict[str, str], stdout: str | None, exit_code: int, make_output: bool
+    body: dict, pm: str, extra_env: dict[str, str], stdout: str | None, exit_code: int, make_output: bool,
+    expect_invoked: bool = True,
 ) -> tuple[subprocess.CompletedProcess, str]:
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
@@ -237,6 +248,9 @@ def run_step(
         bin_dir.mkdir()
         for name in ("pnpm", "npx"):
             write_stub(bin_dir, name, TOOL_STUB)
+        node_dir = root / "node-bin"
+        node_dir.mkdir()
+        (node_dir / "node").symlink_to(NODE)
         app = root / "app"
         app.mkdir()
         if make_output:
@@ -244,7 +258,9 @@ def run_step(
         log = root / "log"
         log.touch()
         env = {
-            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            # Only the stubs and node: a real pnpm/npx on the host PATH must
+            # never answer in place of a stub (it made negative checks vacuous).
+            "PATH": f"{bin_dir}:{node_dir}:/usr/bin:/bin",
             "PM": pm,
             "STUB_LOG": str(log),
             "STUB_EXIT": str(exit_code),
@@ -257,7 +273,10 @@ def run_step(
             env["STUB_STDOUT_FILE"] = str(out)
         env.update(extra_env)
         result = run_bash(body["run"], env, tmp)
-        return result, log.read_text()
+        text = log.read_text()
+        if expect_invoked and not text:
+            check(False, f"stub not invoked (the step never reached the tool): {result.stdout} {result.stderr}")
+        return result, text
 
 
 def report(violations: list[dict] | None = None) -> str:
@@ -282,7 +301,7 @@ r, _ = run_step(PERF, "pnpm", {"PERF_ARGS": ""},
                 report([{"path": "_nuxt/app.css", "message": "CSS is 40 KiB, budget is 35 KiB."}]), 1, True)
 check(r.returncode != 0 and "_nuxt/app.css: CSS is 40 KiB" in r.stdout, f"a violation must fail and name the file: {r.stdout}")
 
-r, _ = run_step(PERF, "pnpm", {"PERF_ARGS": ""}, report(), 0, False)
+r, _ = run_step(PERF, "pnpm", {"PERF_ARGS": ""}, report(), 0, False, expect_invoked=False)
 check(r.returncode != 0 and "no build output" in r.stdout, "a missing .output/public must fail closed")
 
 r, _ = run_step(PERF, "pnpm", {"PERF_ARGS": ""}, "not json", 0, True)
