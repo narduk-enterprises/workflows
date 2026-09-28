@@ -259,11 +259,25 @@ def check_required_job(path: Path, doc: dict, f: Findings) -> None:
         return
     for jid, job in required.items():
         cond = str(job.get("if", "")).strip()
-        if "always()" not in cond:
-            f.add(path, f"R5 job '{jid}' is named Required but its `if:` is {cond!r} — it must be `always()`")
         needs = job.get("needs") or []
         if isinstance(needs, str):
             needs = [needs]
+        # A self-contained `Required` (the file's ONLY job, doing the work
+        # itself) has no upstream result to wait for, so `always()` would only
+        # start it after a cancellation. It must carry NO `if:` at all: a
+        # skipped job counts as passing, so any condition could turn
+        # `ci / Required` green without running. An aggregating `Required`
+        # must run even when a needed job failed, so it keeps `always()`.
+        self_contained = not needs and set(jobs) == {jid}
+        if self_contained:
+            if cond:
+                f.add(
+                    path,
+                    f"R5 job '{jid}' is a self-contained Required but has `if:` {cond!r} — "
+                    "a skipped Required passes; drop the condition",
+                )
+        elif "always()" not in cond:
+            f.add(path, f"R5 job '{jid}' is named Required but its `if:` is {cond!r} — it must be `always()`")
         missing = sorted(set(jobs) - set(needs) - {jid} - non_gating_jobs(path, doc, f))
         if missing:
             f.add(

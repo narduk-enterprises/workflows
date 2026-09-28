@@ -109,7 +109,11 @@ branch, read back from the API — not that the caller parses.
 This is the actual point of the repo, not an implementation detail.
 
 `docs-governance.yml`, `node-library.yml`, and `nuxt-cloudflare.yml` each end
-with a job named **exactly** `Required`. That job `needs:` every other job the
+with a job named **exactly** `Required`. (Since the CI reset, 2026-09-28,
+`docs-governance.yml`'s `Required` is its only job and runs the check itself:
+with nothing to aggregate, a second job only cost a runner allocation per
+call. `lint_callables.py` R5 exempts exactly that self-contained shape from
+`always()`.) An aggregating `Required` `needs:` every other job the
 workflow defines, runs with `if: always()`, and explicitly checks each
 `needs.<job>.result` — a job that's enabled must report `success`; it may
 report `skipped` only when its controlling input is off. In particular,
@@ -322,6 +326,22 @@ so a private caller that passes nothing is Blacksmith-eligible (it is on the
   (`reusable-browser-tests.yml`'s browser-runner job is untouched — its own
   trust boundary per company-hq `CI-RUNNER-POLICY.md` §5), and Apple builds
   (`apple.yml` is untouched — it has its own D-APPLE-CI-1 ladder).
+- **Per-repo ordinary route (`CI_LINUX_RUNNER`, CI reset 2026-09-28)**: in
+  `nuxt-cloudflare.yml`, the ordinary private route of `Build`, `Checks`,
+  `Extra gate`, `Deploy dry run` and `Fast` reads a repo-level Actions
+  variable `CI_LINUX_RUNNER` (a JSON `runsOn` value) after an explicit
+  `runner` input and ahead of the linux-ci default:
+  `(inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '<linux-ci route>') || '"ubuntu-latest"')`.
+  A controller sets or deletes it to move one burst repository's ordinary CI
+  (for example to a Blacksmith label) without a pin bump. Unset, the route is
+  byte-for-byte the previous one (`scripts/test_runner_default.py` evaluates
+  both). It never applies to a public caller, never overrides an explicit
+  `runner`, and does not touch the lightweight, browser or preview routes.
+  The Blacksmith switch above still applies to the resulting route unchanged.
+  Configuration variables in a called workflow resolve from the CALLER's
+  repository (GitHub docs, "Variables": *"For reusable workflows, the
+  variables from the caller workflow's repository are used"*), so a repo-level
+  value reaches this callable.
 - **Adding a job is not additive here without checking this section again**:
   a new job that copies `${{ fromJSON(inputs.runner) }}` verbatim does *not*
   get Blacksmith overflow automatically — use the expression above, or it
@@ -361,8 +381,23 @@ event. `review-deep` is also consumed; unrelated label additions skip. One order
 refuses to wake at all while `no-ai-review` is on, and removing that label is
 an `unlabeled` event nothing listens for — so **clear the opt-out first, then
 add `review-now`**, not the other way round. The callable's job `if:` is an
-allow-list of `opened` / `reopened` / `ready_for_review` / a re-request label,
-so a caller that has not yet dropped `synchronize` launches nothing here.
+allow-list of a re-request label (plus `opened` / `reopened` /
+`ready_for_review` only when the caller passes `automatic-reviews: true`), so a
+caller that has not yet dropped `synchronize` launches nothing here.
+
+**Label-only by default (CI reset, 2026-09-28).** The job waits on the Cursor
+API for up to `wait-minutes`, and a private caller's job waits on a `linux-ci`
+seat. Starting it automatically on every opened pull request held one of the
+pool's few seats for a review nobody asked for, so `automatic-reviews` now
+defaults to `false`: the job starts only for `review-now`, `review-p0`,
+`review-p1` or `review-deep`, and every other event is skipped before it takes a
+runner. P0 paths are no longer reviewed on open; add `review-p0` (or
+`review-now`) to ask. A caller that wants the old behaviour passes
+`automatic-reviews: true` and keeps the four-event trigger set. A label-only
+caller should listen on `labeled` alone, as the shape below does: an `opened`,
+`reopened` or `ready_for_review` run would otherwise land in the `review`
+bucket of the caller group and could cancel a live labelled review before the
+job `if:` skipped it.
 
 **A pin-only bump is not safe.** A caller that keeps `synchronize` and a single
 `cancel-in-progress` concurrency group starts a run on the first push, cancels
@@ -406,10 +441,11 @@ succeeded; the workflow records the review as unavailable until a later run.
 name: Cursor review
 
 # No `synchronize`: a push does not re-review. A lane adds `review-now` to ask
-# for the new head, and the callable clears the label again.
+# for the new head, and the callable clears the label again. Label-only: add
+# opened/reopened/ready_for_review back only with `automatic-reviews: true`.
 on:
   pull_request:
-    types: [opened, reopened, ready_for_review, labeled]
+    types: [labeled]
 
 # A label addition that is NOT a review re-request must never cancel a live
 # review: a run-level cancel happens before any job condition is evaluated, so
@@ -1042,11 +1078,17 @@ provided" sentinel for either input). A caller that sets both gets
 `node-version-file`; `node-version` is silently ignored in that case, exactly
 as if the caller had left it unset.
 
-#### `caller-lint`: hygiene gate over the caller's OWN workflows
+#### Caller lint: hygiene gate over the caller's OWN workflows
 
-Every `nuxt-cloudflare.yml` adopter now gets a `caller-lint` job as part of
-`Required` (Logan, 2026-09-17 askme round, "Caller lint + job timeouts in
-workflows (Recommended)"; company-hq#745). It checks out the CALLING
+Every `nuxt-cloudflare.yml` adopter gets Caller lint as part of `Required`
+(Logan, 2026-09-17 askme round, "Caller lint + job timeouts in
+workflows (Recommended)"; company-hq#745). Since the CI reset (2026-09-28) it
+is a set of steps inside the `Required` job, not a `Caller lint` job of its
+own: the separate job cost a whole runner allocation for about ten seconds of
+lint on every call. The steps run after `Required`'s gate steps under
+`!cancelled()`, so a lane failure and a lint finding both show in one run, and
+a finding fails `Required` directly. On a protected-path pull request the job
+holding `Fast` (`fast-escalated`) runs the same anchored scripts. It checks out the CALLING
 repository (not this one), runs pinned `actionlint` over the caller's own
 `.github/workflows/*.yml`, and runs a small inline Python audit that fails
 the job when a caller workflow:
@@ -1065,7 +1107,7 @@ the job when a caller workflow:
 
 This is a caller-side hygiene check, distinct from what `actionlint` alone
 proves (schema/expression validity) and distinct from what `lint_callables.py`
-proves about THIS repo's own callables — `caller-lint` proves the same class
+proves about THIS repo's own callables — Caller lint proves the same class
 of thing about the repository that adopted one.
 
 #### Dependency audit (`dependency-audit`, `audit-ignore`)
@@ -1133,7 +1175,7 @@ carries no GHSA id for are matched by `NPM-<numeric-id>`.
 ##### Why a step in `build` and not its own job
 
 The tree it audits is the one `build` just installed. A standalone lightweight
-job on the `caller-lint` runner class would cost a second checkout, a second
+job on the lightweight runner class would cost a second checkout, a second
 `setup-node` and a second full install — 60–120s and a second runner slot on
 this repo's adopters — to re-derive state that already exists in `build`, for
 the ~5–10s the audit command itself takes. It never touches the browser pool.
@@ -1626,7 +1668,7 @@ workflow run:
 
 | Run | Check named `Fast` | Other Fast checks |
 | --- | --- | --- |
-| Plain | the `fast` job (lint and unit scripts) | `Fast (escalation not needed)` (no-op) |
+| Plain | the `fast` job (lint and unit scripts) | none (`fast-escalated` is skipped) |
 | Escalated | the `fast-escalated` job (the full `Required` gate) | `Fast lanes (escalated)` (the lint and unit scripts) |
 
 So a readiness check that needs to know whether a `ci / Fast` run over 180
@@ -1635,13 +1677,17 @@ in the same check suite. Reading check-run names needs no extra permission,
 so callers grant nothing new for this. For people reading the run, the job
 holding `Fast` also writes a `### Fast escalation` step-summary section with
 the line `escalated: true` or `escalated: false`; that step never fails the
-job. Callers that leave `fast-scripts` empty skip every step in both Fast jobs;
-the jobs finish as `Fast (not run)` and `Fast (escalation not needed)`. Reused
-runs and journey-smoke mode use these same no-op names. Both jobs start so
-GitHub evaluates their names instead of displaying a raw expression for a
-skipped job. This costs two brief runner allocations when Fast is disabled,
-but does not check out code, install dependencies, or run scripts. Neither
-no-op job is named `Fast`, so it cannot satisfy a required `ci / Fast` check.
+job. A Fast job that does not apply is skipped and takes no runner: both jobs
+when `fast-scripts` is empty, in reused runs and in journey-smoke mode, and
+`fast-escalated` on every run that does not escalate (CI reset, 2026-09-28;
+until then both started as no-op jobs, which cost two runner allocations per
+call). GitHub never evaluates a skipped job's name, so such a check shows the
+raw name expression (for example
+`(inputs.fast-scripts != '' && ...) && 'Fast' || 'Fast (escalation not needed)'`),
+never `Fast`, and cannot satisfy a required `ci / Fast` check. A readiness
+check should match `ci / Fast lanes (escalated)` exactly, not as a substring:
+a skipped `fast` job's raw expression contains that text. `Required` demands
+each Fast job succeed when it applies and be skipped when it does not.
 
 #### A non-blocking quarantine lane (`e2e-quarantine-args`)
 
@@ -1783,7 +1829,7 @@ too.
 
 ##### Runner class
 
-Lightweight (the same route as `caller-lint` and `E2E plan`) **unless**
+Lightweight (the same route as `Required` and `E2E plan`) **unless**
 `e2e-subset` is selected, which needs a browser guest and therefore the
 `e2e-runner` route. On that route the lane runs the **same YAML nodes** as the
 `e2e` job's isolated-route guard, image-equality assertion and browser
@@ -1991,7 +2037,7 @@ P3-C2 / O-D8 rather than kept as a dead compatibility surface.
 ## Versioning policy
 
 - **Callers pin full commit SHAs, never `@main`.** `@main` is how the last
-  outage happened; it is not a supported reference. The caller-lint job and
+  outage happened; it is not a supported reference. Caller lint (in `Required`) and
   narduk-app-tools foundation item 5.1 both reject a bare `@v2` tag, so a
   caller pins the SHA the tag points to and names the tag in a comment:
   `uses: …/<workflow>.yml@<40-char sha> # v2`. Existing `@v1` pins still

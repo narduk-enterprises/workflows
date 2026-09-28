@@ -18,7 +18,10 @@ name: Reusable Cursor Review
 # for a caller that has not opted in.
 #
 # TRIGGERS AND CLASS RULE (agent-infrastructure, reviewer untangle 2026-09-19).
-# Callers listen on [opened, reopened, ready_for_review, labeled] and NOT on
+# Since the CI reset (2026-09-28) the job starts ONLY for a review-request
+# label unless the caller passes `automatic-reviews: true` (see the job `if:`).
+# Callers listen on [labeled] (or [opened, reopened, ready_for_review, labeled]
+# with `automatic-reviews: true`) and NOT on
 # `synchronize`: a push no longer re-reviews on its own. A lane that wants the
 # new head reviewed adds the `review-now` label, which this job clears again so
 # the next add is a fresh event. Every other label addition skips.
@@ -235,6 +238,18 @@ on:
         required: false
         type: number
         default: 30
+      automatic-reviews:
+        description: >-
+          Also start a review on `opened`, `reopened` and `ready_for_review`
+          (the P0/P1/P2 class rule and spend floors then decide). FALSE by
+          default since the CI reset (2026-09-28): the job starts ONLY for a
+          review-request label (`review-now`, `review-p0`, `review-p1`,
+          `review-deep`), so an ordinary pull-request event never takes a
+          runner seat to wait on the Cursor API. TRUE restores the previous
+          automatic P0 review on open.
+        required: false
+        type: boolean
+        default: false
       approve-on-clean:
         description: >-
           Submit APPROVE when the reviewer's verdict is approve. FALSE submits
@@ -280,7 +295,15 @@ jobs:
     # A caller that declares workflow-level concurrency needs the same
     # discrimination in its GROUP NAME, because a run-level cancel happens
     # before any job condition is evaluated. The README caller shape has it.
-    if: ${{ inputs.enabled && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review' || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1","review-deep"]'), github.event.label.name))) }}
+    # LABEL-ONLY BY DEFAULT (CI reset, 2026-09-28). `opened`, `reopened` and
+    # `ready_for_review` reach the job only when the caller passes
+    # `automatic-reviews: true`. This job waits on the Cursor API for up to
+    # `wait-minutes` and, for a private caller, it waits on a linux-ci seat;
+    # an automatic start on every opened pull request held that seat for
+    # nothing the author asked for. A caller that stays label-only should
+    # listen on `labeled` alone (the README caller shape), so no other event
+    # can share the review bucket of its concurrency group.
+    if: ${{ inputs.enabled && github.event.pull_request.draft == false && !contains(github.event.pull_request.labels.*.name, 'no-ai-review') && ((inputs.automatic-reviews && (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review')) || (github.event.action == 'labeled' && contains(fromJSON('["review-now","review-p0","review-p1","review-deep"]'), github.event.label.name))) }}
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 45
     permissions:

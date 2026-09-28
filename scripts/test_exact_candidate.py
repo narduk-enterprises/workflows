@@ -33,6 +33,12 @@ class ExactCandidate(unittest.TestCase):
                     condition = "inputs.expected-candidate-sha != ''"
                     if name == 'fast':
                         condition = f"env.FAST_ENABLED == 'true' && ({condition})"
+                    # Caller lint runs inside Required (and escalated Fast)
+                    # after the gate steps, under !cancelled().
+                    if name == 'required':
+                        condition = f"!cancelled() && {condition}"
+                    if name == 'fast-escalated':
+                        condition = f"env.FAST_ENABLED == 'true' && !cancelled() && {condition}"
                     self.assertEqual(guard['if'], condition, name)
                     self.assertEqual(guard['working-directory'], '${{ github.workspace }}')
         self.assertGreaterEqual(checked, 8)
@@ -68,19 +74,37 @@ class ExactCandidate(unittest.TestCase):
 
     def test_required_does_not_waive_failed_candidate_jobs(self):
         required = self.workflow['jobs']['required']
-        for name in ['build', 'checks', 'caller-lint']:
+        for name in ['build', 'checks']:
             self.assertIn(name, required['needs'])
+        # Caller lint is no longer a job: Required runs it itself, so a
+        # finding fails Required directly (no result to waive).
+        self.assertNotIn('caller-lint', self.workflow['jobs'])
+        lint = [step.get('name') for step in required['steps']]
+        self.assertIn("actionlint (caller's own workflows)", lint)
+        self.assertIn('Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)', lint)
         self.assertEqual(required['if'], 'always()')
+        # The Caller lint steps must run after a failed gate step (so both
+        # show) but never be skipped on a live run: exact conditions pinned.
+        caller_lint = ['Check out the caller for Caller lint', 'Ensure PyYAML is available',
+                       'Install actionlint', "actionlint (caller's own workflows)",
+                       'Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)']
+        escalated = self.workflow['jobs']['fast-escalated']
+        for job, expected in [(required, '!cancelled()'),
+                              (escalated, "env.FAST_ENABLED == 'true' && !cancelled()")]:
+            steps = {step.get('name'): step for step in job['steps']}
+            for name in caller_lint:
+                with self.subTest(job=job.get('name'), step=name):
+                    self.assertEqual(steps[name].get('if'), expected)
         gate = next(step for step in required['steps'] if step.get('name') ==
                     'Require enabled gates to succeed and disabled gates to skip')
         script = gate['run'].replace('${{ inputs.extra-gate-scripts }}', '')
         base = dict(os.environ, BUILD_RESULT='success', CHECKS_RESULT='success',
-                    CALLER_LINT_RESULT='success', EXTRA_GATE_RESULT='skipped',
+                    EXTRA_GATE_RESULT='skipped',
                     E2E_PLAN_RESULT='skipped', E2E_RESULT='skipped',
                     DEPLOY_DRY_RUN_RESULT='skipped', PREVIEW_RESULT='skipped',
                     PREVIEW_CHECKS='none', EVENT_NAME='workflow_dispatch', RUN_E2E='false',
                     E2E_SHARDS='1', E2E_PLAN_SKIPPED='', RUN_DEPLOY_DRY_RUN='false')
-        for job in ['BUILD_RESULT', 'CHECKS_RESULT', 'CALLER_LINT_RESULT']:
+        for job in ['BUILD_RESULT', 'CHECKS_RESULT']:
             for outcome in ['failure', 'cancelled', 'skipped', '']:
                 result = subprocess.run(['bash', '-c', script], env=base | {job: outcome},
                                         capture_output=True, text=True)
