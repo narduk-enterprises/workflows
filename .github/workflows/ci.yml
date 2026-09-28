@@ -224,6 +224,13 @@ jobs:
       - name: web-foundation conformance gate behaviour tests
         run: python3 scripts/test_foundation_check.py
 
+      # `quality-level`: legacy stays a no-op, every opt-out carries a reason,
+      # the three jobs share one resolver, the performance budget fails closed
+      # on a missing build or report, and the security-headers probe turns
+      # FAIL and UNKNOWN into a red step. Executes the shipped run: text.
+      - name: quality-level gate behaviour tests
+        run: python3 scripts/test_quality_gates.py
+
       - name: prebuilt E2E application fail-closed tests
         run: python3 scripts/test_e2e_build_artifact.py
 

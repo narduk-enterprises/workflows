@@ -938,6 +938,10 @@ jobs:
       typecheck-web-script: web:typecheck
       run-e2e: true
       wrangler-dry-run: true
+      # The estate web quality gates (foundation check, performance budget,
+      # live security headers), each with a reasoned opt-out. See
+      # "Quality level" below; new apps start here.
+      quality-level: standard
     secrets:
       # Foundation checks and direct registry installs use the canonical PAT.
       NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
@@ -1145,6 +1149,91 @@ may not exist, while this one reads the lockfile every adopter already has, and
 it is a security bar rather than an optional lane. It is still a new gate that
 can turn an existing adopter red, so the `v1` tag must not move onto it until
 the adopters have been checked — see [Versioning policy](#versioning-policy).
+
+#### Quality level (`quality-level`, `quality-opt-out`)
+
+The estate has web quality tools that gated nothing on most apps, because each
+one was an opt-in nobody opted into. `quality-level: standard` turns them on as
+one set. It adds no job, no check name and no permission:
+
+| Gate | What runs | Where | Blocks on |
+|---|---|---|---|
+| `foundation-check` | `narduk-app foundation:check` (the existing [`foundation-check`](#nuxt-cloudflareyml) steps) | `Build` | FAIL or UNKNOWN |
+| `performance-budget` | `narduk-app performance-budget --json [performance-budget-args]` over `.output/public` | `Build`, after `build-script` and `extra-scripts` | any violation, a missing build output, an unreadable report |
+| `security-headers` | `narduk-app foundation:check:security-headers --base-url <origin> [--path …]` | `Preview` on pull requests (the PR's own Cloudflare preview); `Journey smoke` in post-deploy mode (`security-headers-url`, else `journey-smoke-url`) | exit 1 (FAIL) or 2 (UNKNOWN) |
+
+**To adopt**, an app adds one line to its `ci:` job's `with:` block, in its own
+next change:
+
+```yaml
+    with:
+      quality-level: standard
+```
+
+`legacy` (the default) runs exactly the gates this workflow ran before the
+input existed. An app never gets these gates from a pin bump alone.
+
+**Why an input, not a default flip.** Callers pin a full SHA (25 of 31
+`nuxt-cloudflare.yml` `uses:` lines across 18 repositories on 2026-09-27; the
+other 6 are frozen `@v1`; none use `@main`). A pin looks like a natural
+one-app-at-a-time gate, but Dependabot opens pin bumps for this callable on most
+of those repositories, so a default flip on `v2`, or in a new major, would
+arrive as a wave of simultaneously red pull requests. The explicit input is the
+only switch that moves exactly one app, in a change that app chose. A later
+major can flip the default once the fleet has adopted.
+
+**Opting out.** Each standard gate turns off only through `quality-opt-out`,
+with a written reason:
+
+```yaml
+      quality-opt-out: >-
+        performance-budget=hero video ships in the next release (tracked in the app's issue 42),
+        security-headers=no Workers Builds preview until the account cutover
+```
+
+Entries are `check=reason`, separated by commas, so a reason cannot contain a
+comma. An entry with no reason, an unknown check name or a duplicate fails
+`Build`. Every opt-out is echoed as a `::warning::` with its reason and a
+job-summary line on every run, so an opted-out gate stays visible. An opt-out at
+`legacy` warns that it does nothing. `foundation-check: true` together with a
+`foundation-check` opt-out is a contradiction and fails.
+
+**Rules the resolver enforces up front** (the `Resolve quality gates` step,
+before any install, so misconfiguration fails the adoption pull request
+itself):
+
+- `security-headers` needs a pull-request preview. With `preview-checks: none`
+  the app either enables a preview check or opts out with its reason.
+- `performance-budget` needs a build. With `build-script: ""` the app opts out.
+- `performance-budget-args` cannot carry `--json` or `--report-only`: the
+  workflow owns the report, and the gate never becomes a warning.
+- `security-headers-paths` entries start with `/`; `security-headers-url` is
+  one `https://` URL.
+
+**Where each gate reads from.** `performance-budget` and both header probes run
+the caller's own installed `@narduk-enterprises/narduk-app-tools`
+(`pnpm exec` / `npx --no-install`), so neither needs a credential beyond the
+install the job already did. The budget runs from `working-directory`; point it
+at a workspace app with `performance-budget-args: --app-dir apps/web`. The
+probes run from `preview-working-directory` (else `working-directory`). The
+header probe needs a narduk-app-tools release that has
+`foundation:check:security-headers` (narduk-libs#360, 2026-09-16). The tool's own
+budget passes silently when `.output/public` is absent, so the step checks for
+the directory itself.
+
+**The pull request probes its preview, never production.** A change that fixes
+the headers must be able to go green before it ships. Headers a Cloudflare zone
+adds on the custom domain, rather than the app itself, are absent on the
+`workers.dev` preview; the estate `narduk-core` security preset sets them in
+the app. The post-deploy probe in `Journey smoke` reads production as just
+deployed, runs whether or not the smoke passed, and never triggers the rollback
+hook.
+
+**Not here: the axe accessibility ratchet.** narduk-testkit's
+`expectAccessible` is an assertion inside the app's own Playwright suite, which
+`run-e2e` already runs. This workflow cannot tell a suite that calls it from one
+that does not, short of grepping test sources, which would prove presence and
+not coverage. The app generator and each app's AGENTS.md own that rule.
 
 #### The unit-test lane and `extra-scripts`
 
@@ -2000,6 +2089,16 @@ P3-C2 / O-D8 rather than kept as a dead compatibility surface.
   fleet migration (D-WEBFOUND-2 Q4/Q10), most fleet apps do not conform to
   the seven-item contract yet, and a moving `v1` tag must not hand every
   existing adopter a brand-new red gate the day the tag advances.
+- `nuxt-cloudflare.yml`'s `quality-level`, `quality-opt-out`,
+  `performance-budget-args`, `security-headers-paths` and
+  `security-headers-url` are within-major on the same rule: five optional
+  inputs, no new job, no new permission, `Required`'s `needs:` graph
+  unchanged. **`quality-level` defaults to `legacy`**, which resolves every new
+  gate off, so moving `v2` over it changes nothing for an app that did not
+  write `quality-level: standard`. The gates are default-on only *inside*
+  `standard`. See [Quality level](#quality-level-quality-level-quality-opt-out)
+  for why this is an input rather than a default flip (Dependabot pin bumps
+  would otherwise turn the fleet red at once).
 - `foundation-check-auth` defaults to `package-token`. `nvault` remains only
   for callers whose legacy `NARDUK_PLATFORM_GH_PACKAGES_READ` mapping carries
   an nVault service token; new callers use the canonical package PAT there and
