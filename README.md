@@ -1038,6 +1038,20 @@ That last row is the same fail-closed rule `require-scripts` exists for: "the
 audit did not run" must never be indistinguishable from "the audit found
 nothing".
 
+**A pull request only warns (Logan, 2026-09-29, "Main + nightly").** An
+advisory is published on its own schedule, not the pull request's, so a fixable
+high/critical finding used to block an unrelated PR the day it appeared. On
+`pull_request` and `pull_request_target` every `::error::` row above is
+re-labelled `::warning::` (the same advisory list, still in the job summary)
+and the step passes; the closing line says the finding will fail the default
+branch. On a `push` to the default branch, a `schedule` run and a
+`workflow_dispatch` the step fails exactly as before, so a red audit is caught
+by the merge that follows and by the nightly run (see
+[E2E off the pull request](#e2e-off-the-pull-request-mode-e2e-and-ci_e2e_in_ci),
+whose nightly caller is not the place for it: the audit runs in the `ci`
+workflow, so add `schedule:` to that caller too if the audit should be checked
+nightly).
+
 Both report shapes are parsed, and the `package-manager` input selects the
 *command*, never the parser — npm changed this format once already, and a
 parser keyed on the input would silently read zero advisories the next time it
@@ -1088,6 +1102,101 @@ may not exist, while this one reads the lockfile every adopter already has, and
 it is a security bar rather than an optional lane. It is still a new gate that
 can turn an existing adopter red, so the `v1` tag must not move onto it until
 the adopters have been checked — see [Versioning policy](#versioning-policy).
+
+#### E2E off the pull request (`mode: e2e` and `CI_E2E_IN_CI`)
+
+Playwright is the slowest lane and it almost never catches a bug that the
+merge-time run would not (Logan, 2026-09-29: "skip on PRs; run after each merge,
+newest wins, plus nightly; one org switch"). Two pieces, both additive: with
+neither in play a caller behaves exactly as before.
+
+**1. The org switch: `vars.CI_E2E_IN_CI`.** When the organization (or one repo,
+which overrides the org value) sets `CI_E2E_IN_CI` to `false`, `E2E plan`, `E2E`
+and `E2E quarantine` are skipped in an ordinary CI run on **every** event, and
+`Required` reads that skip as success (a lane that runs anyway still fails
+it). Build then skips packing and uploading the prebuilt application for the E2E
+jobs, and a `checks-in-build` caller with no other lane folds `Required` into
+`Build` (one job, no extra queue hop). Unset, empty or any other value changes
+nothing. The switch deliberately does **not** override two promises to run
+browsers: `e2e-full-paths` (a caller that sets it wants protected-path escalation,
+which needs `E2E plan` to decide, so acre-oracle keeps browsers on auth/payment
+changes) and `expected-candidate-sha` (explicit release validation cannot skip
+configured browser coverage).
+
+**2. The post-merge and nightly run: `mode: e2e`.** With `mode: e2e` the
+callable runs only Build -> E2E plan -> E2E (and the quarantine lane) and a
+`Required` verdict. Every other lane, the Caller lint and the dependency audit
+are skipped, the `CI_E2E_IN_CI` variable is ignored, and the run never
+path-skips (a newer push cancels this run, so no diff can prove a skip).
+`Required` is red if the mode is not `ci` or `e2e`, if `run-e2e` is not `true`,
+if `journey-smoke-url` is set, or if any E2E lane fails, is cancelled, or was
+skipped without the plan's say-so. The mode has its own workflow because an
+app's `promote.yml` fires on `workflow_run` completion of the **whole** CI
+workflow: E2E left in `ci.yml` would delay every promotion.
+
+Name the caller workflow **`E2E`** (the reaper and the red-main listener look for
+that name) and stamp it exactly, with the same `with:` values as the app's `ci`
+job for the E2E inputs and the same runner inputs:
+
+```yaml
+name: E2E
+
+# Post-merge and nightly Playwright. The newest merge wins: a push cancels the
+# run still in flight, and every run tests the whole suite.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 8 * * *"   # 08:17 UTC = 3:17 AM CT
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.repository }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+      pull-requests: write
+    uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@<sha> # v2
+    secrets: inherit
+    with:
+      mode: e2e
+      run-e2e: true
+      # ...the app's ci.yml E2E and runner inputs, verbatim (e2e-runner,
+      # e2e-shards, e2e-args, e2e-build-artifact-path, e2e-quarantine-args,
+      # install-script, node-version, working-directory, ...)
+```
+
+The calling job id stays `ci` so the composed context reads `E2E / ci / Required`.
+`concurrency` sits in the caller, never in the callable (R6). Pass the same
+`permissions:` block the app's `ci` job grants: a job in the callable may only
+use what its caller granted (R12).
+
+A red post-merge or nightly run reaches the same `red-main` issue flow as CI:
+add the workflow to the app's red-main listener, and accept `schedule`.
+
+```yaml
+on:
+  workflow_run:
+    workflows: ["CI", "E2E"]
+    types: [completed]
+jobs:
+  red-main:
+    if: |
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch' || github.event.workflow_run.event == 'schedule') &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch
+```
+
+Each workflow keeps its own "main is red: `<name>`" issue, opened by the first
+red run and closed by the next green one. A run cancelled by a newer merge is
+not a verdict and does nothing.
 
 #### Quality level (`quality-level`, `quality-opt-out`)
 
@@ -2070,6 +2179,13 @@ P3-C2 / O-D8 rather than kept as a dead compatibility surface.
   callers who never asked for one, which is a breaking change dressed as an
   additive input. Getting the *default* wrong is how an "additive" change
   breaks people.
+- `nuxt-cloudflare.yml`'s `mode` input and `vars.CI_E2E_IN_CI` switch
+  ([E2E off the pull request](#e2e-off-the-pull-request-mode-e2e-and-ci_e2e_in_ci))
+  are within-major on the same rule: one optional input defaulting to `ci`, no
+  new job, no new permission, and an unset variable reproduces every
+  adopter's behaviour exactly. The `Dependency audit` step's pull-request
+  downgrade (warn on `pull_request`, block on push, schedule and dispatch) only
+  *loosens* a gate on one event, so no adopter turns red because of it.
 - `nuxt-cloudflare.yml`'s `foundation-check` / `foundation-check-tool-version`
   (company-hq docs/WEB-FOUNDATION-CHECK.md, D-WEBFOUND-2 Q5/Q9 (a),
   D-WEBFOUND-3) are within-major on the same rule — two optional inputs, no

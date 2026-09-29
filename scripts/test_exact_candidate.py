@@ -38,7 +38,7 @@ class ExactCandidate(unittest.TestCase):
                     # Caller lint runs inside Required (and escalated Fast)
                     # after the gate steps, under !cancelled().
                     if name == 'required':
-                        condition = f"!cancelled() && {condition}"
+                        condition = f"!cancelled() && inputs.mode != 'e2e' && {condition}"
                     if name == 'fast-escalated':
                         condition = f"env.FAST_ENABLED == 'true' && !cancelled() && {condition}"
                     self.assertEqual(guard['if'], condition, name)
@@ -104,7 +104,7 @@ class ExactCandidate(unittest.TestCase):
                        'Install actionlint', "actionlint (caller's own workflows)",
                        'Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)']
         escalated = self.workflow['jobs']['fast-escalated']
-        for job, expected in [(required, '!cancelled()'),
+        for job, expected in [(required, "!cancelled() && inputs.mode != 'e2e'"),
                               (escalated, "env.FAST_ENABLED == 'true' && !cancelled()")]:
             steps = {step.get('name'): step for step in job['steps']}
             for name in caller_lint:

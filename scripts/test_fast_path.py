@@ -463,8 +463,9 @@ def test_checks_in_build() -> None:
     names = ["Typecheck Worker", "Typecheck Nuxt", "Unit tests"]
     for name in names:
         assert steps[name]["run"] == checks[name]["run"] and steps[name]["env"] == checks[name]["env"], name
-    assert steps["Typecheck Worker"]["if"] == steps["Typecheck Nuxt"]["if"] == "inputs.checks-in-build"
-    assert steps["Unit tests"]["if"] == "inputs.checks-in-build && inputs.run-tests"
+    # `mode: e2e` (the post-merge / nightly Playwright run) never typechecks or tests.
+    assert steps["Typecheck Worker"]["if"] == steps["Typecheck Nuxt"]["if"] == "inputs.checks-in-build && inputs.mode != 'e2e'"
+    assert steps["Unit tests"]["if"] == "inputs.checks-in-build && inputs.run-tests && inputs.mode != 'e2e'"
     assert "if" not in checks["Typecheck Worker"] and checks["Unit tests"]["if"] == "inputs.run-tests"
     order = [s.get("name") for s in JOBS["build"]["steps"]]
     assert order.index("Unit tests") < order.index("Build"), order
@@ -945,7 +946,7 @@ def test_concurrent_scripts() -> None:
     a failed, missing, hooked or killed script fails Build."""
     start = step("build", "Start concurrent scripts")
     wait = step("build", "Await concurrent scripts")
-    assert INPUTS["concurrent-scripts"]["default"] == "" and start["if"] == "inputs.concurrent-scripts != ''"
+    assert INPUTS["concurrent-scripts"]["default"] == "" and start["if"] == "inputs.concurrent-scripts != '' && inputs.mode != 'e2e'"
     assert wait["if"] == "!cancelled() && steps.concurrent-start.outcome == 'success'"
     order = [x.get("name") for x in JOBS["build"]["steps"]]
     assert order.index("Start concurrent scripts") + 1 == order.index("Build") < order.index("Await concurrent scripts")

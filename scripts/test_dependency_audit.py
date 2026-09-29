@@ -20,6 +20,10 @@ What the gate promises, and what each case below pins down:
   * a stale `audit-ignore` entry warns so it gets removed
   * a missing, empty, non-JSON or unrecognised report is a HARD FAILURE --
     "the audit did not run" must never look like "the audit found nothing"
+  * on `pull_request` / `pull_request_target` EVERY finding above becomes a
+    `::warning::` carrying the same advisory list and the step passes; the
+    default branch (`push`), `schedule` and `workflow_dispatch` keep failing
+    (fast-CI program, Logan 2026-09-29 "Main + nightly")
 
 Run: python3 scripts/test_dependency_audit.py
 """
@@ -139,7 +143,8 @@ UNKNOWN_SHAPE = json.dumps({"metadata": {"vulnerabilities": {}}, "somethingElse"
 
 
 # --- harness --------------------------------------------------------------
-def run_case(script: str, *, pm: str, stdout: str, exit_code: int, audit_ignore: str = "") -> tuple[int, str, str]:
+def run_case(script: str, *, pm: str, stdout: str, exit_code: int, audit_ignore: str = "",
+             event_name: str | None = None) -> tuple[int, str, str]:
     """Execute the shipped gate text with a fake package manager on PATH."""
     tmp = tempfile.mkdtemp(prefix="dependency-audit-")
     try:
@@ -164,6 +169,8 @@ def run_case(script: str, *, pm: str, stdout: str, exit_code: int, audit_ignore:
             "GITHUB_STEP_SUMMARY": str(summary),
             "HOME": tmp,
         }
+        if event_name is not None:
+            env["EVENT_NAME"] = event_name
         proc = subprocess.run(
             ["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True
         )
@@ -318,6 +325,97 @@ CASES: list[tuple[str, dict, int, list[str], list[str]]] = [
         [],
     ),
 ]
+
+
+# The same findings, on the event that decides whether they block. A pull
+# request only warns; every other event (unset included) fails as before.
+PR_EVENTS = ("pull_request", "pull_request_target")
+BLOCKING_EVENTS = ("push", "schedule", "workflow_dispatch")
+for _event in PR_EVENTS:
+    CASES += [
+        (
+            f"{_event}: fixable high warns and passes, listing the advisory",
+            {"pm": "pnpm", "stdout": FIXABLE_HIGH, "exit_code": 1, "event_name": _event},
+            0,
+            ["::warning::high in left-pad", "FIX AVAILABLE (>=1.2.3)", "GHSA-AAAA-BBBB-CCCC",
+             "do not fail this pull request"],
+            ["::error::"],
+        ),
+        (
+            f"{_event}: mixed tree warns on both and passes",
+            {"pm": "pnpm", "stdout": MIXED, "exit_code": 1, "event_name": _event},
+            0,
+            ["::warning::high in left-pad", "::warning::critical in tar", "1 fixable, 1 unfixable"],
+            ["::error::"],
+        ),
+        (
+            f"{_event}: an audit-ignore entry without a reason warns and passes",
+            {"pm": "pnpm", "stdout": FIXABLE_HIGH, "exit_code": 1, "audit_ignore": "GHSA-aaaa-bbbb-cccc",
+             "event_name": _event},
+            0,
+            ["::warning::audit-ignore entry", "has no reason"],
+            ["::error::"],
+        ),
+        (
+            f"{_event}: an empty report (audit did not run) warns and passes",
+            {"pm": "pnpm", "stdout": "", "exit_code": 0, "event_name": _event},
+            0,
+            ["::warning::dependency audit produced no report", "did not run on this pull request"],
+            ["::error::"],
+        ),
+        (
+            f"{_event}: a non-JSON report warns and passes",
+            {"pm": "pnpm", "stdout": "ERR_PNPM_AUDIT_ENDPOINT_UNAVAILABLE\n", "exit_code": 1, "event_name": _event},
+            0,
+            ["::warning::dependency audit report is not JSON"],
+            ["::error::"],
+        ),
+        (
+            f"{_event}: an unrecognised report shape warns and passes",
+            {"pm": "pnpm", "stdout": UNKNOWN_SHAPE, "exit_code": 0, "event_name": _event},
+            0,
+            ["::warning::dependency audit report has neither"],
+            ["::error::"],
+        ),
+        (
+            f"{_event}: npm 7+ fixable high warns and passes",
+            {"pm": "npm", "stdout": NPM7_FIXABLE_HIGH, "exit_code": 1, "event_name": _event},
+            0,
+            ["::warning::high in axios", "FIX AVAILABLE (axios@1.7.4)"],
+            ["::error::"],
+        ),
+        (
+            f"{_event}: a clean report still says nothing alarming",
+            {"pm": "pnpm", "stdout": CLEAN_PNPM, "exit_code": 0, "event_name": _event},
+            0,
+            ["0 fixable, 0 unfixable, 0 suppressed"],
+            ["::error::", "::warning::"],
+        ),
+    ]
+for _event in BLOCKING_EVENTS:
+    CASES += [
+        (
+            f"{_event}: fixable high still fails",
+            {"pm": "pnpm", "stdout": FIXABLE_HIGH, "exit_code": 1, "event_name": _event},
+            1,
+            ["::error::high in left-pad", "FIX AVAILABLE (>=1.2.3)"],
+            ["do not fail this pull request"],
+        ),
+        (
+            f"{_event}: an empty report (audit did not run) still fails",
+            {"pm": "pnpm", "stdout": "", "exit_code": 0, "event_name": _event},
+            1,
+            ["::error::dependency audit produced no report"],
+            [],
+        ),
+        (
+            f"{_event}: a non-JSON report still fails",
+            {"pm": "pnpm", "stdout": "ERR_PNPM_AUDIT_ENDPOINT_UNAVAILABLE\n", "exit_code": 1, "event_name": _event},
+            1,
+            ["::error::dependency audit report is not JSON"],
+            [],
+        ),
+    ]
 
 
 def check_shipped_flags(script: str) -> list[str]:

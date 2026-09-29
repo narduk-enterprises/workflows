@@ -122,9 +122,9 @@ check(RESOLVER["env"]["CONTEXT"] == "build", "Build resolver must set CONTEXT=bu
 check(PREVIEW_PROBE["run"] == SMOKE_PROBE["run"], "both security-headers probes must run the anchored text")
 
 conditions = {
-    ("build", "Run web-foundation conformance check"): "steps.quality.outputs.foundation-check == 'true'",
-    ("build", "Evaluate web-foundation conformance check"): "always() && steps.quality.outputs.foundation-check == 'true'",
-    ("build", "Performance budget"): "steps.quality.outputs.performance-budget == 'true'",
+    ("build", "Run web-foundation conformance check"): "steps.quality.outputs.foundation-check == 'true' && inputs.mode != 'e2e'",
+    ("build", "Evaluate web-foundation conformance check"): "always() && steps.quality.outputs.foundation-check == 'true' && inputs.mode != 'e2e'",
+    ("build", "Performance budget"): "steps.quality.outputs.performance-budget == 'true' && inputs.mode != 'e2e'",
 }
 for (job, name), expected in conditions.items():
     check(str(step(job, name).get("if", "")).strip() == expected, f"{job}/{name} condition drifted")

@@ -34,16 +34,22 @@ name: Reusable Red-Main Listener
 #       types: [completed]
 #   jobs:
 #     red-main:
-#       # `event == 'push' || event == 'workflow_dispatch'` matters: CI also
+#       # `event == 'push' || event == 'workflow_dispatch' || event ==
+#       # 'schedule'` matters: CI also
 #       # runs on `pull_request`, whose `head_branch` is the PR's OWN
 #       # branch, not `main` -- a branch that happens to be named `main`
 #       # would otherwise pass the filter below. `workflow_dispatch` is
 #       # included because a manually-dispatched CI run against the default
 #       # branch is just as real a "main is red" signal as a push; drop it
 #       # from this list if a given caller's `workflow_dispatch` runs never
-#       # target the default branch as CI.
+#       # target the default branch as CI. `schedule` is included because a
+#       # scheduled run always runs the default branch, so a red nightly
+#       # (the `E2E` workflow's safety net, see README "E2E off the pull
+#       # request") must open or refresh the issue too. List the post-merge
+#       # workflow beside CI: `workflows: ["CI", "E2E"]`; each workflow gets
+#       # its own "main is red: <name>" issue.
 #       if: |
-#         (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
+#         (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch' || github.event.workflow_run.event == 'schedule') &&
 #         github.event.workflow_run.head_branch == github.event.repository.default_branch
 #       uses: narduk-enterprises/workflows/.github/workflows/red-main-listener.yml@<sha> # v1
 #       permissions:

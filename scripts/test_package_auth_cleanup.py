@@ -123,7 +123,7 @@ def auth_jobs(document: dict) -> dict[str, dict]:
 
 def validate_cleanup_step(job_id: str, step: dict, condition: str = "always() && inputs.install-script == ''") -> None:
     if job_id in ("fast", "fast-escalable"):
-        condition += " && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
+        condition += " && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     assert step.get("if") == condition, (
         f"{job_id}: cleanup must always run for the legacy materialization path, "
         f"got {step.get('if')!r}"
