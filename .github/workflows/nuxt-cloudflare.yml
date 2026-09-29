@@ -3556,9 +3556,9 @@ jobs:
               const workflow = process.env.CALLER_WORKFLOW_REF.split('@')[0];
               const workflowPath = workflow.slice(`${repo.owner}/${repo.repo}/`.length);
               const inputs = JSON.parse(process.env.E2E_INPUTS);
-              // `mode` says which caller workflow ran this, not what was tested,
-              // so a proof minted by a CI run and one asked for by the E2E run
-              // are the same proof.
+              // `mode` is not part of the key (it says which caller ran this, not
+              // what was tested). The workflow path IS, so a ci.yml proof and an
+              // E2E-workflow proof never cross.
               delete inputs.mode;
               // Fast-path inputs (P3-C1) and the quality-level inputs stay out of
               // the key at their defaults, so proof minted before they existed
@@ -6391,13 +6391,17 @@ jobs:
       # script `Reuse plan` runs on the push.
       - name: Compute Required proof key
         id: required-key
+        # RAW `run-e2e`, not the effective switch: a pull request that skipped
+        # E2E because `CI_E2E_IN_CI` was false must mint no proof, or the
+        # variable's later removal (rollback) or a repo override would let the
+        # push reuse it and turn main green without E2E ever having run.
         if: >-
           success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == ''
           && github.event_name == 'pull_request'
           && github.event.pull_request.head.repo.full_name == github.repository
           && needs.build.result == 'success'
           && (needs.checks.result == 'success' || (inputs.checks-in-build && needs.checks.result == 'skipped'))
-          && (!(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards))
+          && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards))
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}

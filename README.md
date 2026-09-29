@@ -1111,12 +1111,14 @@ newest wins, plus nightly; one org switch"). Two pieces, both additive: with
 neither in play a caller behaves exactly as before.
 
 **1. The org switch: `vars.CI_E2E_IN_CI`.** When the organization (or one repo,
-which overrides the org value) sets `CI_E2E_IN_CI` to `false`, `E2E plan`, `E2E`
+which overrides the org value) sets `CI_E2E_IN_CI` to `false` (GitHub compares strings case-insensitively, so `False` and `FALSE` switch it off too), `E2E plan`, `E2E`
 and `E2E quarantine` are skipped in an ordinary CI run on **every** event, and
 `Required` reads that skip as success (a lane that runs anyway still fails
 it). Build then skips packing and uploading the prebuilt application for the E2E
 jobs, and a `checks-in-build` caller with no other lane folds `Required` into
-`Build` (one job, no extra queue hop). Unset, empty or any other value changes
+`Build` (one job, no extra queue hop). A pull request that skipped E2E this way mints no `Required` proof (the proof key does not
+include the variable, so a reusable proof would let a later push, after the variable is removed
+or overridden, go green without E2E ever having run). Unset, empty or any other value changes
 nothing. The switch deliberately does **not** override two promises to run
 browsers: `e2e-full-paths` (a caller that sets it wants protected-path escalation,
 which needs `E2E plan` to decide, so acre-oracle keeps browsers on auth/payment

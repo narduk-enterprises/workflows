@@ -314,13 +314,45 @@ def test_proof_key_ignores_mode() -> None:
     print("PASS  the mode input never changes a proof key (E2E: always dropped; Required: dropped at its default)")
 
 
+def test_switch_off_pull_request_mints_no_required_proof() -> None:
+    """A PR that skipped E2E because the variable was false must not mint a Required proof.
+
+    The proof key does not include the variable. If it minted, unsetting the
+    variable (the rollback) or a repo override would let the push's Reuse plan
+    reuse the proof and turn main green without E2E ever having run.
+    """
+    key_if = tfp.step("required", "Compute Required proof key")["if"]
+    inputs = {"run-e2e": True, "required-reuse-pr-results": True, "e2e-args": "--project=web", "e2e-shards": 3}
+
+    def mint(variables: dict, e2e: dict, plan_outputs: dict) -> bool:
+        ctx = context_with_vars("pull_request", "refs/pull/1/merge", inputs, {
+            "build": {"result": "success", "outputs": {}}, "checks": {"result": "success", "outputs": {}},
+            "e2e": {"result": e2e["result"], "outputs": {}},
+            "e2e-plan": {"result": "success" if plan_outputs else "skipped", "outputs": plan_outputs},
+        }, variables=variables)
+        ctx["github"]["repository"] = "o/r"
+        ctx["github"]["event"]["pull_request"] = {"head": {"repo": {"full_name": "o/r"}}}
+        return tfp.ev(key_if, ctx)
+
+    ran_plan = {"e2e-args": "--project=web", "shard-total": "3"}
+    for variables in ({"CI_E2E_IN_CI": "false"}, {"CI_E2E_IN_CI": "False"}):
+        assert mint(variables, {"result": "skipped"}, {}) is False, variables
+    # Unchanged when E2E really ran and passed, with the variable off or not.
+    for variables in ({}, {"CI_E2E_IN_CI": "true"}, {"CI_E2E_IN_CI": "false"}):
+        assert mint(variables, {"result": "success"}, ran_plan) is True, variables
+    # And still no proof for an unset variable when E2E was skipped or failed.
+    assert mint({}, {"result": "skipped"}, {}) is False
+    assert mint({}, {"result": "failure"}, ran_plan) is False
+    print("PASS  CI_E2E_IN_CI=false: a pull request that skipped E2E mints no Required proof (rollback cannot reuse it)")
+
+
 def main() -> None:
     for test in (test_mode_input, test_switch_defaults_change_nothing, test_switch_off_skips_the_e2e_lanes,
                  test_switch_leaves_promises_to_run_browsers, test_switch_off_without_run_e2e_is_unchanged,
                  test_fold_reads_the_effective_switch, test_mode_e2e_runs_only_the_e2e_chain,
                  test_mode_e2e_verdict, test_mode_e2e_skips_caller_lint_and_lint_steps,
                  test_prebuilt_handoff_follows_the_switch, test_mode_e2e_never_path_skips,
-                 test_proof_key_ignores_mode):
+                 test_proof_key_ignores_mode, test_switch_off_pull_request_mints_no_required_proof):
         test()
     print("e2e mode contract passed")
 
