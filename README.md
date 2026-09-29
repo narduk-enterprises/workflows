@@ -983,7 +983,7 @@ a finding fails `Required` directly. On a protected-path pull request the job
 holding `Fast` (`fast-escalated`) runs the same anchored scripts, and when
 `Required` is folded into Build (see `checks-in-build` below) Build runs them
 at its own full checkout. `Required`'s own checkout is sparse (ci-reset W10,
-W8 item 9): only `.github` and a root `action.yml`/`action.yaml`, which is all
+W8 item 9): only `.github` and `action.yml`/`action.yaml` at any depth, which is all
 the lint reads, so it no longer fetches the whole tree for ten seconds of lint.
 It checks out the CALLING
 repository (not this one), runs pinned `actionlint` over the caller's own

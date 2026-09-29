@@ -339,13 +339,21 @@ def check_folded_gate(path: Path, doc: dict, f: Findings) -> None:
             f"R5 folded Build '{build_id}' `if:` {build_if!r} must start with `!cancelled()` — "
             "it reports `ci / Required` after a failed or skipped need",
         )
-    agg_lint = {
-        s.get("name") for s in jobs[agg_id].get("steps") or [] if isinstance(s, dict) and s.get("name") in CALLER_LINT_STEPS
+    agg_steps = {
+        s.get("name"): s for s in jobs[agg_id].get("steps") or [] if isinstance(s, dict) and s.get("name") in CALLER_LINT_STEPS
     }
+    agg_lint = set(agg_steps)
+    # The same script, from the workspace root (the audit exits 0 when it
+    # finds no workflows, so a drifted directory would pass silently), under
+    # exactly `!cancelled() && (X)`.
     build_lint = {
         s.get("name")
         for s in jobs[build_id].get("steps") or []
-        if isinstance(s, dict) and s.get("name") in CALLER_LINT_STEPS and f"({agg_cond})" in str(s.get("if", ""))
+        if isinstance(s, dict)
+        and s.get("name") in agg_steps
+        and str(s.get("if", "")).strip() == f"!cancelled() && ({agg_cond})"
+        and s.get("run") == agg_steps[s.get("name")].get("run")
+        and s.get("working-directory") == "${{ github.workspace }}"
     }
     missing = sorted(agg_lint - build_lint)
     if missing:

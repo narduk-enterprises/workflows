@@ -921,6 +921,12 @@ def test_folded_gate_lint() -> None:
                                      "if": "!cancelled() && !(inputs.run-tests)"})),
         "build caller lint not under the fold": lambda jobs: lint_step(jobs, "Install actionlint").update(
             {"if": "!cancelled()"}),
+        "build caller lint disabled": lambda jobs: lint_step(jobs, "Install actionlint").update(
+            {"if": f"false && ({fold})"}),
+        "build caller lint left the workspace root": lambda jobs: lint_step(
+            jobs, "Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)").pop("working-directory"),
+        "build caller lint script replaced": lambda jobs: lint_step(jobs, "actionlint (caller's own workflows)").update(
+            {"run": "exit 0"}),
         "build dropped a caller lint step": lambda jobs: jobs["build"].update(
             {"steps": [x for x in jobs["build"]["steps"] if x.get("name") != "actionlint (caller's own workflows)"]}),
         "build does not start after a failed need": lambda jobs: jobs["build"].update({"if": "inputs.run-tests"}),
