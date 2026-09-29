@@ -342,15 +342,21 @@ so a private caller that passes nothing is Blacksmith-eligible (it is on the
   (`apple.yml` is untouched — it has its own D-APPLE-CI-1 ladder).
 - **Per-repo ordinary route (`CI_LINUX_RUNNER`, CI reset 2026-09-28)**: in
   `nuxt-cloudflare.yml`, the ordinary private route of `Build`, `Checks`,
-  `Extra gate`, `Deploy dry run` and `Fast` reads a repo-level Actions
-  variable `CI_LINUX_RUNNER` (a JSON `runsOn` value) after an explicit
-  `runner` input and ahead of the linux-ci default:
-  `(inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '<linux-ci route>') || '"ubuntu-latest"')`.
+  `Extra gate`, `Deploy dry run` and both `Fast` jobs reads a repo-level
+  Actions variable `CI_LINUX_RUNNER` (a JSON `runsOn` value). **When set on a
+  private caller it wins over the caller's `runner` input** (ci-reset W10,
+  W8 item 8): every sampled nuxt caller passes `runner:` with the linux-ci
+  route verbatim, so the variable used to be unreachable exactly where the
+  overflow was needed:
+  `(github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '<linux-ci route>' || '"ubuntu-latest"')`.
   A controller sets or deletes it to move one burst repository's ordinary CI
-  (for example to a Blacksmith label) without a pin bump. Unset, the route is
+  (for example to a Blacksmith label) without a pin bump. Setting it is a
+  deliberate per-repo routing decision that also overrides an explicit
+  `runner:` (a CI-RUNNER-POLICY §2 hosted exception included), so only set it
+  where that repo's policy allows the target. Unset, the route is
   byte-for-byte the previous one (`scripts/test_runner_default.py` evaluates
-  both). It never applies to a public caller, never overrides an explicit
-  `runner`, and does not touch the lightweight, browser or preview routes.
+  both). It never applies to a public caller and does not touch the
+  lightweight, browser or preview routes.
   The Blacksmith switch above still applies to the resulting route unchanged.
   Configuration variables in a called workflow resolve from the CALLER's
   repository (GitHub docs, "Variables": *"For reusable workflows, the
@@ -494,7 +500,7 @@ Which gates each callable exposes this way:
 |---|---|---|
 | `nuxt-cloudflare.yml` | `run-e2e` (`e2e`, `e2e-plan`), `wrangler-dry-run`, `run-tests` | `build`, `checks` (its steps run inside `build` with `checks-in-build`) |
 | `apple.yml` | `run-swiftlint` / `linux-checks` (`lint`), `run-build`, `run-tests` | `xcode` |
-| `python-data.yml` | `run-ruff` (`lint`), `run-tests`, `run-pyright` | `test` |
+| `python-data.yml` | `run-ruff` (ruff steps in `test`), `run-tests`, `run-pyright` | `test` |
 | `reusable-browser-tests.yml` | `run-webkit` (`webkit`) | `validate`, `chromium` |
 | `node-library.yml` | `run-lint`, `run-typecheck`, `run-tests`, `run-build` | `package` |
 | `reusable-weekly-drift-check.yml` | all three jobs | — |
@@ -627,7 +633,14 @@ Notes:
   a static-analysis gate is usually red on first contact — narduk-data's
   `earth-data-pipeline` has 36 violations today, including six `F821`
   undefined-name — so the template does not decide for the caller when to take
-  that on.
+  that on. Since ci-reset W10 (W8 item 10) ruff runs as the last steps of the
+  `test` job, not in a `lint` job of its own: that job did about 0.1 min of
+  work for a whole runner allocation. The steps run under `!cancelled()`
+  after the tests, so a lint finding and a test failure both show, and ruff
+  gets its own interpreter (called by path), so it never installs into the
+  project environment. A caller's ruleset that required `<job> / lint` would
+  lose that context; none does (narduk-data's `earth-data-ci` is the only
+  caller, and narduk-data's `require-checks` ruleset names no `ci / lint`).
 - `run-pyright` is **opt-in** for `v1` compatibility, but it is a real static
   gate: the workflow provisions Node 24 explicitly, installs exact
   `pyright-version` under `$RUNNER_TEMP`, and runs it in the installed Python
@@ -676,7 +689,7 @@ backward compatible; required check names and failure/skip semantics are unchang
 `CI_LIGHTWEIGHT_RUNNER` is an organization Actions variable containing a JSON
 `runs-on` value, initially `"ubuntu-slim"` for the authorized company gates.
 Every shared `Required` job reads it except `python-data.yml`'s, which runs on
-the caller's own `lint`/`test` route (CI reset 2026-09-28): its only caller runs
+the caller's own `test` route (CI reset 2026-09-28): its only caller runs
 those jobs GitHub-hosted, so a lightweight `Required` on `linux-ci` was the one
 self-hosted job in each run. Changing this one value changes routing
 for subsequent jobs without changing callable code or repinning callers.
@@ -967,7 +980,12 @@ own: the separate job cost a whole runner allocation for about ten seconds of
 lint on every call. The steps run after `Required`'s gate steps under
 `!cancelled()`, so a lane failure and a lint finding both show in one run, and
 a finding fails `Required` directly. On a protected-path pull request the job
-holding `Fast` (`fast-escalated`) runs the same anchored scripts. It checks out the CALLING
+holding `Fast` (`fast-escalated`) runs the same anchored scripts, and when
+`Required` is folded into Build (see `checks-in-build` below) Build runs them
+at its own full checkout. `Required`'s own checkout is sparse (ci-reset W10,
+W8 item 9): only `.github` and a root `action.yml`/`action.yaml`, which is all
+the lint reads, so it no longer fetches the whole tree for ten seconds of lint.
+It checks out the CALLING
 repository (not this one), runs pinned `actionlint` over the caller's own
 `.github/workflows/*.yml`, and runs a small inline Python audit that fails
 the job when a caller workflow:
@@ -1195,6 +1213,38 @@ allocation, checkout and install per run, and the E2E shards, preview and
 deploy dry run start after the checks instead of beside them. An extra script that does **not** need build output belongs
 in `extra-gate-scripts`, which also runs in parallel. On riverstatus, two
 migration-proof scripts in `extra-scripts` held its E2E back by about 8 minutes.
+
+**`Required` folded into Build (ci-reset W10, W8 item 3).** With
+`checks-in-build: true` and no other lane in the run (no `extra-gate-scripts`,
+`fast-scripts`, `run-e2e`, preview checks, `wrangler-dry-run`,
+`journey-smoke-url` or `required-reuse-pr-results`), Build is the only lane,
+so a separate `Required` job only waited a second runner queue hop to read one
+result (operator-portal PRs: 1.7 min queued for 0.2 min of work). In exactly
+that case the `build` job is **named `Required`** and runs Caller lint itself,
+and the aggregating job skips; its check shows the raw name expression, never
+`Required`. The check `ci / Required` keeps its name, so no ruleset changes,
+and exactly one started job carries it in every run. Any of the lanes above
+brings back the usual `Build` plus aggregating `Required`. `lint_callables.py`
+R5 pins the shape (the same condition on both jobs, `checks-in-build` in it,
+the aggregator's `if:` exactly `!cancelled() && !(<condition>)`).
+
+**`concurrent-scripts` (opt-in, ci-reset W10, W8 item 2a).** Package scripts
+listed here start in the background just before `build-script` and are awaited
+after `extra-scripts`; each one's output is replayed in its own log group, and
+a failed, missing (under `require-scripts`) or killed script fails Build like
+any other gate. Use it for checks that need the installed tree but not the
+build output (lint, a vendored-package pin check), to take them off the
+critical path without a separate job. Two caveats:
+
+- **Memory.** The scripts share the build's runner and memory. A Nuxt build
+  plus `vue-tsc` or ESLint can exceed a 2-vCPU guest's memory; an OOM kill of
+  a background script fails Build ("exited without a status"), and an OOM kill
+  of the build itself fails it too. Prefer `extra-gate-scripts` (its own job)
+  on small runners.
+- **Build outputs.** A concurrent script must not read or write what
+  `build-script` produces (`.nuxt`, `.output`, `dist`). A script with a
+  `pre<name>` hook is refused, because a `prelint: nuxt prepare` would rewrite
+  `.nuxt` under the running build.
 
 #### `require-scripts`: a lane that matched no script is not a passing lane
 
@@ -1552,8 +1602,17 @@ workflow run:
 
 | Run | Check named `Fast` | Other Fast checks |
 | --- | --- | --- |
-| Plain | the `fast` job (lint and unit scripts) | none (`fast-escalated` is skipped) |
-| Escalated | the `fast-escalated` job (the full `Required` gate) | `Fast lanes (escalated)` (the lint and unit scripts) |
+| Plain | the `fast` job (lint and unit scripts); on a pull request of a caller with `e2e-full-paths` (or an exact candidate), `fast-escalable` | none (`fast-escalated` is skipped) |
+| Escalated | the `fast-escalated` job (the full `Required` gate) | `Fast lanes (escalated)` (`fast-escalable`: the lint and unit scripts) |
+
+`fast` and `fast-escalable` run one step list (a YAML alias) on disjoint
+domains (ci-reset W10, W8 item 4). Only a pull request of a caller that set
+`e2e-full-paths`, or an exact candidate, can escalate, so only there does the
+lane wait for `E2E plan`; everywhere else `fast` needs only `Reuse plan` and
+starts with the run (riverstatus main 36497919511: Fast queued 12.0 min behind
+a 0.1 min plan). On a push, plain `fast` no longer fails closed on a failed
+`E2E plan` (its `full` output never applies to Fast off a pull request);
+`Required` still demands the plan succeed.
 
 So a readiness check that needs to know whether a `ci / Fast` run over 180
 seconds was the full gate looks for a `ci / Fast lanes (escalated)` check run
@@ -2317,8 +2376,9 @@ A run has no store credentials when it is a fork pull request, a Dependabot run
 (Dependabot sees only Dependabot secrets), a public caller, a caller that does
 not pass the secrets, or a caller missing from their repository list. Then:
 
-- **Build** publishes nothing.
-- **Each E2E job** runs `build-script` itself and fails if it cannot produce
+- **Build** publishes nothing, with a `::warning::` naming the three secrets
+  (a notice until ci-reset W10, W8 item 1, and nobody read it).
+- **Each E2E job** warns that it rebuilds the application, then runs `build-script` itself and fails if it cannot produce
   the output.
 - **Proofs.** No proof is published or honoured, so the default-branch push
   runs the full gate.

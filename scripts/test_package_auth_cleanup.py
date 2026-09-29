@@ -63,6 +63,8 @@ AUTH_JOBS = (
     # P3-C1 fast-path jobs: each installs the caller's dependencies with the
     # same materialize-then-remove block as `checks`.
     "fast",
+    # Runs `fast`'s own anchored steps (`*fast_steps`), cleanup included.
+    "fast-escalable",
     "journey-smoke",
 )
 
@@ -120,7 +122,7 @@ def auth_jobs(document: dict) -> dict[str, dict]:
 
 
 def validate_cleanup_step(job_id: str, step: dict, condition: str = "always() && inputs.install-script == ''") -> None:
-    if job_id == "fast":
+    if job_id in ("fast", "fast-escalable"):
         condition += " && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     assert step.get("if") == condition, (
         f"{job_id}: cleanup must always run for the legacy materialization path, "
@@ -144,7 +146,7 @@ def validate_cleanup_step(job_id: str, step: dict, condition: str = "always() &&
 
 def install_condition(job_id: str, step: dict) -> str:
     condition = step.get("if", "")
-    if job_id == "fast":
+    if job_id in ("fast", "fast-escalable"):
         prefix = "env.FAST_ENABLED == 'true' && ("
         assert condition.startswith(prefix) and condition.endswith(")"), condition
         return condition[len(prefix):-1]

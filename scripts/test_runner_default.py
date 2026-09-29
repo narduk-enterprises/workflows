@@ -7,7 +7,10 @@ was private or public, which put every private caller that forgot the input on
 hosted capacity -- drift from company-hq CI-RUNNER-POLICY.md Sec 1. The default
 input is now EMPTY and each `runs-on:` resolves it per run:
 
-  explicit input                       -> that input, exactly as before
+  explicit input                       -> that input, exactly as before (on
+                                          nuxt-cloudflare's ordinary route a
+                                          SET vars.CI_LINUX_RUNNER on a private
+                                          caller wins over it, W8 item 8)
   empty + repository.private == true   -> the linux-ci organization-group route
   empty + anything else                -> "ubuntu-latest" (Sec 3: public repos)
 
@@ -49,13 +52,14 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 LINUX_CI = '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
 DEFAULT_TAIL = f"github.event.repository.private == true && '{LINUX_CI}' || '\"ubuntu-latest\"'"
 # The ORDINARY private route (nuxt-cloudflare.yml's Build/Checks/Extra gate/
-# Deploy dry run/Fast) also honours a per-repo `vars.CI_LINUX_RUNNER` after an
-# explicit `inputs.runner` and ahead of the linux-ci default (ci-reset W4
-# addendum, 2026-09-28): a controller sets or deletes that repo variable to
-# move one burst repo's ordinary CI. Private callers only; unset is identical
-# to DEFAULT_TAIL, which check_callable proves by evaluating both.
-LINUX_VAR_TAIL = f"github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{LINUX_CI}') || '\"ubuntu-latest\"'"
-LINUX_VAR_SITES = {"nuxt-cloudflare.yml": {"build", "checks", "extra-gate", "deploy-dry-run", "fast"}}
+# Deploy dry run/Fast) also honours a per-repo `vars.CI_LINUX_RUNNER` (ci-reset
+# W4 addendum, 2026-09-28): a controller sets or deletes that repo variable to
+# move one burst repo's ordinary CI. Since ci-reset W10 (W8 item 8) a SET
+# variable wins over an explicit `inputs.runner` too, so the Blacksmith
+# overflow can engage on a caller that pins a runner. Private callers only;
+# unset is identical to the pre-variable expression, which check_callable
+# proves by evaluating both.
+LINUX_VAR_SITES = {"nuxt-cloudflare.yml": {"build", "checks", "extra-gate", "deploy-dry-run", "fast", "fast-escalable"}}
 
 # callable -> the input that carries the caller's route
 CALLABLES = {
@@ -251,7 +255,7 @@ def check_callable(fname: str, name: str) -> int:
     assert inp.get("required") is False, f"{fname}: {name} must stay optional"
 
     default_effective = f"(inputs.{name} || {DEFAULT_TAIL})"
-    var_effective = f"(inputs.{name} || {LINUX_VAR_TAIL})"
+    var_effective = f"(github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.{name} || {DEFAULT_TAIL})"
     var_sites = LINUX_VAR_SITES.get(fname, set())
     sites = list(runs_on_sites(doc, name))
     assert sites, f"{fname}: no runs-on site reads inputs.{name}"
@@ -270,13 +274,15 @@ def check_callable(fname: str, name: str) -> int:
                         c = ctx_for(vis, name, val, blacksmith=bs)
                         assert evaluate(ro, c) == evaluate(legacy, c), f"{fname}:{jid} unset CI_LINUX_RUNNER changed the route"
                         checks += 1
-                        # Set: an explicit input still wins; a public caller never uses it.
+                        # Set: it wins on a private caller, over an explicit
+                        # input too (W8 item 8); a public or visibility-unknown
+                        # caller never uses it.
                         c = ctx_for(vis, name, val, blacksmith=bs, linux='"blacksmith-4vcpu-ubuntu-2404"')
                         got = evaluate(ro, c)
-                        if val:
-                            assert got == evaluate(legacy, c), f"{fname}:{jid} CI_LINUX_RUNNER overrode inputs.{name}"
-                        elif vis is not True:
-                            assert is_hosted_ubuntu_latest(got), f"{fname}:{jid} public caller took CI_LINUX_RUNNER -> {got!r}"
+                        if vis is not True:
+                            assert got == evaluate(legacy, c), f"{fname}:{jid} public caller took CI_LINUX_RUNNER -> {got!r}"
+                            if not val:
+                                assert is_hosted_ubuntu_latest(got), f"{fname}:{jid} public caller left hosted -> {got!r}"
                         elif bs == "true":
                             # Blacksmith logic unchanged and not widened: a
                             # non-hosted effective route becomes the Blacksmith label.
@@ -358,7 +364,9 @@ def check_python_data_required() -> None:
     # lint and test hosted (narduk-data earth-data-ci) takes no linux-ci seat.
     jobs = yaml.safe_load((WORKFLOWS / "python-data.yml").read_text())["jobs"]
     ro = jobs["required"]["runs-on"]
-    assert ro == jobs["test"]["runs-on"] == jobs["lint"]["runs-on"], "python-data:required must share test's route"
+    # ci-reset W10 (W8 item 10) folded the `lint` job into `test`.
+    assert "lint" not in jobs, "python-data: ruff runs inside `test`, not a job of its own"
+    assert ro == jobs["test"]["runs-on"], "python-data:required must share test's route"
     assert "CI_LIGHTWEIGHT_RUNNER" not in ro, "python-data:required must not read CI_LIGHTWEIGHT_RUNNER"
     got = evaluate(ro, ctx_for(True, "runner", '"ubuntu-24.04"', lightweight=LINUX_CI))
     assert got == "ubuntu-24.04", f"python-data:required hosted caller -> {got!r}"
