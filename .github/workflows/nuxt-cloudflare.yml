@@ -77,6 +77,20 @@ name: Reusable Nuxt + Cloudflare CI
 # check context `ci / Required` on every adopting repo regardless of whether
 # e2e or the deploy dry-run gate ran. See README for the full explanation.
 #
+# REQUIRED FOLDED INTO BUILD (ci-reset W10, W8 item 3). With `checks-in-build`
+# and NO other lane for the event (no extra gate, Fast, E2E, preview, deploy
+# dry run, journey smoke or Required reuse), `Build` is the only job that can
+# run, so a separate `Required` job would only wait a fresh queue hop to read
+# one result. In that configuration `Build` itself is NAMED `Required` and runs
+# the Caller lint steps at its end, and the `required` job is skipped (a
+# skipped job displays its raw name expression, never `Required`; see NAMING IS
+# THE GATE at `fast`). The composed context stays `ci / Required`; `ci / Build`
+# does not appear in that configuration. The condition is the same expression
+# in three places (Build's name, the Caller lint steps in Build, and the
+# `required` job's name and `if:`); scripts/lint_callables.py (R5) and
+# scripts/test_fast_path.py prove they agree and that every other lane's own
+# `if:` is false whenever it holds.
+#
 # THE FAST PATH (narduk reboot P3-C1; DECISIONS Round 3 Q1 "Local proof, CI
 # after"). Four opt-in inputs, all default off, let CI become the asynchronous
 # safety net instead of the thing a merge waits on:
@@ -290,6 +304,31 @@ on:
           half of one. A repo-specific gate that would otherwise need a second
           job with a second full install goes here instead — earthdata-viewer's
           vendored-package pin check is the first case.
+        required: false
+        type: string
+        default: ""
+      concurrent-scripts:
+        description: >-
+          Opt-in (default empty: nothing changes). Space-separated package
+          scripts that `Build` starts in the BACKGROUND immediately before
+          `build-script` and awaits after `extra-scripts`, so a long gate such
+          as type-aware `lint` overlaps the build instead of running after it
+          (W8 item 2a: lint was 98-122 s of the serial Extra scripts step).
+          Each script's output is captured and replayed as its own log group,
+          and `Build` fails if any of them fails, exits without a status, or
+          does not exist (per `require-scripts`). Move a script here FROM
+          `extra-scripts`; do not list it in both. Two caveats. MEMORY: the
+          scripts share the Build runner with `build-script` (a linux-ci slot
+          is about 2.5-3 vCPU and 5-6 GiB), so a type-aware eslint beside a
+          vite build can hit the memory ceiling and get a process OOM-killed;
+          canary with memory telemetry before adopting, and drop back to
+          `extra-scripts` if it does. BUILD OUTPUTS: a concurrent script must
+          not write what `build-script` writes (`.nuxt`, `.output`, `dist`).
+          A script with a `pre<name>` hook is refused, because a typical
+          `prelint: nuxt prepare` would rewrite `.nuxt` under the running
+          build; give it a hook-free alias instead (`.nuxt` already exists
+          from the install's `postinstall` or from `checks-in-build`'s
+          `Typecheck Nuxt`).
         required: false
         type: string
         default: ""
@@ -1382,7 +1421,10 @@ jobs:
               return;
             }
             if (!cfg) {
-              core.notice('No CI artifact store credentials in this run (fork, Dependabot, public repository, or a caller that does not pass them); each E2E job builds its own application instead.');
+              // A warning, not a notice (ci-reset W10, W8 item 1): every E2E
+              // shard then pays for its own build and E2E proof reuse cannot
+              // engage, and a notice was read by nobody.
+              core.warning('No CI artifact store credentials in this run (fork, Dependabot, public repository, or a caller that does not pass CI_ARTIFACTS_R2_ACCOUNT_ID, CI_ARTIFACTS_R2_ACCESS_KEY_ID and CI_ARTIFACTS_R2_SECRET_ACCESS_KEY in its secrets: block); each E2E job builds its own application instead.');
               return;
             }
             try {
@@ -1587,7 +1629,9 @@ jobs:
             }
 
   build:
-    name: Build
+    # Named `Required` when it is the only lane for this event (REQUIRED
+    # FOLDED INTO BUILD in the header); `Build` otherwise, as before.
+    name: ${{ (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results) && 'Required' || 'Build' }}
     # P3-C1: skipped only when `Reuse plan` proved this exact tree, or in
     # journey-smoke mode. `!cancelled()` keeps it running when `Reuse plan`
     # was skipped (the default) or could not decide.
@@ -1628,7 +1672,7 @@ jobs:
     # expanded by D-CI-CAP-1 (c)): a job landing on Blacksmith here is
     # exercising that named exception, not drift.
     # ---------------------------------------------------------------------
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"')) }}
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -2627,6 +2671,64 @@ jobs:
           fi
           if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
 
+      # CONCURRENT SCRIPTS (`concurrent-scripts`, opt-in; W8 item 2a). Each
+      # named script starts in the background here, just before
+      # `build-script`, with its output captured to a file, and `Await
+      # concurrent scripts` below replays it and fails the job on any failure.
+      # Stdin and stdout are redirected so the step itself returns at once;
+      # the runner only reaps leftover processes at the end of the job. The
+      # same presence probe as `Extra scripts`, plus a refusal of `pre<name>`
+      # hooks (see the input's BUILD OUTPUTS caveat).
+      - name: Start concurrent scripts
+        id: concurrent-start
+        if: inputs.concurrent-scripts != ''
+        env:
+          GATE: Concurrent scripts
+          SCRIPTS: ${{ inputs.concurrent-scripts }}
+          PM: ${{ inputs.package-manager }}
+          REQUIRE: ${{ inputs.require-scripts }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP:?}/concurrent-scripts"
+          rm -rf -- "$dir"
+          mkdir -p -- "$dir"
+          i=0
+          # Deliberate word splitting: concurrent-scripts is a space-separated list.
+          # shellcheck disable=SC2086
+          for SCRIPT in $SCRIPTS; do
+            raw=$(npm pkg get "scripts.$SCRIPT" 2>/dev/null || echo '{}')
+            present=$(printf '%s' "$raw" | node -e \
+              'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+            if [ "$present" != "yes" ]; then
+              msg="$GATE names \"$SCRIPT\" but no such script exists — that entry ran NOTHING"
+              echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+              if [ "$REQUIRE" = "true" ]; then
+                echo "::error::$msg (require-scripts is on)"
+                exit 1
+              fi
+              echo "::warning::$msg. Set require-scripts: true to make this a hard failure."
+              continue
+            fi
+            raw=$(npm pkg get "scripts.pre$SCRIPT" 2>/dev/null || echo '{}')
+            pre=$(printf '%s' "$raw" | node -e \
+              'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+            if [ "$pre" = "yes" ]; then
+              echo "::error::$GATE: \"$SCRIPT\" has a \"pre$SCRIPT\" hook, which would run beside build-script (a prelint 'nuxt prepare' rewrites .nuxt under the running build). List a hook-free alias instead."
+              exit 1
+            fi
+            i=$((i + 1))
+            printf '%s\n' "$SCRIPT" > "$dir/$i.name"
+            (
+              set +e
+              if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
+              rc=$?
+              printf '%s\n' "$rc" > "$dir/$i.rc.tmp" && mv -- "$dir/$i.rc.tmp" "$dir/$i.rc"
+            ) > "$dir/$i.log" 2>&1 < /dev/null &
+            printf '%s\n' "$!" > "$dir/$i.pid"
+            echo "started $SCRIPT in the background (pid $!)"
+          done
+          printf '%s\n' "$i" > "$dir/count"
+
       - name: Build
         env:
           GATE: Build
@@ -2694,6 +2796,38 @@ jobs:
             if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
             echo "::endgroup::"
           done
+
+      # Replays each concurrent script's log as a group, in the order they
+      # were named, and fails on a non-zero status. A script whose process is
+      # gone without writing a status (OOM-killed: see the input's MEMORY
+      # caveat) is a failure, never a pass. Runs after a failed build too, so
+      # both results are reported.
+      - name: Await concurrent scripts
+        if: "!cancelled() && steps.concurrent-start.outcome == 'success'"
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP:?}/concurrent-scripts"
+          count=$(cat "$dir/count")
+          status=0
+          for i in $(seq 1 "$count"); do
+            SCRIPT=$(cat "$dir/$i.name")
+            pid=$(cat "$dir/$i.pid")
+            while [ ! -f "$dir/$i.rc" ] && kill -0 "$pid" 2>/dev/null; do
+              sleep 1
+            done
+            if [ -f "$dir/$i.rc" ]; then rc=$(cat "$dir/$i.rc"); else rc=gone; fi
+            echo "::group::$SCRIPT (concurrent, exit $rc)"
+            cat -- "$dir/$i.log" || true
+            echo "::endgroup::"
+            if [ "$rc" = gone ]; then
+              echo "::error::concurrent script \"$SCRIPT\" exited without a status (killed? see the concurrent-scripts MEMORY caveat)"
+              status=1
+            elif [ "$rc" != 0 ]; then
+              echo "::error::concurrent script \"$SCRIPT\" failed (exit $rc)"
+              status=1
+            fi
+          done
+          exit "$status"
 
       # PERFORMANCE BUDGET (quality-level standard). Handbook ch02's per-route
       # budget, enforced by the tool that already encodes it, in the lane that
@@ -2832,6 +2966,168 @@ jobs:
             const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
             await store.publishPrebuiltStep({ core });
 
+      # REQUIRED FOLDED INTO BUILD (see the header): when `Build` is named
+      # `Required`, it runs the Caller lint `Required` would have run, under
+      # the same `!cancelled()` so a build failure and a lint finding are both
+      # reported. These are the anchored definitions; `required` and
+      # `fast-escalated` alias them (aliases must follow their anchors). From
+      # the workspace root, because they audit the caller's `.github/workflows`.
+      # This step imports PyYAML. Hosted images currently include it, but
+      # keep the checked fallback so a runner-image update cannot silently
+      # remove a required parser (mirrors ci.yml's own "Ensure PyYAML is
+      # available" step).
+      - name: Ensure PyYAML is available
+        if: "!cancelled() && (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        working-directory: ${{ github.workspace }}
+        run: &caller_lint_pyyaml |
+          set -euo pipefail
+          if python3 -c "import yaml" 2>/dev/null; then
+            echo "PyYAML already available"
+          else
+            echo "PyYAML missing on this guest; installing into user site-packages"
+            python3 -m pip install --user --quiet pyyaml
+            python3 -c "import yaml" || { echo "::error::PyYAML still unavailable after install"; exit 1; }
+          fi
+
+      - name: Install actionlint
+        if: "!cancelled() && (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        working-directory: ${{ github.workspace }}
+        env: &caller_lint_actionlint_env
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: &caller_lint_install_actionlint |
+          set -euo pipefail
+          # Pinned version + checksum rather than `curl | bash` from the
+          # project's install script (same pin ci.yml uses for its own
+          # actionlint install -- keep both in sync on a bump).
+          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL --retry 3 -o "$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
+          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
+          tar -xzf "$tarball" actionlint
+          ./actionlint -version
+
+      - name: actionlint (caller's own workflows)
+        if: "!cancelled() && (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        working-directory: ${{ github.workspace }}
+        run: &caller_lint_actionlint |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(.github/workflows/*.yml .github/workflows/*.yaml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no workflow files found under .github/workflows; nothing to lint"
+            exit 0
+          fi
+          ./actionlint -no-color "${files[@]}"
+
+      - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
+        if: "!cancelled() && (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        working-directory: ${{ github.workspace }}
+        run: &caller_lint_audit |
+          set -euo pipefail
+          python3 - <<'PYEOF_AUDIT'
+          import glob
+          import re
+          import sys
+
+          import yaml
+
+          SHA_PIN = re.compile(r"^[0-9a-f]{40}$")
+          USES_LINE = re.compile(r"^\s*(?:-\s*)?uses:\s*(\S+)\s*(#.*)?$")
+          LOCAL_USES = ("./", "docker://")
+
+          files = sorted(
+              glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml")
+          )
+          if not files:
+              print("no caller workflow files found under .github/workflows; nothing to audit")
+              sys.exit(0)
+
+          findings = []
+
+          for path in files:
+              text = open(path, encoding="utf-8").read()
+              try:
+                  doc = yaml.safe_load(text)
+              except yaml.YAMLError as exc:
+                  findings.append(f"{path}: does not parse as YAML ({exc})")
+                  continue
+              if not isinstance(doc, dict):
+                  findings.append(f"{path}: does not parse as a YAML mapping")
+                  continue
+
+              # PyYAML parses the bare key `on:` as the boolean True.
+              on = doc.get("on", doc.get(True))
+              if isinstance(on, str):
+                  on_keys = {on}
+              elif isinstance(on, list):
+                  on_keys = set(on)
+              elif isinstance(on, dict):
+                  on_keys = set(on.keys())
+              else:
+                  on_keys = set()
+              # A workflow_call-only file is a callable, not a caller: its concurrency
+              # group would be evaluated in ITS OWN caller's context and could cancel
+              # that caller's run, so it must not declare one (the reason this repo's
+              # own callables never do -- see README "Concurrency is the caller's job").
+              is_callable_only = bool(on_keys) and on_keys.issubset({"workflow_call"})
+
+              if not is_callable_only and doc.get("concurrency") is None:
+                  findings.append(
+                      f"{path}: no workflow-level concurrency: block (repeated "
+                      "pushes/PR updates queue redundant runs instead of superseding "
+                      "them)"
+                  )
+
+              if doc.get("permissions") is None:
+                  findings.append(f"{path}: no top-level permissions: block")
+
+              for job_id, job in (doc.get("jobs") or {}).items():
+                  if not isinstance(job, dict):
+                      continue
+                  # A job whose only step is `uses:` a reusable workflow cannot
+                  # declare timeout-minutes at all -- the called workflow's own jobs
+                  # own that. Report it as information, not a finding.
+                  if "uses" in job:
+                      print(
+                          f"::notice::{path}: job '{job_id}' uses {job['uses']!r} -- "
+                          "its timeout lives in the called workflow, not here"
+                      )
+                  elif job.get("timeout-minutes") is None:
+                      findings.append(
+                          f"{path}: job '{job_id}' has no timeout-minutes (would "
+                          "inherit GitHub's 6-hour default)"
+                      )
+                  if job.get("permissions") is None:
+                      findings.append(
+                          f"{path}: job '{job_id}' has no permissions: block (job "
+                          "level replaces, never merges, the workflow level)"
+                      )
+
+              for lineno, line in enumerate(text.splitlines(), start=1):
+                  m = USES_LINE.match(line)
+                  if not m:
+                      continue
+                  ref = m.group(1)
+                  if ref.startswith(LOCAL_USES):
+                      continue
+                  if "@" not in ref:
+                      findings.append(f"{path}:{lineno}: `uses: {ref}` has no ref at all")
+                      continue
+                  pin = ref.rsplit("@", 1)[1]
+                  if not SHA_PIN.match(pin):
+                      findings.append(
+                          f"{path}:{lineno}: `uses: {ref}` is not pinned to a full "
+                          "40-character commit SHA"
+                      )
+
+          for item in findings:
+              print(f"::error::{item}")
+
+          print(f"\ncaller-lint: {len(files)} file(s) checked, {len(findings)} finding(s)")
+          sys.exit(1 if findings else 0)
+          PYEOF_AUDIT
+
   # Typecheck and unit tests run beside `build`, not inside it (workflows row 19,
   # CI critical path). Nothing downstream consumes their output, but while they
   # ran in `build` every E2E shard, the preview and the deploy dry run waited
@@ -2848,7 +3144,7 @@ jobs:
     needs: [reuse-plan]
     if: "!cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !inputs.checks-in-build"
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"')) }}
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -3001,7 +3297,7 @@ jobs:
     needs: [reuse-plan]
     if: "!cancelled() && inputs.extra-gate-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"')) }}
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -3192,7 +3488,7 @@ jobs:
               // Fast-path inputs (P3-C1) and the quality-level inputs stay out of
               // the key at their defaults, so proof minted before they existed
               // still matches.
-              const fastPathDefaults = { 'fast-scripts': '', 'required-reuse-pr-results': false, 'e2e-pr-only-changed': false, 'journey-smoke-url': '', 'journey-smoke-args': '--grep=@smoke --retries=1', 'journey-smoke-rollback-script': '', 'journey-smoke-rollback-to': '', 'quality-level': 'legacy', 'quality-opt-out': '', 'performance-budget-args': '', 'security-headers-paths': '', 'security-headers-url': '', 'checks-in-build': false };
+              const fastPathDefaults = { 'fast-scripts': '', 'required-reuse-pr-results': false, 'e2e-pr-only-changed': false, 'journey-smoke-url': '', 'journey-smoke-args': '--grep=@smoke --retries=1', 'journey-smoke-rollback-script': '', 'journey-smoke-rollback-to': '', 'quality-level': 'legacy', 'quality-opt-out': '', 'performance-budget-args': '', 'security-headers-paths': '', 'security-headers-url': '', 'checks-in-build': false, 'concurrent-scripts': '' };
               for (const [name, value] of Object.entries(fastPathDefaults)) {
                 if (inputs[name] === value) delete inputs[name];
               }
@@ -4050,6 +4346,25 @@ jobs:
       # and an application at the same path. Fails closed: an empty or
       # missing build script, or a build that leaves no output, is a red E2E,
       # never a suite pointed at nothing (`require-scripts` does not apply).
+      # W8 item 1: say loudly WHY this shard is paying for a build, and when
+      # the cause is missing CI artifact store secrets, what fixes it. Never
+      # fails the job.
+      - name: Warn that this shard rebuilds the application
+        if: needs.build.outputs.e2e-build-path != '' && steps.e2e-build-fetch.outputs.mode != 'r2'
+        env:
+          PUBLISHED: ${{ needs.build.outputs.e2e-build-object != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$PUBLISHED" = true ]; then
+            msg="Build published a prebuilt application, but this shard could not read it (see Fetch prebuilt E2E application), so it rebuilds the application itself."
+          else
+            msg="This E2E shard rebuilds the application because Build published none: the CI artifact store secrets (CI_ARTIFACTS_R2_ACCOUNT_ID, CI_ARTIFACTS_R2_ACCESS_KEY_ID, CI_ARTIFACTS_R2_SECRET_ACCESS_KEY) are missing from the caller's secrets: block, or the publish failed (see Build)."
+          fi
+          echo "::warning::$msg"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            echo "- :warning: $msg" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Build E2E application in this job
         if: needs.build.outputs.e2e-build-path != '' && steps.e2e-build-fetch.outputs.mode != 'r2'
         env:
@@ -4854,7 +5169,7 @@ jobs:
     if: "!cancelled() && needs.build.result == 'success' && inputs.wrangler-dry-run"
     needs: build
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"')) }}
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 15
     permissions:
       contents: read
@@ -5067,9 +5382,26 @@ jobs:
   # T1 readiness tells a full gate (allowed over 180s) from a slow plain Fast
   # run by that sibling check in the same run. Reading check-run names needs
   # no permission, so no caller grant changes (workflows#59).
+  # TWO JOBS, ONE STEP LIST (ci-reset W10, W8 item 4). `fast` is the plain
+  # lane and needs only `Reuse plan`, so it starts with the run instead of
+  # waiting a fresh linux-ci queue hop for `E2E plan` (riverstatus main
+  # 36497919511: Fast queued 12.0 min behind a 0.1 min plan). `fast-escalable`
+  # is the same steps (a YAML alias) for the one case that must read the plan:
+  # a pull request that CAN escalate, because `e2e-full-paths` (or an exact
+  # candidate, which the plan always treats as full) is set. Every event on
+  # which `E2E plan` can report `full=true` for a pull request is in
+  # `fast-escalable`'s domain, so escalation can only ever move the name off
+  # `fast-escalable`. `fast-escalated` is confined to that domain too (its
+  # conditions repeat the `e2e-full-paths`/candidate test), so a plan that
+  # ever reported `full=true` outside it could not name a second `Fast`. The
+  # two domains are disjoint: exactly one of them runs when Fast applies, and
+  # the other skips with its raw name expression.
+  # Only the escalable job fails closed on an unknown plan; on a push the
+  # plan's `full` never applies to Fast, and `Required` still demands the
+  # plan succeed.
   fast:
-    name: ${{ !(inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && 'Fast (not run)' || ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true') && 'Fast lanes (escalated)' || 'Fast' }}
-    needs: [reuse-plan, e2e-plan]
+    name: ${{ (inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != ''))) && 'Fast' || 'Fast (not run)' }}
+    needs: [reuse-plan]
     # !cancelled() runs Fast after a failed or skipped need, and never after
     # the run is cancelled: GitHub reports a job whose `if:` is false in a
     # cancelled run as CANCELLED (not skipped, so never a passing check), and
@@ -5077,11 +5409,15 @@ jobs:
     # caller's concurrency group while it queued for a seat (operator-portal
     # run 36494070028, ~14 min). The rest is FAST_ENABLED, so a disabled Fast
     # takes no runner at all (see NAMING IS THE GATE above).
-    if: "!cancelled() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
+    if: "!cancelled() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != ''))"
     env:
-      FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' }}
+      FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) }}
+      # Read by the shared steps: this job never escalates and never reads
+      # `E2E plan`.
+      FAST_ESCALABLE: false
+      ESCALATED: false
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && (vars.CI_LINUX_RUNNER || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"')) }}
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
     timeout-minutes: 20
     permissions:
@@ -5090,7 +5426,7 @@ jobs:
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
-    steps:
+    steps: &fast_steps
       # Escalation is only as good as the `E2E plan` decision it reads. When
       # the caller configured `e2e-full-paths` and that plan did not succeed,
       # whether this PR touches a protected path is unknown: fail closed. That
@@ -5099,22 +5435,22 @@ jobs:
       - name: Resolve protected-path escalation
         if: env.FAST_ENABLED == 'true'
         working-directory: ${{ github.workspace }}
+        # FAST_ESCALABLE, E2E_PLAN_RESULT and ESCALATED come from the job's
+        # `env:` (this step list is shared by `fast` and `fast-escalable`).
         env:
           RUN_E2E: ${{ inputs.run-e2e }}
           FULL_PATHS: ${{ inputs.e2e-full-paths }}
-          E2E_PLAN_RESULT: ${{ needs.e2e-plan.result }}
-          ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
         run: |
           set -euo pipefail
           if [ -n "$FULL_PATHS" ] && [ "$RUN_E2E" != true ]; then
             echo "::error::e2e-full-paths is set but run-e2e is false: E2E plan never runs, so protected-path escalation cannot be decided; set run-e2e: true or clear e2e-full-paths"
             exit 1
           fi
-          if [ -n "$FULL_PATHS" ] && [ "$E2E_PLAN_RESULT" != success ]; then
+          if [ "${FAST_ESCALABLE:-}" = true ] && [ -n "$FULL_PATHS" ] && [ "${E2E_PLAN_RESULT:-}" != success ]; then
             echo "::error::E2E plan reported '$E2E_PLAN_RESULT', so protected-path escalation is unknown; failing closed"
             exit 1
           fi
-          if [ "$ESCALATED" = true ]; then
+          if [ "${ESCALATED:-}" = true ]; then
             echo "A changed file matches e2e-full-paths: these lanes still run, and the check named Fast waits for the full gate."
           else
             echo "No protected-path escalation: this job is ci / Fast."
@@ -5286,8 +5622,7 @@ jobs:
       - name: Publish Fast escalation
         if: env.FAST_ENABLED == 'true' && (success())
         working-directory: ${{ github.workspace }}
-        env:
-          ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
+        # ESCALATED comes from the job's `env:` (shared step list).
         run: &fast_escalation_publish |
           set -uo pipefail
           case "${ESCALATED:-}" in
@@ -5308,6 +5643,31 @@ jobs:
               || echo "::warning::could not write the Fast escalation step summary"
           fi
           exit 0
+
+  # The escalable twin of `fast` (see TWO JOBS, ONE STEP LIST above): the
+  # same steps, for a pull request that can escalate. It reads `E2E plan`, so
+  # it keeps that `needs:` and today's behaviour exactly: named `Fast`, or
+  # `Fast lanes (escalated)` when `fast-escalated` takes the name.
+  fast-escalable:
+    name: ${{ !(inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && 'Fast (not run)' || ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true') && 'Fast lanes (escalated)' || 'Fast' }}
+    needs: [reuse-plan, e2e-plan]
+    if: "!cancelled() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')"
+    env:
+      FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') }}
+      FAST_ESCALABLE: true
+      E2E_PLAN_RESULT: ${{ needs.e2e-plan.result }}
+      ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true' }}
+    # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
+    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+    # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps: *fast_steps
 
   # POST-DEPLOY JOURNEY SMOKE (`journey-smoke-url`, P3-C1, O-velocity D5/D6).
   # A caller's promote or deploy workflow calls this callable a second time,
@@ -5617,13 +5977,19 @@ jobs:
         run: *probe_security_headers
 
   required:
-    name: Required
+    # REQUIRED FOLDED INTO BUILD (see the header): when `Build` is the only
+    # lane for this event, `Build` is named `Required` and this job is
+    # skipped. A skipped job shows its raw name expression, and even
+    # evaluated this name is not `Required` then, so it can never produce a
+    # second, skipped (passing) `ci / Required`. The condition is the one in
+    # `build`'s name, verbatim (R5 in scripts/lint_callables.py).
+    name: ${{ (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results) && 'Required (folded into Build)' || 'Required' }}
     # !cancelled(), not always(): it still runs after any failed or skipped
     # need, and a cancelled run reports it CANCELLED -- a non-passing check --
     # without queueing for a runner that would hold the caller's concurrency
     # group (operator-portal run 36494070028 waited ~14 min for one).
-    if: "!cancelled()"
-    needs: [reuse-plan, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run, fast, fast-escalated, journey-smoke]
+    if: "!cancelled() && !(inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+    needs: [reuse-plan, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run, fast, fast-escalable, fast-escalated, journey-smoke]
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     timeout-minutes: 20
@@ -5758,12 +6124,15 @@ jobs:
           REUSE_APPLIES: ${{ inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
           REUSE_PLAN_RESULT: ${{ needs.reuse-plan.result }}
           FAST_RESULT: ${{ needs.fast.result }}
+          FAST_ESCALABLE_RESULT: ${{ needs.fast-escalable.result }}
           FAST_ESCALATED_RESULT: ${{ needs.fast-escalated.result }}
-          # The two jobs' own start conditions: each must succeed when it
+          # The three jobs' own start conditions: each must succeed when it
           # applies and be skipped when it does not (a disabled Fast job takes
-          # no runner, so `skipped` is its only correct result).
-          FAST_APPLIES: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' }}
-          FAST_ESCALATION_APPLIES: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
+          # no runner, so `skipped` is its only correct result). `fast` and
+          # `fast-escalable` split one condition into two disjoint domains.
+          FAST_APPLIES: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) }}
+          FAST_ESCALABLE_APPLIES: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') }}
+          FAST_ESCALATION_APPLIES: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true' }}
           JOURNEY_SMOKE_URL: ${{ inputs.journey-smoke-url }}
           JOURNEY_SMOKE_RESULT: ${{ needs.journey-smoke.result }}
         run: |
@@ -5790,6 +6159,11 @@ jobs:
             require_success fast "$FAST_RESULT"
           else
             require_skipped fast "$FAST_RESULT"
+          fi
+          if [ "$FAST_ESCALABLE_APPLIES" = true ]; then
+            require_success fast-escalable "$FAST_ESCALABLE_RESULT"
+          else
+            require_skipped fast-escalable "$FAST_ESCALABLE_RESULT"
           fi
           if [ "$FAST_ESCALATION_APPLIES" = true ]; then
             require_success fast-escalated "$FAST_ESCALATED_RESULT"
@@ -5826,6 +6200,15 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.expected-candidate-sha }}
+          # W8 item 9: Caller lint reads only `.github` (workflows, and an
+          # actionlint config if any) plus local action metadata, so fetch
+          # only those paths (actions/checkout adds `--filter=blob:none`).
+          # Non-cone patterns match at any depth.
+          sparse-checkout: |
+            .github
+            action.yml
+            action.yaml
+          sparse-checkout-cone-mode: false
 
       - name: Verify exact validation candidate
         if: "!cancelled() && inputs.expected-candidate-sha != ''"
@@ -5848,157 +6231,24 @@ jobs:
             exit 1
           fi
 
-      # This step imports PyYAML. Hosted images currently include it, but
-      # keep the checked fallback so a runner-image update cannot silently
-      # remove a required parser (mirrors ci.yml's own "Ensure PyYAML is
-      # available" step).
+      # This step imports PyYAML (the anchored scripts are defined in `build`,
+      # which runs them when Required is folded into it).
       - name: Ensure PyYAML is available
         if: "!cancelled()"
-        run: &caller_lint_pyyaml |
-          set -euo pipefail
-          if python3 -c "import yaml" 2>/dev/null; then
-            echo "PyYAML already available"
-          else
-            echo "PyYAML missing on this guest; installing into user site-packages"
-            python3 -m pip install --user --quiet pyyaml
-            python3 -c "import yaml" || { echo "::error::PyYAML still unavailable after install"; exit 1; }
-          fi
+        run: *caller_lint_pyyaml
 
       - name: Install actionlint
         if: "!cancelled()"
-        env: &caller_lint_actionlint_env
-          ACTIONLINT_VERSION: 1.7.12
-          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
-        run: &caller_lint_install_actionlint |
-          set -euo pipefail
-          # Pinned version + checksum rather than `curl | bash` from the
-          # project's install script (same pin ci.yml uses for its own
-          # actionlint install -- keep both in sync on a bump).
-          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -sSfL --retry 3 -o "$tarball" \
-            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
-          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
-          tar -xzf "$tarball" actionlint
-          ./actionlint -version
+        env: *caller_lint_actionlint_env
+        run: *caller_lint_install_actionlint
 
       - name: actionlint (caller's own workflows)
         if: "!cancelled()"
-        run: &caller_lint_actionlint |
-          set -euo pipefail
-          shopt -s nullglob
-          files=(.github/workflows/*.yml .github/workflows/*.yaml)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "no workflow files found under .github/workflows; nothing to lint"
-            exit 0
-          fi
-          ./actionlint -no-color "${files[@]}"
+        run: *caller_lint_actionlint
 
       - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
         if: "!cancelled()"
-        run: &caller_lint_audit |
-          set -euo pipefail
-          python3 - <<'PYEOF_AUDIT'
-          import glob
-          import re
-          import sys
-
-          import yaml
-
-          SHA_PIN = re.compile(r"^[0-9a-f]{40}$")
-          USES_LINE = re.compile(r"^\s*(?:-\s*)?uses:\s*(\S+)\s*(#.*)?$")
-          LOCAL_USES = ("./", "docker://")
-
-          files = sorted(
-              glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml")
-          )
-          if not files:
-              print("no caller workflow files found under .github/workflows; nothing to audit")
-              sys.exit(0)
-
-          findings = []
-
-          for path in files:
-              text = open(path, encoding="utf-8").read()
-              try:
-                  doc = yaml.safe_load(text)
-              except yaml.YAMLError as exc:
-                  findings.append(f"{path}: does not parse as YAML ({exc})")
-                  continue
-              if not isinstance(doc, dict):
-                  findings.append(f"{path}: does not parse as a YAML mapping")
-                  continue
-
-              # PyYAML parses the bare key `on:` as the boolean True.
-              on = doc.get("on", doc.get(True))
-              if isinstance(on, str):
-                  on_keys = {on}
-              elif isinstance(on, list):
-                  on_keys = set(on)
-              elif isinstance(on, dict):
-                  on_keys = set(on.keys())
-              else:
-                  on_keys = set()
-              # A workflow_call-only file is a callable, not a caller: its concurrency
-              # group would be evaluated in ITS OWN caller's context and could cancel
-              # that caller's run, so it must not declare one (the reason this repo's
-              # own callables never do -- see README "Concurrency is the caller's job").
-              is_callable_only = bool(on_keys) and on_keys.issubset({"workflow_call"})
-
-              if not is_callable_only and doc.get("concurrency") is None:
-                  findings.append(
-                      f"{path}: no workflow-level concurrency: block (repeated "
-                      "pushes/PR updates queue redundant runs instead of superseding "
-                      "them)"
-                  )
-
-              if doc.get("permissions") is None:
-                  findings.append(f"{path}: no top-level permissions: block")
-
-              for job_id, job in (doc.get("jobs") or {}).items():
-                  if not isinstance(job, dict):
-                      continue
-                  # A job whose only step is `uses:` a reusable workflow cannot
-                  # declare timeout-minutes at all -- the called workflow's own jobs
-                  # own that. Report it as information, not a finding.
-                  if "uses" in job:
-                      print(
-                          f"::notice::{path}: job '{job_id}' uses {job['uses']!r} -- "
-                          "its timeout lives in the called workflow, not here"
-                      )
-                  elif job.get("timeout-minutes") is None:
-                      findings.append(
-                          f"{path}: job '{job_id}' has no timeout-minutes (would "
-                          "inherit GitHub's 6-hour default)"
-                      )
-                  if job.get("permissions") is None:
-                      findings.append(
-                          f"{path}: job '{job_id}' has no permissions: block (job "
-                          "level replaces, never merges, the workflow level)"
-                      )
-
-              for lineno, line in enumerate(text.splitlines(), start=1):
-                  m = USES_LINE.match(line)
-                  if not m:
-                      continue
-                  ref = m.group(1)
-                  if ref.startswith(LOCAL_USES):
-                      continue
-                  if "@" not in ref:
-                      findings.append(f"{path}:{lineno}: `uses: {ref}` has no ref at all")
-                      continue
-                  pin = ref.rsplit("@", 1)[1]
-                  if not SHA_PIN.match(pin):
-                      findings.append(
-                          f"{path}:{lineno}: `uses: {ref}` is not pinned to a full "
-                          "40-character commit SHA"
-                      )
-
-          for item in findings:
-              print(f"::error::{item}")
-
-          print(f"\ncaller-lint: {len(files)} file(s) checked, {len(findings)} finding(s)")
-          sys.exit(1 if findings else 0)
-          PYEOF_AUDIT
+        run: *caller_lint_audit
       # `required-reuse-pr-results` proof: minted only on a same-repository
       # pull request whose Required passed with every enabled lane RUN, and
       # E2E (when enabled) at its full configuration -- never a path skip, the
@@ -6071,29 +6321,31 @@ jobs:
   # A job waiting on its needs has no check run yet, so the `Fast` context stays pending, which blocks the
   # merge, until the full gate has finished.
   fast-escalated:
-    name: ${{ (inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true') && 'Fast' || 'Fast (escalation not needed)' }}
-    needs: [reuse-plan, fast, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run]
+    name: ${{ (inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true') && 'Fast' || 'Fast (escalation not needed)' }}
+    needs: [reuse-plan, fast-escalable, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run]
     # Starts only when this run escalates (the same condition as FAST_ENABLED);
     # !cancelled() keeps a failed or skipped lane from skipping it, because it
     # is then the check named `Fast` and must report that failure. A cancelled
     # run reports it CANCELLED without a runner (see `fast`).
-    if: "!cancelled() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true'"
+    if: "!cancelled() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true'"
     env:
-      FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
+      FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true' }}
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     timeout-minutes: 20
     permissions:
       contents: read
     steps:
+      # Escalation only happens in `fast-escalable`'s domain (see TWO JOBS,
+      # ONE STEP LIST at `fast`), so the lint/unit lanes it demands are there.
       - name: Require the fast lanes to succeed
         if: env.FAST_ENABLED == 'true'
         env:
-          FAST_RESULT: ${{ needs.fast.result }}
+          FAST_RESULT: ${{ needs.fast-escalable.result }}
         run: |
           set -euo pipefail
           if [ "$FAST_RESULT" != success ]; then
-            echo "::error::fast job reported '$FAST_RESULT' (must succeed)"
+            echo "::error::fast-escalable job reported '$FAST_RESULT' (must succeed)"
             exit 1
           fi
       - name: Require enabled gates to succeed and disabled gates to skip
@@ -6108,6 +6360,15 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ inputs.expected-candidate-sha }}
+          # W8 item 9: Caller lint reads only `.github` (workflows, and an
+          # actionlint config if any) plus local action metadata, so fetch
+          # only those paths (actions/checkout adds `--filter=blob:none`).
+          # Non-cone patterns match at any depth.
+          sparse-checkout: |
+            .github
+            action.yml
+            action.yaml
+          sparse-checkout-cone-mode: false
       - name: Verify exact validation candidate
         if: env.FAST_ENABLED == 'true' && !cancelled() && inputs.expected-candidate-sha != ''
         working-directory: ${{ github.workspace }}
@@ -6130,5 +6391,5 @@ jobs:
       - name: Publish Fast escalation
         if: env.FAST_ENABLED == 'true' && (success())
         env:
-          ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && needs.e2e-plan.outputs.full == 'true' }}
+          ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true' }}
         run: *fast_escalation_publish

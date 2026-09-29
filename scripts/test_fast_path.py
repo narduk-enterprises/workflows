@@ -49,9 +49,12 @@ NEW_INPUTS = {
     "journey-smoke-rollback-script": "",
     "journey-smoke-rollback-to": "",
     "checks-in-build": False,
+    "concurrent-scripts": "",
 }
 GATE_STEP = "Require enabled gates to succeed and disabled gates to skip"
 FAST_STEP = "Require fast-path and journey-smoke lanes"
+FAST_JOBS = ("fast", "fast-escalable", "fast-escalated")
+PR_EVENTS = ("pull_request", "pull_request_target")
 
 
 class StatusEvaluator(Evaluator):
@@ -277,7 +280,7 @@ OLD_GRAPH = {
     "required": {"needs": ["build", "checks", "extra-gate", "e2e-plan", "e2e", "preview",
                            "deploy-dry-run"], "if": "always()"},
 }
-NEW_JOBS = {"reuse-plan", "fast", "fast-escalated", "journey-smoke"}
+NEW_JOBS = {"reuse-plan", "fast", "fast-escalable", "fast-escalated", "journey-smoke"}
 CI_LANES = ["build", "checks", "extra-gate", "e2e-plan", "e2e", "e2e-quarantine",
             "preview", "deploy-dry-run"]
 
@@ -384,22 +387,45 @@ def test_enabled_modes_on_the_real_graph() -> None:
     ran = {j for j in JOBS if state[j]["result"] == "success"}
     assert ran == {"journey-smoke", "required"}, ran
     green("required", state)
-    # ci / Fast on a pull request without a protected path.
+    # ci / Fast on a pull request of a caller without `e2e-full-paths`: the
+    # plain `fast` job, which does not wait for `E2E plan` (W8 item 4).
     state = simulate(JOBS, full, "pull_request", "refs/pull/1/merge", plan_outputs("false", "2", "false"))
-    assert state["fast"]["result"] == "success" and state["fast-escalated"]["result"] == "skipped"
+    assert state["fast"]["result"] == "success"
+    assert state["fast-escalable"]["result"] == state["fast-escalated"]["result"] == "skipped"
     assert render(JOBS["fast"]["name"], state["fast"]["ctx"]) == "Fast"
+    assert "e2e-plan" not in needs_of(JOBS["fast"]), JOBS["fast"]["needs"]
     assert all(state[j]["result"] == "success" for j in CI_LANES), state
     green("required", state)
-    # A protected path: `fast-escalated` becomes `Fast` and runs the full gate.
+    # Even a plan that (wrongly) reported full=true cannot escalate a caller
+    # without `e2e-full-paths`: no second job is named Fast.
     state = simulate(JOBS, full, "pull_request", "refs/pull/1/merge", plan_outputs("false", "2", "true"))
-    assert state["fast"]["result"] == state["fast-escalated"]["result"] == "success"
-    assert render(JOBS["fast"]["name"], state["fast"]["ctx"]) == "Fast lanes (escalated)"
+    assert state["fast"]["result"] == "success"
+    assert state["fast-escalable"]["result"] == state["fast-escalated"]["result"] == "skipped"
+    green("required", state)
+    # With `e2e-full-paths`, a pull request runs `fast-escalable`, which reads
+    # the plan: no protected path keeps the name `Fast` on it.
+    escalable = {**full, "e2e-full-paths": "src/auth/**"}
+    state = simulate(JOBS, escalable, "pull_request", "refs/pull/1/merge", plan_outputs("false", "2", "false"))
+    assert state["fast-escalable"]["result"] == "success"
+    assert state["fast"]["result"] == state["fast-escalated"]["result"] == "skipped"
+    assert render(JOBS["fast-escalable"]["name"], state["fast-escalable"]["ctx"]) == "Fast"
+    green("required", state)
+    # On a push the same caller runs the plain `fast` (escalation is PR-only).
+    state = simulate(JOBS, escalable, "push", "refs/heads/main", plan_outputs("false", "2", "true"))
+    assert state["fast"]["result"] == "success"
+    assert state["fast-escalable"]["result"] == state["fast-escalated"]["result"] == "skipped"
+    green("required", state)
+    # A protected path: `fast-escalated` becomes `Fast` and runs the full gate.
+    state = simulate(JOBS, escalable, "pull_request", "refs/pull/1/merge", plan_outputs("false", "2", "true"))
+    assert state["fast-escalable"]["result"] == state["fast-escalated"]["result"] == "success"
+    assert state["fast"]["result"] == "skipped"
+    assert render(JOBS["fast-escalable"]["name"], state["fast-escalable"]["ctx"]) == "Fast lanes (escalated)"
     assert render(JOBS["fast-escalated"]["name"], state["fast-escalated"]["ctx"]) == "Fast"
     green("fast-escalated", state)
     green("required", state)
     # A failed lane on an escalated PR: always() still starts the job named
     # Fast, and it goes red.
-    state = simulate(JOBS, full, "pull_request", "refs/pull/1/merge", plan_outputs("false", "2", "true"),
+    state = simulate(JOBS, escalable, "pull_request", "refs/pull/1/merge", plan_outputs("false", "2", "true"),
                      {"e2e": "failure"})
     assert state["fast-escalated"]["result"] == "success"
     assert any(code == 1 for _, code, _ in run_gates("fast-escalated", state))
@@ -421,9 +447,9 @@ def test_cancelled_run_starts_no_gate_job() -> None:
             "e2e-shards": 2, "preview-checks": "og", "fast-scripts": "lint"}
     for (event, ref), escalate in itertools.product(EVENTS, ["false", "true"]):
         state = simulate(JOBS, full, event, ref, plan_outputs("false", "2", escalate), cancelled=True)
-        for job in ("required", "fast", "fast-escalated"):
+        for job in ("required", "build") + FAST_JOBS:
             assert state[job]["result"] == "cancelled", (job, event, state[job]["result"])
-    for job in ("required", "fast", "fast-escalated"):
+    for job in ("required", "build") + FAST_JOBS:
         cond = str(JOBS[job]["if"])
         assert cond.startswith("!cancelled()") and "always()" not in cond, (job, cond)
     print("PASS  a cancelled run starts no Required or Fast job, and none reports a pass")
@@ -484,9 +510,14 @@ def test_defaults_leave_every_lane_as_before() -> None:
             assert bool(ev(JOBS[job]["if"], ctx)) == expected, (job, event, status)
         needs = dict(SKIPPED_REUSE, **{"e2e-plan": {"result": "success", "outputs": {"full": "true"}}})
         ctx["needs"] = needs
-        assert ev(JOBS["fast"]["if"], ctx) is False
-        assert ev(JOBS["fast"]["env"]["FAST_ENABLED"], ctx) is False
-        assert ev(JOBS["fast"]["name"], ctx) == "Fast (not run)"
+        for job in ("fast", "fast-escalable"):
+            assert ev(JOBS[job]["if"], ctx) is False, job
+            assert ev(JOBS[job]["env"]["FAST_ENABLED"], ctx) is False, job
+            assert ev(JOBS[job]["name"], ctx) == "Fast (not run)", job
+        # The Required-into-Build fold is off: the old names hold.
+        assert ev(JOBS["build"]["name"], ctx) == "Build"
+        assert ev(JOBS["required"]["name"], ctx) == "Required"
+        assert ev(JOBS["required"]["if"], ctx) is (status != "cancelled")
         assert ev(JOBS["fast-escalated"]["if"], ctx) is False
         assert ev(JOBS["fast-escalated"]["env"]["FAST_ENABLED"], ctx) is False
         assert ev(JOBS["fast-escalated"]["name"], ctx) != "Fast"
@@ -538,8 +569,8 @@ def test_required_gate_reuse_and_smoke_branches() -> None:
 def test_required_fast_path_step() -> None:
     script = step("required", FAST_STEP)["run"]
     base = {"REUSE_APPLIES": "false", "REUSE_PLAN_RESULT": "skipped",
-            "FAST_APPLIES": "true", "FAST_ESCALATION_APPLIES": "true",
-            "FAST_RESULT": "success", "FAST_ESCALATED_RESULT": "success",
+            "FAST_APPLIES": "true", "FAST_ESCALABLE_APPLIES": "true", "FAST_ESCALATION_APPLIES": "true",
+            "FAST_RESULT": "success", "FAST_ESCALABLE_RESULT": "success", "FAST_ESCALATED_RESULT": "success",
             "JOURNEY_SMOKE_URL": "", "JOURNEY_SMOKE_RESULT": "skipped"}
     cases = [
         ({}, 0),
@@ -551,20 +582,28 @@ def test_required_fast_path_step() -> None:
         ({"JOURNEY_SMOKE_URL": "https://app.example", "JOURNEY_SMOKE_RESULT": "failure"}, 1),
     ]
     for key, outcome in itertools.product(
-            ("FAST_RESULT", "FAST_ESCALATED_RESULT"), ("failure", "cancelled", "skipped", "")):
+            ("FAST_RESULT", "FAST_ESCALABLE_RESULT", "FAST_ESCALATED_RESULT"), ("failure", "cancelled", "skipped", "")):
         cases.append(({key: outcome}, 1))
     # A job that does not apply must be skipped (it takes no runner); one
     # that ran anyway, or failed, fails the gate.
-    off = {"FAST_APPLIES": "false", "FAST_ESCALATION_APPLIES": "false",
-           "FAST_RESULT": "skipped", "FAST_ESCALATED_RESULT": "skipped"}
+    off = {"FAST_APPLIES": "false", "FAST_ESCALABLE_APPLIES": "false", "FAST_ESCALATION_APPLIES": "false",
+           "FAST_RESULT": "skipped", "FAST_ESCALABLE_RESULT": "skipped", "FAST_ESCALATED_RESULT": "skipped"}
     cases.append((off, 0))
     cases.append(({"FAST_ESCALATION_APPLIES": "false", "FAST_ESCALATED_RESULT": "skipped"}, 0))
-    for key, outcome in itertools.product(("FAST_RESULT", "FAST_ESCALATED_RESULT"),
+    for key, outcome in itertools.product(("FAST_RESULT", "FAST_ESCALABLE_RESULT", "FAST_ESCALATED_RESULT"),
                                           ("success", "failure", "cancelled", "")):
         cases.append(({**off, key: outcome}, 1))
     for overrides, expected in cases:
         result = run_bash(script, {**base, **overrides})
         assert result.returncode == expected, (overrides, result.stdout, result.stderr)
+    # The applies flags are the job conditions themselves, so Required can
+    # never demand a result from a job that did not start, or accept one that
+    # started while disabled.
+    for job, key in (("fast", "FAST_APPLIES"), ("fast-escalable", "FAST_ESCALABLE_APPLIES"),
+                     ("fast-escalated", "FAST_ESCALATION_APPLIES")):
+        applies = step("required", FAST_STEP)["env"][key]
+        assert applies == JOBS[job]["env"]["FAST_ENABLED"], (job, applies)
+        assert JOBS[job]["if"] == f"!cancelled() && {applies[4:-3]}", (job, JOBS[job]["if"])
     print(f"PASS  Required fast-path/smoke aggregation ({len(cases)} cases)")
 
 
@@ -574,14 +613,16 @@ def test_fast_naming_never_skips_a_fast_check() -> None:
     a ruleset without proving anything."""
     matrix = itertools.product(
         EVENTS, ["", "lint typecheck"], ["", "https://app.example"], ["", "true", "false"],
-        ["true", "false", ""], ["success", "cancelled"])
+        ["true", "false", ""], ["success", "cancelled"], ["", "src/auth/**"], ["", "a" * 40])
     seen_fast = 0
-    for (event, ref), scripts, smoke, reused, full, status in matrix:
+    for (event, ref), scripts, smoke, reused, full, status, full_paths, candidate in matrix:
         needs = {"reuse-plan": {"result": "success", "outputs": {"reused": reused}},
                  "e2e-plan": {"result": "success", "outputs": {"full": full}}}
-        ctx = context(event, ref, {"fast-scripts": scripts, "journey-smoke-url": smoke}, needs, status)
+        ctx = context(event, ref, {"fast-scripts": scripts, "journey-smoke-url": smoke,
+                                   "e2e-full-paths": full_paths, "expected-candidate-sha": candidate},
+                      needs, status)
         named_fast = []
-        for job in ("fast", "fast-escalated"):
+        for job in FAST_JOBS:
             name = ev(JOBS[job]["name"], ctx)
             if name == "Fast":
                 # ... except in a cancelled run, where it does not start and
@@ -594,8 +635,12 @@ def test_fast_naming_never_skips_a_fast_check() -> None:
         assert len(named_fast) == (1 if runs_fast else 0), (named_fast, event, scripts, smoke, reused, full)
         if runs_fast:
             seen_fast += 1
-            escalated = event in ("pull_request", "pull_request_target") and full == "true"
-            assert named_fast == (["fast-escalated"] if escalated else ["fast"])
+            # Every combination of plan output is tried, including a `full`
+            # the plan never reports outside the escalable domain.
+            escalable = event in PR_EVENTS and bool(full_paths or candidate)
+            escalated = escalable and full == "true"
+            expected = "fast-escalated" if escalated else "fast-escalable" if escalable else "fast"
+            assert named_fast == [expected], (named_fast, event, full_paths, candidate, full)
     assert seen_fast
     print("PASS  exactly one running job is named Fast when enabled; none otherwise; escalation moves it")
 
@@ -615,7 +660,12 @@ def test_fast_escalated_reuses_the_required_gate() -> None:
         assert step("fast-escalated", name)["run"] == step("required", name)["run"], name
     referenced = set(re.findall(r"needs\.([a-z0-9-]+)\.", json.dumps(gate)))
     assert referenced <= set(job["needs"]), referenced - set(job["needs"])
-    assert "fast" in job["needs"] and "required" not in job["needs"]
+    assert "fast-escalable" in job["needs"] and "fast" not in job["needs"] and "required" not in job["needs"]
+    # Its first step demands the escalable lane (the only one that can
+    # precede an escalation) succeeded.
+    first = job["steps"][0]
+    assert first["name"] == "Require the fast lanes to succeed"
+    assert first["env"]["FAST_RESULT"] == "${{ needs.fast-escalable.result }}", first["env"]
     assert "fast-escalated" in JOBS["required"]["needs"]
     print("PASS  escalated Fast is the Required gate step itself, with every lane it reads in needs")
 
@@ -653,19 +703,26 @@ def test_fast_escalation_is_published_on_the_check_named_fast() -> None:
     neither job may request `checks: write` (a caller that bumps without that
     grant would end in startup_failure, workflows#59). Both jobs that can hold
     the name run the same summary-only script, and it never fails the job."""
-    for job in ("fast", "fast-escalated"):
+    for job in FAST_JOBS:
         assert "checks" not in JOBS[job]["permissions"], job
         assert "outputs" not in JOBS[job], job
         publish = step(job, "Publish Fast escalation")
         assert publish["if"] == "env.FAST_ENABLED == 'true' && (success())"
-        assert set(publish["env"]) == {"ESCALATED"}, publish["env"]
+        # `fast`/`fast-escalable` share one step list and read ESCALATED from
+        # their job env; the escalated job binds it on the step.
+        escalated = (publish.get("env") or {}).get("ESCALATED", JOBS[job]["env"].get("ESCALATED"))
+        assert escalated is not None, job
+    assert JOBS["fast"]["env"]["ESCALATED"] is False
+    assert JOBS["fast-escalable"]["env"]["ESCALATED"] == step("fast-escalated", "Publish Fast escalation")["env"]["ESCALATED"]
+    assert JOBS["fast"]["steps"] is JOBS["fast-escalable"]["steps"], "fast-escalable must alias fast's steps"
     assert step("fast", "Publish Fast escalation")["run"] == step("fast-escalated", "Publish Fast escalation")["run"]
     # The name expressions carry the flag: escalation moves `Fast` and names
     # the lint/unit job `Fast lanes (escalated)`.
-    assert "'Fast lanes (escalated)'" in JOBS["fast"]["name"]
-    assert "|| 'Fast'" in JOBS["fast"]["name"]
+    assert "'Fast lanes (escalated)'" in JOBS["fast-escalable"]["name"]
+    assert "|| 'Fast'" in JOBS["fast-escalable"]["name"]
+    assert "'Fast lanes (escalated)'" not in JOBS["fast"]["name"]
     assert "&& 'Fast' ||" in JOBS["fast-escalated"]["name"]
-    # The publish step is the fast job's last step and the escalated job's
+    # The publish step is the fast jobs' last step and the escalated job's
     # step after the Required gate, so it can never skip the proof.
     assert JOBS["fast"]["steps"][-1]["name"] == "Publish Fast escalation"
     script = step("fast", "Publish Fast escalation")["run"]
@@ -691,10 +748,18 @@ def test_fast_escalation_is_published_on_the_check_named_fast() -> None:
 
 def test_escalation_fails_closed_on_unknown_plan() -> None:
     script = step("fast", "Resolve protected-path escalation")["run"]
-    ok = {"RUN_E2E": "true", "FULL_PATHS": "src/auth/**", "E2E_PLAN_RESULT": "success", "ESCALATED": "false"}
+    ok = {"RUN_E2E": "true", "FULL_PATHS": "src/auth/**", "E2E_PLAN_RESULT": "success", "ESCALATED": "false",
+          "FAST_ESCALABLE": "true"}
     assert run_bash(script, ok).returncode == 0
     for outcome in ("failure", "cancelled", "skipped", ""):
         assert run_bash(script, {**ok, "E2E_PLAN_RESULT": outcome}).returncode == 1, outcome
+    # The plain `fast` job (never escalates, never reads the plan) does not
+    # wait on it; `Required` still demands E2E plan succeed.
+    plain = {"RUN_E2E": "true", "FULL_PATHS": "src/auth/**", "FAST_ESCALABLE": "false", "ESCALATED": "false"}
+    assert run_bash(script, plain).returncode == 0
+    assert JOBS["fast"]["env"]["FAST_ESCALABLE"] is False and JOBS["fast-escalable"]["env"]["FAST_ESCALABLE"] is True
+    assert JOBS["fast-escalable"]["env"]["E2E_PLAN_RESULT"] == "${{ needs.e2e-plan.result }}"
+    assert "E2E_PLAN_RESULT" not in JOBS["fast"]["env"]
     assert run_bash(script, {**ok, "FULL_PATHS": "", "E2E_PLAN_RESULT": "failure"}).returncode == 0
     # run-e2e false: `E2E plan` never runs, so a protected path could never
     # escalate and `Fast` would pass on lint/unit alone. Fail closed instead.
@@ -709,18 +774,21 @@ def test_fast_jobs_have_readable_names_and_disabled_steps() -> None:
     """Each Fast job starts exactly when it applies (a skipped job shows its raw
     name expression, never `Fast`); disabled steps would do no work either."""
     cases = 0
-    for (event, ref), scripts, smoke, reused, full, status in itertools.product(
+    for (event, ref), scripts, smoke, reused, full, status, full_paths in itertools.product(
             EVENTS, ["", "lint"], ["", "https://app.example"], ["", "true", "false"],
-            ["", "true", "false"], ["success", "failure", "cancelled"]):
-        ctx = context(event, ref, {"fast-scripts": scripts, "journey-smoke-url": smoke},
+            ["", "true", "false"], ["success", "failure", "cancelled"], ["", "src/auth/**"]):
+        ctx = context(event, ref, {"fast-scripts": scripts, "journey-smoke-url": smoke,
+                                   "e2e-full-paths": full_paths},
                       {"reuse-plan": {"outputs": {"reused": reused}},
                        "e2e-plan": {"outputs": {"full": full}}}, status)
         ctx["runner"] = {"environment": "github-hosted"}
         fast_enabled = bool(scripts) and not smoke and reused != "true"
-        escalated = event in ("pull_request", "pull_request_target") and full == "true"
-        for job_id in ("fast", "fast-escalated"):
+        escalable = event in PR_EVENTS and bool(full_paths)
+        escalated = escalable and full == "true"
+        for job_id in FAST_JOBS:
             job = JOBS[job_id]
-            enabled = fast_enabled and (job_id == "fast" or escalated)
+            enabled = fast_enabled and {"fast": not escalable, "fast-escalable": escalable,
+                                        "fast-escalated": escalated}[job_id]
             # A cancelled run never STARTS a Fast job (GitHub reports it
             # cancelled, without a runner); `status` still stands for a
             # cancellation that lands mid-job in the step checks below.
@@ -734,19 +802,192 @@ def test_fast_jobs_have_readable_names_and_disabled_steps() -> None:
             if not enabled:
                 assert name != "Fast", (job_id, ctx)
                 for item in job["steps"]:
+                    # The shared cleanup keys on immutable inputs, never on
+                    # FAST_ENABLED (a caller script can rewrite env through
+                    # GITHUB_ENV), so it cannot tell the two domains of the
+                    # shared step list apart. The job's own `if:`, asserted
+                    # false above, keeps it from ever starting.
+                    if item.get("name") == "Remove package auth materialization" and job_id != "fast-escalated":
+                        continue
                     assert not ev(job_condition(item), ctx), (job_id, item, ctx)
-            if job_id == "fast":
+            if job_id in ("fast", "fast-escalable"):
                 assert ev(job_condition(step(job_id, "Run fast scripts")), ctx) == (
                     enabled and status == "success"), ctx
                 # Cleanup must still run on failure/cancellation when enabled.
                 # Caller scripts may write GITHUB_ENV; cleanup uses immutable inputs.
                 ctx["env"]["FAST_ENABLED"] = "false"
-                assert ev(job_condition(step(job_id, "Remove package auth materialization")), ctx) == enabled, ctx
+                # (It covers both domains of the shared list: `fast_enabled`.)
+                assert ev(job_condition(step(job_id, "Remove package auth materialization")), ctx) == fast_enabled, ctx
         cases += 1
     for job_id, job in JOBS.items():
-        if job_id not in ("fast", "fast-escalated"):
+        # `build`/`required` carry the Required-into-Build fold
+        # (test_required_folds_into_build).
+        if job_id not in FAST_JOBS + ("build", "required"):
             assert "${{" not in job["name"] and job["name"] != "Fast", (job_id, job["name"])
     print(f"PASS  readable Fast names, disabled steps do no work, enabled cleanup survives cancellation ({cases} cases)")
+
+
+FOLD_INPUTS = {"checks-in-build": True, "run-e2e": False, "preview-checks": "none", "wrangler-dry-run": False,
+               "extra-gate-scripts": "", "fast-scripts": "", "journey-smoke-url": "",
+               "required-reuse-pr-results": False}
+CALLER_LINT = ["Ensure PyYAML is available", "Install actionlint", "actionlint (caller's own workflows)",
+               "Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)"]
+
+
+def running_names(state: dict) -> list:
+    """Check names of the jobs that STARTED. A skipped job's check is its raw
+    name expression (NAMING IS THE GATE), which is never a readable name."""
+    return sorted(str(render(JOBS[j]["name"], state[j]["ctx"])) for j in JOBS
+                  if state[j]["result"] not in ("skipped", "cancelled"))
+
+
+def test_required_folds_into_build() -> None:
+    """W8 item 3: under `checks-in-build` with Build the only lane, Build itself
+    reports `ci / Required` (one job, one runner); any other lane brings the
+    aggregating Required back. Exactly one started job is named Required in
+    every run, and it can fail."""
+    runs = 0
+    for (event, ref), skipped, candidate in itertools.product(EVENTS, ["false", "true"], ["", "a" * 40]):
+        inputs = {**FOLD_INPUTS, "expected-candidate-sha": candidate}
+        state = simulate(JOBS, inputs, event, ref, plan_outputs(skipped))
+        started = {j for j in JOBS if state[j]["result"] != "skipped"}
+        assert started == {"build"}, (started, event)
+        assert running_names(state) == ["Required"], running_names(state)
+        # The skipped aggregator's check is its raw expression, never `Required`.
+        assert JOBS["required"]["name"].strip() != "Required"
+        # Build is the gate now: a failed Build is a red `ci / Required`, and
+        # it runs Caller lint and the candidate check itself.
+        failed = simulate(JOBS, inputs, event, ref, plan_outputs(skipped), {"build": "failure"})
+        assert failed["build"]["result"] == "failure" and failed["required"]["result"] == "skipped"
+        ctx = {**state["build"]["ctx"], "__status": "failure"}
+        for name in CALLER_LINT:
+            lint = step("build", name)
+            assert ev(lint["if"], ctx) is True, name  # runs after a failed build step too
+            assert lint["run"] == step("required", name)["run"], name
+            assert lint["working-directory"] == "${{ github.workspace }}", name
+        guard = step("build", "Verify exact validation candidate")
+        assert ev(guard["if"], state["build"]["ctx"]) is bool(candidate)
+        # A cancelled run reports the folded check CANCELLED, never passing.
+        cancelled = simulate(JOBS, inputs, event, ref, plan_outputs(skipped), cancelled=True)
+        assert cancelled["build"]["result"] == "cancelled"
+        runs += 1
+    # Every lane that is not Build un-folds: Build is `Build`, the aggregator
+    # starts as `Required` and still demands every lane.
+    unfold = [{"checks-in-build": False}, {"run-e2e": True}, {"preview-checks": "og"},
+              {"wrangler-dry-run": True}, {"extra-gate-scripts": "lint"}, {"fast-scripts": "lint"},
+              {"journey-smoke-url": "https://app.example"}, {"required-reuse-pr-results": True}]
+    for (event, ref), override in itertools.product(EVENTS, unfold):
+        inputs = {**FOLD_INPUTS, **override}
+        state = simulate(JOBS, inputs, event, ref, plan_outputs(), {}, False)
+        assert state["required"]["result"] == "success", (override, event)
+        names = running_names(state)
+        assert names.count("Required") == 1, (override, event, names)
+        if state["build"]["result"] == "success":
+            assert render(JOBS["build"]["name"], state["build"]["ctx"]) == "Build", override
+            for name in CALLER_LINT:
+                assert ev(step("build", name)["if"], state["build"]["ctx"]) is False, (override, name)
+        runs += 1
+    print(f"PASS  Required folds into Build only when Build is the only lane; one started Required per run ({runs} runs)")
+
+
+def test_folded_gate_lint() -> None:
+    """lint_callables R5 accepts the shipped fold and refuses every drift that
+    could let two jobs, or none, report `ci / Required`."""
+    import copy
+
+    import lint_callables
+
+    def findings(mutate) -> list:
+        doc = copy.deepcopy(DOC)
+        mutate(doc["jobs"])
+        f = lint_callables.Findings()
+        lint_callables.check_required_job(WORKFLOW, doc, f)
+        return [m for m in f.items if " R5 " in m]
+
+    assert findings(lambda jobs: None) == []
+    fold = re.fullmatch(r"\$\{\{ \((.+)\) && 'Required' \|\| 'Build' \}\}", JOBS["build"]["name"]).group(1)
+
+    def lint_step(jobs, name):
+        return next(x for x in jobs["build"]["steps"] if x.get("name") == name)
+
+    drifts = {
+        "aggregator if lost the fold": lambda jobs: jobs["required"].update({"if": "!cancelled()"}),
+        "aggregator if widened": lambda jobs: jobs["required"].update({"if": f"!cancelled() && !({fold} && false)"}),
+        "build fold differs": lambda jobs: jobs["build"].update(
+            {"name": "${{ (" + fold + " && true) && 'Required' || 'Build' }}"}),
+        "fold not opt-in": lambda jobs: (
+            jobs["build"].update({"name": "${{ (inputs.run-tests) && 'Required' || 'Build' }}"}),
+            jobs["required"].update({"name": "${{ (inputs.run-tests) && 'Folded' || 'Required' }}",
+                                     "if": "!cancelled() && !(inputs.run-tests)"})),
+        "build caller lint not under the fold": lambda jobs: lint_step(jobs, "Install actionlint").update(
+            {"if": "!cancelled()"}),
+        "build caller lint disabled": lambda jobs: lint_step(jobs, "Install actionlint").update(
+            {"if": f"false && ({fold})"}),
+        "build caller lint left the workspace root": lambda jobs: lint_step(
+            jobs, "Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)").pop("working-directory"),
+        "build caller lint script replaced": lambda jobs: lint_step(jobs, "actionlint (caller's own workflows)").update(
+            {"run": "exit 0"}),
+        "build dropped a caller lint step": lambda jobs: jobs["build"].update(
+            {"steps": [x for x in jobs["build"]["steps"] if x.get("name") != "actionlint (caller's own workflows)"]}),
+        "build does not start after a failed need": lambda jobs: jobs["build"].update({"if": "inputs.run-tests"}),
+        "aggregator lost a need": lambda jobs: jobs["required"]["needs"].remove("build"),
+        "a third job can be named Required": lambda jobs: jobs["checks"].update(
+            {"name": "${{ inputs.run-tests && 'Required' || 'Checks' }}"}),
+        "a literal Required beside the fold": lambda jobs: jobs["checks"].update({"name": "Required"}),
+    }
+    for label, mutate in drifts.items():
+        assert findings(mutate), label
+    print(f"PASS  R5 accepts the shipped fold and refuses {len(drifts)} drifts")
+
+
+def test_concurrent_scripts() -> None:
+    """W8 item 2a: `concurrent-scripts` start beside the build and are awaited;
+    a failed, missing, hooked or killed script fails Build."""
+    start = step("build", "Start concurrent scripts")
+    wait = step("build", "Await concurrent scripts")
+    assert INPUTS["concurrent-scripts"]["default"] == "" and start["if"] == "inputs.concurrent-scripts != ''"
+    assert wait["if"] == "!cancelled() && steps.concurrent-start.outcome == 'success'"
+    order = [x.get("name") for x in JOBS["build"]["steps"]]
+    assert order.index("Start concurrent scripts") + 1 == order.index("Build") < order.index("Await concurrent scripts")
+    assert "MEMORY" in INPUTS["concurrent-scripts"]["description"]
+
+    def run(scripts: dict, listed: str, require: str = "true", kill: bool = False):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tmp").mkdir()
+            bindir = root / "bin"
+            bindir.mkdir()
+            # `pnpm run X` runs the fixture's script body with bash.
+            pnpm = bindir / "pnpm"
+            pnpm.write_text('#!/bin/bash\nexec bash -c "$(node -p "require(\'./package.json\').scripts[\'$2\']")"\n')
+            pnpm.chmod(pnpm.stat().st_mode | stat.S_IEXEC)
+            (root / "package.json").write_text(json.dumps({"name": "fixture", "scripts": scripts}))
+            env = {"PATH": f"{bindir}:{os.environ['PATH']}", "RUNNER_TEMP": str(root / "tmp"),
+                   "GITHUB_STEP_SUMMARY": str(root / "summary"), "GATE": "Concurrent scripts",
+                   "SCRIPTS": listed, "PM": "pnpm", "REQUIRE": require}
+            started = run_bash(start["run"], env, cwd=tmp)
+            if started.returncode:
+                return "start", started.returncode, started.stdout + started.stderr
+            if kill:
+                for pid in (root / "tmp" / "concurrent-scripts").glob("*.pid"):
+                    subprocess.run(["kill", "-9", pid.read_text().strip()], check=False)
+            waited = run_bash(wait["run"], env, cwd=tmp)
+            return "await", waited.returncode, waited.stdout + waited.stderr
+
+    ok = {"lint": "sleep 1; echo linted", "typecheck": "echo typed"}
+    phase, rc, out = run(ok, "lint typecheck")
+    assert (phase, rc) == ("await", 0) and "linted" in out and "typed" in out, out
+    phase, rc, out = run({**ok, "typecheck": "echo broken; exit 3"}, "lint typecheck")
+    assert (phase, rc) == ("await", 1) and "failed (exit 3)" in out and "broken" in out, out
+    phase, rc, out = run(ok, "lint missing")
+    assert (phase, rc) == ("start", 1) and "no such script" in out, out
+    phase, rc, out = run(ok, "lint missing", require="false")
+    assert (phase, rc) == ("await", 0), out
+    phase, rc, out = run({**ok, "prelint": "nuxt prepare"}, "lint")
+    assert (phase, rc) == ("start", 1) and "prelint" in out, out
+    phase, rc, out = run({"lint": "sleep 30"}, "lint", kill=True)
+    assert (phase, rc) == ("await", 1) and "without a status" in out, out
+    print("PASS  concurrent scripts run beside the build; a failed, missing, hooked or killed one fails Build")
 
 
 def run_script(script: str, scenario: dict, inputs: dict, env_name: str,
@@ -952,6 +1193,9 @@ def main() -> None:
     test_new_inputs_default_off()
     test_cancelled_run_starts_no_gate_job()
     test_checks_in_build()
+    test_required_folds_into_build()
+    test_concurrent_scripts()
+    test_folded_gate_lint()
     test_simulator_models_skip_propagation()
     test_defaults_leave_every_lane_as_before()
     test_default_graph_matches_origin_main()

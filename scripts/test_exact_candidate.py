@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -31,7 +32,8 @@ class ExactCandidate(unittest.TestCase):
                     guard = steps[index + 1]
                     self.assertEqual(guard['name'], 'Verify exact validation candidate', name)
                     condition = "inputs.expected-candidate-sha != ''"
-                    if name == 'fast':
+                    # fast-escalable aliases fast's step list.
+                    if name in ('fast', 'fast-escalable'):
                         condition = f"env.FAST_ENABLED == 'true' && ({condition})"
                     # Caller lint runs inside Required (and escalated Fast)
                     # after the gate steps, under !cancelled().
@@ -83,8 +85,19 @@ class ExactCandidate(unittest.TestCase):
         self.assertIn("actionlint (caller's own workflows)", lint)
         self.assertIn('Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)', lint)
         # !cancelled(): runs after any failed or skipped need; a cancelled run
-        # reports it CANCELLED (never passing) without taking a runner.
-        self.assertEqual(required['if'], '!cancelled()')
+        # reports it CANCELLED (never passing) without taking a runner. The
+        # one extra clause is the Required-into-Build fold (ci-reset W10):
+        # when Build is the only lane, Build itself reports `Required` (it
+        # verifies the candidate at its own checkout) and runs Caller lint.
+        build = self.workflow['jobs']['build']
+        fold = re.fullmatch(r"\$\{\{ \((.+)\) && 'Required' \|\| 'Build' \}\}", build['name']).group(1)
+        self.assertIn('inputs.checks-in-build', fold)
+        self.assertEqual(required['if'], f'!cancelled() && !({fold})')
+        build_steps = {step.get('name'): step for step in build['steps']}
+        for name in ['Ensure PyYAML is available', 'Install actionlint', "actionlint (caller's own workflows)",
+                     'Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)']:
+            with self.subTest(job='build', step=name):
+                self.assertEqual(build_steps[name].get('if'), f'!cancelled() && ({fold})')
         # The Caller lint steps must run after a failed gate step (so both
         # show) but never be skipped on a live run: exact conditions pinned.
         caller_lint = ['Check out the caller for Caller lint', 'Ensure PyYAML is available',

@@ -156,7 +156,8 @@ on:
         default: ""
       run-ruff:
         description: >-
-          Run `ruff check` on the lint job. Opt-in: pointing ruff at a repo
+          Run `ruff check` as the last steps of the `test` job (it had a
+          `lint` job of its own until ci-reset W10). Opt-in: pointing ruff at a repo
           that has never had a static-analysis gate is usually red on first
           contact, and a template should not decide for the caller when to
           take that on.
@@ -245,9 +246,15 @@ on:
         default: 1
 
 jobs:
-  lint:
-    name: lint
-    if: inputs.run-ruff
+  # `ruff` (`run-ruff`) runs as the last steps of this job. It was a job of
+  # its own (`lint`) until ci-reset W10 (W8 item 10): 0.1 min of work that
+  # cost a whole runner allocation, and at least one billed GitHub minute on
+  # a hosted caller, on every run. Its steps are unchanged; they run after the
+  # tests under `!cancelled()`, so a lint finding and a test failure are both
+  # reported, and after them so the ruff interpreter setup cannot change the
+  # environment the tests ran in.
+  test:
+    name: test
     # ---------------------------------------------------------------------
     # Blacksmith overflow (D-CI-CAP-1 (c), extends D-BLACKSMITH-2; company-hq
     # DECISIONS.md, fleet#337). Manual, kill-switched overflow for the
@@ -276,33 +283,6 @@ jobs:
     # expanded by D-CI-CAP-1 (c)): a job landing on Blacksmith here is
     # exercising that named exception, not drift.
     # ---------------------------------------------------------------------
-    runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
-    # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
-    timeout-minutes: 20
-    permissions:
-      contents: read
-    defaults:
-      run:
-        working-directory: ${{ inputs.working-directory }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          fetch-depth: ${{ inputs.fetch-depth }}
-
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version: ${{ inputs.python-version }}
-
-      - name: Install ruff
-        run: python -m pip install --disable-pip-version-check "ruff==${{ inputs.ruff-version }}"
-
-      - name: Ruff
-        run: ruff check ${{ inputs.ruff-paths }}
-
-  test:
-    name: test
-    # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: ${{ inputs.test-timeout-minutes }}
     permissions:
@@ -535,12 +515,36 @@ jobs:
         if: inputs.extra-checks != ''
         run: ${{ inputs.extra-checks }}
 
+      # Its own interpreter, called by path, so ruff never installs into (or
+      # resolves from) the project environment that is on PATH above.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        id: ruff-python
+        if: ${{ !cancelled() && inputs.run-ruff }}
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install ruff
+        if: ${{ !cancelled() && inputs.run-ruff }}
+        env:
+          RUFF_PYTHON: ${{ steps.ruff-python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          "$RUFF_PYTHON" -m pip install --disable-pip-version-check "ruff==${{ inputs.ruff-version }}"
+
+      - name: Ruff
+        if: ${{ !cancelled() && inputs.run-ruff }}
+        env:
+          RUFF_PYTHON: ${{ steps.ruff-python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          "$RUFF_PYTHON" -m ruff check ${{ inputs.ruff-paths }}
+
   required:
     name: Required
     if: always()
-    needs: [lint, test]
-    # The caller's own effective route -- the SAME expression as `lint` and
-    # `test` -- not the org lightweight route (CI reset 2026-09-28): a caller
+    needs: [test]
+    # The caller's own effective route -- the SAME expression as `test` --
+    # not the org lightweight route (CI reset 2026-09-28): a caller
     # that runs lint and test hosted (narduk-data's earth-data-ci) otherwise
     # paid one linux-ci seat per run just for this aggregator.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
@@ -548,24 +552,13 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Require the test/static job to succeed and the lint gate to succeed-or-skip
+      - name: Require the test/static job (tests, Pyright, extra checks and ruff) to succeed
         env:
-          LINT_RESULT: ${{ needs.lint.result }}
           TEST_RESULT: ${{ needs.test.result }}
         run: |
-          status=0
-          # test has no `if:` — it must always report success.
+          # test has no `if:` -- it must always report success. It also runs
+          # ruff when `run-ruff` is on (the former `lint` job's steps).
           if [ "$TEST_RESULT" != "success" ]; then
             echo "::error::test job reported '$TEST_RESULT' (must succeed)"
-            status=1
+            exit 1
           fi
-          # lint is opt-in — "skipped" means the caller left run-ruff off;
-          # only an actual failure blocks Required.
-          case "$LINT_RESULT" in
-            success | skipped) ;;
-            *)
-              echo "::error::lint job reported '$LINT_RESULT' (must succeed or be skipped)"
-              status=1
-              ;;
-          esac
-          exit "$status"

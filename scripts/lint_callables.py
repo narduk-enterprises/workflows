@@ -88,6 +88,18 @@ Each rule below exists because breaking it has a specific, known blast radius:
   true`, `Required` does not list it, and no other job `needs:` it. Every
   other R11 rule still applies to it.
 
+  The FOLDED GATE is the one sanctioned way for a job other than a literal
+  `Required` to report the `Required` check (ci-reset W10, W8 item 3): when
+  a single condition X says Build is the only lane, Build is named
+  `${{ (X) && 'Required' || '<other>' }}` and the aggregator is named
+  `${{ (X) && '<other>' || 'Required' }}` with `if:` exactly
+  `!cancelled() && !(X)`. A skipped job's check is its raw name expression,
+  never `Required`, so exactly one job reports the check either way. R5
+  demands the pair share the SAME X, that X contains `inputs.checks-in-build`,
+  that the aggregator still `needs:` every job, that Build starts under
+  `!cancelled()`, and that Build runs the aggregator's Caller-lint steps
+  under X. Any other name expression that can yield `Required` is a finding.
+
 Run: python3 scripts/lint_callables.py [paths...]
 Exit 0 clean, 1 on any finding. No third-party imports beyond PyYAML.
 """
@@ -248,13 +260,131 @@ def non_gating_jobs(path: Path, doc: dict, f: Findings) -> frozenset[str]:
     return declared
 
 
+FOLD_NAME = re.compile(r"^\$\{\{ \((?P<cond>.+)\) && '(?P<on>[^']*)' \|\| '(?P<off>[^']*)' \}\}$")
+FOLD_MARKER = "inputs.checks-in-build"
+
+
+def folded_gate(jobs: dict) -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """(aggregators, builds, others): job id -> fold condition for the two halves
+    of the sanctioned folded gate, and the ids of any OTHER job whose name
+    expression can yield `Required`."""
+    aggregators: dict[str, str] = {}
+    builds: dict[str, str] = {}
+    others: list[str] = []
+    for jid, job in jobs.items():
+        if not isinstance(job, dict):
+            continue
+        name = str(job.get("name") or "")
+        if "${{" not in name or "'Required'" not in name:
+            continue
+        m = FOLD_NAME.match(name.strip())
+        if m and m["off"] == "Required" and m["on"] != "Required":
+            aggregators[jid] = m["cond"]
+        elif m and m["on"] == "Required" and m["off"] != "Required":
+            builds[jid] = m["cond"]
+        else:
+            others.append(jid)
+    return aggregators, builds, others
+
+
+def gate_job(jobs: dict) -> dict | None:
+    """The aggregating gate job: the literal `Required`, else the folded aggregator."""
+    for jid, job in jobs.items():
+        if isinstance(job, dict) and (job.get("name") or jid) == "Required":
+            return job
+    aggregators, _, _ = folded_gate(jobs)
+    return jobs[next(iter(aggregators))] if aggregators else None
+
+
+def check_folded_gate(path: Path, doc: dict, f: Findings) -> None:
+    jobs = doc.get("jobs") or {}
+    aggregators, builds, others = folded_gate(jobs)
+    for jid in others:
+        f.add(
+            path,
+            f"R5 job '{jid}' can be named Required through an expression outside the sanctioned "
+            "folded-gate shape — two jobs could report `ci / Required`, or none",
+        )
+    if not aggregators and not builds:
+        return
+    if len(aggregators) != 1 or len(builds) != 1:
+        f.add(
+            path,
+            f"R5 a folded gate needs exactly one aggregator and one folded Build; found "
+            f"aggregators {sorted(aggregators)} and builds {sorted(builds)}",
+        )
+        return
+    (agg_id, agg_cond), (build_id, build_cond) = next(iter(aggregators.items())), next(iter(builds.items()))
+    if agg_cond != build_cond:
+        f.add(
+            path,
+            f"R5 folded gate: '{agg_id}' and '{build_id}' use different fold conditions — "
+            "both or neither could report `ci / Required`",
+        )
+    if FOLD_MARKER not in agg_cond:
+        f.add(path, f"R5 folded gate condition does not contain `{FOLD_MARKER}` — the fold is opt-in only")
+    if any(isinstance(j, dict) and (j.get("name") or jid) == "Required" for jid, j in jobs.items()):
+        f.add(path, "R5 folded gate alongside a literal `Required` job — two jobs could report the check")
+    want_if = f"!cancelled() && !({agg_cond})"
+    got_if = str(jobs[agg_id].get("if", "")).strip()
+    if got_if != want_if:
+        f.add(
+            path,
+            f"R5 folded aggregator '{agg_id}' must have `if:` exactly {want_if!r}, got {got_if!r}",
+        )
+    build_if = str(jobs[build_id].get("if", "")).strip()
+    if build_if and not build_if.startswith("!cancelled()"):
+        f.add(
+            path,
+            f"R5 folded Build '{build_id}' `if:` {build_if!r} must start with `!cancelled()` — "
+            "it reports `ci / Required` after a failed or skipped need",
+        )
+    agg_steps = {
+        s.get("name"): s for s in jobs[agg_id].get("steps") or [] if isinstance(s, dict) and s.get("name") in CALLER_LINT_STEPS
+    }
+    agg_lint = set(agg_steps)
+    # The same script, from the workspace root (the audit exits 0 when it
+    # finds no workflows, so a drifted directory would pass silently), under
+    # exactly `!cancelled() && (X)`.
+    build_lint = {
+        s.get("name")
+        for s in jobs[build_id].get("steps") or []
+        if isinstance(s, dict)
+        and s.get("name") in agg_steps
+        and str(s.get("if", "")).strip() == f"!cancelled() && ({agg_cond})"
+        and s.get("run") == agg_steps[s.get("name")].get("run")
+        and s.get("working-directory") == "${{ github.workspace }}"
+    }
+    missing = sorted(agg_lint - build_lint)
+    if missing:
+        f.add(
+            path,
+            f"R5 folded Build '{build_id}' does not run the aggregator's Caller-lint step(s) {missing} "
+            "under the fold condition — folding would drop that gate",
+        )
+
+
+CALLER_LINT_STEPS = {
+    "Ensure PyYAML is available",
+    "Install actionlint",
+    "actionlint (caller's own workflows)",
+    "Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)",
+}
+
+
 def check_required_job(path: Path, doc: dict, f: Findings) -> None:
     jobs = doc.get("jobs") or {}
+    check_folded_gate(path, doc, f)
+    aggregators, _, _ = folded_gate(jobs)
     required = {jid: j for jid, j in jobs.items() if (j.get("name") or jid) == "Required"}
+    required.update({jid: jobs[jid] for jid in aggregators})
     if not required:
         return
     for jid, job in required.items():
         cond = str(job.get("if", "")).strip()
+        if jid in aggregators:
+            # check_folded_gate owns the `if:` shape of a folded aggregator.
+            cond = "!cancelled()"
         needs = job.get("needs") or []
         if isinstance(needs, str):
             needs = [needs]
@@ -549,10 +679,7 @@ def check_fail_closed_playwright(path: Path, doc: dict, f: Findings) -> None:
         if forbidden in suite_script:
             f.add(path, f"R11 E2E suite gate contains forbidden fail-open shape {forbidden!r}")
 
-    required = next(
-        (job for job in jobs.values() if isinstance(job, dict) and (job.get("name") or "") == "Required"),
-        None,
-    )
+    required = gate_job(jobs)
     required_text = "\n".join(
         _run_script(step) for step in (required or {}).get("steps", []) if isinstance(step, dict)
     )

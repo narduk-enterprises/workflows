@@ -557,7 +557,7 @@ def test_prebuilt(client: Client, root: Path) -> None:
     before = dict(double.objects)
     double.log.clear()
     for name, overrides, level, fragment in (
-        ("no credentials", {k: None for k in CREDS}, "notice", "No CI artifact store credentials"),
+        ("no credentials", {k: None for k in CREDS}, "warning", "No CI artifact store credentials"),
         ("malformed credentials", {"CI_ARTIFACTS_R2_ACCESS_KEY_ID": "nope"}, "warning", "malformed"),
         ("missing build output", {"BUILD_DIR": str(root / "absent")}, "warning", "Could not publish"),
     ):
