@@ -1928,11 +1928,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm config set store-dir "$GITHUB_WORKSPACE/.cache/pnpm-store"
-            echo "path=.cache/pnpm-store" >> "$GITHUB_OUTPUT"
+            # Beside the checkout, not in it: an app's own `prettier "**/*"` or
+            # lint glob scans anything under the workspace.
+            pnpm config set store-dir "$GITHUB_WORKSPACE/../.ci-cache/pnpm-store"
+            echo "path=../.ci-cache/pnpm-store" >> "$GITHUB_OUTPUT"
           else
-            npm config set cache "$GITHUB_WORKSPACE/.cache/npm"
-            echo "path=.cache/npm" >> "$GITHUB_OUTPUT"
+            npm config set cache "$GITHUB_WORKSPACE/../.ci-cache/npm"
+            echo "path=../.ci-cache/npm" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Restore dependency cache
@@ -3198,11 +3200,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm config set store-dir "$GITHUB_WORKSPACE/.cache/pnpm-store"
-            echo "path=.cache/pnpm-store" >> "$GITHUB_OUTPUT"
+            # Beside the checkout, not in it: an app's own `prettier "**/*"` or
+            # lint glob scans anything under the workspace.
+            pnpm config set store-dir "$GITHUB_WORKSPACE/../.ci-cache/pnpm-store"
+            echo "path=../.ci-cache/pnpm-store" >> "$GITHUB_OUTPUT"
           else
-            npm config set cache "$GITHUB_WORKSPACE/.cache/npm"
-            echo "path=.cache/npm" >> "$GITHUB_OUTPUT"
+            npm config set cache "$GITHUB_WORKSPACE/../.ci-cache/npm"
+            echo "path=../.ci-cache/npm" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Restore dependency cache
@@ -4005,7 +4009,7 @@ jobs:
       # GitHub Actions cache is a network blob service, not local disk, so it
       # is reachable from a self-hosted guest exactly when job-log upload and
       # runner registration are (both already required for the job to run at
-      # all). The npm cache directory below (`.cache/npm`, under
+      # all). The npm cache directory below (`../.ci-cache/npm`, beside
       # `$GITHUB_WORKSPACE`) never crosses a device boundary the way pnpm's
       # HOME-rooted store can, so enabling it for self-hosted npm callers
       # carries none of the copy-not-link risk #17 fixed. pnpm keeps its
@@ -4017,11 +4021,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm config set store-dir "$GITHUB_WORKSPACE/.cache/pnpm-store"
-            echo "path=.cache/pnpm-store" >> "$GITHUB_OUTPUT"
+            # Beside the checkout, not in it: an app's own `prettier "**/*"` or
+            # lint glob scans anything under the workspace.
+            pnpm config set store-dir "$GITHUB_WORKSPACE/../.ci-cache/pnpm-store"
+            echo "path=../.ci-cache/pnpm-store" >> "$GITHUB_OUTPUT"
           else
-            npm config set cache "$GITHUB_WORKSPACE/.cache/npm"
-            echo "path=.cache/npm" >> "$GITHUB_OUTPUT"
+            npm config set cache "$GITHUB_WORKSPACE/../.ci-cache/npm"
+            echo "path=../.ci-cache/npm" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Restore dependency cache
@@ -5241,11 +5247,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm config set store-dir "$GITHUB_WORKSPACE/.cache/pnpm-store"
-            echo "path=.cache/pnpm-store" >> "$GITHUB_OUTPUT"
+            # Beside the checkout, not in it: an app's own `prettier "**/*"` or
+            # lint glob scans anything under the workspace.
+            pnpm config set store-dir "$GITHUB_WORKSPACE/../.ci-cache/pnpm-store"
+            echo "path=../.ci-cache/pnpm-store" >> "$GITHUB_OUTPUT"
           else
-            npm config set cache "$GITHUB_WORKSPACE/.cache/npm"
-            echo "path=.cache/npm" >> "$GITHUB_OUTPUT"
+            npm config set cache "$GITHUB_WORKSPACE/../.ci-cache/npm"
+            echo "path=../.ci-cache/npm" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Restore dependency cache
@@ -5504,11 +5512,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            pnpm config set store-dir "$GITHUB_WORKSPACE/.cache/pnpm-store"
-            echo "path=.cache/pnpm-store" >> "$GITHUB_OUTPUT"
+            # Beside the checkout, not in it: an app's own `prettier "**/*"` or
+            # lint glob scans anything under the workspace.
+            pnpm config set store-dir "$GITHUB_WORKSPACE/../.ci-cache/pnpm-store"
+            echo "path=../.ci-cache/pnpm-store" >> "$GITHUB_OUTPUT"
           else
-            npm config set cache "$GITHUB_WORKSPACE/.cache/npm"
-            echo "path=.cache/npm" >> "$GITHUB_OUTPUT"
+            npm config set cache "$GITHUB_WORKSPACE/../.ci-cache/npm"
+            echo "path=../.ci-cache/npm" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Restore dependency cache
