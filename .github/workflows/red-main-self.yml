@@ -25,8 +25,13 @@ jobs:
     # is exactly as real a "main is red" signal as a red push -- the
     # `head_branch == default_branch` check still excludes a manual dispatch
     # against any other branch or ref.
+    # `schedule` is included (fast-CI program, 2026-09-29): a nightly run --
+    # the post-merge `E2E` workflow's safety net -- runs the default branch, so
+    # a red nightly is a "main is red" signal too. This repository's own CI has
+    # no schedule trigger; the clause keeps the reference adopter identical to
+    # the caller shape README documents for adopters that do.
     if: |
-      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
+      (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch' || github.event.workflow_run.event == 'schedule') &&
       github.event.workflow_run.head_branch == github.event.repository.default_branch
     uses: ./.github/workflows/red-main-listener.yml
     permissions:

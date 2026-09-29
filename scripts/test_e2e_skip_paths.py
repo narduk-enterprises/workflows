@@ -84,7 +84,9 @@ def check_job_wiring() -> None:
     # `Reuse plan` ancestor would turn false (scripts/test_fast_path.py).
     assert e2e["if"] == (
         "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' "
-        "&& inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'"
+        "&& (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' "
+        "|| inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) "
+        "&& needs.e2e-plan.outputs.skipped != 'true'"
     )
     assert "e2e-plan" in e2e["needs"]
 

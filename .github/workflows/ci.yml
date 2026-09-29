@@ -255,6 +255,11 @@ jobs:
       - name: Fast-path contract tests
         run: python3 scripts/test_fast_path.py
 
+      # E2E off the pull request: the `CI_E2E_IN_CI` switch and `mode: e2e`
+      # (the post-merge / nightly run), over the real job graph.
+      - name: E2E mode contract tests
+        run: python3 scripts/test_e2e_mode.py
+
       # The pull-request E2E subset (`e2e-pr-shards`/`e2e-pr-args`). Two
       # halves: that leaving both unset is byte-for-byte today's behaviour on
       # every event — every pinned adopter passes neither — and that `e2e`

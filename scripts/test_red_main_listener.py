@@ -228,6 +228,18 @@ def check_self_adopter_allows_workflow_dispatch() -> tuple[bool, str]:
     return ok, f"red-main-self.yml job `if:` was: {condition!r}"
 
 
+def check_self_adopter_allows_schedule() -> tuple[bool, str]:
+    """A nightly `schedule` run always runs the default branch, so a red one is
+    a "main is red" signal (the post-merge `E2E` workflow's nightly). The job
+    `if:` must accept it, still gated by `head_branch == default_branch`; the
+    pull_request exclusion above is untouched."""
+    doc = yaml.safe_load(SELF_ADOPTER.read_text())
+    condition = doc["jobs"]["red-main"].get("if") or ""
+    ok = ("workflow_run.event == 'schedule'" in condition and "head_branch" in condition
+          and "pull_request" not in condition)
+    return ok, f"red-main-self.yml job `if:` was: {condition!r}"
+
+
 def main() -> int:
     script = extract_step_script()
     total = 0
@@ -241,6 +253,11 @@ def main() -> int:
     total += 1
     ok, detail = check_self_adopter_allows_workflow_dispatch()
     if not check("self-adopter if: also allows event == 'workflow_dispatch'", ok, detail):
+        failures += 1
+
+    total += 1
+    ok, detail = check_self_adopter_allows_schedule()
+    if not check("self-adopter if: also allows event == 'schedule' (nightly E2E)", ok, detail):
         failures += 1
 
     with tempfile.TemporaryDirectory() as tmp_str:

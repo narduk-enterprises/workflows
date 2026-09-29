@@ -112,6 +112,29 @@ name: Reusable Nuxt + Cloudflare CI
 # alongside its push/pull_request triggers, with the same `ci:` job. The
 # quarantine lane (`e2e-quarantine-args`) runs there too.
 #
+# E2E OFF THE PULL REQUEST (fast-CI program, Logan 2026-09-29: "skip on PRs;
+# run after each merge, newest wins, plus nightly; one org switch"). Two
+# additive pieces, both no-ops until used:
+#   vars.CI_E2E_IN_CI == 'false'  -> `E2E plan`, `E2E` and `E2E quarantine` are
+#                                    skipped in an ordinary CI run on any event
+#                                    and `Required` reads that skip as success.
+#                                    It never overrides `e2e-full-paths`
+#                                    (protected-path escalation) or
+#                                    `expected-candidate-sha` (explicit release
+#                                    validation), both promises to run browsers.
+#   mode: e2e                     -> the post-merge / nightly run: Build ->
+#                                    E2E plan -> E2E and a `Required` verdict,
+#                                    every other lane skipped, the variable
+#                                    ignored. It lives in its own caller
+#                                    workflow (`E2E`) because an app's promote
+#                                    workflow fires on completion of the whole
+#                                    CI workflow. See README "E2E off the pull
+#                                    request".
+# The effective switch is one expression, repeated wherever `inputs.run-e2e`
+# used to gate a lane; scripts/test_e2e_mode.py evaluates all of them.
+# `pnpm audit` is a warning on a pull request and blocks on the default branch,
+# schedule and workflow_dispatch (see the `Dependency audit` step).
+#
 # THE QUALITY LEVEL (coding-standards deep dive, 2026-09-27). The estate has
 # web quality tools that gate nothing on most apps because each one is an
 # opt-in nobody opted into: the foundation check, the per-route performance
@@ -420,6 +443,20 @@ on:
         required: false
         type: boolean
         default: false
+      mode:
+        description: >-
+          `ci` (the default) is the ordinary gate. `e2e` is the post-merge and
+          nightly Playwright run and nothing else: Build -> E2E plan -> E2E and a
+          final `Required` verdict, every other lane skipped, and the
+          `CI_E2E_IN_CI` variable ignored. It requires `run-e2e: true` (the
+          verdict fails otherwise) and is meant for a caller workflow named
+          `E2E` triggered by push to the default branch, a nightly schedule and
+          workflow_dispatch, with a workflow-level concurrency group keyed on the
+          repository and `cancel-in-progress: true` so the newest merge wins. See README
+          "E2E off the pull request". Any other value fails `Required`.
+        required: false
+        type: string
+        default: "ci"
       e2e-script:
         description: >-
           package.json script for the e2e suite. When run-e2e is true this
@@ -1055,7 +1092,8 @@ jobs:
   reuse-plan:
     name: Reuse plan
     if: >-
-      inputs.required-reuse-pr-results
+      inputs.mode != 'e2e'
+      && inputs.required-reuse-pr-results
       && inputs.journey-smoke-url == ''
       && github.event_name == 'push'
       && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
@@ -1604,6 +1642,9 @@ jobs:
               const workflow = process.env.CALLER_WORKFLOW_REF.split('@')[0];
               const workflowPath = workflow.slice(`${repo.owner}/${repo.repo}/`.length);
               const inputs = JSON.parse(process.env.PROOF_INPUTS);
+              // Added after proofs already existed; absent from the key at its
+              // default so those proofs still match (the E2E key drops it always).
+              if (inputs.mode === 'ci') delete inputs.mode;
               const canonicalInputs = Object.fromEntries(Object.entries(inputs).sort(([a], [b]) => a.localeCompare(b)));
               const { data: commit } = await github.rest.repos.getCommit({ ...repo, ref: context.sha, request: { timeout: 10000 } });
               const tree = commit.commit.tree.sha;
@@ -1631,7 +1672,7 @@ jobs:
   build:
     # Named `Required` when it is the only lane for this event (REQUIRED
     # FOLDED INTO BUILD in the header); `Build` otherwise, as before.
-    name: ${{ (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results) && 'Required' || 'Build' }}
+    name: ${{ (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results) && 'Required' || 'Build' }}
     # P3-C1: skipped only when `Reuse plan` proved this exact tree, or in
     # journey-smoke mode. `!cancelled()` keeps it running when `Reuse plan`
     # was skipped (the default) or could not decide.
@@ -2171,12 +2212,28 @@ jobs:
       # audit itself takes. `Required` covers it through `build`, which it
       # already demands success from.
       - name: Dependency audit
-        if: inputs.dependency-audit
+        if: inputs.dependency-audit && inputs.mode != 'e2e'
         env:
           PM: ${{ inputs.package-manager }}
           AUDIT_IGNORE: ${{ inputs.audit-ignore }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          # WARN ON A PULL REQUEST, BLOCK ON MAIN. An advisory is published on
+          # its own schedule, not the pull request's, so a red `pnpm audit` on
+          # an unrelated PR blocks work the PR did not cause (Logan 2026-09-29,
+          # "Main + nightly"). On `pull_request` / `pull_request_target` every
+          # finding below is re-labelled `::warning::` (the advisory list is
+          # still printed and summarised) and the step passes. A push to the
+          # default branch, a schedule and a manual dispatch keep the
+          # fail-closed behaviour: "the audit did not run" is still a failure.
+          warn_only=false
+          case "${EVENT_NAME:-}" in
+            pull_request|pull_request_target) warn_only=true ;;
+          esac
+          as_annotation() {
+            if [ "$warn_only" = true ]; then sed 's/^::error::/::warning::/'; else cat; fi
+          }
           tmpdir="${RUNNER_TEMP:-/tmp}"
           report="$tmpdir/dependency-audit.json"
           errlog="$tmpdir/dependency-audit.err"
@@ -2188,11 +2245,16 @@ jobs:
           audit_status=$?
           set -e
           if [ ! -s "$report" ]; then
-            echo "::error::dependency audit produced no report ($PM audit exited $audit_status) -- the audit did not run, which is a failure, not a pass"
+            echo "::error::dependency audit produced no report ($PM audit exited $audit_status) -- the audit did not run, which is a failure, not a pass" | as_annotation
             sed -n '1,20p' "$errlog" >&2 || true
+            if [ "$warn_only" = true ]; then
+              echo "::warning::dependency audit did not run on this pull request; it blocks on the default branch, schedule and manual runs"
+              exit 0
+            fi
             exit 1
           fi
-          AUDIT_REPORT="$report" AUDIT_STATUS="$audit_status" python3 - <<'PYEOF_AUDIT'
+          audit_rc=0
+          AUDIT_REPORT="$report" AUDIT_STATUS="$audit_status" python3 - <<'PYEOF_AUDIT' | as_annotation || audit_rc=$?
           import json
           import os
           import re
@@ -2375,6 +2437,11 @@ jobs:
               )
               raise SystemExit(1)
           PYEOF_AUDIT
+          if [ "$audit_rc" -ne 0 ] && [ "$warn_only" = true ]; then
+            echo "::warning::dependency audit found blocking findings (listed above as warnings). They do not fail this pull request; they will fail the default branch, the nightly run and a manual run until fixed or given an audit-ignore reason."
+            exit 0
+          fi
+          exit "$audit_rc"
 
       # OPT-IN web-foundation conformance gate (company-hq
       # docs/WEB-FOUNDATION-CHECK.md §4/§5, D-WEBFOUND-2 Q5/Q9 (a), D-WEBFOUND-3).
@@ -2401,7 +2468,7 @@ jobs:
       # check" below prints it to the log and applies the decided blocking
       # rule.
       - name: Run web-foundation conformance check
-        if: steps.quality.outputs.foundation-check == 'true'
+        if: steps.quality.outputs.foundation-check == 'true' && inputs.mode != 'e2e'
         env:
           PM: ${{ inputs.package-manager }}
           TOOL_VERSION: ${{ inputs.foundation-check-tool-version }}
@@ -2520,7 +2587,7 @@ jobs:
       # a check that cannot see cannot pass (WEB-FOUNDATION-CHECK.md §5, "the
       # app's CI must treat [UNKNOWN] as a failure too").
       - name: Evaluate web-foundation conformance check
-        if: always() && steps.quality.outputs.foundation-check == 'true'
+        if: always() && steps.quality.outputs.foundation-check == 'true' && inputs.mode != 'e2e'
         run: |
           set -uo pipefail
           echo "## Web foundation conformance check" >> "$GITHUB_STEP_SUMMARY"
@@ -2577,7 +2644,7 @@ jobs:
       # copied, so the two places cannot drift. Before `build-script`, so a
       # type error fails the job before the build spends its time.
       - name: Typecheck Worker
-        if: inputs.checks-in-build
+        if: inputs.checks-in-build && inputs.mode != 'e2e'
         env: &checks_tw_env
           GATE: Typecheck Worker
           SCRIPT: ${{ inputs.typecheck-worker-script }}
@@ -2609,7 +2676,7 @@ jobs:
           fi
           if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
       - name: Typecheck Nuxt
-        if: inputs.checks-in-build
+        if: inputs.checks-in-build && inputs.mode != 'e2e'
         env: &checks_tn_env
           GATE: Typecheck Nuxt
           SCRIPT: ${{ inputs.typecheck-web-script }}
@@ -2641,7 +2708,7 @@ jobs:
           fi
           if [ "$PM" = "pnpm" ]; then pnpm run "$SCRIPT"; else npm run "$SCRIPT"; fi
       - name: Unit tests
-        if: inputs.checks-in-build && inputs.run-tests
+        if: inputs.checks-in-build && inputs.run-tests && inputs.mode != 'e2e'
         env: &checks_ut_env
           GATE: Unit tests
           SCRIPT: ${{ inputs.test-script }}
@@ -2683,7 +2750,7 @@ jobs:
       # hooks (see the input's BUILD OUTPUTS caveat).
       - name: Start concurrent scripts
         id: concurrent-start
-        if: inputs.concurrent-scripts != ''
+        if: inputs.concurrent-scripts != '' && inputs.mode != 'e2e'
         env:
           GATE: Concurrent scripts
           SCRIPTS: ${{ inputs.concurrent-scripts }}
@@ -2769,7 +2836,7 @@ jobs:
       # extra-scripts entry is always something the caller wrote down by name,
       # so a typo in one of them is precisely the silent-loss case.
       - name: Extra scripts
-        if: inputs.extra-scripts != ''
+        if: inputs.extra-scripts != '' && inputs.mode != 'e2e'
         env:
           GATE: Extra scripts
           SCRIPTS: ${{ inputs.extra-scripts }}
@@ -2838,7 +2905,7 @@ jobs:
       # this step refuses a report whose app has no build output, and treats
       # an unreadable report as a failure rather than as "no violations".
       - name: Performance budget
-        if: steps.quality.outputs.performance-budget == 'true'
+        if: steps.quality.outputs.performance-budget == 'true' && inputs.mode != 'e2e'
         env:
           PM: ${{ inputs.package-manager }}
           PERF_ARGS: ${{ inputs.performance-budget-args }}
@@ -2901,7 +2968,7 @@ jobs:
         id: e2e-build-path
         env:
           BUILD_PATH: ${{ inputs.e2e-build-artifact-path }}
-          RUN_E2E: ${{ inputs.run-e2e }}
+          RUN_E2E: ${{ (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) }}
           ARTIFACT_SCOPE: ${{ inputs.artifact-scope }}
         run: |
           set -euo pipefail
@@ -2979,7 +3046,7 @@ jobs:
       # remove a required parser (mirrors ci.yml's own "Ensure PyYAML is
       # available" step).
       - name: Ensure PyYAML is available
-        if: "!cancelled() && (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
         working-directory: ${{ github.workspace }}
         run: &caller_lint_pyyaml |
           set -euo pipefail
@@ -2992,7 +3059,7 @@ jobs:
           fi
 
       - name: Install actionlint
-        if: "!cancelled() && (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
         working-directory: ${{ github.workspace }}
         env: &caller_lint_actionlint_env
           ACTIONLINT_VERSION: 1.7.12
@@ -3010,7 +3077,7 @@ jobs:
           ./actionlint -version
 
       - name: actionlint (caller's own workflows)
-        if: "!cancelled() && (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
         working-directory: ${{ github.workspace }}
         run: &caller_lint_actionlint |
           set -euo pipefail
@@ -3023,7 +3090,7 @@ jobs:
           ./actionlint -no-color "${files[@]}"
 
       - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
-        if: "!cancelled() && (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
         working-directory: ${{ github.workspace }}
         run: &caller_lint_audit |
           set -euo pipefail
@@ -3144,7 +3211,7 @@ jobs:
     # P3-C1: same reuse/smoke gating as `Build`. `checks-in-build` runs these
     # steps in `Build` instead, and this job is skipped.
     needs: [reuse-plan]
-    if: "!cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !inputs.checks-in-build"
+    if: "!cancelled() && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !inputs.checks-in-build"
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
@@ -3299,7 +3366,7 @@ jobs:
     name: Extra gate
     # P3-C1: same reuse/smoke gating as `Build`.
     needs: [reuse-plan]
-    if: "!cancelled() && inputs.extra-gate-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
+    if: "!cancelled() && inputs.mode != 'e2e' && inputs.extra-gate-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
@@ -3437,7 +3504,7 @@ jobs:
     name: E2E plan
     # P3-C1: same reuse/smoke gating as `Build`.
     needs: [reuse-plan]
-    if: "!cancelled() && inputs.run-e2e && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
+    if: "!cancelled() && (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     # CI lightweight route (company-hq CI policy); caller override takes precedence.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
@@ -3489,6 +3556,10 @@ jobs:
               const workflow = process.env.CALLER_WORKFLOW_REF.split('@')[0];
               const workflowPath = workflow.slice(`${repo.owner}/${repo.repo}/`.length);
               const inputs = JSON.parse(process.env.E2E_INPUTS);
+              // `mode` is not part of the key (it says which caller ran this, not
+              // what was tested). The workflow path IS, so a ci.yml proof and an
+              // E2E-workflow proof never cross.
+              delete inputs.mode;
               // Fast-path inputs (P3-C1) and the quality-level inputs stay out of
               // the key at their defaults, so proof minted before they existed
               // still matches.
@@ -3533,6 +3604,7 @@ jobs:
           REUSED: ${{ steps.proof.outputs.reused }}
           SKIP_PATTERNS: ${{ inputs.e2e-skip-paths }}
           FULL_PATTERNS: ${{ inputs.e2e-full-paths }}
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           # `set -f`: the pattern lists below are split with unquoted `$SKIP_PATTERNS`
@@ -3551,6 +3623,17 @@ jobs:
             echo "skipped=true" >> "$GITHUB_OUTPUT"
             echo "full=false" >> "$GITHUB_OUTPUT"
             echo "the same Git tree and full E2E configuration already passed on the pull request"
+            exit 0
+          fi
+          # THE POST-MERGE RUN NEVER PATH-SKIPS. Its concurrency group cancels
+          # the run in flight when a newer merge lands, so the newest push's
+          # diff no longer covers the commits whose run was cancelled: a
+          # docs-only push after a code push would skip E2E while the code push
+          # was never tested. Running the whole suite is the only sound answer.
+          if [ "${MODE:-ci}" = e2e ]; then
+            echo "skipped=false" >> "$GITHUB_OUTPUT"
+            echo "full=true" >> "$GITHUB_OUTPUT"
+            echo "mode e2e runs the full suite: a newer push cancels this run, so no diff can prove a skip"
             exit 0
           fi
           # One changed-file read serves both path inputs. `full` answers
@@ -3837,7 +3920,7 @@ jobs:
     # opt-in and off by default.
     name: E2E
     # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
-    if: "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && inputs.run-e2e && needs.e2e-plan.outputs.skipped != 'true'"
+    if: "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && needs.e2e-plan.outputs.skipped != 'true'"
     needs: [build, e2e-plan]
     # `e2e-runner` when the caller routes browsers to an isolated pool,
     # otherwise `runner` — same guest as the build, the previous behaviour.
@@ -4508,7 +4591,7 @@ jobs:
   e2e-quarantine:
     name: E2E
     # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
-    if: "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && inputs.run-e2e && inputs.e2e-quarantine-args != '' && needs.e2e-plan.outputs.skipped != 'true'"
+    if: "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.e2e-quarantine-args != '' && needs.e2e-plan.outputs.skipped != 'true'"
     needs: [build, e2e-plan]
     runs-on: ${{ fromJSON(inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
@@ -4570,6 +4653,7 @@ jobs:
     # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
     if: >-
       !cancelled() && needs.build.result == 'success'
+      && inputs.mode != 'e2e'
       && inputs.preview-checks != 'none'
       && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
     needs: build
@@ -5172,7 +5256,7 @@ jobs:
   deploy-dry-run:
     name: Deploy dry run
     # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
-    if: "!cancelled() && needs.build.result == 'success' && inputs.wrangler-dry-run"
+    if: "!cancelled() && needs.build.result == 'success' && inputs.mode != 'e2e' && inputs.wrangler-dry-run"
     needs: build
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
@@ -5408,7 +5492,7 @@ jobs:
   # plan's `full` never applies to Fast, and `Required` still demands the
   # plan succeed.
   fast:
-    name: ${{ (inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != ''))) && 'Fast' || 'Fast (not run)' }}
+    name: ${{ (inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != ''))) && 'Fast' || 'Fast (not run)' }}
     needs: [reuse-plan]
     # !cancelled() runs Fast after a failed or skipped need, and never after
     # the run is cancelled: GitHub reports a job whose `if:` is false in a
@@ -5417,9 +5501,9 @@ jobs:
     # caller's concurrency group while it queued for a seat (operator-portal
     # run 36494070028, ~14 min). The rest is FAST_ENABLED, so a disabled Fast
     # takes no runner at all (see NAMING IS THE GATE above).
-    if: "!cancelled() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != ''))"
+    if: "!cancelled() && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != ''))"
     env:
-      FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) }}
+      FAST_ENABLED: ${{ inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) }}
       # Read by the shared steps: this job never escalates and never reads
       # `E2E plan`.
       FAST_ESCALABLE: false
@@ -5564,7 +5648,7 @@ jobs:
       # Exact-path cleanup only: persistent self-hosted workspaces must not keep
       # registry credentials after install (success, failure, or cancel).
       - name: Remove package auth materialization
-        if: always() && inputs.install-script == '' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'
+        if: always() && inputs.install-script == '' && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'
         run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
       - name: Install dependencies (caller script)
         if: env.FAST_ENABLED == 'true' && (inputs.install-script != '')
@@ -5659,11 +5743,11 @@ jobs:
   # it keeps that `needs:` and today's behaviour exactly: named `Fast`, or
   # `Fast lanes (escalated)` when `fast-escalated` takes the name.
   fast-escalable:
-    name: ${{ !(inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && 'Fast (not run)' || ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true') && 'Fast lanes (escalated)' || 'Fast' }}
+    name: ${{ !(inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && 'Fast (not run)' || ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true') && 'Fast lanes (escalated)' || 'Fast' }}
     needs: [reuse-plan, e2e-plan]
-    if: "!cancelled() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')"
+    if: "!cancelled() && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')"
     env:
-      FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') }}
+      FAST_ENABLED: ${{ inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') }}
       FAST_ESCALABLE: true
       E2E_PLAN_RESULT: ${{ needs.e2e-plan.result }}
       ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true' }}
@@ -5696,7 +5780,7 @@ jobs:
   # deploy back.
   journey-smoke:
     name: Journey smoke
-    if: inputs.journey-smoke-url != ''
+    if: inputs.journey-smoke-url != '' && inputs.mode != 'e2e'
     runs-on: ${{ fromJSON(inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 15
     permissions:
@@ -5993,12 +6077,12 @@ jobs:
     # evaluated this name is not `Required` then, so it can never produce a
     # second, skipped (passing) `ci / Required`. The condition is the one in
     # `build`'s name, verbatim (R5 in scripts/lint_callables.py).
-    name: ${{ (inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results) && 'Required (folded into Build)' || 'Required' }}
+    name: ${{ (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results) && 'Required (folded into Build)' || 'Required' }}
     # !cancelled(), not always(): it still runs after any failed or skipped
     # need, and a cancelled run reports it CANCELLED -- a non-passing check --
     # without queueing for a runner that would hold the caller's concurrency
     # group (operator-portal run 36494070028 waited ~14 min for one).
-    if: "!cancelled() && !(inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !inputs.run-e2e && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+    if: "!cancelled() && !(inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
     needs: [reuse-plan, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run, fast, fast-escalable, fast-escalated, journey-smoke]
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
@@ -6023,7 +6107,10 @@ jobs:
           PREVIEW_CHECKS: ${{ inputs.preview-checks }}
           # The preview lane exists only where a pull-request preview does.
           EVENT_NAME: ${{ github.event_name }}
-          RUN_E2E: ${{ inputs.run-e2e }}
+          RUN_E2E: ${{ (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) }}
+          # `ci` (default) or `e2e`: the post-merge / nightly Playwright run.
+          MODE: ${{ inputs.mode }}
+          REQUESTED_E2E: ${{ inputs.run-e2e }}
           # The plan job's EFFECTIVE shard count, falling back to the input
           # when the plan produced no output at all (it was skipped, or it
           # failed before writing one). The fallback keeps this aggregation
@@ -6054,6 +6141,44 @@ jobs:
               status=1
             fi
           }
+          case "${MODE:-ci}" in
+            ci|e2e) ;;
+            *)
+              echo "::error::mode must be 'ci' or 'e2e' (got '${MODE:-}')"
+              exit 1
+              ;;
+          esac
+          # MODE E2E (post-merge / nightly). Only Build -> E2E plan -> E2E ran:
+          # every other lane must be SKIPPED, and the E2E lanes are judged
+          # exactly as in the ordinary gate below. `CI_E2E_IN_CI` is ignored
+          # here. A caller that asks for this mode without `run-e2e` gets a red
+          # verdict, never a green run that tested nothing.
+          if [ "${MODE:-ci}" = e2e ]; then
+            if [ "${REQUESTED_E2E:-}" != true ]; then
+              echo "::error::mode e2e requires run-e2e: true; nothing was tested"
+              status=1
+            fi
+            if [ -n "${JOURNEY_SMOKE_URL:-}" ]; then
+              echo "::error::mode e2e cannot be combined with journey-smoke-url"
+              status=1
+            fi
+            for lane in checks:"$CHECKS_RESULT" extra-gate:"$EXTRA_GATE_RESULT" \
+                preview:"$PREVIEW_RESULT" deploy-dry-run:"$DEPLOY_DRY_RUN_RESULT"; do
+              require_skipped "${lane%%:*}" "${lane#*:}"
+            done
+            require_success build "$BUILD_RESULT"
+            require_success e2e-plan "$E2E_PLAN_RESULT"
+            if [ "$E2E_PLAN_SKIPPED" = "true" ]; then
+              require_skipped e2e "$E2E_RESULT"
+            else
+              require_success e2e "$E2E_RESULT"
+              if ! [ "$E2E_SHARDS" -ge 1 ] 2>/dev/null; then
+                echo "::error::effective e2e shard count is not a positive integer (got '$E2E_SHARDS')"
+                status=1
+              fi
+            fi
+            exit "$status"
+          fi
           # P3-C1: when `Reuse plan` proved this exact tree (or this call is a
           # journey smoke), every CI lane must be SKIPPED -- a lane that ran
           # anyway, or failed, still fails the gate. Unset (the default) falls
@@ -6131,7 +6256,7 @@ jobs:
           exit "$status"
       - name: Require fast-path and journey-smoke lanes
         env:
-          REUSE_APPLIES: ${{ inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          REUSE_APPLIES: ${{ inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
           REUSE_PLAN_RESULT: ${{ needs.reuse-plan.result }}
           FAST_RESULT: ${{ needs.fast.result }}
           FAST_ESCALABLE_RESULT: ${{ needs.fast-escalable.result }}
@@ -6140,9 +6265,9 @@ jobs:
           # applies and be skipped when it does not (a disabled Fast job takes
           # no runner, so `skipped` is its only correct result). `fast` and
           # `fast-escalable` split one condition into two disjoint domains.
-          FAST_APPLIES: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) }}
-          FAST_ESCALABLE_APPLIES: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') }}
-          FAST_ESCALATION_APPLIES: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true' }}
+          FAST_APPLIES: ${{ inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) }}
+          FAST_ESCALABLE_APPLIES: ${{ inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') }}
+          FAST_ESCALATION_APPLIES: ${{ inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true' }}
           JOURNEY_SMOKE_URL: ${{ inputs.journey-smoke-url }}
           JOURNEY_SMOKE_RESULT: ${{ needs.journey-smoke.result }}
         run: |
@@ -6205,7 +6330,7 @@ jobs:
       # `Required` before any proof-publishing step (those need `success()`).
       # `fast-escalated` runs the same anchored scripts when it holds `Fast`.
       - name: Check out the caller for Caller lint
-        if: "!cancelled()"
+        if: "!cancelled() && inputs.mode != 'e2e'"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -6221,7 +6346,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Verify exact validation candidate
-        if: "!cancelled() && inputs.expected-candidate-sha != ''"
+        if: "!cancelled() && inputs.mode != 'e2e' && inputs.expected-candidate-sha != ''"
         working-directory: ${{ github.workspace }}
         shell: bash
         env: &caller_lint_candidate_env
@@ -6244,20 +6369,20 @@ jobs:
       # This step imports PyYAML (the anchored scripts are defined in `build`,
       # which runs them when Required is folded into it).
       - name: Ensure PyYAML is available
-        if: "!cancelled()"
+        if: "!cancelled() && inputs.mode != 'e2e'"
         run: *caller_lint_pyyaml
 
       - name: Install actionlint
-        if: "!cancelled()"
+        if: "!cancelled() && inputs.mode != 'e2e'"
         env: *caller_lint_actionlint_env
         run: *caller_lint_install_actionlint
 
       - name: actionlint (caller's own workflows)
-        if: "!cancelled()"
+        if: "!cancelled() && inputs.mode != 'e2e'"
         run: *caller_lint_actionlint
 
       - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
-        if: "!cancelled()"
+        if: "!cancelled() && inputs.mode != 'e2e'"
         run: *caller_lint_audit
       # `required-reuse-pr-results` proof: minted only on a same-repository
       # pull request whose Required passed with every enabled lane RUN, and
@@ -6266,6 +6391,10 @@ jobs:
       # script `Reuse plan` runs on the push.
       - name: Compute Required proof key
         id: required-key
+        # RAW `run-e2e`, not the effective switch: a pull request that skipped
+        # E2E because `CI_E2E_IN_CI` was false must mint no proof, or the
+        # variable's later removal (rollback) or a repo override would let the
+        # push reuse it and turn main green without E2E ever having run.
         if: >-
           success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == ''
           && github.event_name == 'pull_request'
@@ -6331,15 +6460,15 @@ jobs:
   # A job waiting on its needs has no check run yet, so the `Fast` context stays pending, which blocks the
   # merge, until the full gate has finished.
   fast-escalated:
-    name: ${{ (inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true') && 'Fast' || 'Fast (escalation not needed)' }}
+    name: ${{ (inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true') && 'Fast' || 'Fast (escalation not needed)' }}
     needs: [reuse-plan, fast-escalable, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run]
     # Starts only when this run escalates (the same condition as FAST_ENABLED);
     # !cancelled() keeps a failed or skipped lane from skipping it, because it
     # is then the check named `Fast` and must report that failure. A cancelled
     # run reports it CANCELLED without a runner (see `fast`).
-    if: "!cancelled() && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true'"
+    if: "!cancelled() && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true'"
     env:
-      FAST_ENABLED: ${{ inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true' }}
+      FAST_ENABLED: ${{ inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true' }}
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     timeout-minutes: 20
