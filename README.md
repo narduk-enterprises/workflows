@@ -1147,7 +1147,7 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: "17 8 * * *"   # 08:17 UTC = 3:17 AM CT
+    - cron: '17 8 * * *' # 08:17 UTC = 3:17 AM CT
   workflow_dispatch:
 
 concurrency:
@@ -1173,6 +1173,8 @@ jobs:
       # e2e-shards, e2e-args, e2e-build-artifact-path, e2e-quarantine-args,
       # install-script, node-version, working-directory, ...)
 ```
+
+Format the stamped file with the app's own Prettier config: apps that run `format:check` over `.github/workflows` (cloudflarestat-us, single quotes) fail a double-quoted cron.
 
 The calling job id stays `ci` so the composed context reads `E2E / ci / Required`.
 `concurrency` sits in the caller, never in the callable (R6). Pass the same
