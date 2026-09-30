@@ -790,8 +790,8 @@ on:
         default: ""
       foundation-check:
         description: >-
-          Run `narduk-app-tools foundation:check` (company-hq
-          docs/WEB-FOUNDATION-CHECK.md, D-WEBFOUND-2 Q5/Q9, D-WEBFOUND-3) after
+          Run `narduk-app-tools foundation:check` (agent-infrastructure
+          docs/standards/WEB-FOUNDATION-CHECK.md, D-WEBFOUND-2 Q5/Q9, D-WEBFOUND-3) after
           install and fail the build job when it reports FAIL or UNKNOWN — the
           spec's decided no-warning-tier rule (§5: "the app's CI must treat
           [UNKNOWN] as a failure too"). OPT-IN and default false, on the same
@@ -2617,7 +2617,7 @@ jobs:
           echo "## Web foundation conformance check" >> "$GITHUB_STEP_SUMMARY"
           if [ ! -s foundation-check.json ]; then
             echo "- :x: **UNKNOWN** — foundation:check produced no output" >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::foundation:check produced no output — treating as UNKNOWN, which blocks (company-hq docs/WEB-FOUNDATION-CHECK.md §5)"
+            echo "::error::foundation:check produced no output — treating as UNKNOWN, which blocks (agent-infrastructure docs/standards/WEB-FOUNDATION-CHECK.md §5)"
             exit 1
           fi
           # The whole artefact goes to this step's log: no GitHub artifact is
@@ -2643,7 +2643,7 @@ jobs:
               ;;
             FAIL|UNKNOWN)
               echo "- :x: **$result** — the failing/undecided items are in \`foundation-check.json\`, printed in this step's log" >> "$GITHUB_STEP_SUMMARY"
-              echo "::error::web-foundation conformance check reported $result — blocking (D-WEBFOUND-2 Q9 (a), company-hq docs/WEB-FOUNDATION-CHECK.md §5)"
+              echo "::error::web-foundation conformance check reported $result — blocking (D-WEBFOUND-2 Q9 (a), agent-infrastructure docs/standards/WEB-FOUNDATION-CHECK.md §5)"
               exit 1
               ;;
             *)

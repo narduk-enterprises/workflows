@@ -32,7 +32,7 @@ name: Reusable Docs Governance Check
 # an EMPTY runner input (the default) resolves per run from the caller's own
 # visibility. `github.event.repository.private == true` selects the fleet
 # manifest's linux-ci organization-group route, group AND labels (fleet
-# Config/github-runner-fleet.json; company-hq CI-RUNNER-POLICY.md Sec 1 and
+# Config/github-runner-fleet.json; agent-infrastructure docs/standards/CI-RUNNER-POLICY.md Sec 1 and
 # Sec 4); anything else (public, or an event with no repository payload)
 # selects GitHub-hosted "ubuntu-latest" (Sec 3). An explicit caller value
 # always wins. Because visibility is read at run time, a caller that goes

@@ -4,7 +4,7 @@
 Row 18 Q3 (Logan, 2026-09-18, "Flip the default (Recommended)"): a caller that
 passes NO runner input used to land on GitHub-hosted `ubuntu-latest` whether it
 was private or public, which put every private caller that forgot the input on
-hosted capacity -- drift from company-hq CI-RUNNER-POLICY.md Sec 1. The default
+hosted capacity -- drift from agent-infrastructure docs/standards/CI-RUNNER-POLICY.md Sec 1. The default
 input is now EMPTY and each `runs-on:` resolves it per run:
 
   explicit input                       -> that input, exactly as before (on
