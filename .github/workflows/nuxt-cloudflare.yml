@@ -560,7 +560,7 @@ on:
 
           This input exists because browser capacity is tiered: three active
           8 GiB on-prem primary guests (343, 345 and 346), three 4 GiB
-          pve-hetzner fallback guests (340-342), and one configured dormant
+          fsn1-pve01 fallback guests (340-342), and one configured dormant
           guest (344). The old three-effective-slots/seven-declared queue
           measurement is historical; heavy jobs request memory-8g and the
           fleet manifest owns current capacity. workflows#83.
