@@ -8,7 +8,7 @@ conformance check") out of the workflow YAML and executes that exact text
 under bash, so an edit to the callable either still passes these tests or
 fails them.
 
-Company-hq `docs/WEB-FOUNDATION-CHECK.md` §5: no warning tier -- `PASS` (exit
+agent-infrastructure `docs/standards/WEB-FOUNDATION-CHECK.md` §5: no warning tier -- `PASS` (exit
 0) is the only green result; `FAIL` and `UNKNOWN` both block, and an artefact
 this step cannot produce or parse is itself treated as `UNKNOWN` rather than
 as a pass, because a check that cannot see cannot pass.

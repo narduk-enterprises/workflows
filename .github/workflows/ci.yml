@@ -214,7 +214,7 @@ jobs:
       # fixtures and stubbed pnpm/npx, proving both invocation paths (already
       # a dependency vs. pinned dlx), the throwaway-npmrc auth and cleanup,
       # `|| true` fail-open on the check command itself, and the decided
-      # no-warning-tier blocking rule (company-hq docs/WEB-FOUNDATION-CHECK.md
+      # no-warning-tier blocking rule (agent-infrastructure docs/standards/WEB-FOUNDATION-CHECK.md
       # §5, D-WEBFOUND-2 Q9 (a)) for every artefact shape including missing,
       # empty, malformed, and unrecognized-result JSON.
       - name: web-foundation conformance gate behaviour tests

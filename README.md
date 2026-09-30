@@ -254,7 +254,7 @@ inputs.runner || github.event.repository.private == true && '{"group":"linux-ci"
 
 | Caller | Before | After |
 |---|---|---|
-| private, passes nothing | GitHub-hosted `ubuntu-latest` (policy drift, company-hq `CI-RUNNER-POLICY.md` §1) | `linux-ci` organization group, group **and** labels (§4) |
+| private, passes nothing | GitHub-hosted `ubuntu-latest` (policy drift, agent-infrastructure `docs/standards/CI-RUNNER-POLICY.md` §1) | `linux-ci` organization group, group **and** labels (§4) |
 | public, or an event with no `repository` payload, passes nothing | `ubuntu-latest` | `ubuntu-latest` (§3) |
 | any caller, explicit value | that value | that value — unchanged, proven by `scripts/test_runner_default.py` |
 
@@ -293,7 +293,7 @@ this README alone when adding the next one.
 
 ### Blacksmith overflow (`BLACKSMITH_RUNNERS_ENABLED`)
 
-D-CI-CAP-1 (c) (2026-09-07, extends D-BLACKSMITH-2; company-hq `DECISIONS.md`,
+D-CI-CAP-1 (c) (2026-09-07, extends D-BLACKSMITH-2; Operator Portal decision log,
 fleet#337) makes Blacksmith a kill-switched overflow for the `linux-ci`
 class's ordinary private CI. Every `runs-on: ${{ fromJSON(inputs.runner) }}`
 site in `nuxt-cloudflare.yml`, `node-library.yml`, `docs-governance.yml`, and
@@ -338,7 +338,7 @@ so a private caller that passes nothing is Blacksmith-eligible (it is on the
 - **Never routes here**: production/deploy jobs (all app-owned and bespoke,
   outside these six CI-only callables), the Playwright/browser class
   (`reusable-browser-tests.yml`'s browser-runner job is untouched — its own
-  trust boundary per company-hq `CI-RUNNER-POLICY.md` §5), and Apple builds
+  trust boundary per agent-infrastructure `docs/standards/CI-RUNNER-POLICY.md` §5), and Apple builds
   (`apple.yml` is untouched — it has its own D-APPLE-CI-1 ladder).
 - **Per-repo ordinary route (`CI_LINUX_RUNNER`, CI reset 2026-09-28)**: in
   `nuxt-cloudflare.yml`, the ordinary private route of `Build`, `Checks`,
@@ -2222,7 +2222,7 @@ P3-C2 / O-D8 rather than kept as a dead compatibility surface.
   downgrade (warn on `pull_request`, block on push, schedule and dispatch) only
   *loosens* a gate on one event, so no adopter turns red because of it.
 - `nuxt-cloudflare.yml`'s `foundation-check` / `foundation-check-tool-version`
-  (company-hq docs/WEB-FOUNDATION-CHECK.md, D-WEBFOUND-2 Q5/Q9 (a),
+  (agent-infrastructure docs/standards/WEB-FOUNDATION-CHECK.md, D-WEBFOUND-2 Q5/Q9 (a),
   D-WEBFOUND-3) are within-major on the same rule — two optional inputs, no
   new job, three added steps inside the existing `build` job, `Required`'s
   `needs:` graph unchanged. **`foundation-check` defaults to `false`** for the
