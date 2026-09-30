@@ -943,6 +943,30 @@ on:
         required: false
         type: string
         default: ""
+      eslint-cache:
+        description: >-
+          Default true. The `Fast` lane runs ESLint with its result cache on
+          (`--cache --cache-strategy content`, the content strategy because a
+          fresh checkout has new mtimes every run), so unchanged files are not
+          linted again: a preload (`node --require`, set only for the `Run fast
+          scripts` step) appends the flags to any `eslint` CLI process the
+          caller's scripts start, however deep in `pnpm --filter`, `turbo` or a
+          wrapper script, and leaves every other command, and an `eslint` that
+          already sets a `--cache*` flag, alone. The cache lives beside the
+          checkout (`../.ci-cache/eslint/<lockfile hash>`): a persistent
+          self-hosted runner keeps it between runs, and on GitHub-hosted
+          runners it is restored everywhere and saved only on the default
+          branch. A new lockfile starts a cold cache. SCOPE: `Fast` only. The
+          full gate (`Build`, `Checks`, `Extra gate`, and the escalated
+          `Fast`) always lints cold, because ESLint's cache is keyed on a
+          file's own content and config and does not see a type change in
+          another file, so a type-aware rule such as
+          `@typescript-eslint/no-floating-promises` can pass a cached, unchanged
+          file that a changed file just broke; the cold full gate is what
+          catches that. Set false to run `Fast` lint cold too.
+        required: false
+        type: boolean
+        default: true
       required-reuse-pr-results:
         description: >-
           Tree-match reuse for the whole `Required` result, extending
@@ -3563,7 +3587,7 @@ jobs:
               // Fast-path inputs (P3-C1) and the quality-level inputs stay out of
               // the key at their defaults, so proof minted before they existed
               // still matches.
-              const fastPathDefaults = { 'fast-scripts': '', 'required-reuse-pr-results': false, 'e2e-pr-only-changed': false, 'journey-smoke-url': '', 'journey-smoke-args': '--grep=@smoke --retries=1', 'journey-smoke-rollback-script': '', 'journey-smoke-rollback-to': '', 'quality-level': 'legacy', 'quality-opt-out': '', 'performance-budget-args': '', 'security-headers-paths': '', 'security-headers-url': '', 'checks-in-build': false, 'concurrent-scripts': '' };
+              const fastPathDefaults = { 'fast-scripts': '', 'required-reuse-pr-results': false, 'e2e-pr-only-changed': false, 'journey-smoke-url': '', 'journey-smoke-args': '--grep=@smoke --retries=1', 'journey-smoke-rollback-script': '', 'journey-smoke-rollback-to': '', 'quality-level': 'legacy', 'quality-opt-out': '', 'performance-budget-args': '', 'security-headers-paths': '', 'security-headers-url': '', 'checks-in-build': false, 'concurrent-scripts': '', 'eslint-cache': true };
               for (const [name, value] of Object.entries(fastPathDefaults)) {
                 if (inputs[name] === value) delete inputs[name];
               }
@@ -5469,6 +5493,18 @@ jobs:
   # cancel, `!cancelled() && ...` and `always() && <false>` alike, reported
   # `cancelled`).
   #
+  # THE RAW NAME CANNOT BE PRETTIED, and neither `inputs`, `github` nor
+  # `vars` rescues it (probed 2026-09-29, workflows run 36654444065 and
+  # 36654519725, both on a skipped job inside a reusable workflow): a skipped
+  # job's name is its literal template whatever contexts the expression reads,
+  # `needs` or not, and a name that mixes text with an expression keeps its
+  # `${{ ... }}` markers. Only a static name renders cleanly, and a static
+  # `Fast` on a skipped job is a green `ci / Fast` (a skipped check passes the
+  # ruleset), which is exactly what this design exists to prevent. The ugly
+  # name on a skipped job is the price of the gate; removing it needs an
+  # always-running job named `Fast` (a runner seat per run) or a ruleset that
+  # requires a differently named context, both a decision outside this file.
+  #
   # The check NAME stays `Fast` when this run escalates too: the name moves
   # onto `fast-escalated`, and this job reports as `Fast lanes (escalated)`.
   # T1 readiness tells a full gate (allowed over 180s) from a slow plain Fast
@@ -5675,18 +5711,98 @@ jobs:
           fi
           "$PM" run "$INSTALL_SCRIPT"
 
+      # ESLint result cache for this lane (input `eslint-cache`). The cache path
+      # handed to actions/cache is ABSOLUTE: cache/save rejects any pattern with
+      # `..` ("Relative pathing '.' and '..' is not allowed", probed
+      # 2026-09-29, workflows run 36657358880), so the dependency cache's
+      # `../.ci-cache/...` form cannot be copied here. The shim is a
+      # tiny CommonJS file with the cache directory baked in, not an env var:
+      # turbo's strict env mode passes NODE_OPTIONS to its tasks (proved with
+      # turbo 2.10.4) and drops anything else. It only touches a process whose
+      # entry script is eslint's own `bin/eslint.js`, and any problem here
+      # leaves the lint uncached rather than failing it.
+      - name: Enable ESLint cache
+        id: eslint-cache-dir
+        if: env.FAST_ENABLED == 'true' && inputs.eslint-cache
+        env:
+          PM: ${{ inputs.package-manager }}
+        run: |
+          set -uo pipefail
+          lockfile=package-lock.json
+          if [ "$PM" = pnpm ]; then lockfile=pnpm-lock.yaml; fi
+          lock=none
+          if [ -f "$lockfile" ]; then
+            lock=$(node -e 'process.stdout.write(require("node:crypto").createHash("sha256").update(require("node:fs").readFileSync(process.argv[1])).digest("hex").slice(0, 16))' "$lockfile") || lock=none
+          fi
+          # Beside the checkout, not in it: an app's own `prettier "**/*"` or
+          # lint glob scans anything under the workspace.
+          dir=$(node -p 'require("node:path").resolve(process.argv[1], "..", ".ci-cache", "eslint", process.argv[2])' "$GITHUB_WORKSPACE" "$lock") || exit 0
+          if ! mkdir -p "$dir" 2>/dev/null || [ ! -w "$dir" ]; then
+            echo "::notice::ESLint cache directory $dir is not writable; linting uncached"
+            exit 0
+          fi
+          shim="$RUNNER_TEMP/narduk-eslint-cache.cjs"
+          {
+            printf 'const dir = %s;\n' "$(node -p 'JSON.stringify(process.argv[1])' "$dir")"
+            cat <<'JS'
+          // Preloaded through NODE_OPTIONS by the Fast lane (nuxt-cloudflare.yml).
+          // Turns ESLint's content-strategy cache on for the `eslint` CLI and
+          // nothing else. Never fails the lint: any problem leaves the command
+          // line as it was.
+          'use strict';
+          try {
+            const argv = process.argv;
+            if (/[\\/]eslint[\\/]bin[\\/]eslint\.js$/.test(argv[1] || '')) {
+              const args = argv.slice(2);
+              const leaveAlone = /^(--cache(-location|-strategy)?|--no-cache|--print-config|--inspect-config|--init|--stdin|--env-info|--mcp|--version|--help|-v|-h)($|=)/;
+              if (!args.some((a) => leaveAlone.test(a))) {
+                require('node:fs').mkdirSync(dir, { recursive: true });
+                argv.push('--cache', '--cache-location', dir + require('node:path').sep, '--cache-strategy', 'content');
+              }
+            }
+          } catch {
+            // leave the command line as it was
+          }
+          JS
+          } > "$shim"
+          {
+            echo "shim=$shim"
+            echo "path=$dir"
+            echo "lock=$lock"
+          } >> "$GITHUB_OUTPUT"
+          echo "ESLint cache: $dir"
+
+      # GitHub-hosted runners are ephemeral, so the cache travels through
+      # actions/cache: restored on every ref, saved only on the default branch
+      # (the dependency-cache rule). A persistent self-hosted runner keeps the
+      # directory itself, and tarballing it is skipped there for the reason in
+      # the SELF-HOSTED RUNNERS DO NOT CACHE DEPENDENCIES block at `build`.
+      - name: Restore ESLint cache
+        id: eslint-cache
+        if: env.FAST_ENABLED == 'true' && (runner.environment == 'github-hosted') && steps.eslint-cache-dir.outputs.path != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.eslint-cache-dir.outputs.path }}
+          key: eslint-cache-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ steps.eslint-cache-dir.outputs.lock }}-${{ github.sha }}
+          restore-keys: |
+            eslint-cache-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ steps.eslint-cache-dir.outputs.lock }}-
+
       - name: Run fast scripts
         if: env.FAST_ENABLED == 'true'
         env:
           SCRIPTS: ${{ inputs.fast-scripts }}
           PM: ${{ inputs.package-manager }}
           FAST_BASE_REF: ${{ github.event_name == 'pull_request' && 'HEAD^1' || '' }}
+          ESLINT_CACHE_SHIM: ${{ steps.eslint-cache-dir.outputs.shim }}
         run: |
           set -euo pipefail
           # Every named script must exist: `fast-scripts` is the caller
           # asserting these lanes are the gate, so a missing one is a failure,
           # never a green no-op.
           export FAST_BASE_REF
+          if [ -n "${ESLINT_CACHE_SHIM:-}" ] && [ -f "$ESLINT_CACHE_SHIM" ]; then
+            export NODE_OPTIONS="${NODE_OPTIONS:+$NODE_OPTIONS }--require=$ESLINT_CACHE_SHIM"
+          fi
           total_start=$(date +%s)
           summary=""
           for SCRIPT in $SCRIPTS; do
@@ -5707,6 +5823,16 @@ jobs:
               printf '\nscripts total: %ss (target: the whole job at 3 min or less, p90)\n' "$(( $(date +%s) - total_start ))"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Save ESLint cache
+        if: >-
+          env.FAST_ENABLED == 'true'
+          && (runner.environment == 'github-hosted')
+          && steps.eslint-cache-dir.outputs.path != ''
+          && github.ref_name == github.event.repository.default_branch
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.eslint-cache-dir.outputs.path }}
+          key: eslint-cache-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ steps.eslint-cache-dir.outputs.lock }}-${{ github.sha }}
       # After the scripts, for people reading the run: the machine-readable
       # flag is the `Fast lanes (escalated)` check name, which needs no API
       # call. This step only writes the step summary and never fails the job,

@@ -1743,7 +1743,38 @@ raw name expression (for example
 never `Fast`, and cannot satisfy a required `ci / Fast` check. A readiness
 check should match `ci / Fast lanes (escalated)` exactly, not as a substring:
 a skipped `fast` job's raw expression contains that text. `Required` demands
-each Fast job succeed when it applies and be skipped when it does not.
+each Fast job succeed when it applies and be skipped when it does not. The
+raw name cannot be made readable: a skipped job's name is its literal template
+whatever contexts it reads (`inputs`, `github` and `vars` included, probed
+2026-09-29), and a static `Fast` would be a passing `ci / Fast`.
+
+#### ESLint cache in the Fast lane (`eslint-cache`, default true)
+
+The `Fast` lane (`fast` and `fast-escalable`) runs any `eslint` CLI process its
+`fast-scripts` start with `--cache --cache-strategy content`, so unchanged files
+are not linted again. No caller change is needed: a preload
+(`NODE_OPTIONS=--require`, set for the `Run fast scripts` step only) appends the
+flags to the process whose entry script is eslint's own `bin/eslint.js`, however
+it was reached (`pnpm --filter web run lint`, `turbo run lint`, a wrapper
+script), and leaves everything else alone: other programs, `eslint
+--print-config`, `--version`, and an eslint that already passes `--cache*`
+flags. (Appending `-- --cache` to the script does not work: the scripts are
+wrappers, and `turbo run lint --cache` would be turbo's own flag.) `narduk-lint`
+(narduk-libs' lint-budget wrapper) is not covered: it takes no
+`--cache-strategy`.
+
+The cache is `../.ci-cache/eslint/<lockfile hash>` beside the checkout. A
+persistent self-hosted runner keeps it between runs. GitHub-hosted runners
+restore it everywhere and save it only on the default branch (the dependency
+cache rule). A changed lockfile starts cold.
+
+Only `Fast` gets it. `Build`, `Checks`, `Extra gate` and the escalated `Fast`
+lint cold: ESLint's cache is keyed on a file's own content and config, so a type
+change in another file does not re-lint a cached file, and a type-aware rule
+(`@typescript-eslint/no-floating-promises`) can pass an unchanged file that a
+changed file just broke. The cold full gate is the net for that. Set
+`eslint-cache: false` to run `Fast` lint cold too. `scripts/test_eslint_cache.py`
+executes the shipped step and preload.
 
 #### A non-blocking quarantine lane (`e2e-quarantine-args`)
 

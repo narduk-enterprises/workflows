@@ -203,6 +203,12 @@ jobs:
       - name: cache-path stability tests
         run: python3 scripts/test_cache_paths.py
 
+      # The Fast lane's ESLint cache: the shipped step and preload are extracted and
+      # executed against a stub eslint bin, and the wiring (Fast only, hosted-guarded
+      # save on the default branch) is asserted.
+      - name: ESLint cache behaviour tests
+        run: python3 scripts/test_eslint_cache.py
+
       # Extracts the opt-in web-foundation gate's two `run:` blocks out of
       # nuxt-cloudflare.yml and executes them against real package.json
       # fixtures and stubbed pnpm/npx, proving both invocation paths (already
