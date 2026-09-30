@@ -2,7 +2,7 @@
 """Pull-request E2E subset: `e2e-pr-shards` / `e2e-pr-args` (workflows#83).
 
 The current browser class is tiered: three active 8 GiB on-prem primary guests
-(343, 345 and 346), three 4 GiB pve-hetzner fallback guests (340-342), and a
+(343, 345 and 346), three 4 GiB fsn1-pve01 fallback guests (340-342), and a
 configured dormant guest (344). The old three-effective-slots/seven-declared
 queue measurement is historical; this callable must not derive capacity from
 it. Fewer pull-request lanes still bound caller fan-out, but fleet owns the

@@ -1621,7 +1621,7 @@ branch.
 ```
 
 Why this exists: the browser class now has three active 8 GiB on-prem primary
-guests (343, 345 and 346), three 4 GiB `pve-hetzner` fallback guests (340–342),
+guests (343, 345 and 346), three 4 GiB `fsn1-pve01` fallback guests (340–342),
 and CT 344 is a configured dormant guest rather than an active slot. The old
 three-effective-slots/seven-declared queue measurements are historical; heavy
 jobs request `memory-8g`, while not every browser guest is 8 GiB. Capacity and
