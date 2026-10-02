@@ -1776,6 +1776,31 @@ changed file just broke. The cold full gate is the net for that. Set
 `eslint-cache: false` to run `Fast` lint cold too. `scripts/test_eslint_cache.py`
 executes the shipped step and preload.
 
+#### Only `Fast` on a pull request (`pr-fast-only`, default false)
+
+For a caller whose one required check is `ci / Fast` (workflows#180). On a
+pull request that does not escalate, the run takes no seat for anything but
+the check named `Fast`: `Build`, `Checks`, `Extra gate`, `E2E plan`, `E2E`,
+`Preview`, `Deploy dry run` and `Required` are skipped for that head.
+
+| Pull request | Jobs that run |
+| --- | --- |
+| No `e2e-full-paths` | `Fast` (decided from inputs; no plan job) |
+| `e2e-full-paths`, no match | `Fast plan`, `E2E plan` (both lightweight), `Fast` (`fast-escalable`) |
+| `e2e-full-paths` matched, or the diff is unknown | the full gate, exactly as without the input, plus `Fast plan` |
+| Exact candidate (`expected-candidate-sha`) | the full gate |
+
+`Fast plan` runs `E2E plan`'s changed-file decision script (a YAML alias), so
+`Build` does not have to wait for `E2E plan`; it runs only when this input is
+on and `e2e-full-paths` is set. The lanes are skipped only when it succeeded
+and reported `full=false`; a failed plan or an unknown diff runs the full gate.
+Pushes, schedules, `workflow_dispatch` and merge queues are unchanged, and so
+is every caller that leaves the input off. A skipped `Required` shows its raw
+name expression, never a passing `ci / Required`. A pull-request run then mints
+no `Required` proof, so `required-reuse-pr-results` runs the full gate on the
+push. `scripts/test_fast_path.py` (`test_pr_fast_only`) simulates each case on
+the shipped job graph.
+
 #### A non-blocking quarantine lane (`e2e-quarantine-args`)
 
 A flaky test is taken out of the gate by tagging it (for example

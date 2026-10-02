@@ -93,7 +93,9 @@ Each rule below exists because breaking it has a specific, known blast radius:
   a single condition X says Build is the only lane, Build is named
   `${{ (X) && 'Required' || '<other>' }}` and the aggregator is named
   `${{ (X) && '<other>' || 'Required' }}` with `if:` exactly
-  `!cancelled() && !(X)`. A skipped job's check is its raw name expression,
+  `!cancelled() && !(X)` (or, with `pr-fast-only`, `!cancelled() && !(X) &&
+  !(Y)` where Y is that opt-in, pull-request-only skip and Build's `if:` ends
+  with the same `&& !(Y)`). A skipped job's check is its raw name expression,
   never `Required`, so exactly one job reports the check either way. R5
   demands the pair share the SAME X, that X contains `inputs.checks-in-build`,
   that the aggregator still `needs:` every job, that Build starts under
@@ -262,6 +264,7 @@ def non_gating_jobs(path: Path, doc: dict, f: Findings) -> frozenset[str]:
 
 FOLD_NAME = re.compile(r"^\$\{\{ \((?P<cond>.+)\) && '(?P<on>[^']*)' \|\| '(?P<off>[^']*)' \}\}$")
 FOLD_MARKER = "inputs.checks-in-build"
+PR_FAST_ONLY_MARKER = "inputs.pr-fast-only"
 
 
 def folded_gate(jobs: dict) -> tuple[dict[str, str], dict[str, str], list[str]]:
@@ -327,7 +330,23 @@ def check_folded_gate(path: Path, doc: dict, f: Findings) -> None:
         f.add(path, "R5 folded gate alongside a literal `Required` job — two jobs could report the check")
     want_if = f"!cancelled() && !({agg_cond})"
     got_if = str(jobs[agg_id].get("if", "")).strip()
-    if got_if != want_if:
+    # PR FAST ONLY (workflows#180) is the one sanctioned extra skip:
+    # `!cancelled() && !(X) && !(Y)` where Y is opt-in (`inputs.pr-fast-only`)
+    # and pull-request only, and `Build` skips under the very same Y, so the
+    # aggregator never skips beside a Build that ran. A skipped aggregator
+    # shows its raw name expression, never a passing `ci / Required`.
+    skip = got_if[len(want_if):] if got_if.startswith(want_if + " && !(") and got_if.endswith(")") else ""
+    skip_cond = skip[len(" && !("):-1] if skip else ""
+    if skip_cond:
+        build_if = str(jobs[build_id].get("if", "")).strip()
+        if (PR_FAST_ONLY_MARKER not in skip_cond or "github.event_name == 'pull_request'" not in skip_cond
+                or not build_if.endswith(f" && !({skip_cond})")):
+            f.add(
+                path,
+                f"R5 folded aggregator '{agg_id}' skip {skip_cond!r} must be opt-in (`{PR_FAST_ONLY_MARKER}`), "
+                "pull-request only, and the exact skip on Build's `if:`",
+            )
+    elif got_if != want_if:
         f.add(
             path,
             f"R5 folded aggregator '{agg_id}' must have `if:` exactly {want_if!r}, got {got_if!r}",

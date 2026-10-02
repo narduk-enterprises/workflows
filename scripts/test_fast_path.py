@@ -50,6 +50,7 @@ NEW_INPUTS = {
     "journey-smoke-rollback-to": "",
     "checks-in-build": False,
     "concurrent-scripts": "",
+    "pr-fast-only": False,
 }
 GATE_STEP = "Require enabled gates to succeed and disabled gates to skip"
 FAST_STEP = "Require fast-path and journey-smoke lanes"
@@ -280,7 +281,7 @@ OLD_GRAPH = {
     "required": {"needs": ["build", "checks", "extra-gate", "e2e-plan", "e2e", "preview",
                            "deploy-dry-run"], "if": "always()"},
 }
-NEW_JOBS = {"reuse-plan", "fast", "fast-escalable", "fast-escalated", "journey-smoke"}
+NEW_JOBS = {"reuse-plan", "fast-plan", "fast", "fast-escalable", "fast-escalated", "journey-smoke"}
 CI_LANES = ["build", "checks", "extra-gate", "e2e-plan", "e2e", "e2e-quarantine",
             "preview", "deploy-dry-run"]
 
@@ -1190,6 +1191,121 @@ def test_journey_smoke_validation() -> None:
     print("PASS  journey smoke configuration is validated before anything installs")
 
 
+# The lanes `pr-fast-only` skips on a pull request that does not escalate;
+# every one of them takes a runner seat when it runs.
+PR_FAST_ONLY_SKIPPED = ["build", "checks", "extra-gate", "e2e-plan", "e2e", "e2e-quarantine",
+                        "preview", "deploy-dry-run", "required"]
+PR_FAST_ONLY_FULL = {"run-e2e": True, "wrangler-dry-run": True, "extra-gate-scripts": "lint",
+                     "e2e-quarantine-args": "--grep=@quarantine", "e2e-shards": 2, "preview-checks": "og",
+                     "fast-scripts": "lint"}
+
+
+def ran(state: dict) -> set:
+    return {j for j in JOBS if state[j]["result"] != "skipped"}
+
+
+def pr_fast_only_outputs(plan_full: str, fast_plan_full: str | None) -> dict:
+    outs = plan_outputs("false", "2", plan_full)
+    if fast_plan_full is not None:
+        outs["fast-plan"] = {"full": fast_plan_full}
+    return outs
+
+
+def test_pr_fast_only() -> None:
+    """workflows#180: the three cases (on and not escalated, on and escalated,
+    off), fail-closed decisions, and every non-PR event unchanged."""
+    spec = INPUTS["pr-fast-only"]
+    assert spec["type"] == "boolean" and spec["default"] is False and spec["required"] is False
+    assert render(JOBS["fast-plan"]["name"], {}) == "Fast plan"
+    assert JOBS["fast-plan"]["steps"][0]["run"] == step("e2e-plan", "Decide whether E2E can be skipped")["run"], (
+        "Fast plan must run E2E plan's decision script, not a copy")
+    assert JOBS["fast-plan"]["permissions"] == {"contents": "read"}
+    assert JOBS["fast-plan"]["runs-on"] == JOBS["e2e-plan"]["runs-on"], "Fast plan takes the lightweight seat"
+    pr = ("pull_request", "refs/pull/1/merge")
+    on = {**PR_FAST_ONLY_FULL, "pr-fast-only": True}
+
+    # 1. ON, NOT ESCALATED, no e2e-full-paths: only `fast` runs, named Fast.
+    for extra in ({}, {"checks-in-build": True}, {"run-e2e": False}):
+        for event, ref in (pr, ("pull_request_target", "refs/heads/main")):
+            state = simulate(JOBS, {**on, **extra}, event, ref, plan_outputs("false", "2"))
+            assert ran(state) == {"fast"}, (extra, event, ran(state))
+            assert render(JOBS["fast"]["name"], state["fast"]["ctx"]) == "Fast"
+            for name, code, out in run_gates("fast", state):
+                assert code == 0, (name, out)
+    # 1b. ON, NOT ESCALATED, with e2e-full-paths: Fast plan (lightweight) and
+    # E2E plan (lightweight, read by Fast) decide; the only heavy job is Fast.
+    escalable = {**on, "e2e-full-paths": "src/auth/**"}
+    state = simulate(JOBS, escalable, *pr, pr_fast_only_outputs("false", "false"))
+    assert ran(state) == {"fast-plan", "e2e-plan", "fast-escalable"}, ran(state)
+    assert render(JOBS["fast-escalable"]["name"], state["fast-escalable"]["ctx"]) == "Fast"
+    for job in ("build", "checks", "extra-gate", "e2e", "preview", "deploy-dry-run", "required"):
+        assert state[job]["result"] == "skipped", job
+
+    # 2. ON, ESCALATED: exactly today's full gate (input off), plus the plan.
+    off_escalable = {**escalable, "pr-fast-only": False}
+    for plan_full in ("true", "false"):
+        new = simulate(JOBS, escalable, *pr, pr_fast_only_outputs(plan_full, "true"))
+        old = simulate(JOBS, off_escalable, *pr, pr_fast_only_outputs(plan_full, "true"))
+        assert new["fast-plan"]["result"] == "success" and old["fast-plan"]["result"] == "skipped"
+        for job in set(JOBS) - {"fast-plan"}:
+            assert new[job]["result"] == old[job]["result"], (job, plan_full)
+    state = simulate(JOBS, escalable, *pr, pr_fast_only_outputs("true", "true"))
+    assert render(JOBS["fast-escalated"]["name"], state["fast-escalated"]["ctx"]) == "Fast"
+    assert all(state[j]["result"] == "success" for j in ("build", "e2e", "preview", "deploy-dry-run", "required"))
+    for job in ("fast-escalated", "required"):
+        for name, code, out in run_gates(job, state):
+            assert code == 0, (job, name, out)
+    # An exact candidate always runs the full gate, with or without paths.
+    for inputs in ({**on, "expected-candidate-sha": "a" * 40}, {**escalable, "expected-candidate-sha": "a" * 40}):
+        state = simulate(JOBS, inputs, *pr, pr_fast_only_outputs("true", None))
+        assert state["build"]["result"] == state["required"]["result"] == "success", inputs
+        assert state["fast-plan"]["result"] == "skipped"
+
+    # FAIL CLOSED: an undecided plan (failed, unknown output, anything but
+    # `false`) runs the full gate.
+    for results, fp_full in (({"fast-plan": "failure"}, None), ({}, ""), ({}, "maybe")):
+        state = simulate(JOBS, escalable, *pr, pr_fast_only_outputs("false", fp_full), results)
+        for job in ("build", "extra-gate", "e2e-plan", "e2e", "preview", "deploy-dry-run", "required"):
+            assert state[job]["result"] == "success", (job, results, fp_full)
+    # A cancelled run starts nothing, the plan included.
+    state = simulate(JOBS, escalable, *pr, pr_fast_only_outputs("false", "false"), cancelled=True)
+    assert {state[j]["result"] for j in JOBS} == {"cancelled"}
+    # Disagreement fails closed: Fast plan said no, E2E plan said yes, so the
+    # check named Fast is the escalated job over a skipped Build, and it is red.
+    state = simulate(JOBS, escalable, *pr, pr_fast_only_outputs("true", "false"))
+    assert state["build"]["result"] == "skipped" and state["fast-escalated"]["result"] == "success"
+    assert render(JOBS["fast-escalated"]["name"], state["fast-escalated"]["ctx"]) == "Fast"
+    assert any(code == 1 for _, code, _ in run_gates("fast-escalated", state))
+    # Without fast-scripts there is no Fast to stand alone: nothing changes.
+    for inputs in ({**on, "fast-scripts": ""}, {**escalable, "fast-scripts": ""}):
+        new = simulate(JOBS, inputs, *pr, pr_fast_only_outputs("false", "false"))
+        old = simulate(JOBS, {**inputs, "pr-fast-only": False}, *pr, pr_fast_only_outputs("false", "false"))
+        assert {j: new[j]["result"] for j in JOBS} == {j: old[j]["result"] for j in JOBS}, inputs
+
+    # 3. Every other event is unchanged, with and without e2e-full-paths, and
+    # the input OFF changes nothing anywhere (the default graph test above
+    # proves the same against origin/main's graph for every lane input).
+    events = EVENTS + [("merge_group", "refs/heads/gh-readonly-queue/main/pr-1")]
+    runs = 0
+    for (event, ref), paths, plan_full, reuse in itertools.product(
+            events, ["", "src/auth/**"], ["false", "true"], [False, True]):
+        inputs = {**PR_FAST_ONLY_FULL, "e2e-full-paths": paths, "required-reuse-pr-results": reuse}
+        outs = pr_fast_only_outputs(plan_full, "false")
+        old = simulate(JOBS, inputs, event, ref, outs)
+        assert old["fast-plan"]["result"] == "skipped"
+        if event in PR_EVENTS:
+            continue
+        new = simulate(JOBS, {**inputs, "pr-fast-only": True}, event, ref, outs)
+        for job in JOBS:
+            assert new[job]["result"] == old[job]["result"], (job, event, paths, plan_full)
+            for key in ("name",):
+                if key in JOBS[job]:
+                    assert render(JOBS[job][key], new[job]["ctx"]) == render(JOBS[job][key], old[job]["ctx"]), job
+        runs += 1
+    print(f"PASS  pr-fast-only: a non-escalating PR runs only Fast; escalation, undecided plans and "
+          f"{runs} non-PR runs keep the full gate")
+
+
 def main() -> None:
     test_new_inputs_default_off()
     test_cancelled_run_starts_no_gate_job()
@@ -1216,6 +1332,7 @@ def main() -> None:
     test_journey_smoke_verdicts()
     test_journey_smoke_rollback_hook()
     test_journey_smoke_validation()
+    test_pr_fast_only()
     print("fast-path contract passed")
 
 

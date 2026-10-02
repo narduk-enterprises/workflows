@@ -92,7 +92,7 @@ name: Reusable Nuxt + Cloudflare CI
 # `if:` is false whenever it holds.
 #
 # THE FAST PATH (narduk reboot P3-C1; DECISIONS Round 3 Q1 "Local proof, CI
-# after"). Four opt-in inputs, all default off, let CI become the asynchronous
+# after"). Five opt-in inputs, all default off, let CI become the asynchronous
 # safety net instead of the thing a merge waits on:
 #   fast-scripts                 -> `ci / Fast`, the one required check for a
 #                                   T1 repo (affected lint/type/unit, no e2e),
@@ -100,6 +100,11 @@ name: Reusable Nuxt + Cloudflare CI
 #                                   paths (`e2e-full-paths`)
 #   required-reuse-pr-results    -> a default-branch push whose tree already
 #                                   passed the full PR gate skips every lane
+#   pr-fast-only                 -> a pull request that does not escalate
+#                                   runs only `Fast` (no Build, Checks, Extra
+#                                   gate, E2E, Preview, Deploy dry run or
+#                                   Required); an escalating one runs the
+#                                   full gate exactly as without it
 #   e2e-pr-only-changed          -> PR-tier Playwright `--only-changed`
 #   journey-smoke-url (+ rollback-script/-to) -> post-deploy `@smoke` journeys
 #                                   (90 s, one retry) with a rollback hook,
@@ -967,6 +972,35 @@ on:
         required: false
         type: boolean
         default: true
+      pr-fast-only:
+        description: >-
+          Default false. For a caller whose one required check is `ci / Fast`
+          (workflows#180): on a `pull_request` / `pull_request_target` event
+          that does not escalate, the run takes no seat for anything but the
+          check named `Fast`. `Build`, `Checks`, `Extra gate`, `E2E plan`,
+          `E2E`, `Preview`, `Deploy dry run` and `Required` are skipped for
+          that head, so `ci / Required` does not report on it (a skipped
+          `Required` shows its raw name expression, never a passing
+          `ci / Required`). Needs `fast-scripts`; without it nothing changes.
+          ESCALATION IS UNTOUCHED. With `e2e-full-paths` empty nothing can
+          escalate and the skip is decided from inputs alone, with no plan job.
+          With `e2e-full-paths` set, a lightweight `Fast plan` job runs the
+          same changed-file decision as `E2E plan` (the identical script) and
+          the full gate is skipped only when it succeeded and reported
+          `full=false`; a match, an unknown diff (no `gh`, a failed compare,
+          the 300-file cap) or a failed or cancelled plan runs the full gate,
+          and the job named `Fast` waits for it exactly as without this input.
+          `E2E plan` still runs there, because `Fast` reads it to choose which
+          job carries the name. An exact candidate (`expected-candidate-sha`)
+          always runs the full gate. Every other event (push, schedule,
+          workflow_dispatch, merge queue) is unchanged. Trade-off: the full
+          `Build`/`extra-scripts` net no longer runs on such a pull request;
+          the caller runs it after merge (a push or schedule run). A pull
+          request run mints no `Required` proof, so `required-reuse-pr-results`
+          then runs the full gate on the push.
+        required: false
+        type: boolean
+        default: false
       required-reuse-pr-results:
         description: >-
           Tree-match reuse for the whole `Required` result, extending
@@ -1700,8 +1734,8 @@ jobs:
     # P3-C1: skipped only when `Reuse plan` proved this exact tree, or in
     # journey-smoke mode. `!cancelled()` keeps it running when `Reuse plan`
     # was skipped (the default) or could not decide.
-    needs: [reuse-plan]
-    if: "!cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
+    needs: [reuse-plan, fast-plan]
+    if: "!cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')))"
     outputs:
       e2e-build-path: ${{ steps.e2e-build-path.outputs.path }}
       # JSON naming the CI artifact store object with its SHA-256, size and
@@ -3234,8 +3268,8 @@ jobs:
     name: Checks
     # P3-C1: same reuse/smoke gating as `Build`. `checks-in-build` runs these
     # steps in `Build` instead, and this job is skipped.
-    needs: [reuse-plan]
-    if: "!cancelled() && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !inputs.checks-in-build"
+    needs: [reuse-plan, fast-plan]
+    if: "!cancelled() && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !inputs.checks-in-build && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')))"
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
@@ -3389,8 +3423,8 @@ jobs:
   extra-gate:
     name: Extra gate
     # P3-C1: same reuse/smoke gating as `Build`.
-    needs: [reuse-plan]
-    if: "!cancelled() && inputs.mode != 'e2e' && inputs.extra-gate-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
+    needs: [reuse-plan, fast-plan]
+    if: "!cancelled() && inputs.mode != 'e2e' && inputs.extra-gate-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')))"
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
@@ -3528,7 +3562,7 @@ jobs:
     name: E2E plan
     # P3-C1: same reuse/smoke gating as `Build`.
     needs: [reuse-plan]
-    if: "!cancelled() && (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
+    if: "!cancelled() && (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && inputs.e2e-full-paths == '')"
     # CI lightweight route (company-hq CI policy); caller override takes precedence.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
@@ -3587,7 +3621,7 @@ jobs:
               // Fast-path inputs (P3-C1) and the quality-level inputs stay out of
               // the key at their defaults, so proof minted before they existed
               // still matches.
-              const fastPathDefaults = { 'fast-scripts': '', 'required-reuse-pr-results': false, 'e2e-pr-only-changed': false, 'journey-smoke-url': '', 'journey-smoke-args': '--grep=@smoke --retries=1', 'journey-smoke-rollback-script': '', 'journey-smoke-rollback-to': '', 'quality-level': 'legacy', 'quality-opt-out': '', 'performance-budget-args': '', 'security-headers-paths': '', 'security-headers-url': '', 'checks-in-build': false, 'concurrent-scripts': '', 'eslint-cache': true };
+              const fastPathDefaults = { 'fast-scripts': '', 'pr-fast-only': false, 'required-reuse-pr-results': false, 'e2e-pr-only-changed': false, 'journey-smoke-url': '', 'journey-smoke-args': '--grep=@smoke --retries=1', 'journey-smoke-rollback-script': '', 'journey-smoke-rollback-to': '', 'quality-level': 'legacy', 'quality-opt-out': '', 'performance-budget-args': '', 'security-headers-paths': '', 'security-headers-url': '', 'checks-in-build': false, 'concurrent-scripts': '', 'eslint-cache': true };
               for (const [name, value] of Object.entries(fastPathDefaults)) {
                 if (inputs[name] === value) delete inputs[name];
               }
@@ -3629,7 +3663,8 @@ jobs:
           SKIP_PATTERNS: ${{ inputs.e2e-skip-paths }}
           FULL_PATTERNS: ${{ inputs.e2e-full-paths }}
           MODE: ${{ inputs.mode }}
-        run: |
+        # Anchored: `Fast plan` runs this exact script (`pr-fast-only`).
+        run: &e2e_path_decision |
           set -euo pipefail
           # `set -f`: the pattern lists below are split with unquoted `$SKIP_PATTERNS`
           # / `$FULL_PATTERNS`, and without this the shell pathname-expands each
@@ -3933,6 +3968,46 @@ jobs:
               "$EVENT_NAME" "$effective_total" "${effective_args:-(none)}" \
               >> "$GITHUB_STEP_SUMMARY"
           fi
+
+  # PR FAST ONLY (`pr-fast-only`, workflows#180). The escalation decision for a
+  # caller that set `e2e-full-paths`, made BEFORE `Build` so a pull request
+  # that does not escalate starts no `linux-ci` seat but the one reporting
+  # `Fast`. `Build` cannot wait for `E2E plan` instead: that edge would delay
+  # `Build` for every caller. This job runs only when the input is on, so for
+  # every other caller it is skipped with no runner and the lanes that list it
+  # in `needs:` (all under `!cancelled()`) start exactly as before. It runs
+  # `E2E plan`'s decision script (anchored, not copied), so the two agree;
+  # if they ever did not, a `Fast plan` that said `false` beside an `E2E plan`
+  # that said `true` puts the name `Fast` on `fast-escalated` over a skipped
+  # `Build`, and that check goes red: disagreement fails closed. A failed, cancelled or
+  # unreadable plan leaves the full gate running (the lanes skip only on
+  # `success` and `full == 'false'`). `Required` needs it (R5) but does not
+  # judge it: on any run where `Required` runs, the full gate ran.
+  fast-plan:
+    name: Fast plan
+    if: "!cancelled() && inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && inputs.e2e-full-paths != ''"
+    # CI lightweight route, the same as `E2E plan`.
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
+    timeout-minutes: 20
+    # The compare endpoint is a Contents read (see `E2E plan`).
+    permissions:
+      contents: read
+    outputs:
+      full: ${{ steps.decide.outputs.full }}
+    steps:
+      - name: Decide whether this pull request escalates
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.after }}
+          EXPECTED_CANDIDATE: ${{ inputs.expected-candidate-sha }}
+          SKIP_PATTERNS: ${{ inputs.e2e-skip-paths }}
+          FULL_PATTERNS: ${{ inputs.e2e-full-paths }}
+          MODE: ${{ inputs.mode }}
+        run: *e2e_path_decision
 
   e2e:
     # Just `E2E` — GitHub appends the matrix value itself (`E2E (1)`,
@@ -6208,8 +6283,8 @@ jobs:
     # need, and a cancelled run reports it CANCELLED -- a non-passing check --
     # without queueing for a runner that would hold the caller's concurrency
     # group (operator-portal run 36494070028 waited ~14 min for one).
-    if: "!cancelled() && !(inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
-    needs: [reuse-plan, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run, fast, fast-escalable, fast-escalated, journey-smoke]
+    if: "!cancelled() && !(inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results) && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')))"
+    needs: [reuse-plan, fast-plan, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run, fast, fast-escalable, fast-escalated, journey-smoke]
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     timeout-minutes: 20
