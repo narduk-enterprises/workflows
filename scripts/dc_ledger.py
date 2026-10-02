@@ -138,8 +138,11 @@ def _sha(text):
 
 
 def screens(board_html):
-    """The screen ids of an app board, in order."""
-    return list(dict.fromkeys(re.findall(r'<sc-if value="\{\{is\.(\w+)\}\}"', board_html)))
+    """The screen ids of an app board, in order. A screen is a box behind `is.<id>`, or, on a
+    board with a later round (`dc_app.py round`), behind `r2.<id>`; round-2-only screens
+    follow the round-1 ones."""
+    found = re.findall(r'<sc-if value="\{\{(?:is|r2)\.(\w+)\}\}"', board_html)
+    return list(dict.fromkeys(found))
 
 
 def design_hash(project, entry):
@@ -150,10 +153,18 @@ def design_hash(project, entry):
         return None
     text = path.read_text()
     if entry.get("screen"):
-        try:
-            text, _ = extract_element(text, 'value="{{is.%s}}"' % entry["screen"])
-        except ValueError:
+        # The round-1 box (`is.`) and the later round's box (`r2.`), whichever the board has:
+        # a board with no `r2.` box hashes exactly as it did before.
+        boxes = []
+        for key in ("is", "r2"):
+            try:
+                box, _ = extract_element(text, 'value="{{%s.%s}}"' % (key, entry["screen"]))
+            except ValueError:
+                continue
+            boxes.append(box)
+        if not boxes:
             return None
+        text = "".join(boxes)
     return _sha(text)
 
 
