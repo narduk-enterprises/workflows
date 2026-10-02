@@ -92,7 +92,13 @@ class ExactCandidate(unittest.TestCase):
         build = self.workflow['jobs']['build']
         fold = re.fullmatch(r"\$\{\{ \((.+)\) && 'Required' \|\| 'Build' \}\}", build['name']).group(1)
         self.assertIn('inputs.checks-in-build', fold)
-        self.assertEqual(required['if'], f'!cancelled() && !({fold})')
+        # The second clause is `pr-fast-only` (workflows#180), which an exact
+        # candidate can never satisfy: it requires the candidate to be empty.
+        head = f'!cancelled() && !({fold})'
+        self.assertTrue(required['if'] == head or required['if'].startswith(head + ' && !(inputs.pr-fast-only'),
+                        required['if'])
+        if required['if'] != head:
+            self.assertIn("inputs.expected-candidate-sha == ''", required['if'][len(head):])
         build_steps = {step.get('name'): step for step in build['steps']}
         for name in ['Ensure PyYAML is available', 'Install actionlint', "actionlint (caller's own workflows)",
                      'Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)']:
