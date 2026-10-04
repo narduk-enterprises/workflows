@@ -2377,6 +2377,20 @@ jobs:
               for name, vuln in vulnerabilities.items():
                   if not isinstance(vuln, dict):
                       continue
+                  # A record whose `via` holds only package NAMES (strings) is a
+                  # DEPENDENT of a vulnerable package, not an advisory of its own:
+                  # npm emits one such record per package up the dependency chain
+                  # (nuxt -> @nuxt/cli -> listhen -> node-forge) and copies the
+                  # root's severity and a derived `fixAvailable` onto it. It
+                  # carries no GHSA id, so `audit-ignore` could never suppress it,
+                  # and the derived fix is often a nonsense major downgrade of the
+                  # direct dependency; an unfixable root would therefore fail the
+                  # gate forever through its dependents. The root record (one with
+                  # at least one advisory object in `via`) is judged and
+                  # suppressible exactly as before, and fixing or ignoring it
+                  # clears its dependents, so they are not counted again here.
+                  if not any(isinstance(via, dict) for via in vuln.get("via") or []):
+                      continue
                   severity = str(vuln.get("severity", "")).lower()
                   fix = vuln.get("fixAvailable", False)
                   ids: list[str] = []

@@ -112,6 +112,37 @@ def npm7_vuln(name: str, severity: str, fix_available, ghsa: str, source: int = 
     }
 
 
+def npm7_dependent(name: str, severity: str, fix_available, via: list[str]) -> dict:
+    """A record npm derives for a package that only DEPENDS on a vulnerable one:
+    `via` holds package names (strings), no advisory object, no GHSA id."""
+    return {
+        "name": name,
+        "severity": severity,
+        "isDirect": False,
+        "via": via,
+        "effects": [],
+        "range": "*",
+        "nodes": [f"node_modules/{name}"],
+        "fixAvailable": fix_available,
+    }
+
+
+# The real shape of a Nuxt tree with the node-forge advisory (no patched
+# release): the root record carries npm's nonsense 'downgrade nuxt' fix, and
+# every package up the chain repeats it with string-only `via`.
+_BOGUS_FIX = {"name": "nuxt", "version": "3.15.1", "isSemVerMajor": True}
+NPM7_NODE_FORGE_CHAIN = npm7_report(
+    npm7_vuln("node-forge", "high", _BOGUS_FIX, "GHSA-86w9-cpqp-85rv", 1240912),
+    npm7_dependent("listhen", "high", _BOGUS_FIX, ["node-forge"]),
+    npm7_dependent("nitropack", "high", _BOGUS_FIX, ["listhen"]),
+    npm7_dependent("nuxt", "high", _BOGUS_FIX, ["@nuxt/cli", "nitropack"]),
+)
+# A dependent whose own `via` mixes names and an advisory object is a root.
+_MIXED_VIA = npm7_vuln("axios", "high", {"name": "axios", "version": "1.7.4", "isSemVerMajor": False},
+                       "GHSA-8hc4-vh64-cxmj")
+_MIXED_VIA["via"] = ["follow-redirects"] + _MIXED_VIA["via"]
+NPM7_MIXED_VIA = npm7_report(_MIXED_VIA)
+
 CLEAN_PNPM = pnpm_report()
 FIXABLE_HIGH = pnpm_report(pnpm_advisory(1234, "high", ">=1.2.3", "GHSA-aaaa-bbbb-cccc"))
 UNFIXABLE_HIGH = pnpm_report(pnpm_advisory(1234, "high", "<0.0.0", "GHSA-aaaa-bbbb-cccc"))
@@ -250,6 +281,33 @@ CASES: list[tuple[str, dict, int, list[str], list[str]]] = [
         0,
         ["0 fixable, 0 unfixable, 0 suppressed"],
         ["::error::", "::warning::"],
+    ),
+    (
+        "npm 7+: only the root of a dependency chain counts; unfixable-by-ignore root passes",
+        {
+            "pm": "npm",
+            "stdout": NPM7_NODE_FORGE_CHAIN,
+            "exit_code": 1,
+            "audit_ignore": "GHSA-86w9-cpqp-85rv=no patched node-forge release exists; dev tooling only",
+        },
+        0,
+        ["suppressed by audit-ignore GHSA-86W9-CPQP-85RV", "0 fixable, 0 unfixable, 1 suppressed",
+         "(1 total advisories parsed)"],
+        ["::error::", "in listhen", "in nitropack", "in nuxt"],
+    ),
+    (
+        "npm 7+: an unsuppressed root still fails, once, without its dependents",
+        {"pm": "npm", "stdout": NPM7_NODE_FORGE_CHAIN, "exit_code": 1},
+        1,
+        ["::error::high in node-forge", "1 fixable, 0 unfixable"],
+        ["in listhen", "in nitropack", "in nuxt"],
+    ),
+    (
+        "npm 7+: a record mixing package names and an advisory object is still a root",
+        {"pm": "npm", "stdout": NPM7_MIXED_VIA, "exit_code": 1},
+        1,
+        ["::error::high in axios", "FIX AVAILABLE (axios@1.7.4)"],
+        [],
     ),
     (
         "audit-ignore with a reason suppresses a fixable high",
