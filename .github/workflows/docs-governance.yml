@@ -251,14 +251,19 @@ jobs:
         if: runner.environment == 'github-hosted' && inputs.node-version != ''
         run: |
           set -euo pipefail
+          # Beside the checkout, not in it: an app's own `prettier "**/*"` or
+          # lint glob scans anything under the workspace. The path the cache
+          # steps receive must be absolute and free of `..` segments:
+          # actions/cache rejects `../x` and `/a/b/../x` alike ("Invalid
+          # pattern ... Relative pathing '.' and '..' is not allowed", and
+          # the save step still reports green; workflows#177).
+          cache_root="$(dirname "$GITHUB_WORKSPACE")/.ci-cache"
           if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
-            # Beside the checkout, not in it: an app's own `prettier "**/*"` or
-            # lint glob scans anything under the workspace.
-            pnpm config set store-dir "$GITHUB_WORKSPACE/../.ci-cache/pnpm-store"
-            echo "path=../.ci-cache/pnpm-store" >> "$GITHUB_OUTPUT"
+            pnpm config set store-dir "$cache_root/pnpm-store"
+            echo "path=$cache_root/pnpm-store" >> "$GITHUB_OUTPUT"
           else
-            npm config set cache "$GITHUB_WORKSPACE/../.ci-cache/npm"
-            echo "path=../.ci-cache/npm" >> "$GITHUB_OUTPUT"
+            npm config set cache "$cache_root/npm"
+            echo "path=$cache_root/npm" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Restore dependency cache
