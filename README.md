@@ -1062,6 +1062,13 @@ changes:
 - **npm 7+** (`auditReportVersion: 2`) — the `vulnerabilities` map. Fixable
   means `fixAvailable` is `true` or a `{name, version, isSemVerMajor}` object;
   a fix that needs a major bump still counts as a fix.
+  npm also emits one record per *dependent* of a vulnerable package (`nuxt`,
+  `@nuxt/cli`, `listhen` ... above an unpatched `node-forge`), recognisable by a
+  `via` holding only package names. Those carry no GHSA id and a derived
+  `fixAvailable` (often a nonsense major downgrade of the direct dependency),
+  so `audit-ignore` could never silence them. Only records with at least one
+  advisory object in `via` (the *roots*) are judged and counted; suppress or
+  fix the root and its dependents clear with it.
 
 Estate contract pins are not advisories and do not count here — only what the
 package manager's own audit reports does.
