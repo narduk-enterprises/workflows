@@ -3139,19 +3139,19 @@ jobs:
         if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
         working-directory: ${{ github.workspace }}
         env: &caller_lint_actionlint_env
-          ACTIONLINT_VERSION: 1.7.12
-          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ACTIONLINT_INSTALLER_SHA: d4d82ba3f2ba4105420c46e5359c1936bce4f517
+          ACTIONLINT_INSTALLER_SHA256: 22c06d1671767285f45756e60aaf03af570514f4b6c5554d15be54c1c8aed051
         run: &caller_lint_install_actionlint |
           set -euo pipefail
-          # Pinned version + checksum rather than `curl | bash` from the
-          # project's install script (same pin ci.yml uses for its own
-          # actionlint install -- keep both in sync on a bump).
-          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -sSfL --retry 3 -o "$tarball" \
-            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
-          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
-          tar -xzf "$tarball" actionlint
-          ./actionlint -version
+          # Same reviewed installer as ci.yml. Fetch immutable public source,
+          # verify its checksum before execution, and retain all lint rules.
+          installer=$(mktemp "${RUNNER_TEMP}/actionlint-installer.XXXXXX")
+          trap 'rm -f "$installer"' EXIT
+          curl -sSfL --retry 3 \
+            "https://raw.githubusercontent.com/narduk-enterprises/workflows/${ACTIONLINT_INSTALLER_SHA}/scripts/install-actionlint-native-alerts.sh" \
+            -o "$installer"
+          echo "${ACTIONLINT_INSTALLER_SHA256}  ${installer}" | sha256sum -c -
+          bash "$installer" ./actionlint
 
       - name: actionlint (caller's own workflows)
         if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"

@@ -2335,6 +2335,17 @@ Logan, 2026-09-18 (askme, 13:41 CT): "Moving v2 tag; repos move when touched
 
 ## Maintainer conventions
 
+- Caller lint uses checksum-pinned actionlint 1.7.12 source with one
+  compatibility correction: GitHub's native `vulnerability-alerts` permission
+  accepts `read` and `none`. `write`, unknown scopes, all other validation,
+  and shellcheck remain enforced. The installer builds with checksum-pinned
+  Go 1.26.1 in a disposable directory and checks dependencies against upstream
+  `go.sum` and the Go checksum database. This adds a cold source build to the
+  lint job. Remove the correction when an upstream release supports the scope.
+  `scripts/test_actionlint_native_permissions.py` exercises the actual binary
+  and verifies that the callable's checksum-pinned installer matches this repo.
+  This change grants no token permission. Consumers adopt it by an explicit
+  immutable workflow pin; preparing this change does not move `v1` or `v2`.
 - **`.github/workflows/ci.yml` gates this repo** (~7s). `actionlint` +
   `scripts/lint_callables.py` + behavior tests including
   `scripts/test_playwright_toolchain.py`. The structural gate
