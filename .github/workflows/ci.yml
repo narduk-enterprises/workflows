@@ -105,23 +105,13 @@ jobs:
           shellcheck --version | head -2
 
       - name: Install actionlint
-        env:
-          ACTIONLINT_VERSION: 1.7.12
-          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
-        run: |
-          set -euo pipefail
-          # Pinned version + checksum rather than `curl | bash` from the
-          # project's install script: a linter that gates seven repos'
-          # workflows is itself supply chain.
-          tarball="actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
-          curl -sSfL --retry 3 -o "$tarball" \
-            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/${tarball}"
-          echo "${ACTIONLINT_SHA256}  ${tarball}" | sha256sum -c -
-          tar -xzf "$tarball" actionlint
-          ./actionlint -version
+        run: bash scripts/install-actionlint-native-alerts.sh ./actionlint
 
       - name: actionlint
         run: ./actionlint -no-color -oneline .github/workflows/*.yml
+
+      - name: Native alert permission validator tests
+        run: python3 scripts/test_actionlint_native_permissions.py
 
       - name: Structural gate (timeouts, permissions, pins, Required, concurrency)
         run: python3 scripts/lint_callables.py
