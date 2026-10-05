@@ -313,6 +313,16 @@ def check_callable(fname: str, name: str) -> int:
                     assert is_hosted_ubuntu_latest(got), f"{fname}:{jid} public={vis} input={val!r} bs={bs} -> {got!r}"
                     checks += 1
 
+            # (1b) public / unknown visibility with an explicit self-hosted
+            # input and the switch ON: never Blacksmith (a public repository
+            # runs free on GitHub-hosted capacity; Logan 2026-10-05).
+            if has_bs:
+                for vis in (False, None):
+                    for val in (LINUX_CI, '["self-hosted","Linux","X64","proxmox","linux-ci"]'):
+                        got = evaluate(ro, ctx_for(vis, name, val, blacksmith=bs, lightweight='"ubuntu-slim"'))
+                        assert "blacksmith" not in json.dumps(got), f"{fname}:{jid} public={vis} input={val!r} bs={bs} landed on Blacksmith -> {got!r}"
+                        checks += 1
+
             for lw in ("", '"ubuntu-slim"'):
                 # (2) private, nothing passed.
                 got = evaluate(ro, ctx_for(True, name, "", blacksmith=bs, lightweight=lw))
