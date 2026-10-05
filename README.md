@@ -322,10 +322,15 @@ so a private caller that passes nothing is Blacksmith-eligible (it is on the
   `vars.BLACKSMITH_LINUX_LABEL`. No Blacksmith runner-group id is pinned
   anywhere — D-BLACKSMITH-4's live proof established that provider-created
   groups are not a stable routing contract; only the label is.
-- **Public `node-library.yml` callers are never affected**: its routing
-  expressions first require `github.event.repository.private == true`, so they
-  ignore both Blacksmith and `CI_LIGHTWEIGHT_RUNNER` for public repositories.
-  Their caller-supplied hosted `runner` value remains the route.
+- **Public callers are never affected**: every Blacksmith branch in
+  `node-library.yml`, `nuxt-cloudflare.yml`, `docs-governance.yml` and
+  `python-data.yml` requires `github.event.repository.private == true` before
+  it reads `BLACKSMITH_RUNNERS_ENABLED`, so a public repository never lands on
+  Blacksmith, even when it passes an explicit self-hosted `runner` (Logan,
+  2026-10-05: public repos run free on GitHub-hosted runners).
+  `node-library.yml` additionally ignores `CI_LIGHTWEIGHT_RUNNER` for public
+  repositories; their caller-supplied hosted `runner` value remains the route.
+  `scripts/test_runner_default.py` asserts it.
 - **Manual, not automatic fallback**: GitHub does not move an already-queued
   job to another `runs-on:` target. If Blacksmith cannot schedule or its free
   allowance is exhausted, flip the variable back to `false` (or remove the
