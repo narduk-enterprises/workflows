@@ -1680,7 +1680,7 @@ jobs:
           CI_ARTIFACT_STORE
       - name: Find equivalent successful PR Required proof
         id: proof
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
           PROOF_INPUTS: ${{ toJSON(inputs) }}
@@ -3100,7 +3100,7 @@ jobs:
       - name: Publish prebuilt E2E application
         id: e2e-build-publish
         if: steps.e2e-build-path.outputs.path != ''
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           BUILD_DIR: ${{ github.workspace }}/${{ inputs.working-directory }}/${{ steps.e2e-build-path.outputs.path }}
           BUILD_SCOPE: ${{ steps.e2e-build-path.outputs.scope }}
@@ -3622,7 +3622,7 @@ jobs:
       - name: Find equivalent successful PR E2E proof
         id: proof
         if: inputs.e2e-reuse-pr-results && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)))
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
           E2E_INPUTS: ${{ toJSON(inputs) }}
@@ -4115,7 +4115,7 @@ jobs:
       - name: Fetch prebuilt E2E application
         id: e2e-build-fetch
         if: needs.build.outputs.e2e-build-path != ''
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PREBUILT_OBJECT: ${{ needs.build.outputs.e2e-build-object }}
           BUILD_PATH: ${{ needs.build.outputs.e2e-build-path }}
@@ -6642,7 +6642,7 @@ jobs:
           && needs.build.result == 'success'
           && (needs.checks.result == 'success' || (inputs.checks-in-build && needs.checks.result == 'skipped'))
           && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards))
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
           PROOF_INPUTS: ${{ toJSON(inputs) }}
@@ -6660,7 +6660,7 @@ jobs:
       # full run.
       - name: Publish Required proof ${{ steps.required-key.outputs.key }}
         if: success() && steps.required-key.outputs.key != ''
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PROOF_KEY: ${{ steps.required-key.outputs.key }}
           CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
@@ -6676,7 +6676,7 @@ jobs:
       - name: Publish full E2E proof ${{ needs.e2e-plan.outputs.proof-key }}
         id: e2e-proof
         if: success() && inputs.e2e-reuse-pr-results && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.e2e.result == 'success' && needs.e2e-plan.outputs.proof-key != '' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PROOF_KEY: ${{ needs.e2e-plan.outputs.proof-key }}
           CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
