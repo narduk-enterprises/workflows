@@ -336,7 +336,7 @@ def issue_body(led, rows, ref_sha):
     if unbuilt and gate.get("state", "open") != "cleared":
         lines += ["", f"{unbuilt} more screen(s) were never built; with the gate open that is expected and not flagged."]
     lines += ["", "After fixing either side, record the match: `python3 dc_ledger.py mark-built <ledger> <id>…`.",
-              "This issue is kept by `claude-design-ops/scripts/dc_ledger.py flag`: it is edited in place, never duplicated, "
+              "This issue is kept by `design-narduk-app/scripts/dc_ledger.py flag`: it is edited in place, never duplicated, "
               "and closed when every screen agrees."]
     return "\n".join(lines) + "\n"
 

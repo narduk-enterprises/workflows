@@ -11,7 +11,7 @@ name: Reusable Design Ledger
 #
 # This callable runs that checker in a caller's CI with no token and no
 # checkout of private agent-infrastructure. `scripts/dc_ledger.py` here is a
-# byte copy of agent-infrastructure's `skills/claude-design-ops/scripts/
+# byte copy of agent-infrastructure's `skills/design-narduk-app/scripts/
 # dc_ledger.py`; agent-infrastructure's `scripts/check-dc-ledger-parity` fails
 # when the two differ. To change it, in this order (the one every gate passes):
 #   1. open the PR here carrying the new byte copy;

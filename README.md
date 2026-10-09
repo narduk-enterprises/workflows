@@ -2090,7 +2090,7 @@ callable reads drift in both directions: `not-built` (the canvas moved),
   cannot change the code that judges it, and the ledger's `build` command is
   never run.
 - **`scripts/dc_ledger.py` is a byte copy.** The canonical file is
-  agent-infrastructure's `skills/claude-design-ops/scripts/dc_ledger.py`, and
+  agent-infrastructure's `skills/design-narduk-app/scripts/dc_ledger.py`, and
   its `scripts/check-dc-ledger-parity` fails when the two differ. To change
   it: open the PR here with the new copy; land the canonical change in
   agent-infrastructure first, its pin at this PR's head commit (the Cursor
