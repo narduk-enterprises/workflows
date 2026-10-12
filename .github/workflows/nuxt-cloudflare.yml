@@ -1945,6 +1945,11 @@ jobs:
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: inputs.package-manager == 'pnpm'
+        # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
+        # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
+        # a clean directory too). Errors still print.
+        env:
+          PNPM_CONFIG_LOGLEVEL: error
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -3326,6 +3331,11 @@ jobs:
           fi
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: inputs.package-manager == 'pnpm'
+        # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
+        # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
+        # a clean directory too). Errors still print.
+        env:
+          PNPM_CONFIG_LOGLEVEL: error
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           # node-version and node-version-file are mutually exclusive on
@@ -3486,6 +3496,11 @@ jobs:
           fi
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: inputs.package-manager == 'pnpm'
+        # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
+        # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
+        # a clean directory too). Errors still print.
+        env:
+          PNPM_CONFIG_LOGLEVEL: error
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           # node-version and node-version-file are mutually exclusive on
@@ -4129,6 +4144,11 @@ jobs:
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: inputs.package-manager == 'pnpm'
+        # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
+        # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
+        # a clean directory too). Errors still print.
+        env:
+          PNPM_CONFIG_LOGLEVEL: error
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -4905,6 +4925,11 @@ jobs:
       # guard would be auditing state it no longer controls. Same anchored text.
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: inputs.package-manager == 'pnpm'
+        # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
+        # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
+        # a clean directory too). Errors still print.
+        env:
+          PNPM_CONFIG_LOGLEVEL: error
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -5424,6 +5449,11 @@ jobs:
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: inputs.package-manager == 'pnpm'
+        # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
+        # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
+        # a clean directory too). Errors still print.
+        env:
+          PNPM_CONFIG_LOGLEVEL: error
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -5722,6 +5752,11 @@ jobs:
           fi
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: env.FAST_ENABLED == 'true' && (inputs.package-manager == 'pnpm')
+        # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
+        # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
+        # a clean directory too). Errors still print.
+        env:
+          PNPM_CONFIG_LOGLEVEL: error
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: env.FAST_ENABLED == 'true'
         with:
@@ -6107,6 +6142,11 @@ jobs:
         run: *resolve_quality_gates
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: inputs.package-manager == 'pnpm'
+        # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
+        # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
+        # a clean directory too). Errors still print.
+        env:
+          PNPM_CONFIG_LOGLEVEL: error
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           # node-version and node-version-file are mutually exclusive on
