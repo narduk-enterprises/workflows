@@ -10,3 +10,6 @@ paths:
   .github/workflows/design-ledger.yml:
     ignore:
       - 'property "workflow_sha" is not defined in object type \{check_run_id'
+  .github/workflows/design-publish.yml:
+    ignore:
+      - 'property "workflow_sha" is not defined in object type \{check_run_id'

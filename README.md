@@ -76,6 +76,7 @@ in their app-class workflow.
 | `reusable-weekly-drift-check.yml` | Retired 2026-07-26: no live caller; see workflows#20 and the 2026-07-26 Actions-optimization audit |
 | `red-main-listener.yml` | **New 2026-09-24** (narduk-reboot P3-C2 / O-D8). Opens or refreshes ONE "main is red: `<workflow-name>`" issue, labelled `red-main`, per repo per listened workflow, the first time that workflow goes red on the default branch; closes it on the next green run. **Prerequisite: the adopting repo must already have the `red-main` label** (`gh label create red-main --color B60205 --description "Main default-branch CI is failing"`) — opening the first issue passes `labels[]=red-main` and GitHub 422s a repo without it, so an adopter that skips this step fails closed on its first real red run (PR #142 review, second round). Optional fail-open portal-mirror POST hook. No automatic revert or rollback — that stays in the app's own deploy tooling |
 | `design-ledger.yml` | **New 2026-09-27** (agent-infrastructure#1804). **Advisory, never required.** Runs the design ledger checker (`scripts/dc_ledger.py`, a byte copy of agent-infrastructure's canonical file) against a product's `design/<canvas>/ledger.json`. `mode: check` goes red while a canvas screen and its code have drifted and writes the table to the job summary; `mode: flag` keeps one `Design drift: <canvas>` issue. See [Design ledger](#design-ledgeryml) |
+| `design-publish.yml` | **New 2026-10-13** (operator-portal#727, design-portal-sync phase 2). Uploads a caller's `design/<slug>/` git mirror to the Operator Portal's designs Worker with the run's own OIDC token, no stored credential. Not a gate. See [Design publish](#design-publishyml) |
 | `flake-digest.yml` | **New 2026-09-24** (narduk-reboot P3-C2). Weekly, advisory: scans a caller's completed runs of one workflow, counts failures in jobs matching `quarantine-job-pattern` (nuxt-cloudflare.yml's `e2e-quarantine` by default), and files or refreshes one digest issue per ISO week. Never gates `main`, never opens `red-main` |
 
 All ten shipped callables are `on: workflow_call` only — none of them declare their own
@@ -103,6 +104,7 @@ branch, read back from the API — not that the caller parses.
 | `red-main-listener.yml` | `narduk-enterprises/workflows` itself (`red-main-self.yml`, listening to this repo's own `CI`) | not yet |
 | `flake-digest.yml` | none yet — no adopter here has a quarantine lane of its own; `nuxt-cloudflare.yml` adopters with `e2e-quarantine-args` set are the natural first callers | not yet |
 | `design-ledger.yml` | `narduk-enterprises/mybo-at-v2` (planned) | never — advisory by design (Logan, 2026-09-27: "Red check + drift issue (Recommended)") |
+| `design-publish.yml` | any app the portal registers (`operator-portal` first; `cloudflarestat-us` is the pilot) | never — a delivery step that runs after merge |
 
 ## The `ci / Required` convention
 
@@ -2122,6 +2124,61 @@ jobs:
 
 `runs-on` follows the [Default route](#default-route-empty-runner): leave it
 empty and a private caller lands on `linux-ci`.
+
+### `design-publish.yml`
+
+An app keeps its design mirror in git under `design/<slug>/` (a `canvas.json` and
+the boards). This callable uploads each design folder to the designs Worker
+(`narduk-enterprises/operator-portal`, `workers/designs`): one `PUT` per file, then
+a finalize call that checks the stored set against the file list and only then
+moves that design's `latest` pointer. The Operator Portal's `/designs` page lists
+every design whose mirror the Worker holds (operator-portal#2017) and renders its
+boards behind the portal's own sign-in. operator-portal#727, design-portal-sync
+phase 2.
+
+- **No stored credential.** The job's OIDC token (audience: the Worker's origin) is
+  the publish credential. The Worker admits a token for a repository of the
+  `narduk-enterprises` organization on `main` whose repository the portal registers
+  (an `app_repo` row, read live from the estate store; Logan, 2026-10-12: "All
+  narduk-enterprises apps"), and lets it write only under its own repository's name.
+  A repository the portal does not register gets 403 and the job goes red naming
+  it: register the app in the portal, then re-run. Client-organization repositories
+  are never admitted.
+- **Read-only on the caller.** Nothing is built, committed or written back.
+- **The script comes from this repo** at `job.workflow_sha`, via a sparse checkout
+  without credentials, so a pull request cannot change the code that holds the
+  token. `scripts/publish_designs.mjs` is a byte copy of operator-portal's
+  `apps/web/script/ci/publish_designs.mjs`.
+- **Main only.** The step refuses any ref but `refs/heads/main` (the Worker does too).
+- **Not a gate.** There is no `Required` job: never add `<job> / publish` to branch
+  protection, and do not name the calling job `ci`.
+- **Grant `contents: read` and `id-token: write`.** A caller that grants less ends in
+  `startup_failure`.
+- A folder is a design when it holds a `canvas.json` (at its root or under `project/`);
+  `archive/` is skipped. With no such folder the job fails loudly.
+
+```yaml
+name: design-publish
+
+on:
+  push:
+    branches: [main]
+    paths: [design/**]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  design-publish:
+    uses: narduk-enterprises/workflows/.github/workflows/design-publish.yml@<sha> # vX.Y.Z
+    permissions:
+      contents: read
+      id-token: write
+```
+
+Inputs: `origin` (default `https://designs.nardukenterprises.com`), `design-dir`
+(default `design`), `runs-on` (the [Default route](#default-route-empty-runner)).
 
 ### Weekly drift check (retired 2026-07-26)
 

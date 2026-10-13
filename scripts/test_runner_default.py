@@ -71,6 +71,7 @@ CALLABLES = {
     "red-main-listener.yml": "runner",
     "flake-digest.yml": "runner",
     "design-ledger.yml": "runs-on",
+    "design-publish.yml": "runs-on",
 }
 BLACKSMITH_LABEL = "blacksmith-2vcpu-ubuntu-2404"
 
