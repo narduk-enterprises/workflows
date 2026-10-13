@@ -2169,6 +2169,11 @@ on:
 permissions:
   contents: read
 
+# The caller-hygiene audit requires a workflow-level concurrency block.
+concurrency:
+  group: design-publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   design-publish:
     uses: narduk-enterprises/workflows/.github/workflows/design-publish.yml@<sha> # vX.Y.Z
