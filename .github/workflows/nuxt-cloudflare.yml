@@ -3141,7 +3141,7 @@ jobs:
           fi
 
       - name: Cache actionlint
-        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        if: "(!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)) && runner.environment == 'github-hosted'"
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.tool_cache }}/actionlint-native-alerts
@@ -6661,7 +6661,7 @@ jobs:
         run: *caller_lint_pyyaml
 
       - name: Cache actionlint
-        if: "!cancelled() && inputs.mode != 'e2e'"
+        if: "(!cancelled() && inputs.mode != 'e2e') && runner.environment == 'github-hosted'"
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.tool_cache }}/actionlint-native-alerts
@@ -6813,7 +6813,7 @@ jobs:
         if: env.FAST_ENABLED == 'true' && !cancelled()
         run: *caller_lint_pyyaml
       - name: Cache actionlint
-        if: env.FAST_ENABLED == 'true' && !cancelled()
+        if: "(env.FAST_ENABLED == 'true' && !cancelled()) && runner.environment == 'github-hosted'"
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.tool_cache }}/actionlint-native-alerts
