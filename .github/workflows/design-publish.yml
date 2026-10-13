@@ -35,6 +35,9 @@ name: Reusable Design Publish
 #     workflow_dispatch:
 #   permissions:
 #     contents: read
+#   concurrency:      # the caller-hygiene audit requires one at workflow level
+#     group: design-publish-${{ github.ref }}
+#     cancel-in-progress: false
 #   jobs:
 #     design-publish:
 #       uses: narduk-enterprises/workflows/.github/workflows/design-publish.yml@<sha> # vX.Y.Z
