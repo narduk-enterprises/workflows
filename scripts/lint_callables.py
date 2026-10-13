@@ -140,7 +140,11 @@ CALLER_GRANTS: dict[str, set[str]] = {
     # Cloudflare's preview comment and updates the sticky one.
     # E2E proof reuse additionally requires actions: read; a new major /
     # explicit SHA adoption must migrate caller grants before use.
-    "nuxt-cloudflare.yml": {"contents", "packages", "pull-requests", "actions"},
+    # WIDENED AGAIN with `id-token` (D-PORTAL-APP-CONFIG-1): the jobs that run
+    # narduk-app tooling or caller scripts resolve the portal-served app config
+    # with the job's OIDC token. Every caller must add `id-token: write` to its
+    # `ci:` job BEFORE it adopts a pin carrying this, or its run dies at startup.
+    "nuxt-cloudflare.yml": {"contents", "packages", "pull-requests", "actions", "id-token"},
     "python-data.yml": {"contents"},
     "reusable-browser-tests.yml": {"contents", "packages", "actions"},
     # Opens, comments on and closes the per-repo `red-main` issue.

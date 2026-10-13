@@ -122,6 +122,46 @@ def check_preview_is_the_only_pull_requests_job() -> None:
     print("PASS  only nuxt-cloudflare.yml's `preview` job holds `pull-requests: write`")
 
 
+# D-PORTAL-APP-CONFIG-1: jobs that run narduk-app or caller-supplied package
+# scripts resolve portal-served app config with the job's OIDC token.
+OIDC_JOBS = {
+    "build", "checks", "extra-gate", "e2e", "e2e-quarantine", "preview",
+    "deploy-dry-run", "fast", "fast-escalable", "journey-smoke",
+}
+
+
+def check_id_token_sits_on_exactly_the_caller_code_jobs() -> None:
+    """`id-token: write` is held by exactly OIDC_JOBS in nuxt-cloudflare.yml."""
+    doc = yaml.safe_load((WORKFLOWS / "nuxt-cloudflare.yml").read_text())
+    holders = set()
+    for job_id, job in doc["jobs"].items():
+        perms = job.get("permissions") or {}
+        if "id-token" in perms:
+            assert perms["id-token"] == "write", f"{job_id}: id-token must be write"
+            holders.add(job_id)
+    assert holders == OIDC_JOBS, (
+        f"id-token: write must sit on exactly {sorted(OIDC_JOBS)}; "
+        f"missing {sorted(OIDC_JOBS - holders)}, extra {sorted(holders - OIDC_JOBS)}"
+    )
+    assert "id-token" not in (doc.get("permissions") or {}), "workflow level must stay least-privilege"
+    # Jobs that run no caller code never hold it.
+    for job_id in ("reuse-plan", "e2e-plan", "fast-plan", "fast-escalated", "required"):
+        assert "id-token" not in doc["jobs"][job_id]["permissions"], job_id
+    print("PASS  nuxt-cloudflare.yml grants `id-token: write` on exactly the caller-code jobs")
+
+
+def check_other_callables_do_not_gain_id_token() -> None:
+    """Only design-publish.yml (its own publish credential) holds id-token elsewhere."""
+    for path in sorted(WORKFLOWS.glob("*.yml")):
+        if path.name in ("nuxt-cloudflare.yml", "design-publish.yml"):
+            continue
+        doc = yaml.safe_load(path.read_text())
+        for job_id, job in (doc.get("jobs") or {}).items():
+            perms = job.get("permissions") if isinstance(job, dict) else None
+            assert not isinstance(perms, dict) or "id-token" not in perms, f"{path.name}:{job_id}"
+    print("PASS  no other callable requests id-token")
+
+
 def check_undeclared_callable_is_rejected() -> None:
     fake = pathlib.Path(".github/workflows/not-declared-anywhere.yml")
     doc = {"jobs": {"only": {"permissions": {"contents": "read"}}}}
@@ -145,6 +185,8 @@ def main() -> None:
     check_e2e_plan_is_read_only()
     check_seeded_escalation_is_rejected()
     check_preview_is_the_only_pull_requests_job()
+    check_id_token_sits_on_exactly_the_caller_code_jobs()
+    check_other_callables_do_not_gain_id_token()
     check_undeclared_callable_is_rejected()
     check_shorthand_permissions_are_rejected()
     print("\ncallable permission-ceiling contract passed")
