@@ -180,6 +180,9 @@ jobs:
       - name: Design ledger shape and behaviour tests
         run: python3 scripts/test_design_ledger.py
 
+      - name: Design publish shape and behaviour tests
+        run: python3 scripts/test_design_publish.py
+
       - name: Apple routing and fail-capable gate tests
         run: python3 scripts/test_apple_gate.py
 

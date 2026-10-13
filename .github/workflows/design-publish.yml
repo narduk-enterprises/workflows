@@ -1,0 +1,118 @@
+name: Reusable Design Publish
+
+# operator-portal#727 slice 3, design-portal-sync phase 2. An app keeps its
+# design mirror in git under `design/<slug>/` (a `canvas.json` and the boards).
+# This callable uploads that mirror to the designs Worker
+# (narduk-enterprises/operator-portal, `workers/designs`), which stores it in a
+# private R2 bucket and serves it to the Operator Portal's /designs page behind
+# the portal's own sign-in. Any app the portal registers can call it.
+#
+# NO STORED CREDENTIAL. The job authenticates with the run's own GitHub Actions
+# OIDC token (audience: the Worker's origin). The Worker admits a token for a
+# repository of the `narduk-enterprises` organization on `main` whose repository
+# the portal registers (`app_repo` rows; Logan, 2026-10-12: "All
+# narduk-enterprises apps"), and lets it write only under its own repository's
+# name. A repository the portal does not register is refused with 403 and the
+# job goes red naming it: register the app in the portal, then re-run.
+#
+# It only READS `design/**`: nothing is built, committed or written back.
+# `scripts/publish_designs.mjs` is a byte copy of operator-portal's
+# `apps/web/script/ci/publish_designs.mjs`; it runs from THIS repository at
+# `job.workflow_sha`, the commit the caller pinned, never from the caller's tree,
+# so a pull request cannot change the code that holds the token. The job refuses
+# any ref but `refs/heads/main`.
+#
+# NOT A GATE. There is no `Required` job on purpose. A caller must not name its
+# calling job `ci`, and must not make `<job> / publish` a required check: it is
+# a delivery step that runs after merge.
+#
+# ADOPTION (a private caller; path-filtered so only a design change publishes):
+#
+#   on:
+#     push:
+#       branches: [main]
+#       paths: [design/**]
+#     workflow_dispatch:
+#   permissions:
+#     contents: read
+#   jobs:
+#     design-publish:
+#       uses: narduk-enterprises/workflows/.github/workflows/design-publish.yml@<sha> # vX.Y.Z
+#       permissions:
+#         contents: read
+#         id-token: write   # the OIDC token is the publish credential
+#
+# PERMISSIONS. `id-token: write` is the publish credential and the only
+# permission beyond `contents: read`; a caller that grants less ends in
+# `startup_failure`.
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      origin:
+        description: "The designs Worker's https origin, which is also the audience of the OIDC token."
+        required: false
+        type: string
+        default: "https://designs.nardukenterprises.com"
+      design-dir:
+        description: "The folder under the caller's root that holds the design folders, each with a canvas.json."
+        required: false
+        type: string
+        default: "design"
+      runs-on:
+        description: >-
+          JSON-encoded runner for this job: a plain string ("ubuntu-latest"),
+          a JSON array, or a JSON object matching the runner-fleet manifest's
+          `runsOn` shape. Decoded with fromJSON(). Empty (the default) routes
+          a PRIVATE caller to the fleet manifest's linux-ci organization-group
+          route and a public or visibility-unknown caller to GitHub-hosted
+          ubuntu-latest; an explicit value always wins. A PUBLIC (or
+          possibly-future-public) CALLER MUST NEVER PASS A SELF-HOSTED LABEL.
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ${{ fromJSON(inputs.runs-on || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # The run's OIDC token is the publish credential; nothing is stored.
+      id-token: write
+    steps:
+      - name: Check out the caller
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the publish script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: narduk-enterprises/workflows
+          ref: ${{ job.workflow_sha }}
+          path: .design-publish-workflows
+          persist-credentials: false
+          sparse-checkout: scripts/publish_designs.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Upload the design mirror and move each design's latest pointer
+        env:
+          DESIGNS_ORIGIN: ${{ inputs.origin }}
+          DESIGN_DIR: ${{ inputs.design-dir }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::design-publish: publishes only from refs/heads/main (got '$GITHUB_REF'); the Worker refuses any other ref"
+            exit 1
+          fi
+          node .design-publish-workflows/scripts/publish_designs.mjs --design-dir "$DESIGN_DIR"

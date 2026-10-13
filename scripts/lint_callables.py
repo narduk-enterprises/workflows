@@ -153,6 +153,8 @@ CALLER_GRANTS: dict[str, set[str]] = {
     # issue. GitHub checks the skipped `flag` job's grant too, so every
     # caller grants `issues: write`, check-only callers included.
     "design-ledger.yml": {"contents", "issues"},
+    # The run's OIDC token is the publish credential to the designs Worker.
+    "design-publish.yml": {"contents", "id-token"},
 }
 
 # Local composite/local-path uses are exempt from SHA pinning: `./...` and
