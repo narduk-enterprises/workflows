@@ -862,6 +862,7 @@ jobs:
       packages: read
       pull-requests: write
       actions: read # E2E proof lookup (required by the new revision)
+      id-token: write # portal-served app config (see "App config from the portal")
     with:
       node-version: "24"
       package-manager: npm # hydrogen's current package manager; pnpm is the default
@@ -917,6 +918,45 @@ Local workstations use `gh-packages-run`, and Workers Builds uses the protected
 build secret `GH_PACKAGES_READ`. Neither uses the Actions input name as a vault
 key. [The credential route](https://github.com/narduk-enterprises/agent-infrastructure/blob/main/docs/agents/credentials.md)
 provides the exact nVault selector and value-free diagnostics.
+
+#### App config from the portal (`id-token: write`)
+
+Decision D-PORTAL-APP-CONFIG-1: the Operator Portal owns an app's
+`Config/cloudflare-app.json` and `Config/project-lifecycle.json`, and repos
+delete their copies. `@narduk-enterprises/narduk-app-tools` (narduk-libs #1832)
+resolves a document from the portal when the file is absent, authenticating
+with the job's GitHub OIDC token, which exists only in a job that holds
+`id-token: write` (`ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN`).
+Contract: operator-portal `docs/estate/app-config.md` ("Tooling contract").
+
+The jobs that run `narduk-app` or a caller-supplied package script (build,
+typecheck, test, `extra-scripts`, `extra-gate`, `fast-scripts`, e2e, preview,
+journey smoke, the deploy dry run) now request `id-token: write`:
+
+| Holds `id-token: write` | Why |
+|---|---|
+| `build` | `foundation:check`, `performance-budget`, and the caller's typecheck/test/build/extra scripts |
+| `checks`, `extra-gate`, `fast`, `fast-escalable` | caller-supplied typecheck, unit, extra-gate and fast scripts |
+| `e2e`, `e2e-quarantine`, `preview` | caller build/e2e scripts, `og:check`, `foundation:check:security-headers` |
+| `journey-smoke` | caller journey script and the `narduk-app deploy rollback` script |
+| `deploy-dry-run` | the dry run's install step and Worker bundle validation, which can resolve the deploy declaration |
+
+`reuse-plan`, `e2e-plan`, `fast-plan`, `fast-escalated` and `required` run no
+caller code and do **not** hold it. `scripts/test_permission_ceiling.py` pins
+this exact set.
+
+**Callers must grant it, or the whole run fails to start.** A called job may
+only request permissions its caller granted on the `uses:` job; ask for one
+the caller did not and GitHub fails the caller's entire run at startup
+(`startup_failure`, zero jobs, no logs; workflows#59). Every caller moving to
+a pin that carries this grant adds `id-token: write` to its `ci:` job next to
+`contents`, `packages`, `pull-requests` and `actions`, in the same PR as the
+SHA bump. Callers pinned to an older SHA are unaffected. The permission only
+lets a job request a token; it gives no access to the caller's repository.
+A repo that still carries its Config files behaves exactly as before
+(`NARDUK_APP_CONFIG_SOURCE=auto` prefers the local file). Whether a
+Dependabot- or fork-triggered run receives an OIDC token is not documented by
+GitHub; canary it on one repo before deleting that repo's Config files.
 
 Deploying with real Cloudflare credentials on push-to-main is **not** this
 workflow's job — that stays a separate `nuxt-cloudflare-deploy.yml` sibling
@@ -2277,6 +2317,11 @@ P3-C2 / O-D8 rather than kept as a dead compatibility surface.
   declared in `scripts/lint_callables.py`'s `CALLER_GRANTS` and enforced as
   **R12**; widening one means updating every adopter's `permissions:` block
   first, then the map, and only then moving the tag.
+- **`id-token: write` on `nuxt-cloudflare.yml`'s caller-code jobs is a
+  breaking permission change** (D-PORTAL-APP-CONFIG-1; see
+  [App config from the portal](#app-config-from-the-portal-id-token-write)).
+  Same rule as `actions: read` above: do not advance `v2` over it; callers add
+  `id-token: write` to their `ci:` job in the PR that bumps to the new SHA.
 - `nuxt-cloudflare.yml`'s browser-shard inputs (`e2e-runner`, `e2e-shards`,
   `e2e-args`, `e2e-install-browsers`, `e2e-browsers-path`) and its two new
   jobs are within-major on the same rule: five optional inputs whose defaults

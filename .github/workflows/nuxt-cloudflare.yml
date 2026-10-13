@@ -69,6 +69,28 @@ name: Reusable Nuxt + Cloudflare CI
 # repo is not registered for produces a job that queues forever, which reads
 # exactly like a hung runner.
 #
+# APP CONFIG FROM THE PORTAL (D-PORTAL-APP-CONFIG-1). The Operator Portal owns
+# an app's `Config/cloudflare-app.json` and `Config/project-lifecycle.json`;
+# repos delete their copies and `@narduk-enterprises/narduk-app-tools` fetches
+# the documents from the portal when the file is absent, authenticating with
+# the job's GitHub OIDC token (it needs ACTIONS_ID_TOKEN_REQUEST_URL/_TOKEN,
+# which exist only in a job holding `id-token: write`). So the jobs that run
+# `narduk-app` or a caller-supplied package script (build, typecheck, test,
+# extra/fast/e2e/journey scripts) request `id-token: write`: build, checks,
+# extra-gate, e2e, e2e-quarantine, preview, deploy-dry-run, fast,
+# fast-escalable and journey-smoke. The planning and aggregator jobs
+# (reuse-plan, e2e-plan, fast-plan, fast-escalated, required) run no caller
+# code and do NOT hold it. scripts/test_permission_ceiling.py pins that exact set.
+#
+# CALLERS MUST GRANT IT. A job in a called workflow can only request
+# permissions its CALLER granted on the `uses:` job; ask for one the caller did
+# not and GitHub fails the caller's WHOLE run at startup (`startup_failure`,
+# zero jobs, no logs; workflows#59). Every caller that moves to the pin carrying
+# this grant must add `id-token: write` beside `contents`, `packages`,
+# `pull-requests` and `actions` on its `ci:` job. Callers pinned to an older SHA
+# are unaffected. `id-token: write` only lets a job REQUEST a token; it grants no
+# repository access.
+#
 # THE "Required" CONVENTION (this is the point of this repo): this workflow's
 # last job is named exactly `Required`, `needs:` every other job, runs with
 # `if: "!cancelled()"`, and fails unless each needed job succeeded or was
@@ -1776,6 +1798,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # Portal-served app config (D-PORTAL-APP-CONFIG-1): see the header, "APP CONFIG FROM THE PORTAL".
+      id-token: write
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -3308,6 +3332,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # Portal-served app config (D-PORTAL-APP-CONFIG-1): see the header, "APP CONFIG FROM THE PORTAL".
+      id-token: write
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -3473,6 +3499,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # Portal-served app config (D-PORTAL-APP-CONFIG-1): see the header, "APP CONFIG FROM THE PORTAL".
+      id-token: write
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -4075,6 +4103,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # Portal-served app config (D-PORTAL-APP-CONFIG-1): see the header, "APP CONFIG FROM THE PORTAL".
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -4755,6 +4785,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # Portal-served app config (D-PORTAL-APP-CONFIG-1): see the header, "APP CONFIG FROM THE PORTAL".
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
@@ -4825,6 +4857,8 @@ jobs:
       contents: read
       packages: read
       pull-requests: write
+      # Portal-served app config (D-PORTAL-APP-CONFIG-1): see the header, "APP CONFIG FROM THE PORTAL".
+      id-token: write
     env:
       # Dependency installation must never acquire a browser as a side effect;
       # the anchored installer below stays the only download path, and it is
@@ -5425,6 +5459,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # Portal-served app config (D-PORTAL-APP-CONFIG-1): see the header, "APP CONFIG FROM THE PORTAL".
+      id-token: write
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -5698,6 +5734,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # Portal-served app config (D-PORTAL-APP-CONFIG-1): see the header, "APP CONFIG FROM THE PORTAL".
+      id-token: write
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -6041,6 +6079,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # Portal-served app config (D-PORTAL-APP-CONFIG-1): see the header, "APP CONFIG FROM THE PORTAL".
+      id-token: write
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
@@ -6069,6 +6109,8 @@ jobs:
     permissions:
       contents: read
       packages: read
+      # Portal-served app config (D-PORTAL-APP-CONFIG-1): see the header, "APP CONFIG FROM THE PORTAL".
+      id-token: write
     env:
       PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
     defaults:
