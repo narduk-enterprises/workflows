@@ -2410,6 +2410,12 @@ Logan, 2026-09-18 (askme, 13:41 CT): "Moving v2 tag; repos move when touched
   archives, a proxy fallback for Go modules, and three build attempts. Each
   mirror's bytes are still checked against the pinned sha256, so a fallback
   widens availability, not trust (workflows#138).
+  The primary path is a prebuilt copy of the installer's own output (release
+  asset `actionlint-1.7.12-native-alerts-1`, linux-amd64, sha256 pinned in the
+  script): ~8 MB from github.com instead of a ~75 MB Go toolchain from go.dev,
+  whose slow download was what actually stalled the gate. A failed fetch or
+  checksum falls through to the source build above. After changing the script
+  or the pinned versions, rebuild, publish a new asset and move the pins.
   `scripts/test_actionlint_native_permissions.py` exercises the actual binary
   and verifies that the callable's checksum-pinned installer matches this repo.
   This change grants no token permission. Consumers adopt it by an explicit

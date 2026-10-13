@@ -3144,8 +3144,8 @@ jobs:
         if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
         working-directory: ${{ github.workspace }}
         env: &caller_lint_actionlint_env
-          ACTIONLINT_INSTALLER_SHA: 617136b005f7b38342d0e192b0995298b56aba1a
-          ACTIONLINT_INSTALLER_SHA256: efff5c92ae5f4acd5eb2347de1565ead39c32cda14b2f639eaa558f2f4114f83
+          ACTIONLINT_INSTALLER_SHA: 8469bf56b69bdade22982998a6a4b808f9b62a23
+          ACTIONLINT_INSTALLER_SHA256: bdbf21373af8f5ce872de5323454aa24bb6ef4fad861a8a918bbbe14ec16649e
         run: &caller_lint_install_actionlint |
           set -euo pipefail
           # Same reviewed installer as ci.yml. Fetch immutable public source,

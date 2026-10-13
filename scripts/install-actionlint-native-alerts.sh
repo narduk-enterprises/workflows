@@ -27,7 +27,7 @@ fetch() {
   shift
   for url in "$@"; do
     if curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 \
-      --connect-timeout 20 --max-time 240 --speed-limit 10240 --speed-time 30 \
+      --connect-timeout 20 --max-time 300 --speed-limit 10240 --speed-time 45 \
       "$url" -o "$out"; then
       return 0
     fi
@@ -36,6 +36,32 @@ fetch() {
   echo "all sources failed for $(basename "$out")" >&2
   return 1
 }
+
+# Fast path: the output of the build below, published once as a release asset
+# of this repo and pinned by sha256. It is ~8 MB from github.com, the host the
+# job already depends on to check out, instead of a ~75 MB Go toolchain from
+# go.dev, which stalled the required gate (workflows#138). Any fetch or checksum
+# failure falls through to the checksum-pinned source build.
+# Rebuild: run this script, then publish the output as a new release asset and
+# move the two values below (and the callers' installer pin) together.
+prebuilt_base=https://github.com/narduk-enterprises/workflows/releases/download/actionlint-1.7.12-native-alerts-1
+case "$(uname -sm)" in
+  'Linux x86_64')
+    prebuilt_asset=actionlint-linux-amd64
+    prebuilt_sha=ff9b4c375dac15c384bb745804beaac248df0d9f7db88e1f20cc2c3649584d17
+    ;;
+  *) prebuilt_asset= ;;
+esac
+if [ -n "$prebuilt_asset" ] \
+  && fetch "$task_dir/prebuilt" "$prebuilt_base/$prebuilt_asset" \
+  && verify_sha "$task_dir/prebuilt" "$prebuilt_sha" \
+  && chmod +x "$task_dir/prebuilt" \
+  && "$task_dir/prebuilt" -version >/dev/null; then
+  "$task_dir/prebuilt" -version
+  cp "$task_dir/prebuilt" "$output"
+  exit 0
+fi
+echo "prebuilt actionlint unavailable; building from the pinned source" >&2
 
 fetch "$task_dir/source.tar.gz" \
   https://codeload.github.com/rhysd/actionlint/tar.gz/refs/tags/v1.7.12 \
