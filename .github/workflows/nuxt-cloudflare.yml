@@ -3140,12 +3140,19 @@ jobs:
             python3 -c "import yaml" || { echo "::error::PyYAML still unavailable after install"; exit 1; }
           fi
 
+      - name: Cache actionlint
+        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.tool_cache }}/actionlint-native-alerts
+          key: actionlint-native-alerts-1.7.12-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install actionlint
         if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
         working-directory: ${{ github.workspace }}
         env: &caller_lint_actionlint_env
-          ACTIONLINT_INSTALLER_SHA: 8469bf56b69bdade22982998a6a4b808f9b62a23
-          ACTIONLINT_INSTALLER_SHA256: bdbf21373af8f5ce872de5323454aa24bb6ef4fad861a8a918bbbe14ec16649e
+          ACTIONLINT_INSTALLER_SHA: 8876c3ae06c937b11cb5a5d3acb3fe63ba6b18d3
+          ACTIONLINT_INSTALLER_SHA256: 5be3eff1deb7e8237ae72f7f38a77216de0f2b550350e5a4c3dc796049822039
         run: &caller_lint_install_actionlint |
           set -euo pipefail
           # Same reviewed installer as ci.yml. Fetch immutable public source,
@@ -6653,6 +6660,13 @@ jobs:
         if: "!cancelled() && inputs.mode != 'e2e'"
         run: *caller_lint_pyyaml
 
+      - name: Cache actionlint
+        if: "!cancelled() && inputs.mode != 'e2e'"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.tool_cache }}/actionlint-native-alerts
+          key: actionlint-native-alerts-1.7.12-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install actionlint
         if: "!cancelled() && inputs.mode != 'e2e'"
         env: *caller_lint_actionlint_env
@@ -6798,6 +6812,13 @@ jobs:
       - name: Ensure PyYAML is available
         if: env.FAST_ENABLED == 'true' && !cancelled()
         run: *caller_lint_pyyaml
+      - name: Cache actionlint
+        if: env.FAST_ENABLED == 'true' && !cancelled()
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.tool_cache }}/actionlint-native-alerts
+          key: actionlint-native-alerts-1.7.12-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install actionlint
         if: env.FAST_ENABLED == 'true' && !cancelled()
         env: *caller_lint_actionlint_env
