@@ -2404,6 +2404,12 @@ Logan, 2026-09-18 (askme, 13:41 CT): "Moving v2 tag; repos move when touched
   Go 1.26.1 in a disposable directory and checks dependencies against upstream
   `go.sum` and the Go checksum database. This adds a cold source build to the
   lint job. Remove the correction when an upstream release supports the scope.
+  Every download in the installer (source, Go, and the callable's fetch of the
+  installer itself) is bounded and retried: `--retry 5 --retry-all-errors`,
+  connect, stall and total timeouts, a second mirror for the source and Go
+  archives, a proxy fallback for Go modules, and three build attempts. Each
+  mirror's bytes are still checked against the pinned sha256, so a fallback
+  widens availability, not trust (workflows#138).
   `scripts/test_actionlint_native_permissions.py` exercises the actual binary
   and verifies that the callable's checksum-pinned installer matches this repo.
   This change grants no token permission. Consumers adopt it by an explicit
