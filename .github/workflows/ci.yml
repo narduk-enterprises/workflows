@@ -104,6 +104,13 @@ jobs:
           fi
           shellcheck --version | head -2
 
+      - name: Cache actionlint
+        if: runner.environment == 'github-hosted'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.tool_cache }}/actionlint-native-alerts
+          key: actionlint-native-alerts-1.7.12-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install actionlint
         run: bash scripts/install-actionlint-native-alerts.sh ./actionlint
 

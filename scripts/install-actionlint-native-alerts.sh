@@ -15,7 +15,7 @@ verify_sha() {
 import hashlib, pathlib, sys
 actual = hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest()
 if actual != sys.argv[2]:
-    raise SystemExit(f"checksum mismatch for {pathlib.Path(sys.argv[1]).name}")
+    raise SystemExit(f"checksum mismatch for {pathlib.Path(sys.argv[1]).name}: expected {sys.argv[2]}, got {actual}")
 PY
 }
 
@@ -26,7 +26,7 @@ fetch() {
   local out=$1 url
   shift
   for url in "$@"; do
-    if curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 \
+    if curl -sS --fail --location --retry 5 --retry-all-errors --retry-delay 2 \
       --connect-timeout 20 --max-time 300 --speed-limit 10240 --speed-time 45 \
       "$url" -o "$out"; then
       return 0
@@ -52,6 +52,20 @@ case "$(uname -sm)" in
     ;;
   *) prebuilt_asset= ;;
 esac
+# Cache: a binary kept from an earlier run (actions/cache restores this dir,
+# keyed by version+OS+arch) is reused only if it still matches the pinned
+# sha256, so a stale or tampered cache falls through to the download. A
+# different actionlint on PATH is not reused: it lacks the native-alerts patch.
+cache_dir=${ACTIONLINT_CACHE_DIR:-${RUNNER_TOOL_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}}/actionlint-native-alerts/1.7.12-$(uname -s)-$(uname -m)}
+if [ -n "$prebuilt_asset" ] && [ -f "$cache_dir/actionlint" ] \
+  && verify_sha "$cache_dir/actionlint" "$prebuilt_sha" \
+  && chmod +x "$cache_dir/actionlint" \
+  && "$cache_dir/actionlint" -version >/dev/null 2>&1; then
+  echo "using cached actionlint from $cache_dir" >&2
+  "$cache_dir/actionlint" -version
+  cp "$cache_dir/actionlint" "$output"
+  exit 0
+fi
 if [ -n "$prebuilt_asset" ] \
   && fetch "$task_dir/prebuilt" "$prebuilt_base/$prebuilt_asset" \
   && verify_sha "$task_dir/prebuilt" "$prebuilt_sha" \
@@ -59,6 +73,7 @@ if [ -n "$prebuilt_asset" ] \
   && "$task_dir/prebuilt" -version >/dev/null; then
   "$task_dir/prebuilt" -version
   cp "$task_dir/prebuilt" "$output"
+  mkdir -p "$cache_dir" && cp "$task_dir/prebuilt" "$cache_dir/actionlint" || true
   exit 0
 fi
 echo "prebuilt actionlint unavailable; building from the pinned source" >&2
