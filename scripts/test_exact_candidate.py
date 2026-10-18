@@ -33,8 +33,8 @@ class ExactCandidate(unittest.TestCase):
                     self.assertEqual(guard['name'], 'Verify exact validation candidate', name)
                     condition = "inputs.expected-candidate-sha != ''"
                     # fast-escalable aliases fast's step list.
-                    if name in ('fast', 'fast-escalable'):
-                        condition = f"env.FAST_ENABLED == 'true' && ({condition})"
+                    if name in ('fast', 'fast-escalable', 'fast-lanes'):
+                        condition = f"env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && ({condition})"
                     # Caller lint runs inside Required (and escalated Fast)
                     # after the gate steps, under !cancelled().
                     if name == 'required':

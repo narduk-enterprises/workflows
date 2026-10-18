@@ -181,7 +181,7 @@ def test_wiring(doc: dict) -> None:
         assert restore["with"]["restore-keys"].strip() == restore["with"]["key"].rsplit("-${{ github.sha }}", 1)[0].strip() + "-"
     # The gate that must lint cold never carries the cache.
     for job, body in doc["jobs"].items():
-        if job in ("fast", "fast-escalable"):
+        if job in ("fast", "fast-escalable", "fast-lanes"):
             continue
         text = json.dumps([s for s in body.get("steps") or [] if isinstance(s, dict)])
         assert "eslint-cache-dir" not in text and "narduk-eslint-cache" not in text and "ESLint cache" not in text, job
