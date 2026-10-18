@@ -22,7 +22,7 @@ import yaml
 
 
 WORKFLOW = Path(".github/workflows/nuxt-cloudflare.yml")
-GITHUB_SCRIPT = "actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd"
+GITHUB_SCRIPT = "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3"
 INSTALL = "Install CI artifact store client"
 PUBLISH = "Publish prebuilt E2E application"
 FETCH = "Fetch prebuilt E2E application"
