@@ -1861,11 +1861,14 @@ the shipped job graph.
 `ci / Fast` wall clock is the sum of the scripts plus one checkout and one
 install. With `fast-parallel: true` each entry is its own matrix job and the
 wall clock is the slowest lane plus its own setup. Needs `fast-scripts`;
-without it, or with the input off, nothing changes for any caller.
+without it, or with the input off, no job runs differently and the required
+context is unchanged (two extra skipped jobs, `Fast lanes plan` and a
+`Fast lane (${{ matrix.script }})` placeholder, appear in the run, as every
+skipped job here does under its raw name).
 
 | Job | Route | What it does |
 | --- | --- | --- |
-| `Fast lanes plan` | lightweight | Splits `fast-scripts` into the matrix: validated (`[A-Za-z0-9:_./@-]`), deduplicated, at most 8 lanes |
+| `Fast lanes plan` | lightweight | Splits `fast-scripts` into the matrix: validated (`[A-Za-z0-9:_./@-]`), duplicates dropped (serial mode ran a repeated script twice), at most 8 lanes; anything else fails the plan, and so `ci / Fast` |
 | `Fast lane (<script>)` (`fast-lanes`) | the caller's ordinary route | Checkout, install, one script; `fail-fast: false`, so one push shows every failing lane |
 | `Fast` (`fast`, or `fast-escalable`) | lightweight | The aggregate. Still named `Fast`, still the one required `ci / Fast`, still the protected-path escalation decision, but it runs no script |
 

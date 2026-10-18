@@ -6041,6 +6041,14 @@ jobs:
           restore-keys: |
             eslint-cache-v1-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ steps.eslint-cache-dir.outputs.lock }}-
 
+      # Lane only: the restore above fills the directory from `restore-keys`
+      # in EVERY lane, so "holds files" cannot tell the lane that ran ESLint
+      # from one that did not. This mark, taken after the restore, lets the
+      # save step ask for files written by this lane's own scripts.
+      - name: Mark the ESLint cache before the lane runs
+        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE == 'lane' && steps.eslint-cache-dir.outputs.path != ''
+        working-directory: ${{ github.workspace }}
+        run: touch "$RUNNER_TEMP/narduk-eslint-cache.mark"
       - name: Run fast scripts
         if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate'
         env:
@@ -6080,17 +6088,18 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
       # Lanes share one cache key and a key is immutable once saved: a lane
-      # that never ran ESLint (typecheck) would win the race with an empty
-      # directory and starve the lane that did. Only a lane whose directory
-      # holds files saves.
+      # that never ran ESLint (typecheck) would win the race with the restored,
+      # stale directory and starve the lane that did. Only a lane that WROTE
+      # to the directory after the mark above saves.
       - name: Check ESLint cache content
         id: eslint-cache-content
         if: env.FAST_ENABLED == 'true' && env.FAST_ROLE == 'lane' && steps.eslint-cache-dir.outputs.path != ''
+        working-directory: ${{ github.workspace }}
         env:
           ESLINT_CACHE_PATH: ${{ steps.eslint-cache-dir.outputs.path }}
         run: |
           set -uo pipefail
-          if [ -n "$(find "$ESLINT_CACHE_PATH" -type f -print -quit 2>/dev/null)" ]; then
+          if [ -n "$(find "$ESLINT_CACHE_PATH" -type f -newer "$RUNNER_TEMP/narduk-eslint-cache.mark" -print -quit 2>/dev/null)" ]; then
             echo "nonempty=true" >> "$GITHUB_OUTPUT"
           else
             echo "nonempty=false" >> "$GITHUB_OUTPUT"

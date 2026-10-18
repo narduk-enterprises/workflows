@@ -28,6 +28,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import yaml
@@ -941,8 +942,8 @@ def test_fast_parallel() -> None:
     # The aggregate fails closed on anything but two successes.
     gate = step("fast", LANES_GATE)
     assert step("fast-escalable", LANES_GATE) is gate
-    for plan_result, lanes_result, expected in itertools.product(
-            ["success", "failure", "cancelled", "skipped", ""], ["success", "failure", "cancelled", "skipped", ""], [None]):
+    for plan_result, lanes_result in itertools.product(
+            ["success", "failure", "cancelled", "skipped", ""], ["success", "failure", "cancelled", "skipped", ""]):
         result = run_bash(gate["run"], {"LANES_PLAN_RESULT": plan_result, "LANES_RESULT": lanes_result})
         assert (result.returncode == 0) == (plan_result == lanes_result == "success"), (plan_result, lanes_result, result.stdout)
 
@@ -979,6 +980,22 @@ def test_fast_parallel() -> None:
     assert "Save ESLint cache" in ran_steps("lane", nonempty="true", ref_name="main")
     assert "Save ESLint cache" not in ran_steps("lane", nonempty="false", ref_name="main")
     assert "Save ESLint cache" not in ran_steps("aggregate", ref_name="main")
+    # The save check: files restored before the mark do not count, files the
+    # lane wrote after it do.
+    mark, check = step("fast", "Mark the ESLint cache before the lane runs"), step("fast", "Check ESLint cache content")
+    for writes, expected in ((False, "false"), (True, "true")):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache, out = Path(tmp) / "cache", Path(tmp) / "out"
+            cache.mkdir()
+            out.write_text("")
+            (cache / "restored").write_text("old")
+            env = {"RUNNER_TEMP": tmp, "ESLINT_CACHE_PATH": str(cache), "GITHUB_OUTPUT": str(out)}
+            assert run_bash(mark["run"], env).returncode == 0
+            if writes:
+                time.sleep(0.05)
+                (cache / "fresh").write_text("new")
+            assert run_bash(check["run"], env).returncode == 0
+            assert out.read_text().strip() == f"nonempty={expected}", (writes, out.read_text())
     # The run step reads its scripts from the job env, never straight from the input.
     assert step("fast", "Run fast scripts")["env"]["SCRIPTS"] == "${{ env.FAST_SCRIPTS }}"
 
@@ -1005,7 +1022,6 @@ def test_fast_parallel() -> None:
         # The job named Fast waits for the lanes, whichever of the three holds it.
         needed = set(needs_of(JOBS[holder]))
         assert {"fast-lanes"} <= needed or "fast-escalable" in needed, (holder, needed)
-        assert JOBS[holder]["env"]["FAST_ROLE"] if holder != "fast-escalated" else True
         if holder != "fast-escalated":
             ctx = {**state[holder]["ctx"], "__status": "success"}
             assert render(JOBS[holder]["env"]["FAST_ROLE"], ctx) == "aggregate"
