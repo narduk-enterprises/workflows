@@ -57,7 +57,7 @@ def main() -> None:
     )
     assert (
         setup_node["uses"]
-        == "actions/setup-node@820762786026740c76f36085b0efc47a31fe5020"
+        == "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
     )
     assert setup_node["if"] == "inputs.run-pyright"
     assert setup_node["with"]["node-version"] == "24"
@@ -69,7 +69,7 @@ def main() -> None:
         if str(item.get("uses", "")).startswith("astral-sh/setup-uv@")
     )
     assert setup_uv["uses"] == (
-        "astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9"
+        "astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884"
     )
 
     install = step(document, "Install pinned Pyright")
