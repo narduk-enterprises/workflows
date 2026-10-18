@@ -1855,6 +1855,58 @@ no `Required` proof, so `required-reuse-pr-results` runs the full gate on the
 push. `scripts/test_fast_path.py` (`test_pr_fast_only`) simulates each case on
 the shipped job graph.
 
+#### Fast lanes side by side (`fast-parallel`, default false)
+
+`fast-scripts` normally runs in one job, one script after another, so the
+`ci / Fast` wall clock is the sum of the scripts plus one checkout and one
+install. With `fast-parallel: true` each entry is its own matrix job and the
+wall clock is the slowest lane plus its own setup. Needs `fast-scripts`;
+without it, or with the input off, nothing changes for any caller.
+
+| Job | Route | What it does |
+| --- | --- | --- |
+| `Fast lanes plan` | lightweight | Splits `fast-scripts` into the matrix: validated (`[A-Za-z0-9:_./@-]`), deduplicated, at most 8 lanes |
+| `Fast lane (<script>)` (`fast-lanes`) | the caller's ordinary route | Checkout, install, one script; `fail-fast: false`, so one push shows every failing lane |
+| `Fast` (`fast`, or `fast-escalable`) | lightweight | The aggregate. Still named `Fast`, still the one required `ci / Fast`, still the protected-path escalation decision, but it runs no script |
+
+The required context does not change. The aggregate fails closed: the plan and
+the lane matrix must both be `success`, so a failed, cancelled, skipped or
+never-started lane (a skipped matrix is a missing lane) cannot leave `ci / Fast`
+green. `Required` additionally demands both lane jobs succeed when the input is
+on and be skipped when it is off. Escalation is untouched: `fast-escalable`
+keeps the name `Fast` or hands it to `fast-escalated`, which still needs it.
+
+**What it costs.** One runner seat per script at once (plus two lightweight
+jobs) instead of one, and one checkout and install per lane instead of one in
+total. Where free seats are few, queueing can eat the saving; the cap of 8
+lanes bounds the burst. A caller with a single `fast-scripts` entry (for
+example `ci:fast`) gains nothing: split the entry first. Scripts must not rely
+on each other's side effects (a `lint` that expects `typecheck` to have written
+`.nuxt` first); `nuxt prepare` is the usual shared prerequisite and the usual
+scripts already run it as `prelint` / `pretypecheck`.
+
+**Install per lane, not one shared install.** The 15 `ci / Fast` jobs measured
+for this change (2026-10-18, five callers) installed in 4-41 s (pnpm store on
+the runner), against 14-149 s for the slowest script. Handing `node_modules`
+from one install job to the lanes means packing and unpacking it through the
+artifact store, which costs more than the install it saves, and the lanes would
+wait for it. N concurrent installs finish as fast as one.
+
+**Checkout is not helped by `filter: blob:none` or a shallower fetch.** The
+checkout step is one `git fetch --depth=2`: 2-4 minutes on slow runs and about
+20 s on quick ones (stonx: 226 s, 139 s, 23 s). Timed against a stonx
+`refs/pull/N/merge` ref: full `--depth=2` fetch 237 s, `--depth=1` 176 s,
+`--depth=2 --filter=blob:none` 1.5 s for the fetch but 345 s for the checkout
+that then downloads the blobs, `--depth=1 --filter=blob:none` 2.8 s plus 220 s.
+Depth 2 stays because `FAST_BASE_REF` is `HEAD^1` of the merge commit; a
+blobless clone moves the same bytes into the checkout. No submodules are
+fetched and `persist-credentials` is already off. Parallel lanes each fetch, so
+a slow fetch is paid by the slowest lane, not added up.
+
+`scripts/test_fast_path.py` (`test_fast_parallel`) covers the plan, the
+fail-closed aggregate, the three roles the shared step list plays
+(`FAST_ROLE` = `serial`, `aggregate`, `lane`) and the simulated job graph.
+
 #### A non-blocking quarantine lane (`e2e-quarantine-args`)
 
 A flaky test is taken out of the gate by tagging it (for example

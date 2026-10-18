@@ -65,6 +65,8 @@ AUTH_JOBS = (
     "fast",
     # Runs `fast`'s own anchored steps (`*fast_steps`), cleanup included.
     "fast-escalable",
+    # Runs `fast`'s anchored steps once per `fast-parallel` matrix leg.
+    "fast-lanes",
     "journey-smoke",
 )
 
@@ -122,7 +124,7 @@ def auth_jobs(document: dict) -> dict[str, dict]:
 
 
 def validate_cleanup_step(job_id: str, step: dict, condition: str = "always() && inputs.install-script == ''") -> None:
-    if job_id in ("fast", "fast-escalable"):
+    if job_id in ("fast", "fast-escalable", "fast-lanes"):
         condition += " && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
     assert step.get("if") == condition, (
         f"{job_id}: cleanup must always run for the legacy materialization path, "
@@ -146,8 +148,8 @@ def validate_cleanup_step(job_id: str, step: dict, condition: str = "always() &&
 
 def install_condition(job_id: str, step: dict) -> str:
     condition = step.get("if", "")
-    if job_id in ("fast", "fast-escalable"):
-        prefix = "env.FAST_ENABLED == 'true' && ("
+    if job_id in ("fast", "fast-escalable", "fast-lanes"):
+        prefix = "env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && ("
         assert condition.startswith(prefix) and condition.endswith(")"), condition
         return condition[len(prefix):-1]
     return condition

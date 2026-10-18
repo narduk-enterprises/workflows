@@ -59,7 +59,7 @@ DEFAULT_TAIL = f"github.event.repository.private == true && '{LINUX_CI}' || '\"u
 # overflow can engage on a caller that pins a runner. Private callers only;
 # unset is identical to the pre-variable expression, which check_callable
 # proves by evaluating both.
-LINUX_VAR_SITES = {"nuxt-cloudflare.yml": {"build", "checks", "extra-gate", "deploy-dry-run", "fast", "fast-escalable"}}
+LINUX_VAR_SITES = {"nuxt-cloudflare.yml": {"build", "checks", "extra-gate", "deploy-dry-run", "fast", "fast-escalable", "fast-lanes"}}
 
 # callable -> the input that carries the caller's route
 CALLABLES = {
@@ -241,6 +241,18 @@ def runs_on_sites(doc: dict, input_name: str):
     for jid, job in doc["jobs"].items():
         ro = job.get("runs-on")
         if isinstance(ro, str) and f"inputs.{input_name}" in ro:
+            if "inputs.fast-parallel &&" in ro:
+                # `fast-parallel` (nuxt-cloudflare.yml): `fast` and
+                # `fast-escalable` become the aggregate of the lane matrix and
+                # take the lightweight route, exactly `fast-escalated`'s. With
+                # it off they are the ordinary route, which is what the rest of
+                # this check proves; the lightweight half is asserted equal to
+                # the sibling it is copied from, whose own checks cover it.
+                light = doc["jobs"]["fast-escalated"]["runs-on"]
+                inner = re.fullmatch(r"\$\{\{ fromJSON\((.*)\) \}\}", light, re.S).group(1)
+                prefix = "${{ fromJSON(inputs.fast-parallel && (" + inner + ") || ("
+                assert ro.startswith(prefix) and ro.endswith(")) }}"), f"{jid}: aggregate route drifted from fast-escalated"
+                ro = "${{ fromJSON(" + ro[len(prefix):-len(")) }}")] + ") }}"
             yield jid, ro
 
 

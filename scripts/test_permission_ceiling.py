@@ -126,7 +126,7 @@ def check_preview_is_the_only_pull_requests_job() -> None:
 # scripts resolve portal-served app config with the job's OIDC token.
 OIDC_JOBS = {
     "build", "checks", "extra-gate", "e2e", "e2e-quarantine", "preview",
-    "deploy-dry-run", "fast", "fast-escalable", "journey-smoke",
+    "deploy-dry-run", "fast", "fast-escalable", "fast-lanes", "journey-smoke",
 }
 
 
@@ -145,7 +145,7 @@ def check_id_token_sits_on_exactly_the_caller_code_jobs() -> None:
     )
     assert "id-token" not in (doc.get("permissions") or {}), "workflow level must stay least-privilege"
     # Jobs that run no caller code never hold it.
-    for job_id in ("reuse-plan", "e2e-plan", "fast-plan", "fast-escalated", "required"):
+    for job_id in ("reuse-plan", "e2e-plan", "fast-plan", "fast-lanes-plan", "fast-escalated", "required"):
         assert "id-token" not in doc["jobs"][job_id]["permissions"], job_id
     print("PASS  nuxt-cloudflare.yml grants `id-token: write` on exactly the caller-code jobs")
 

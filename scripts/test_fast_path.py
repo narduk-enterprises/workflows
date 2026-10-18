@@ -51,6 +51,7 @@ NEW_INPUTS = {
     "checks-in-build": False,
     "concurrent-scripts": "",
     "pr-fast-only": False,
+    "fast-parallel": False,
 }
 GATE_STEP = "Require enabled gates to succeed and disabled gates to skip"
 FAST_STEP = "Require fast-path and journey-smoke lanes"
@@ -250,11 +251,12 @@ def run_gates(job_id: str, state: dict) -> list:
                   for key, value in JOBS[job_id].get("env", {}).items()}
     ran = []
     for s in JOBS[job_id]["steps"]:
-        if s.get("name") not in (GATE_STEP, FAST_STEP, "Require the fast lanes to succeed"):
+        if s.get("name") not in (GATE_STEP, FAST_STEP, "Require the fast lanes to succeed",
+                                 "Require the parallel fast lanes to succeed"):
             continue
         if not ev(job_condition(s), ctx):
             continue
-        env = {key: gh_str(render(value, ctx)) for key, value in (s.get("env") or {}).items()}
+        env = {**ctx["env"], **{key: gh_str(render(value, ctx)) for key, value in (s.get("env") or {}).items()}}
         result = run_bash(render(s["run"], ctx), env)
         ran.append((s["name"], result.returncode, result.stdout + result.stderr))
         if result.returncode:
@@ -281,7 +283,8 @@ OLD_GRAPH = {
     "required": {"needs": ["build", "checks", "extra-gate", "e2e-plan", "e2e", "preview",
                            "deploy-dry-run"], "if": "always()"},
 }
-NEW_JOBS = {"reuse-plan", "fast-plan", "fast", "fast-escalable", "fast-escalated", "journey-smoke"}
+NEW_JOBS = {"reuse-plan", "fast-plan", "fast", "fast-escalable", "fast-escalated", "fast-lanes-plan", "fast-lanes",
+            "journey-smoke"}
 CI_LANES = ["build", "checks", "extra-gate", "e2e-plan", "e2e", "e2e-quarantine",
             "preview", "deploy-dry-run"]
 
@@ -573,6 +576,7 @@ def test_required_fast_path_step() -> None:
     base = {"REUSE_APPLIES": "false", "REUSE_PLAN_RESULT": "skipped",
             "FAST_APPLIES": "true", "FAST_ESCALABLE_APPLIES": "true", "FAST_ESCALATION_APPLIES": "true",
             "FAST_RESULT": "success", "FAST_ESCALABLE_RESULT": "success", "FAST_ESCALATED_RESULT": "success",
+            "FAST_LANES_APPLIES": "false", "FAST_LANES_PLAN_RESULT": "skipped", "FAST_LANES_RESULT": "skipped",
             "JOURNEY_SMOKE_URL": "", "JOURNEY_SMOKE_RESULT": "skipped"}
     cases = [
         ({}, 0),
@@ -595,6 +599,16 @@ def test_required_fast_path_step() -> None:
     for key, outcome in itertools.product(("FAST_RESULT", "FAST_ESCALABLE_RESULT", "FAST_ESCALATED_RESULT"),
                                           ("success", "failure", "cancelled", "")):
         cases.append(({**off, key: outcome}, 1))
+    # `fast-parallel`: the lane plan and the lane matrix must both succeed when
+    # they apply and both be skipped when they do not.
+    on = {"FAST_LANES_APPLIES": "true", "FAST_LANES_PLAN_RESULT": "success", "FAST_LANES_RESULT": "success"}
+    cases.append((on, 0))
+    for key, outcome in itertools.product(("FAST_LANES_PLAN_RESULT", "FAST_LANES_RESULT"),
+                                          ("failure", "cancelled", "skipped", "")):
+        cases.append(({**on, key: outcome}, 1))
+    for key, outcome in itertools.product(("FAST_LANES_PLAN_RESULT", "FAST_LANES_RESULT"),
+                                          ("success", "failure", "cancelled", "")):
+        cases.append(({key: outcome}, 1))
     for overrides, expected in cases:
         result = run_bash(script, {**base, **overrides})
         assert result.returncode == expected, (overrides, result.stdout, result.stderr)
@@ -606,6 +620,11 @@ def test_required_fast_path_step() -> None:
         applies = step("required", FAST_STEP)["env"][key]
         assert applies == JOBS[job]["env"]["FAST_ENABLED"], (job, applies)
         assert JOBS[job]["if"] == f"!cancelled() && {applies[4:-3]}", (job, JOBS[job]["if"])
+    lanes = step("required", FAST_STEP)["env"]["FAST_LANES_APPLIES"]
+    assert lanes == "${{ inputs.fast-parallel && " + step("required", FAST_STEP)["env"]["FAST_APPLIES"][4:-3].replace(
+        " && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != ''))", "") + " }}", lanes
+    assert JOBS["fast-lanes-plan"]["if"] == f"!cancelled() && {lanes[4:-3]}", JOBS["fast-lanes-plan"]["if"]
+    assert JOBS["fast-lanes"]["env"]["FAST_ENABLED"] == "${{ " + lanes[len("${{ inputs.fast-parallel && "):-3] + " }}"
     print(f"PASS  Required fast-path/smoke aggregation ({len(cases)} cases)")
 
 
@@ -709,7 +728,10 @@ def test_fast_escalation_is_published_on_the_check_named_fast() -> None:
         assert "checks" not in JOBS[job]["permissions"], job
         assert "outputs" not in JOBS[job], job
         publish = step(job, "Publish Fast escalation")
-        assert publish["if"] == "env.FAST_ENABLED == 'true' && (success())"
+        # The shared list also feeds the `fast-parallel` lanes, which never
+        # publish: escalation is the aggregate's business.
+        lane_guard = " && env.FAST_ROLE != 'lane'" if job != "fast-escalated" else ""
+        assert publish["if"] == f"env.FAST_ENABLED == 'true'{lane_guard} && (success())"
         # `fast`/`fast-escalable` share one step list and read ESCALATED from
         # their job env; the escalated job binds it on the step.
         escalated = (publish.get("env") or {}).get("ESCALATED", JOBS[job]["env"].get("ESCALATED"))
@@ -824,9 +846,181 @@ def test_fast_jobs_have_readable_names_and_disabled_steps() -> None:
     for job_id, job in JOBS.items():
         # `build`/`required` carry the Required-into-Build fold
         # (test_required_folds_into_build).
-        if job_id not in FAST_JOBS + ("build", "required"):
+        if job_id == "fast-lanes":
+            # The one matrix job: its legs are `Fast lane (<script>)`, never `Fast`.
+            assert job["name"] == "Fast lane (${{ matrix.script }})", job["name"]
+        elif job_id not in FAST_JOBS + ("build", "required"):
             assert "${{" not in job["name"] and job["name"] != "Fast", (job_id, job["name"])
     print(f"PASS  readable Fast names, disabled steps do no work, enabled cleanup survives cancellation ({cases} cases)")
+
+
+LANES_PLAN = "Plan the fast lanes"
+LANES_GATE = "Require the parallel fast lanes to succeed"
+
+
+def run_lane_plan(scripts: str) -> tuple[int, dict, str]:
+    script = step("fast-lanes-plan", LANES_PLAN)["run"]
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "output"
+        out.write_text("")
+        # Run from a directory holding files a `*` could expand to.
+        (Path(tmp) / "package.json").write_text("{}")
+        result = run_bash(script, {"SCRIPTS": scripts, "GITHUB_OUTPUT": str(out)}, cwd=tmp)
+        outputs = dict(line.split("=", 1) for line in out.read_text().splitlines() if "=" in line)
+        return result.returncode, outputs, result.stdout
+
+
+def test_fast_parallel() -> None:
+    """`fast-parallel`: the lane plan, the matrix, the aggregate and the shared
+    step list's roles. The required context stays `ci / Fast`, and a missing or
+    unsuccessful lane can never leave it green."""
+    # Off by default, and the lane jobs never start without it.
+    assert INPUTS["fast-parallel"]["default"] is False and INPUTS["fast-parallel"]["required"] is False
+    for (event, ref), parallel, scripts, smoke, reused, status in itertools.product(
+            EVENTS, [False, True], ["", "lint typecheck"], ["", "https://app.example"], ["", "true"],
+            ["success", "cancelled"]):
+        ctx = context(event, ref, {"fast-parallel": parallel, "fast-scripts": scripts, "journey-smoke-url": smoke},
+                      {"reuse-plan": {"result": "success", "outputs": {"reused": reused}},
+                       "fast-lanes-plan": {"result": "success", "outputs": {"matrix": "{}"}}}, status)
+        applies = parallel and bool(scripts) and not smoke and reused != "true" and status != "cancelled"
+        assert ev(JOBS["fast-lanes-plan"]["if"], ctx) is applies, (event, parallel, scripts, smoke, reused, status)
+        # A plan that did not start is skipped, and then no lane starts.
+        ctx["needs"]["fast-lanes-plan"]["result"] = "success" if applies else "skipped"
+        assert ev(JOBS["fast-lanes"]["if"], ctx) is applies, (event, parallel, scripts, smoke, reused, status)
+        ctx["needs"]["fast-lanes-plan"]["result"] = "failure"
+        assert ev(JOBS["fast-lanes"]["if"], ctx) is False, "a failed plan starts no lane"
+        # The lane's FAST_ENABLED is Fast's own union condition; the job `if:`
+        # above adds `fast-parallel`.
+        assert ev(JOBS["fast-lanes"]["env"]["FAST_ENABLED"], ctx) is (
+            bool(scripts) and not smoke and reused != "true")
+        for job in ("fast", "fast-escalable"):
+            assert ev(JOBS[job]["env"]["FAST_ROLE"], ctx) == ("aggregate" if parallel else "serial"), job
+    lanes = JOBS["fast-lanes"]
+    assert lanes["strategy"]["fail-fast"] is False
+    assert lanes["env"]["FAST_ROLE"] == "lane" and lanes["env"]["FAST_SCRIPTS"] == "${{ matrix.script }}"
+    assert lanes["name"] == "Fast lane (${{ matrix.script }})"
+    assert lanes["steps"] is JOBS["fast"]["steps"], "lanes must run fast's anchored steps"
+    assert lanes["permissions"] == JOBS["fast"]["permissions"] and lanes["timeout-minutes"] == JOBS["fast"]["timeout-minutes"]
+    # Lanes take `fast`'s ordinary route; the aggregate takes `fast-escalated`'s
+    # lightweight one when `fast-parallel` is on (and the ordinary one off).
+    light = JOBS["fast-escalated"]["runs-on"][len("${{ fromJSON("):-len(") }}")]
+    prefix = "${{ fromJSON(inputs.fast-parallel && (" + light + ") || ("
+    for job in ("fast", "fast-escalable"):
+        assert JOBS[job]["runs-on"].startswith(prefix) and JOBS[job]["runs-on"].endswith(")) }}"), job
+    ordinary = "${{ fromJSON(" + JOBS["fast"]["runs-on"][len(prefix):-len(")) }}")] + ") }}"
+    assert lanes["runs-on"] == ordinary
+    assert JOBS["fast-escalable"]["runs-on"] == JOBS["fast"]["runs-on"]
+    assert JOBS["fast-lanes-plan"]["runs-on"] == JOBS["fast-escalated"]["runs-on"]
+    assert lanes["defaults"] == JOBS["fast"]["defaults"]
+    for job in ("fast", "fast-escalable"):
+        assert {"fast-lanes-plan", "fast-lanes"} <= set(needs_of(JOBS[job])), job
+        assert JOBS[job]["env"]["FAST_SCRIPTS"] == "${{ inputs.fast-scripts }}"
+        assert JOBS[job]["env"]["LANES_PLAN_RESULT"] == "${{ needs.fast-lanes-plan.result }}"
+        assert JOBS[job]["env"]["LANES_RESULT"] == "${{ needs.fast-lanes.result }}"
+    assert set(needs_of(JOBS["fast-lanes"])) == {"reuse-plan", "fast-lanes-plan"}
+    assert {"fast-lanes-plan", "fast-lanes"} <= set(needs_of(JOBS["required"]))
+    # The strategy matrix is the plan's output, with a harmless fallback that
+    # is never reached when the job starts.
+    assert "needs.fast-lanes-plan.outputs.matrix" in lanes["strategy"]["matrix"]
+
+    # The plan: validated, deduplicated, bounded, glob-proof.
+    code, out, _ = run_lane_plan("lint typecheck test")
+    assert code == 0 and json.loads(out["matrix"]) == {"script": ["lint", "typecheck", "test"]}, out
+    code, out, _ = run_lane_plan("  lint\ttest:changed  lint  ")
+    assert code == 0 and json.loads(out["matrix"]) == {"script": ["lint", "test:changed"]}, out
+    code, out, _ = run_lane_plan("lint:build-plugins @scope/pkg.x_y")
+    assert code == 0 and json.loads(out["matrix"]) == {"script": ["lint:build-plugins", "@scope/pkg.x_y"]}, out
+    for bad in ("", "   ", "*", "lint ; rm -rf x", 'a"b', "a$(b)", "lint\\x", "a b'c"):
+        code, out, text = run_lane_plan(bad)
+        assert code == 1 and "matrix" not in out, (bad, code, out, text)
+    code, out, text = run_lane_plan(" ".join(f"s{i}" for i in range(8)))
+    assert code == 0 and len(json.loads(out["matrix"])["script"]) == 8
+    code, out, text = run_lane_plan(" ".join(f"s{i}" for i in range(9)))
+    assert code == 1 and "at most 8 lanes" in text and "matrix" not in out, text
+
+    # The aggregate fails closed on anything but two successes.
+    gate = step("fast", LANES_GATE)
+    assert step("fast-escalable", LANES_GATE) is gate
+    for plan_result, lanes_result, expected in itertools.product(
+            ["success", "failure", "cancelled", "skipped", ""], ["success", "failure", "cancelled", "skipped", ""], [None]):
+        result = run_bash(gate["run"], {"LANES_PLAN_RESULT": plan_result, "LANES_RESULT": lanes_result})
+        assert (result.returncode == 0) == (plan_result == lanes_result == "success"), (plan_result, lanes_result, result.stdout)
+
+    # One step list, three roles: which steps run where (a GitHub-hosted pnpm
+    # run of a pull request, then the default branch for the cache save).
+    def ran_steps(role: str, nonempty: str = "true", ref_name: str = "feature") -> set:
+        ctx = context("pull_request", "refs/pull/1/merge", {"fast-scripts": "lint typecheck", "package-manager": "pnpm"},
+                      {"reuse-plan": {"outputs": {"reused": "false"}}}, "success")
+        ctx["runner"] = {"environment": "github-hosted"}
+        ctx["github"]["ref_name"] = ref_name
+        ctx["env"] = {"FAST_ENABLED": "true", "FAST_ROLE": role}
+        ctx["steps"] = {"eslint-cache-dir": {"outputs": {"path": "/x"}},
+                        "eslint-cache-content": {"outputs": {"nonempty": nonempty}}}
+        return {item.get("name") or item["uses"] for item in JOBS["fast"]["steps"] if ev(job_condition(item), ctx)}
+
+    aggregate = ran_steps("aggregate")
+    assert aggregate == {"Resolve protected-path escalation", LANES_GATE, "Remove package auth materialization",
+                         "Publish Fast escalation"}, aggregate
+    serial = ran_steps("serial")
+    assert {"Run fast scripts", "Install dependencies (pnpm)", "Resolve protected-path escalation",
+            "Publish Fast escalation"} <= serial and not {LANES_GATE, "Check ESLint cache content"} & serial, serial
+    lane = ran_steps("lane")
+    assert {"Run fast scripts", "Install dependencies (pnpm)", "Check ESLint cache content"} <= lane, lane
+    assert not {LANES_GATE, "Resolve protected-path escalation", "Publish Fast escalation"} & lane, lane
+    # Every step the aggregate skips is a step the serial job runs: nothing is
+    # only-in-parallel except the gate itself.
+    assert aggregate - serial == {LANES_GATE}, aggregate - serial
+    # The ESLint cache is saved from the default branch only; a lane saves it
+    # only when its directory holds files (a typecheck lane must not claim the
+    # immutable key with an empty directory), the serial job as before.
+    assert "Save ESLint cache" not in ran_steps("serial", ref_name="feature")
+    assert "Save ESLint cache" in ran_steps("serial", ref_name="main")
+    assert "Save ESLint cache" in ran_steps("serial", nonempty="", ref_name="main")
+    assert "Save ESLint cache" in ran_steps("lane", nonempty="true", ref_name="main")
+    assert "Save ESLint cache" not in ran_steps("lane", nonempty="false", ref_name="main")
+    assert "Save ESLint cache" not in ran_steps("aggregate", ref_name="main")
+    # The run step reads its scripts from the job env, never straight from the input.
+    assert step("fast", "Run fast scripts")["env"]["SCRIPTS"] == "${{ env.FAST_SCRIPTS }}"
+
+    # On the real graph: the lanes run beside nothing else, the name stays `Fast`
+    # on the same single job as in the serial mode, and any lane not green
+    # reddens that job (and `Required`, where it runs).
+    matrix = '{"script":["lint","typecheck"]}'
+    for event, ref, full_paths, plan_full in (
+            ("pull_request", "refs/pull/1/merge", "", "false"),
+            ("pull_request", "refs/pull/1/merge", "src/auth/**", "false"),
+            ("pull_request", "refs/pull/1/merge", "src/auth/**", "true"),
+            ("push", "refs/heads/main", "", "false")):
+        base = {"run-e2e": bool(full_paths), "e2e-full-paths": full_paths, "fast-scripts": "lint typecheck"}
+        outputs = {**plan_outputs("false", "1", plan_full), "fast-lanes-plan": {"matrix": matrix}}
+        serial = simulate(JOBS, base, event, ref, plan_outputs("false", "1", plan_full))
+        state = simulate(JOBS, {**base, "fast-parallel": True}, event, ref, outputs)
+        assert state["fast-lanes-plan"]["result"] == state["fast-lanes"]["result"] == "success"
+        assert serial["fast-lanes-plan"]["result"] == serial["fast-lanes"]["result"] == "skipped"
+        for job in FAST_JOBS:
+            assert state[job]["result"] == serial[job]["result"], (job, event, full_paths)
+            assert render(JOBS[job]["name"], state[job]["ctx"]) == render(JOBS[job]["name"], serial[job]["ctx"]), job
+        holder = next(job for job in FAST_JOBS if render(JOBS[job]["name"], state[job]["ctx"]) == "Fast")
+        assert state[holder]["result"] == "success"
+        # The job named Fast waits for the lanes, whichever of the three holds it.
+        needed = set(needs_of(JOBS[holder]))
+        assert {"fast-lanes"} <= needed or "fast-escalable" in needed, (holder, needed)
+        assert JOBS[holder]["env"]["FAST_ROLE"] if holder != "fast-escalated" else True
+        if holder != "fast-escalated":
+            ctx = {**state[holder]["ctx"], "__status": "success"}
+            assert render(JOBS[holder]["env"]["FAST_ROLE"], ctx) == "aggregate"
+        for gate in ("fast-escalated", "required") if holder == "fast-escalated" else ("required",):
+            for _name, code, out in run_gates(gate, state):
+                assert code == 0, (gate, event, full_paths, out)
+        # Any lane or plan result but success reddens the aggregate and Required.
+        for job in ("fast-lanes", "fast-lanes-plan"):
+            for bad in ("failure", "cancelled"):
+                red = simulate(JOBS, {**base, "fast-parallel": True}, event, ref, outputs, {job: bad})
+                if holder != "fast-escalated":
+                    steps = run_gates(holder, red)
+                    assert [code for name, code, _ in steps if name == LANES_GATE] == [1], (holder, job, bad, steps)
+                assert any(code == 1 for _, code, _ in run_gates("required", red)), (event, job, bad)
+    print("PASS  fast-parallel: lane plan, matrix, fail-closed aggregate, roles of the shared step list, real graph")
 
 
 FOLD_INPUTS = {"checks-in-build": True, "run-e2e": False, "preview-checks": "none", "wrangler-dry-run": False,
@@ -1333,6 +1527,7 @@ def main() -> None:
     test_journey_smoke_rollback_hook()
     test_journey_smoke_validation()
     test_pr_fast_only()
+    test_fast_parallel()
     print("fast-path contract passed")
 
 
