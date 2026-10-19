@@ -1888,6 +1888,26 @@ on each other's side effects (a `lint` that expects `typecheck` to have written
 `.nuxt` first); `nuxt prepare` is the usual shared prerequisite and the usual
 scripts already run it as `prelint` / `pretypecheck`.
 
+**When it pays (measured on stonx, 2026-10-19, two runs of `lint typecheck test`).**
+End to end (plan job created to aggregate completed) the two runs took 328 s and
+321 s. In both, one lane's checkout took 158 s and 181 s while the other two took
+3-23 s, so the slowest lane was a checkout, not a script (the scripts were
+92 / 51 / 40 s and 48 / 48 / 81 s, lint / typecheck / test). The same repo's
+serial `ci / Fast` (job time from `created_at`, queue included) took 121-131 s
+on two other pull requests (scripts 84-93 s, checkout 22-23 s) and 531-633 s on
+two more (scripts 331-350 s, checkout 139-226 s). These are different pull
+requests, not a same-commit comparison, so they show where the time goes and
+not a measured speed-up. They do not show the break-even point: in both
+parallel runs the slowest lane was a checkout, and the plan, aggregate and
+lane-setup hops add roughly 15-30 s on top of it (plan 5-6 s, aggregate 10-20 s;
+the rest of the gap is install and setup that the serial job pays too). The
+matrix can only win when the serial script sum is large next to that overhead
+and a slow fetch in any of the N parallel lanes costs the whole run (in both
+measured runs it paid the slowest of N fetches, not one). Before keeping it on,
+compare its first runs with that caller's serial history on comparable changes;
+a caller whose serial scripts run to several hundred seconds is the plausible
+case (the ~300 s figure is an estimate, not a measured threshold).
+
 **Install per lane, not one shared install.** The 15 `ci / Fast` jobs measured
 for this change (2026-10-18, five callers) installed in 4-41 s (pnpm store on
 the runner), against 14-149 s for the slowest script. Handing `node_modules`
