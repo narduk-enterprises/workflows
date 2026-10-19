@@ -2601,6 +2601,18 @@ jobs:
           TOOL_VERSION: ${{ inputs.foundation-check-tool-version }}
           AUTH_SOURCE: ${{ inputs.foundation-check-auth }}
           NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          # Item 2.3 reads the narduk-core packument. On GitHub Packages that
+          # is the FULL document and it ignores the abbreviated Accept header:
+          # 10.4 MB on 2026-10-19 (it was 240 KB on 2026-09-16), about 15 s on
+          # an idle ~0.7 MB/s link to GitHub's origin. The tool's default
+          # 20 s per attempt (narduk-libs#341) therefore times out three times
+          # on any pool whose origin path is not the fast relay (aus1-ci-1,
+          # home2-ci-1: acre-oracle runs 39199389653, 39187710828,
+          # 39164027564), item 2.3 reads UNKNOWN and the gate blocks. 90 s
+          # gives a 6x margin and still fails closed after three attempts if
+          # the registry is truly unreachable. Callers on the npm.nard.uk
+          # mirror are unaffected (the same read takes under a second).
+          NARDUK_FOUNDATION_REGISTRY_TIMEOUT_MS: '90000'
         run: |
           set -uo pipefail
           # A failed credential resolve still leaves a file for the always()
