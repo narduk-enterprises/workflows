@@ -1888,6 +1888,20 @@ on each other's side effects (a `lint` that expects `typecheck` to have written
 `.nuxt` first); `nuxt prepare` is the usual shared prerequisite and the usual
 scripts already run it as `prelint` / `pretypecheck`.
 
+**When it pays (measured on stonx, 2026-10-19, two runs of `lint typecheck test`).**
+End to end (plan start to aggregate end) the two runs took 328 s and 321 s. In
+both, one lane's checkout took 158 s and 181 s while the other two took 3-23 s,
+so the slowest lane was a checkout, not a script (the scripts were 92 / 51 / 40 s
+and 48 / 81 / 48 s). The same repo's serial `ci / Fast` took 121-131 s on small
+pull requests (scripts 84-93 s, checkout 22 s) and 531-633 s on two others
+(scripts 331-350 s, checkout 139-226 s). So the matrix wins only when the
+serial script sum is large (a few hundred seconds against a ~35 s fixed cost for
+the plan hop, the lane setup and the aggregate), and it loses its gain whenever
+any one of the N parallel fetches is slow: it pays the maximum of N fetches, not
+one. Turn it on for a caller whose serial scripts routinely exceed ~300 s and
+whose checkout is quick; compare the first runs against that caller's serial
+history before keeping it.
+
 **Install per lane, not one shared install.** The 15 `ci / Fast` jobs measured
 for this change (2026-10-18, five callers) installed in 4-41 s (pnpm store on
 the runner), against 14-149 s for the slowest script. Handing `node_modules`
