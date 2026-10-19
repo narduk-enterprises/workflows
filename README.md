@@ -825,7 +825,11 @@ and the pinned dlx download fetches from `https://npm.nard.uk`. That needs
 narduk-app-tools 0.10.0 or later (the `foundation-check-tool-version` default),
 because older releases hard-code GitHub Packages for their live registry
 lookup. A caller that has adopted the tool as a dependency must depend on
-0.10.0 or later too.
+0.10.0 or later too. A caller still on GitHub Packages reads the full
+`narduk-core` packument (10.4 MB on 2026-10-19); the callable sets
+`NARDUK_FOUNDATION_REGISTRY_TIMEOUT_MS=90000` for the check so a slow origin
+path (the auxiliary pools) reads item 2.3 instead of timing out to `UNKNOWN`.
+The mirror read takes under a second.
 Without a caller bootstrap,
 the callable writes a temporary user config containing a literal variable
 reference, then removes it after the install.
