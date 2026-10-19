@@ -1892,7 +1892,7 @@ scripts already run it as `prelint` / `pretypecheck`.
 End to end (plan start to aggregate end) the two runs took 328 s and 321 s. In
 both, one lane's checkout took 158 s and 181 s while the other two took 3-23 s,
 so the slowest lane was a checkout, not a script (the scripts were 92 / 51 / 40 s
-and 48 / 81 / 48 s). The same repo's serial `ci / Fast` took 121-131 s on small
+and 48 / 48 / 81 s, lint / typecheck / test). The same repo's serial `ci / Fast` took 121-131 s on small
 pull requests (scripts 84-93 s, checkout 22 s) and 531-633 s on two others
 (scripts 331-350 s, checkout 139-226 s). So the matrix wins only when the
 serial script sum is large (a few hundred seconds against a ~35 s fixed cost for
