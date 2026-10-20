@@ -430,12 +430,15 @@ jobs:
         with:
           python-version: ${{ inputs.python-version }}
           # `enable-cache` is deliberately left at its `auto` default: auto
-          # means "on for GitHub-hosted, off for self-hosted", which is
-          # already the right answer. A self-hosted linux-ci guest keeps
-          # `~/.cache/uv` between jobs, so uploading a tarball of it would add
-          # cost to a cache that is already warm on disk. Forcing
-          # `enable-cache: true` here would be a regression for the only
-          # current adopter (narduk-data, on linux-ci).
+          # means "on for GitHub-hosted, off for self-hosted". Do not read
+          # that as "a self-hosted guest keeps ~/.cache/uv warm": the linux-ci
+          # JIT slots (/var/lib/github-runner-transient/aux/slot-N) wipe
+          # HOME, the workspace and the uv cache after every job (measured in
+          # narduk-data#1064: the whole heavy group re-downloaded each run).
+          # Their warm layer is the guest's PyPI pull-through cache, which
+          # `Install project (uv)` below uses. Forcing `enable-cache: true`
+          # would only add a tarball upload and restore to a cache the slot
+          # discards anyway.
           #
           # `save-cache` is gated for the hosted case, for the same reason the
           # Node workflows here split restore from save (company-hq#269): a
@@ -461,7 +464,49 @@ jobs:
 
       - name: Install project (uv)
         if: inputs.dependency-manager == 'uv'
-        run: uv sync ${{ inputs.uv-sync-args }}
+        env:
+          UV_SYNC_ARGS: ${{ inputs.uv-sync-args }}
+        run: |
+          set -euo pipefail
+          # `uv sync --locked` downloads each file from the URL recorded in
+          # uv.lock, which bypasses the linux-ci guests' PyPI pull-through
+          # cache (127.0.0.1:4874). fleet cannot set UV_INDEX_URL: it makes
+          # `--locked` reject a lock that names pypi.org (fleet
+          # runner-guests/README.md). It exports NARDUK_PYPI_CACHE_INDEX_URL
+          # instead, only while the cache answers. Pre-install the lock's
+          # registry packages through it (hash-verified, so the cache cannot
+          # change what is installed), then run the real sync, which finds
+          # them installed and fetches only the local packages. Any failure
+          # falls through to the plain sync; the sync alone decides the env.
+          if [ -n "${NARDUK_PYPI_CACHE_INDEX_URL:-}" ]; then
+            req="$RUNNER_TEMP/uv-cache-requirements.txt"
+            export_args=()
+            # shellcheck disable=SC2086
+            set -- $UV_SYNC_ARGS
+            while [ "$#" -gt 0 ]; do
+              case "$1" in
+                --extra|--group|--only-group) [ "$#" -ge 2 ] || break; export_args+=("$1" "$2"); shift 2 ;;
+                --no-dev|--only-dev|--all-groups|--all-extras) export_args+=("$1"); shift ;;
+                *) shift ;;
+              esac
+            done
+            # Local path packages (an editable sibling that is not a workspace
+            # member) carry no hash and cannot come from an index: drop their
+            # entries, hash continuation lines included. The sync installs them.
+            if uv export --locked --no-emit-workspace --no-emit-project --format requirements.txt \
+                 ${export_args[@]+"${export_args[@]}"} --output-file "$req.all" >/dev/null 2>&1 \
+               && awk '/^[^ #]/ { skip = ($0 ~ /^-e / || $0 ~ / @ (file:|\.|\/)/) } !skip' "$req.all" > "$req" \
+               && { [ -d "$UV_PROJECT_ENVIRONMENT" ] || uv venv --quiet "$UV_PROJECT_ENVIRONMENT"; } \
+               && uv pip install --quiet --require-hashes --no-deps \
+                    --index-url "$NARDUK_PYPI_CACHE_INDEX_URL" \
+                    --python "$UV_PROJECT_ENVIRONMENT/bin/python" -r "$req"; then
+              echo "locked packages installed through the PyPI cache ($NARDUK_PYPI_CACHE_INDEX_URL)"
+            else
+              echo "::warning::PyPI cache pre-install skipped or failed; syncing straight from uv.lock"
+            fi
+          fi
+          # shellcheck disable=SC2086
+          uv sync $UV_SYNC_ARGS
 
       - name: Install project (pip)
         if: inputs.dependency-manager == 'pip'

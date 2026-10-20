@@ -210,10 +210,15 @@ false and the write is skipped — the safe direction.
 Two deliberate exceptions:
 
 - **`python-data.yml` keeps `setup-uv`'s `enable-cache: auto`.** `auto` means
-  on for GitHub-hosted, off for self-hosted, which is already correct: a
-  persistent linux-ci guest keeps `~/.cache/uv` between jobs, so uploading a
-  tarball of an already-warm cache would be a regression for the only current
-  adopter. Only `save-cache` is gated, for a future hosted caller.
+  on for GitHub-hosted, off for self-hosted, which is the right default there:
+  the linux-ci JIT slots wipe HOME and the uv cache after every job, so a
+  tarball restore would only add cost. Their warm layer is the guest PyPI
+  pull-through cache: the `Install project (uv)` step pre-installs the lock's
+  hash-verified registry packages through `NARDUK_PYPI_CACHE_INDEX_URL` (set by
+  the runner launcher only while the cache answers) before the real
+  `uv sync`, because `uv sync --locked` downloads from the URLs in `uv.lock`
+  and never touches that cache (narduk-data#1064). Only `save-cache` is gated,
+  for a future hosted caller.
 - **`reusable-weekly-drift-check.yml` keeps `cache: pnpm`.** It is a weekly
   `schedule` on `ubuntu-latest`, so it runs on the default branch almost
   every time — the write it makes is the one the next run reads.
