@@ -54,6 +54,7 @@ def main() -> int:
     check("job grant is contents: read + id-token: write", job["permissions"] == {"contents": "read", "id-token": "write"})
     check("origin defaults to the designs Worker", call["inputs"]["origin"]["default"] == "https://designs.nardukenterprises.com")
     check("design-dir defaults to design", call["inputs"]["design-dir"]["default"] == "design")
+    check("probe is an opt-in boolean", call["inputs"]["probe"]["type"] == "boolean" and call["inputs"]["probe"]["default"] is False)
 
     script_checkout = next(s for s in steps if s.get("with", {}).get("repository") == "narduk-enterprises/workflows")
     check("script comes from this repo at job.workflow_sha, sparse, credential-free",
@@ -66,10 +67,10 @@ def main() -> int:
     publish = next(s for s in steps if "publish_designs.mjs" in s.get("run", ""))
     run = publish["run"]
     check("passes the origin and dir by env, not interpolated into the script",
-          publish["env"] == {"DESIGNS_ORIGIN": "${{ inputs.origin }}", "DESIGN_DIR": "${{ inputs.design-dir }}"} and "${{" not in run)
+          publish["env"] == {"DESIGNS_ORIGIN": "${{ inputs.origin }}", "DESIGN_DIR": "${{ inputs.design-dir }}", "PROBE": "${{ inputs.probe }}"} and "${{" not in run)
     check("runs the script from the tool checkout", f"node {TOOL_DIR}/scripts/publish_designs.mjs" in run)
 
-    for ref, expect in [("refs/heads/main", True), ("refs/heads/feature", False), ("refs/pull/1/merge", False)]:
+    for ref, expect, probe in [("refs/heads/main", True, "false"), ("refs/heads/feature", False, "false"), ("refs/pull/1/merge", False, "false"), ("refs/heads/main", True, "true"), ("refs/heads/feature", False, "true")]:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             bin_dir = tmp_path / "bin"
@@ -79,10 +80,11 @@ def main() -> int:
             node.chmod(0o755)
             log = tmp_path / "node.log"
             env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF": ref, "NODE_LOG": str(log),
-                   "DESIGNS_ORIGIN": "https://designs.example.test", "DESIGN_DIR": "design"}
+                   "DESIGNS_ORIGIN": "https://designs.example.test", "DESIGN_DIR": "design", "PROBE": probe}
             result = subprocess.run(["bash", "-c", run], env=env, cwd=tmp, capture_output=True, text=True)
-            ran = log.exists() and "publish_designs.mjs --design-dir design" in log.read_text()
-            check(f"{ref}: {'publishes' if expect else 'refuses before node runs'}",
+            want = "publish_designs.mjs --probe" if probe == "true" else "publish_designs.mjs --design-dir design"
+            ran = log.exists() and want in log.read_text()
+            check(f"{ref} probe={probe}: {'runs ' + want if expect else 'refuses before node runs'}",
                   (result.returncode == 0) == expect and ran == expect, result.stdout + result.stderr)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -97,6 +99,9 @@ def main() -> int:
         no_token = subprocess.run(["node", str(SCRIPT), "--design-dir", str(design)], capture_output=True, text=True,
                                   env={"PATH": os.environ["PATH"], "DESIGNS_ORIGIN": "https://designs.example.test", "GITHUB_SHA": "a" * 40, "GITHUB_REPOSITORY": "narduk-enterprises/x"})
         check("without an OIDC token it fails and names the permission", no_token.returncode == 1 and "id-token: write" in no_token.stdout + no_token.stderr, no_token.stdout + no_token.stderr)
+        probe_no_token = subprocess.run(["node", str(SCRIPT), "--probe"], capture_output=True, text=True,
+                                        env={"PATH": os.environ["PATH"], "DESIGNS_ORIGIN": "https://designs.example.test", "GITHUB_SHA": "a" * 40, "GITHUB_REPOSITORY": "narduk-enterprises-clients/x"})
+        check("--probe without an OIDC token fails and names the permission", probe_no_token.returncode == 1 and "id-token: write" in probe_no_token.stdout + probe_no_token.stderr, probe_no_token.stdout + probe_no_token.stderr)
 
     if failures:
         print(f"\n{len(failures)} failure(s)")
