@@ -181,14 +181,19 @@ def run_check_step(
         return p.returncode, p.stdout + p.stderr, produced, str(leftover)
 
 
-def run_eval_step(*, artefact_content: str | None) -> tuple[int, str, str]:
+def run_eval_step(
+    *, artefact_content: str | None, run_outcome: str = "success", job_status: str = "success",
+) -> tuple[int, str, str]:
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = pathlib.Path(tmp)
         if artefact_content is not None:
             (tmp_path / "foundation-check.json").write_text(artefact_content)
         summary = tmp_path / "summary"
         summary.touch()
-        env = {**os.environ, "GITHUB_STEP_SUMMARY": str(summary)}
+        env = {
+            **os.environ, "GITHUB_STEP_SUMMARY": str(summary),
+            "RUN_OUTCOME": run_outcome, "JOB_STATUS": job_status,
+        }
         p = subprocess.run(["bash", "-c", EVAL_STEP], cwd=tmp, env=env, capture_output=True, text=True)
         return p.returncode, p.stdout + p.stderr, summary.read_text()
 
@@ -406,6 +411,32 @@ def main() -> int:
     ok = rc == 1 and "UNKNOWN" in summary
     failures += 0 if check(
         "eval: no warning tier -- an unrecognized result blocks, never passes",
+        ok, f"rc={rc} summary={summary!r}",
+    ) else 1
+
+    # An earlier step (e.g. the dependency audit) failed, so the run step was
+    # skipped: no artefact exists, and that must not read as a second failure.
+    total += 1
+    rc, out, summary = run_eval_step(artefact_content=None, run_outcome="skipped", job_status="failure")
+    ok = rc == 0 and "SKIPPED" in summary and "UNKNOWN" not in summary and "produced no output" not in out
+    failures += 0 if check(
+        "eval: run step skipped after an earlier failure -> reported as skipped, not UNKNOWN",
+        ok, f"rc={rc} summary={summary!r}\n{out}",
+    ) else 1
+
+    total += 1
+    rc, out, summary = run_eval_step(artefact_content="", run_outcome="success", job_status="failure")
+    ok = rc == 1 and "UNKNOWN" in summary
+    failures += 0 if check(
+        "eval: run step ran and wrote nothing -> still UNKNOWN even if the job is red",
+        ok, f"rc={rc} summary={summary!r}",
+    ) else 1
+
+    total += 1
+    rc, out, summary = run_eval_step(artefact_content=None, run_outcome="skipped", job_status="success")
+    ok = rc == 1 and "UNKNOWN" in summary
+    failures += 0 if check(
+        "eval: skipped with a green job is not explained by an earlier failure -> UNKNOWN",
         ok, f"rc={rc} summary={summary!r}",
     ) else 1
 
