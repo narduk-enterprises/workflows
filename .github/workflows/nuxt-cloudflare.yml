@@ -2595,6 +2595,7 @@ jobs:
       # check" below prints it to the log and applies the decided blocking
       # rule.
       - name: Run web-foundation conformance check
+        id: foundation-run
         if: steps.quality.outputs.foundation-check == 'true' && inputs.mode != 'e2e'
         env:
           PM: ${{ inputs.package-manager }}
@@ -2727,9 +2728,21 @@ jobs:
       # app's CI must treat [UNKNOWN] as a failure too").
       - name: Evaluate web-foundation conformance check
         if: always() && steps.quality.outputs.foundation-check == 'true' && inputs.mode != 'e2e'
+        env:
+          RUN_OUTCOME: ${{ steps.foundation-run.outcome }}
+          JOB_STATUS: ${{ job.status }}
         run: |
           set -uo pipefail
           echo "## Web foundation conformance check" >> "$GITHUB_STEP_SUMMARY"
+          # The run step is skipped (no artefact at all, unlike a run that
+          # wrote an empty one) when an earlier step such as the dependency
+          # audit already failed. The job is red for that step's reason;
+          # reporting UNKNOWN here would read as a second, unrelated failure.
+          if [ "$RUN_OUTCOME" = skipped ] && [ "$JOB_STATUS" != success ] && [ ! -e foundation-check.json ]; then
+            echo "- :fast_forward: **SKIPPED** — foundation:check did not run because an earlier step failed or the job was cancelled; fix that step first" >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::foundation:check skipped because an earlier step failed (not an UNKNOWN result)"
+            exit 0
+          fi
           if [ ! -s foundation-check.json ]; then
             echo "- :x: **UNKNOWN** — foundation:check produced no output" >> "$GITHUB_STEP_SUMMARY"
             echo "::error::foundation:check produced no output — treating as UNKNOWN, which blocks (agent-infrastructure docs/standards/WEB-FOUNDATION-CHECK.md §5)"
