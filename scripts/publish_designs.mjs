@@ -1,7 +1,7 @@
 // Publishes this repository's design mirrors to the designs Worker
 // (operator-portal#1613, #727 slice 3). It only READS `design/**`.
 //
-//   node script/ci/publish_designs.mjs [--dry-run] [--design-dir <dir>]
+//   node script/ci/publish_designs.mjs [--dry-run | --probe] [--design-dir <dir>]
 //
 // For each design folder under `design/` that holds a `canvas.json` (at its
 // root, or under its `project/` folder, as a Claude Design export lays it out)
@@ -12,8 +12,15 @@
 //
 // Authentication is the run's own GitHub Actions OIDC token, audience the
 // Worker's origin: there is no stored Cloudflare or R2 credential. The Worker
-// admits a token for a repository of this organization on `main`, writing
-// under that repository's own name.
+// admits a token on `main` for a registered repository of `narduk-enterprises`
+// or `narduk-enterprises-clients`, writing only under that repository's key:
+// its bare name in narduk-enterprises, `<owner>~<name>` in any other owner
+// (`designRepoKey` below; the Worker's is apps/web/shared/utils/design-repo-key.ts).
+//
+// `--probe` asks the Worker whether this run would be admitted, and writes
+// nothing: it finalizes an empty file list, which the Worker refuses with 400
+// `files-required` only after it has admitted the token and matched the key
+// (401 or 403 otherwise). It needs no design folder.
 //
 // Environment: DESIGNS_ORIGIN, GITHUB_SHA, GITHUB_REPOSITORY, and the two
 // ACTIONS_ID_TOKEN_REQUEST_* variables a job with `id-token: write` receives.
@@ -26,6 +33,16 @@ const SHA = /^[0-9a-f]{40}$/
 const MAX_FILE_BYTES = 25 * 1024 * 1024
 const MAX_FILES = 800
 const CONCURRENCY = 6
+const BARE_OWNER = 'narduk-enterprises'
+const OWNER = /^[a-z0-9][a-z0-9-]{0,38}$/i
+const NAME = /^[a-z0-9][\w.-]{0,99}$/i
+
+/** The key `owner/name` publishes under, or null; the same rule as the Worker's `designRepoKeyOf`. */
+export function designRepoKey(repository) {
+  const [owner, name, ...rest] = String(repository ?? '').trim().split('/')
+  if (!owner || !name || rest.length > 0 || !OWNER.test(owner) || !NAME.test(name)) return null
+  return owner === BARE_OWNER ? name : `${owner}~${name}`
+}
 
 /** Folders under `designDir` that are designs, each with the folder its files are read from. */
 export async function designRoots(designDir) {
@@ -108,27 +125,53 @@ async function publishOne({ origin, repo, root, sha, slug }, token) {
     headers: { 'content-type': 'application/json' },
   }, token)
   if (!finalized.ok) throw new Error(`${slug}: finalize answered ${finalized.status} ${await finalized.text()}`)
-  return files.length
+  // The Worker records the publication in the estate store (operator-portal#1601). The publish stands either way; a miss is said, not hidden.
+  const answer = await finalized.json().catch(() => null)
+  const recorded = answer?.publication?.recorded === true
+  if (!recorded) console.warn(`::warning title=Publish designs::${slug} was published but not recorded for the Changes board: ${answer?.publication?.reason ?? 'the Worker did not say'}`)
+  return { files: files.length, recorded }
 }
 
-/** Publishes every design folder under `designDir`; returns `[{ slug, files }]`. Throws on the first failure. */
-export async function publishAll({ designDir, env }) {
+/** The run's origin, sha, repository key and a cached token reader, or a thrown reason. */
+function runOf(env) {
   const origin = (env.DESIGNS_ORIGIN ?? '').replace(/\/$/, '')
   const sha = env.GITHUB_SHA ?? ''
-  const repo = (env.GITHUB_REPOSITORY ?? '').split('/')[1] ?? ''
+  const repo = designRepoKey(env.GITHUB_REPOSITORY)
   if (!/^https:\/\/[^/]+$/.test(origin)) throw new Error('DESIGNS_ORIGIN must be an https origin')
   if (!SHA.test(sha) || !repo) throw new Error('GITHUB_SHA and GITHUB_REPOSITORY are required')
   if (!env.ACTIONS_ID_TOKEN_REQUEST_URL || !env.ACTIONS_ID_TOKEN_REQUEST_TOKEN) throw new Error('no OIDC token request: the job needs `permissions: id-token: write`')
-  const roots = await designRoots(designDir)
-  if (roots.length === 0) throw new Error('no design folder holds a canvas.json')
-
   let cached = null
   const token = async () => {
     if (!cached || Date.now() - cached.at > 3 * 60_000) cached = { at: Date.now(), value: await requestToken(env) }
     return cached.value
   }
+  return { origin, repo, sha, token }
+}
+
+/**
+ * Whether the Worker admits this run, writing nothing: `{ admitted, status, error, repo }`. An empty finalize is
+ * answered 400 `files-required` only past admission and the key check; a refused token is 401, an unregistered or
+ * mismatched repository 403.
+ */
+export async function probe({ env }) {
+  const { origin, repo, sha, token } = runOf(env)
+  const response = await call(`${origin}/_publish/${encodeURIComponent(repo)}/probe/${sha}/_finalize`, {
+    method: 'POST',
+    body: JSON.stringify({ files: [] }),
+    headers: { 'content-type': 'application/json' },
+  }, token)
+  const error = (await response.json().catch(() => null))?.error ?? null
+  return { admitted: response.status === 400 && error === 'files-required', error, repo, status: response.status }
+}
+
+/** Publishes every design folder under `designDir`; returns `[{ slug, files, recorded }]`. Throws on the first failure. */
+export async function publishAll({ designDir, env }) {
+  const { origin, repo, sha, token } = runOf(env)
+  const roots = await designRoots(designDir)
+  if (roots.length === 0) throw new Error('no design folder holds a canvas.json')
+
   const published = []
-  for (const { root, slug } of roots) published.push({ slug, files: await publishOne({ origin, repo, root, sha, slug }, token) })
+  for (const { root, slug } of roots) published.push({ slug, ...(await publishOne({ origin, repo, root, sha, slug }, token)) })
   return published
 }
 
@@ -137,6 +180,12 @@ async function main() {
   const designDir = args.includes('--design-dir') ? args[args.indexOf('--design-dir') + 1] : 'design'
   if (args.includes('--dry-run')) {
     for (const { root, slug } of await designRoots(designDir)) console.log(`${slug}: ${(await listFiles(root)).length} files from ${root}`)
+    return
+  }
+  if (args.includes('--probe')) {
+    const answer = await probe({ env: process.env })
+    if (!answer.admitted) throw new Error(`the Worker did not admit ${process.env.GITHUB_REPOSITORY} as ${answer.repo}: ${answer.status} ${answer.error ?? ''}`.trim())
+    console.log(`admitted: ${process.env.GITHUB_REPOSITORY} may publish as ${answer.repo} (probe answered ${answer.status} ${answer.error}; nothing written)`)
     return
   }
   for (const { files, slug } of await publishAll({ designDir, env: process.env })) console.log(`${slug}: published ${files} files at ${process.env.GITHUB_SHA}`)
