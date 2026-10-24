@@ -45,6 +45,11 @@ permissions:
 on:
   workflow_call:
     inputs:
+      ci-concurrency-key:
+        description: "Stable unique key per invocation when this callable is used more than once in the same caller workflow."
+        required: false
+        type: string
+        default: ''
       linux-runner:
         description: >-
           Required JSON runsOn object for build-artifact validation.
@@ -159,7 +164,101 @@ on:
         required: false
 
 jobs:
+  ci-admission:
+    name: CI admission
+    if: "(github.event_name == 'pull_request') && (github.event.pull_request.draft || github.event.action == 'edited')"
+    runs-on: ${{ fromJSON(github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+      reason: ${{ steps.plan.outputs.reason }}
+      source: ${{ steps.plan.outputs.source }}
+    steps:
+      - name: Plan PR validation
+        id: plan
+        env:
+          CI_INPUTS_JSON: ${{ toJSON(inputs) }}
+          CI_VARS_JSON: ${{ toJSON(vars) }}
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            core.setOutput('skip', 'false');
+            core.setOutput('reason', 'validate');
+            const pr = context.payload.pull_request;
+            if (context.eventName !== 'pull_request' || !pr) return;
+            if (Number(process.env.GITHUB_RUN_ATTEMPT || '1') > 1) return;
+            if (pr.draft) {
+              core.setOutput('skip', 'true');
+              core.setOutput('reason', 'draft');
+              return;
+            }
+            // Only title/body edits qualify. A base edit, synchronize, rerun, or an
+            // unreadable/incomplete proof must execute the real gate.
+            const changes = Object.keys(context.payload.changes || {});
+            if (context.payload.action !== 'edited' || !changes.length ||
+                changes.some(key => !['title', 'body'].includes(key))) return;
+            try {
+              const {createHash} = require('node:crypto');
+              const contract = createHash('sha256')
+                .update(process.env.CI_INPUTS_JSON).update('\n')
+                .update(process.env.CI_VARS_JSON).digest('hex');
+              const marker = `Validated CI contract ${contract}`;
+              const current = (await github.rest.actions.getWorkflowRun({
+                ...context.repo, run_id: context.runId,
+              })).data;
+              if (current.run_attempt !== 1 || !current.head_sha || !current.workflow_id ||
+                  !current.path || !current.repository?.id) return;
+              const revisions = run => {
+                const refs = run.referenced_workflows;
+                if (!Array.isArray(refs) || !refs.length ||
+                    refs.some(ref => !ref.path || !/^[a-f0-9]{40}$/.test(ref.sha || ''))) return null;
+                return JSON.stringify(refs.map(ref => [ref.path, ref.sha]).sort());
+              };
+              const currentRefs = revisions(current);
+              if (!currentRefs) return;
+              const runs = (await github.rest.actions.listWorkflowRuns({
+                ...context.repo, workflow_id: current.workflow_id, event: 'pull_request',
+                head_sha: current.head_sha, status: 'success', per_page: 20,
+              })).data.workflow_runs;
+              for (const run of runs) {
+                if (run.id === context.runId || run.event !== 'pull_request' ||
+                    run.status !== 'completed' || run.conclusion !== 'success' ||
+                    run.head_sha !== current.head_sha || run.path !== current.path ||
+                    run.workflow_id !== current.workflow_id ||
+                    run.repository?.id !== current.repository.id ||
+                    run.head_repository?.id !== pr.head.repo.id ||
+                    !run.pull_requests?.some(item => item.number === pr.number &&
+                      item.head?.sha === pr.head.sha && item.base?.sha === pr.base.sha) ||
+                    revisions(run) !== currentRefs) continue;
+                const result = (await github.rest.actions.listJobsForWorkflowRunAttempt({
+                  ...context.repo, run_id: run.id, attempt_number: run.run_attempt, per_page: 100,
+                })).data;
+                // Bounded lookup: incomplete job lists are unknown, never a reuse hit.
+                if (!Array.isArray(result.jobs) || result.total_count !== result.jobs.length) continue;
+                const gates = result.jobs.filter(job => /(?:^| \/ )(?:Required|Fast)$/.test(job.name));
+                if (!gates.length || gates.some(job => job.conclusion !== 'success') ||
+                    !gates.some(job => job.steps?.some(step => step.name === marker && step.conclusion === 'success'))) continue;
+                core.setOutput('skip', 'true');
+                core.setOutput('reason', 'successful-head');
+                core.setOutput('source', String(run.id));
+                core.info(`Reusing successful run ${run.id} for the identical workflow, PR head, base and callable revisions.`);
+                return;
+              }
+            } catch (error) {
+              // Most non-Nuxt callers grant contents: read only. Never widen their
+              // permission contract: a denied Actions read simply runs validation.
+              core.notice(`Prior success could not be verified; running validation (${error.status || 'unavailable'}).`);
+            }
+
   contract:
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true'"
+    needs: [ci-admission]
+    concurrency:
+      group: workflows-reusable-browser-tests-contract-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     name: Validate routes and browser contract
     # This must run before any caller-controlled self-hosted route is evaluated.
     # A labels-only or wrong-group route therefore fails on a runner this file
@@ -273,8 +372,12 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   validate:
+    concurrency:
+      group: workflows-reusable-browser-tests-validate-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     name: Validate same-run production build
-    needs: contract
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && needs.contract.result == 'success'"
+    needs: ["contract", "ci-admission"]
     runs-on: ${{ fromJSON(inputs.linux-runner) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
@@ -301,8 +404,12 @@ jobs:
           echo "validated same-run production build marker: $MARKER"
 
   chromium:
+    concurrency:
+      group: workflows-reusable-browser-tests-chromium-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}-${{ toJSON(matrix) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     name: Chromium
-    needs: [contract, validate]
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && needs.contract.result == 'success' && needs.validate.result == 'success'"
+    needs: ["contract", "validate", "ci-admission"]
     runs-on: ${{ fromJSON(inputs.browser-runner) }}
     timeout-minutes: ${{ inputs.browser-timeout-minutes }}
     permissions:
@@ -641,9 +748,12 @@ jobs:
           fi
 
   webkit:
+    concurrency:
+      group: workflows-reusable-browser-tests-webkit-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}-${{ toJSON(matrix) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     name: WebKit
-    if: inputs.run-webkit
-    needs: [contract, validate, chromium]
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && inputs.run-webkit && needs.contract.result == 'success' && needs.validate.result == 'success' && needs.chromium.result == 'success'"
+    needs: ["contract", "validate", "chromium", "ci-admission"]
     runs-on: ${{ fromJSON(inputs.browser-runner) }}
     timeout-minutes: ${{ inputs.browser-timeout-minutes }}
     permissions:
@@ -770,9 +880,12 @@ jobs:
           fi
 
   required:
+    concurrency:
+      group: workflows-reusable-browser-tests-required-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     name: Required
     if: always()
-    needs: [contract, validate, chromium, webkit]
+    needs: ["contract", "validate", "chromium", "webkit", "ci-admission"]
     # The organization lightweight route is independent of browser inputs.
     # Invalid browser inputs must still produce a visible Required failure.
     runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
@@ -780,7 +893,54 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Check CI admission
+        env:
+          ADMISSION_RESULT: ${{ needs.ci-admission.result }}
+          ADMISSION_REASON: ${{ needs.ci-admission.outputs.reason }}
+          ADMISSION_SKIP: ${{ needs.ci-admission.outputs.skip }}
+          ADMISSION_SOURCE: ${{ needs.ci-admission.outputs.source }}
+        run: |
+          set -euo pipefail
+          if [ "$ADMISSION_RESULT" = skipped ] && [ -z "$ADMISSION_SKIP$ADMISSION_REASON" ]; then
+            exit 0
+          fi
+          if [ "$ADMISSION_RESULT" != success ]; then
+            echo "::error::CI admission failed; no validation proof is available"
+            exit 1
+          fi
+          case "$ADMISSION_SKIP:$ADMISSION_REASON" in
+            false:validate) exit 0 ;;
+            true:successful-head)
+              if [[ "$ADMISSION_SOURCE" =~ ^[0-9]+$ ]]; then
+                echo "Reusing successful run $ADMISSION_SOURCE"
+                exit 0
+              fi
+              ;;
+            true:draft)
+              echo "::error::Expensive validation deferred for draft PR. Mark ready and trigger ready_for_review or rerun CI before merging."
+              exit 1
+              ;;
+          esac
+          echo "::error::Invalid CI admission result; validation cannot be skipped"
+          exit 1
+      - name: Fingerprint validation contract
+        id: ci-contract
+        if: "needs.ci-admission.outputs.skip != 'true'"
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CI_INPUTS_JSON: ${{ toJSON(inputs) }}
+          CI_VARS_JSON: ${{ toJSON(vars) }}
+        with:
+          script: |
+            const {createHash} = require('node:crypto');
+            core.setOutput('sha', createHash('sha256')
+              .update(process.env.CI_INPUTS_JSON).update('\n')
+              .update(process.env.CI_VARS_JSON).digest('hex'));
+      - name: Validated CI contract ${{ steps.ci-contract.outputs.sha }}
+        if: "needs.ci-admission.outputs.skip != 'true' && steps.ci-contract.outputs.sha != ''"
+        run: ':'
       - name: Require every enabled browser gate
+        if: "needs.ci-admission.outputs.skip != 'true'"
         env:
           CHROMIUM_RESULT: ${{ needs.chromium.result }}
           CONTRACT_RESULT: ${{ needs.contract.result }}

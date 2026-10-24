@@ -134,6 +134,10 @@ module.exports = {
         selected.chmod(0o755)
         (visible / directory).symlink_to(target, target_is_directory=True)
 
+    # Model the immutable pool image independently of the invoking umask.
+    for path in [image, *image.rglob("*")]:
+        path.chmod(path.stat().st_mode & ~0o022)
+
     summary = root / "summary.md"
     summary.touch()
     return {

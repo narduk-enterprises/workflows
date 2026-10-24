@@ -126,6 +126,8 @@ def auth_jobs(document: dict) -> dict[str, dict]:
 def validate_cleanup_step(job_id: str, step: dict, condition: str = "always() && inputs.install-script == ''") -> None:
     if job_id in ("fast", "fast-escalable", "fast-lanes"):
         condition += " && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
+    if job_id in ("fast", "fast-escalable", "fast-lanes"):
+        condition = "needs.ci-admission.outputs.skip != 'true' && (" + condition + ")"
     assert step.get("if") == condition, (
         f"{job_id}: cleanup must always run for the legacy materialization path, "
         f"got {step.get('if')!r}"
@@ -148,6 +150,10 @@ def validate_cleanup_step(job_id: str, step: dict, condition: str = "always() &&
 
 def install_condition(job_id: str, step: dict) -> str:
     condition = step.get("if", "")
+    if job_id in ("fast", "fast-escalable", "fast-lanes"):
+        admission = "needs.ci-admission.outputs.skip != 'true' && ("
+        assert condition.startswith(admission) and condition.endswith(")"), condition
+        condition = condition[len(admission):-1]
     if job_id in ("fast", "fast-escalable", "fast-lanes"):
         prefix = "env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && ("
         assert condition.startswith(prefix) and condition.endswith(")"), condition

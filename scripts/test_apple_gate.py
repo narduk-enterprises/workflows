@@ -330,7 +330,7 @@ def main() -> None:
     assert document["jobs"]["lint"]["runs-on"] == "${{ fromJSON(" + lint_default + ") }}"
     assert document["jobs"]["xcode"]["runs-on"] == "${{ fromJSON(inputs.apple-runner) }}"
     assert document["jobs"]["required"]["runs-on"] == "${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || (" + lint_default + ")) }}"
-    assert document["jobs"]["required"]["needs"] == ["lint", "xcode"]
+    assert document["jobs"]["required"]["needs"] == ["lint", "xcode", "ci-admission"]
     install_swiftlint = next(
         item
         for item in document["jobs"]["lint"]["steps"]
@@ -355,7 +355,6 @@ def main() -> None:
     assert "|| true" not in validation
     assert "xcodebuild -version" in validation
     assert "swift --version" in validation
-    text = WORKFLOW.read_text().lower()
     for forbidden in ("codesign", "keychain", "notarize", "testflight", "sparkle"):
         # Scope comments explain why release/signing is excluded; no command may
         # invoke it.

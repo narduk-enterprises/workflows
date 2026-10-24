@@ -80,7 +80,8 @@ in their app-class workflow.
 | `flake-digest.yml` | **New 2026-09-24** (narduk-reboot P3-C2). Weekly, advisory: scans a caller's completed runs of one workflow, counts failures in jobs matching `quarantine-job-pattern` (nuxt-cloudflare.yml's `e2e-quarantine` by default), and files or refreshes one digest issue per ISO week. Never gates `main`, never opens `red-main` |
 
 All ten shipped callables are `on: workflow_call` only — none of them declare their own
-triggers, and none declare `concurrency:` (see "How to consume" below for why).
+triggers, and none declare workflow-level `concurrency:` (see "How to consume"
+below for job-level cancellation and the caller's workflow group).
 
 ### Adopters
 
@@ -459,14 +460,55 @@ group and **cancel the run that is calling us**. Seven repos would start
 cancelling their own CI the moment `v1` moved, and the symptom (a run that
 cancels itself for no visible reason) points at the adopter, not at here.
 
-A callable-level group that was carefully uniquified to avoid the collision
-would still buy nothing: `cancel-in-progress` on the caller's workflow-level
-group already supersedes the *entire* previous run, jobs of this callable
-included. A second gate underneath it can only add a way to be wrong.
+The six CI callables also apply **job-level** concurrency as a fallback for
+callers whose workflow group does not cancel superseded PR work. Groups have
+a reserved `workflows-<callable>-<job>-` prefix, the caller workflow name,
+working directory, optional `ci-concurrency-key`, PR number and matrix identity.
+They never share the caller's workflow group. Give each invocation a distinct
+`ci-concurrency-key` when calling the same callable more than once from one
+workflow. Reserve the `workflows-` prefix for the shared workflows.
+
+Only `pull_request` work is cancelled. Every other event gets a unique
+run-id/attempt group, so even a *pending* default-branch push cannot be
+superseded by another push. Nuxt E2E mode, exact-candidate validation and
+post-deploy journey smoke also use unique groups and never cancel. Job-level
+groups cancel work when its replacement job starts; retain caller-level PR
+concurrency to cancel the entire old run immediately, including jobs omitted
+by a changed plan. Deployment workflows must retain their own safe policy.
 
 `concurrency` **is** a permitted key on a job that calls a reusable workflow,
 so a caller with an unusual need can scope it at `jobs.ci.concurrency` — but
 per the same doc, do not reuse the callable's group value there either.
+
+#### Draft PRs and metadata edits
+
+Apple, Node library, Python data, docs governance, Nuxt CI and reusable browser
+tests run a lightweight `CI admission` job only for draft PRs or `edited` PR
+events. Ordinary PR updates and non-PR events allocate no admission runner.
+Heavy draft jobs are deferred; `Required` (and Nuxt's applicable `Fast`) still
+reports a completed **failure** explaining how to run validation. This is
+deliberate: a draft must never leave an untested success that could satisfy
+protection after it becomes ready. Callers should include `ready_for_review`
+in their `pull_request.types`; otherwise manually rerun CI after marking ready.
+Nuxt's E2E, exact-candidate and post-deploy smoke invocations are excluded.
+
+A title/body-only `edited` event reuses a successful run only when the workflow
+ID/path, run head, PR number, PR head/base, head repository, every referenced
+callable revision and the fingerprint of effective inputs and repository
+variables match. A successful `Required` or `Fast` context must contain the
+matching validation-contract step, with no failing gate in the complete job
+list. The invocation key is part of that fingerprint. Lookups inspect at most 20
+successful runs and 100 jobs per run; missing, denied or truncated evidence
+runs normal validation. Manual reruns always validate. Deferred paths never
+publish build or gate proof artifacts. Successful reuse still emits the gate
+context with the prior run ID in admission's log and output.
+
+This does not widen caller grants: Nuxt and browser admission use their existing
+`actions: read` contracts; other CI callables retain `contents: read` and run
+normal validation if GitHub denies the Actions lookup. Enabling private-repo
+metadata reuse for those callables needs a separately coordinated caller grant
+and callable permission-contract change. This repository's own PR trigger
+already excludes metadata-only edits.
 
 #### Path filtering: use the boolean inputs, never `paths` / `paths-ignore`
 
@@ -1242,7 +1284,7 @@ jobs:
 Format the stamped file with the app's own Prettier config: apps that run `format:check` over `.github/workflows` (cloudflarestat-us, single quotes) fail a double-quoted cron.
 
 The calling job id stays `ci` so the composed context reads `E2E / ci / Required`.
-`concurrency` sits in the caller, never in the callable (R6). Pass the same
+Workflow-level `concurrency` sits in the caller (R6). Pass the same
 `permissions:` block the app's `ci` job grants: a job in the callable may only
 use what its caller granted (R12).
 

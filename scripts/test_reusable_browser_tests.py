@@ -83,9 +83,9 @@ def validate_structure(document: dict) -> None:
     assert jobs["validate"]["runs-on"] == "${{ fromJSON(inputs.linux-runner) }}"
     assert "report" not in jobs
     assert jobs["required"]["runs-on"] == "${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || " + visibility_route + ") }}"
-    assert jobs["validate"]["needs"] == "contract"
-    assert jobs["chromium"]["needs"] == ["contract", "validate"]
-    assert jobs["webkit"]["needs"] == ["contract", "validate", "chromium"]
+    assert jobs["validate"]["needs"] == ["contract", "ci-admission"]
+    assert jobs["chromium"]["needs"] == ["contract", "validate", "ci-admission"]
+    assert jobs["webkit"]["needs"] == ["contract", "validate", "chromium", "ci-admission"]
     assert jobs["chromium"]["strategy"]["max-parallel"] == 3
     assert jobs["webkit"]["strategy"]["max-parallel"] == 3
     assert jobs["chromium"]["env"]["E2E_PREBUILT_ARTIFACT"] == "1"
@@ -95,6 +95,7 @@ def validate_structure(document: dict) -> None:
         "validate",
         "chromium",
         "webkit",
+        "ci-admission",
     ]
 
     for job in ('validate', 'chromium', 'webkit'):
