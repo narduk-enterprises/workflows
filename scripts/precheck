@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Run the workflows AGENTS.md gate, with one timed receipt per command."""
+from pathlib import Path
+import os
+import shlex
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def main():
+    root = Path(__file__).resolve().parent.parent
+    with tempfile.TemporaryDirectory(prefix="precheck-", dir=root) as scratch:
+        return check(root, Path(scratch) / "actionlint")
+
+
+def check(root, actionlint):
+    commands = [
+        ["bash", "scripts/install-actionlint-native-alerts.sh", str(actionlint)],
+        [str(actionlint), "-no-color", "-oneline", *map(str, sorted(root.glob(".github/workflows/*.yml")))],
+        ["python3", "scripts/lint_callables.py"],
+        *[["python3", str(path.relative_to(root))] for path in sorted(root.glob("scripts/test_*.py"))],
+    ]
+    # actionlint silently skips shell analysis without shellcheck.
+    subprocess.run(["shellcheck", "--version"], capture_output=True, check=True)
+    for command in commands:
+        started = time.monotonic()
+        result = subprocess.run(command, cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                env={**os.environ, "ACTIONLINT_BIN": str(actionlint)})
+        elapsed = time.monotonic() - started
+        print(f"{'PASS' if result.returncode == 0 else 'FAIL'} {elapsed:.2f}s {shlex.join(command)}", flush=True)
+        if result.returncode:
+            print(result.stdout, end="", flush=True)
+            return result.returncode
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
