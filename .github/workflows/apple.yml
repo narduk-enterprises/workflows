@@ -216,7 +216,7 @@ on:
 jobs:
   ci-admission:
     name: CI admission
-    if: "(github.event_name == 'pull_request') && (github.event.pull_request.draft || github.event.action == 'edited')"
+    if: "(github.event_name == 'pull_request') && github.event.pull_request.draft"
     runs-on: ${{ fromJSON(inputs.lint-runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
     timeout-minutes: 20
     permissions:
@@ -224,13 +224,9 @@ jobs:
     outputs:
       skip: ${{ steps.plan.outputs.skip }}
       reason: ${{ steps.plan.outputs.reason }}
-      source: ${{ steps.plan.outputs.source }}
     steps:
       - name: Plan PR validation
         id: plan
-        env:
-          CI_INPUTS_JSON: ${{ toJSON(inputs) }}
-          CI_VARS_JSON: ${{ toJSON(vars) }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
@@ -243,63 +239,6 @@ jobs:
               core.setOutput('skip', 'true');
               core.setOutput('reason', 'draft');
               return;
-            }
-            // Only title/body edits qualify. A base edit, synchronize, rerun, or an
-            // unreadable/incomplete proof must execute the real gate.
-            const changes = Object.keys(context.payload.changes || {});
-            if (context.payload.action !== 'edited' || !changes.length ||
-                changes.some(key => !['title', 'body'].includes(key))) return;
-            try {
-              const {createHash} = require('node:crypto');
-              const contract = createHash('sha256')
-                .update(process.env.CI_INPUTS_JSON).update('\n')
-                .update(process.env.CI_VARS_JSON).digest('hex');
-              const marker = `Validated CI contract ${contract}`;
-              const current = (await github.rest.actions.getWorkflowRun({
-                ...context.repo, run_id: context.runId,
-              })).data;
-              if (current.run_attempt !== 1 || !current.head_sha || !current.workflow_id ||
-                  !current.path || !current.repository?.id) return;
-              const revisions = run => {
-                const refs = run.referenced_workflows;
-                if (!Array.isArray(refs) || !refs.length ||
-                    refs.some(ref => !ref.path || !/^[a-f0-9]{40}$/.test(ref.sha || ''))) return null;
-                return JSON.stringify(refs.map(ref => [ref.path, ref.sha]).sort());
-              };
-              const currentRefs = revisions(current);
-              if (!currentRefs) return;
-              const runs = (await github.rest.actions.listWorkflowRuns({
-                ...context.repo, workflow_id: current.workflow_id, event: 'pull_request',
-                head_sha: current.head_sha, status: 'success', per_page: 20,
-              })).data.workflow_runs;
-              for (const run of runs) {
-                if (run.id === context.runId || run.event !== 'pull_request' ||
-                    run.status !== 'completed' || run.conclusion !== 'success' ||
-                    run.head_sha !== current.head_sha || run.path !== current.path ||
-                    run.workflow_id !== current.workflow_id ||
-                    run.repository?.id !== current.repository.id ||
-                    run.head_repository?.id !== pr.head.repo.id ||
-                    !run.pull_requests?.some(item => item.number === pr.number &&
-                      item.head?.sha === pr.head.sha && item.base?.sha === pr.base.sha) ||
-                    revisions(run) !== currentRefs) continue;
-                const result = (await github.rest.actions.listJobsForWorkflowRunAttempt({
-                  ...context.repo, run_id: run.id, attempt_number: run.run_attempt, per_page: 100,
-                })).data;
-                // Bounded lookup: incomplete job lists are unknown, never a reuse hit.
-                if (!Array.isArray(result.jobs) || result.total_count !== result.jobs.length) continue;
-                const gates = result.jobs.filter(job => /(?:^| \/ )(?:Required|Fast)$/.test(job.name));
-                if (!gates.length || gates.some(job => job.conclusion !== 'success') ||
-                    !gates.some(job => job.steps?.some(step => step.name === marker && step.conclusion === 'success'))) continue;
-                core.setOutput('skip', 'true');
-                core.setOutput('reason', 'successful-head');
-                core.setOutput('source', String(run.id));
-                core.info(`Reusing successful run ${run.id} for the identical workflow, PR head, base and callable revisions.`);
-                return;
-              }
-            } catch (error) {
-              // Most non-Nuxt callers grant contents: read only. Never widen their
-              // permission contract: a denied Actions read simply runs validation.
-              core.notice(`Prior success could not be verified; running validation (${error.status || 'unavailable'}).`);
             }
 
   lint:
@@ -565,7 +504,6 @@ jobs:
           ADMISSION_RESULT: ${{ needs.ci-admission.result }}
           ADMISSION_REASON: ${{ needs.ci-admission.outputs.reason }}
           ADMISSION_SKIP: ${{ needs.ci-admission.outputs.skip }}
-          ADMISSION_SOURCE: ${{ needs.ci-admission.outputs.source }}
         run: |
           set -euo pipefail
           if [ "$ADMISSION_RESULT" = skipped ] && [ -z "$ADMISSION_SKIP$ADMISSION_REASON" ]; then
@@ -577,35 +515,13 @@ jobs:
           fi
           case "$ADMISSION_SKIP:$ADMISSION_REASON" in
             false:validate) exit 0 ;;
-            true:successful-head)
-              if [[ "$ADMISSION_SOURCE" =~ ^[0-9]+$ ]]; then
-                echo "Reusing successful run $ADMISSION_SOURCE"
-                exit 0
-              fi
-              ;;
             true:draft)
-              echo "::error::Expensive validation deferred for draft PR. Mark ready and trigger ready_for_review or rerun CI before merging."
+              echo "::error::Expensive validation deferred for draft PR. Mark ready, then push a commit or choose Re-run all jobs (Re-run failed jobs keeps draft admission outputs). Automatic recovery requires ready_for_review in the caller pull_request.types."
               exit 1
               ;;
           esac
           echo "::error::Invalid CI admission result; validation cannot be skipped"
           exit 1
-      - name: Fingerprint validation contract
-        id: ci-contract
-        if: "needs.ci-admission.outputs.skip != 'true'"
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          CI_INPUTS_JSON: ${{ toJSON(inputs) }}
-          CI_VARS_JSON: ${{ toJSON(vars) }}
-        with:
-          script: |
-            const {createHash} = require('node:crypto');
-            core.setOutput('sha', createHash('sha256')
-              .update(process.env.CI_INPUTS_JSON).update('\n')
-              .update(process.env.CI_VARS_JSON).digest('hex'));
-      - name: Validated CI contract ${{ steps.ci-contract.outputs.sha }}
-        if: "needs.ci-admission.outputs.skip != 'true' && steps.ci-contract.outputs.sha != ''"
-        run: ':'
       - name: Require the Xcode job to succeed and the Linux gate to succeed-or-skip
         if: "needs.ci-admission.outputs.skip != 'true'"
         env:

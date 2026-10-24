@@ -958,21 +958,18 @@ def test_fast_parallel() -> None:
         ctx["github"]["ref_name"] = ref_name
         ctx["env"] = {"FAST_ENABLED": "true", "FAST_ROLE": role}
         ctx["steps"] = {"eslint-cache-dir": {"outputs": {"path": "/x"}},
-                        "eslint-cache-content": {"outputs": {"nonempty": nonempty}},
-                        "ci-contract": {"outputs": {"sha": "a" * 64}}}
+                        "eslint-cache-content": {"outputs": {"nonempty": nonempty}}}
         return {item.get("name") or item["uses"] for item in JOBS["fast"]["steps"] if ev(job_condition(item), ctx)}
 
     aggregate = ran_steps("aggregate")
     assert aggregate == {"Resolve protected-path escalation", LANES_GATE, "Remove package auth materialization",
-                         "Publish Fast escalation", "Check CI admission", "Fingerprint validation contract",
-                         "Validated CI contract ${{ steps.ci-contract.outputs.sha }}"}, aggregate
+                         "Publish Fast escalation", "Check CI admission"}, aggregate
     serial = ran_steps("serial")
     assert {"Run fast scripts", "Install dependencies (pnpm)", "Resolve protected-path escalation",
             "Publish Fast escalation"} <= serial and not {LANES_GATE, "Check ESLint cache content"} & serial, serial
     lane = ran_steps("lane")
     assert {"Run fast scripts", "Install dependencies (pnpm)", "Check ESLint cache content"} <= lane, lane
     assert not {LANES_GATE, "Resolve protected-path escalation", "Publish Fast escalation"} & lane, lane
-    assert not {"Fingerprint validation contract", "Validated CI contract ${{ steps.ci-contract.outputs.sha }}"} & lane
     # Every step the aggregate skips is a step the serial job runs: nothing is
     # only-in-parallel except the gate itself.
     assert aggregate - serial == {LANES_GATE}, aggregate - serial
