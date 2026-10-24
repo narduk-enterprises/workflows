@@ -52,10 +52,12 @@ const github = {rest: {actions: {
 
 
 def fixture():
-    return copy.deepcopy({"payload": {"action": "edited", "changes": {"body": {}}, "pull_request": PR},
+    data = copy.deepcopy({"payload": {"action": "edited", "changes": {"body": {}}, "pull_request": PR},
                           "current": {**RUN, "id": 20}, "runs": [RUN],
                           "jobs": {"total_count": 1, "jobs": [{"name": "ci / Required", "conclusion": "success",
                           "steps": [{"name": f"Validated CI contract {CONTRACT}", "conclusion": "success"}]}]}})
+    data["runs"] = copy.deepcopy(data["runs"])
+    return data
 
 
 class Expr(StatusEvaluator):
@@ -88,7 +90,7 @@ def context(doc, draft=False, event="pull_request", **inputs):
             "vars": {}, "env": {}, "matrix": {}, "__status": "success"}
 
 
-def graph(doc, ctx, reason, admission="success", results=None):
+def graph(doc, ctx, reason, admission="success", results=None, admission_outputs=None):
     state = {}
 
     def settle(jid):
@@ -104,7 +106,7 @@ def graph(doc, ctx, reason, admission="success", results=None):
         enabled = truthy(ev(cond, local))
         if not re.search(r"\b(always|cancelled|failure|success)\(", str(cond)):
             enabled &= all(state[dep]["result"] == "success" for dep in deps)
-        outputs = {"skip": "true", "reason": reason, "source": "10"} if jid == "ci-admission" and admission == "success" else {}
+        outputs = (admission_outputs or {"skip": "true", "reason": reason}) if jid == "ci-admission" and admission == "success" else {}
         outcome = admission if jid == "ci-admission" else (results or {}).get(jid, "success")
         state[jid] = {"result": outcome if enabled else "skipped",
                       "outputs": outputs if enabled else {}, "ctx": local}
@@ -125,24 +127,22 @@ class AdmissionTests(unittest.TestCase):
                                     text=True, capture_output=True, check=True)
             return json.loads(result.stdout)
 
-    def test_all_shipped_scripts_agree_and_reuse_real_success(self):
+    def test_all_shipped_scripts_agree_and_edits_validate_without_api(self):
         scripts = {doc["jobs"]["ci-admission"]["steps"][0]["with"]["script"] for doc in DOCS.values()}
         self.assertEqual(len(scripts), 1)
-        for slug in FILES:
-            permissions = DOCS[slug]["jobs"]["ci-admission"]["permissions"]
-            self.assertEqual(permissions, {"contents": "read", "actions": "read"}
+        for slug, doc in DOCS.items():
+            self.assertEqual(doc["jobs"]["ci-admission"]["permissions"],
+                             {"contents": "read", "actions": "read"}
                              if slug in ("nuxt-cloudflare", "reusable-browser-tests") else {"contents": "read"})
-            result = self.execute(fixture(), slug)
-            self.assertEqual(result["outputs"], {"skip": "true", "reason": "successful-head", "source": "10"})
-            self.assertEqual([call[0] for call in result["calls"]], ["current", "runs", "jobs"])
-            self.assertEqual(result["calls"][1][1]["per_page"], 20)
-            reporter = DOCS[slug]["jobs"]["required"]
-            record = next(step for step in reporter["steps"] if step.get("id") == "ci-contract")
-            self.assertEqual(self.execute(fixture(), slug, record["with"]["script"])["outputs"], {"sha": CONTRACT})
-        folded = DOCS["nuxt-cloudflare"]["jobs"]["build"]
-        record = next(step for step in folded["steps"] if step.get("id") == "ci-contract")
-        self.assertIn("inputs.checks-in-build", record["if"])
-        self.assertEqual(self.execute(fixture(), script=record["with"]["script"])["outputs"], {"sha": CONTRACT})
+            for changes in ({"title": {}}, {"body": {}}, {"title": {}, "body": {}},
+                            {}, {"base": {}}, {"body": {}, "base": {}}):
+                with self.subTest(slug=slug, changes=changes):
+                    data = fixture()
+                    data["payload"]["changes"] = changes
+                    result = self.execute(data, slug)
+                    self.assertEqual(result["outputs"], {"skip": "false", "reason": "validate"})
+                    self.assertEqual(result["calls"], [])
+            self.assertFalse(ev(doc["jobs"]["ci-admission"]["if"], context(doc)))
 
     def test_browser_contract_failure_still_blocks_unvalidated_routes(self):
         doc = DOCS["reusable-browser-tests"]
@@ -169,75 +169,92 @@ class AdmissionTests(unittest.TestCase):
             self.assertEqual(result["outputs"]["skip"], "false")
             self.assertEqual(result["calls"], [])
 
-    def test_only_body_and_title_edits_reuse(self):
-        for action in ("opened", "synchronize", "ready_for_review", "reopened"):
+    def test_ready_and_full_rerun_recover_from_draft_outputs(self):
+        for slug, doc in DOCS.items():
+            for action in ("opened", "synchronize", "ready_for_review", "reopened"):
+                data = fixture()
+                data["payload"]["action"] = action
+                self.assertEqual(self.execute(data, slug)["outputs"]["skip"], "false")
+            ctx = context(doc)
+            ctx["github"]["event"]["action"] = "ready_for_review"
+            ready = graph(doc, ctx, "validate")
+            self.assertEqual(ready["ci-admission"]["result"], "skipped")
+            self.assertEqual(ready["required"]["result"], "success")
+            # A full rerun executes admission again, but retains the draft event payload.
             data = fixture()
-            data["payload"]["action"] = action
-            self.assertEqual(self.execute(data)["outputs"]["skip"], "false")
-        for changes in ({}, {"base": {}}, {"body": {}, "base": {}}):
-            data = fixture()
-            data["payload"]["changes"] = changes
-            self.assertEqual(self.execute(data)["outputs"]["skip"], "false")
+            data["payload"]["pull_request"]["draft"] = True
+            data["attempt"] = 2
+            result = self.execute(data, slug)
+            self.assertEqual(result["outputs"], {"skip": "false", "reason": "validate"})
+            self.assertEqual(result["calls"], [])
+            ctx = context(doc, draft=True)
+            ctx["github"]["run_attempt"] = 2
+            rerun = graph(doc, ctx, "validate", admission_outputs=result["outputs"])
+            self.assertEqual(rerun["ci-admission"]["result"], "success")
+            self.assertEqual(rerun["required"]["result"], "success")
+            for jid in doc["jobs"]:
+                if jid != "ci-admission":
+                    self.assertEqual(rerun[jid]["result"], ready[jid]["result"], (slug, jid))
+
+    def test_retargeted_pr_current_api_state_cannot_reuse_old_base_success(self):
         data = fixture()
-        data["payload"]["changes"] = {"title": {}, "body": {}}
-        self.assertEqual(self.execute(data)["outputs"]["skip"], "true")
+        # The successful run validated BASE. After retargeting, GitHub returns
+        # the PR's CURRENT base on that old run too, not the validated base.
+        current_pr = copy.deepcopy(PR)
+        current_pr["base"] = {"sha": "d" * 40, "ref": "release"}
+        data["payload"]["pull_request"] = current_pr
+        data["runs"][0]["pull_requests"] = [copy.deepcopy(current_pr)]
+        data["current"]["pull_requests"] = [copy.deepcopy(current_pr)]
+        self.assertNotEqual(BASE, data["runs"][0]["pull_requests"][0]["base"]["sha"])
+        # The retarget run failed, then a body edit arrives on the same head.
+        data["runs"].append({**copy.deepcopy(data["runs"][0]), "id": 11, "conclusion": "failure"})
+        for slug in FILES:
+            result = self.execute(data, slug)
+            self.assertEqual(result["outputs"], {"skip": "false", "reason": "validate"})
+            self.assertEqual(result["calls"], [])
+
+    def test_two_open_prs_from_one_head_to_different_bases_each_validate(self):
+        first = copy.deepcopy(PR)
+        first["base"]["ref"] = "main"
+        second = copy.deepcopy(PR)
+        second.update(number=8, base={"sha": "d" * 40, "ref": "release"})
+        self.assertEqual(first["head"], second["head"])
+        for pr in (first, second):
+            data = fixture()
+            data["payload"]["pull_request"] = pr
+            # Run associations contain both current PRs; they do not identify
+            # which base a historical run actually validated.
+            data["runs"][0]["pull_requests"] = copy.deepcopy([first, second])
+            for slug in FILES:
+                with self.subTest(pr=pr["number"], slug=slug):
+                    result = self.execute(data, slug)
+                    self.assertEqual(result["outputs"], {"skip": "false", "reason": "validate"})
+                    self.assertEqual(result["calls"], [])
 
     def test_admission_report_rejects_missing_or_inconsistent_outputs(self):
-        script = next(step for step in DOCS["node-library"]["jobs"]["required"]["steps"]
-                      if step.get("name") == "Check CI admission")["run"]
         cases = [
-            ("skipped", "", "", "", 0), ("success", "false", "validate", "", 0),
-            ("success", "true", "successful-head", "10", 0),
-            ("success", "true", "successful-head", "", 1),
-            ("success", "true", "draft", "", 1), ("success", "true", "unknown", "", 1),
-            ("success", "", "", "", 1), ("failure", "false", "validate", "", 1),
-            ("cancelled", "true", "successful-head", "10", 1),
+            ("skipped", "", "", 0), ("success", "false", "validate", 0),
+            ("success", "true", "successful-head", 1),
+            ("success", "true", "draft", 1), ("success", "true", "unknown", 1),
+            ("success", "", "", 1), ("failure", "false", "validate", 1),
+            ("cancelled", "true", "draft", 1),
         ]
-        for result, skip, reason, source, expected in cases:
-            env = {**os.environ, "ADMISSION_RESULT": result, "ADMISSION_SKIP": skip,
-                   "ADMISSION_REASON": reason, "ADMISSION_SOURCE": source}
-            actual = subprocess.run(["bash", "-c", script], env=env, capture_output=True)
-            self.assertEqual(actual.returncode, expected, (result, skip, reason, source))
-
-    def test_unknown_failed_stale_and_truncated_proofs_run_validation(self):
-        mutations = [
-            lambda d: d.update(denied=True),
-            lambda d: d.update(runs=[]),
-            lambda d: d["current"].update(run_attempt=2),
-            lambda d: d["current"].update(referenced_workflows=[]),
-            lambda d: d["runs"][0].update(id=20),
-            lambda d: d["runs"][0].update(head_sha="d" * 40),
-            lambda d: d["runs"][0].update(path="other.yml"),
-            lambda d: d["runs"][0].update(workflow_id=9),
-            lambda d: d["runs"][0].update(event="push"),
-            lambda d: d["runs"][0].update(status="in_progress"),
-            lambda d: d["runs"][0].update(conclusion="failure"),
-            lambda d: d["runs"][0].update(repository={"id": 9}),
-            lambda d: d["runs"][0].update(head_repository={"id": 9}),
-            lambda d: d["runs"][0].update(pull_requests=[]),
-            lambda d: d["runs"][0]["pull_requests"][0].update(number=8),
-            lambda d: d["runs"][0]["pull_requests"][0]["head"].update(sha="d" * 40),
-            lambda d: d["runs"][0]["pull_requests"][0]["base"].update(sha="d" * 40),
-            lambda d: d["runs"][0]["referenced_workflows"][0].update(sha="d" * 40),
-            lambda d: d["runs"][0]["referenced_workflows"][0].update(sha="invalid"),
-            lambda d: d["jobs"].update(total_count=101),
-            lambda d: d["jobs"].update(jobs=[], total_count=0),
-            lambda d: d["jobs"]["jobs"][0].update(name="ci / Required (folded into Build)"),
-            lambda d: d["jobs"]["jobs"][0].update(conclusion="skipped"),
-            lambda d: d["jobs"]["jobs"][0].update(conclusion="failure"),
-            lambda d: d.update(inputs='{"package-matrix":"nonempty"}'),
-            lambda d: d.update(vars='{"CI_E2E_IN_CI":"true"}'),
-            lambda d: d.update(inputs='{"ci-concurrency-key":"second"}'),
-            lambda d: d["jobs"]["jobs"][0].update(steps=[]),
-            lambda d: d["jobs"]["jobs"][0]["steps"][0].update(conclusion="skipped"),
-        ]
-        for number, mutate in enumerate(mutations):
-            with self.subTest(number=number):
-                data = fixture()
-                # Avoid aliasing identical current/previous data in the fixture.
-                data["runs"] = copy.deepcopy(data["runs"])
-                mutate(data)
-                self.assertEqual(self.execute(data)["outputs"]["skip"], "false")
+        for slug, doc in DOCS.items():
+            for job in doc["jobs"].values():
+                for step in job.get("steps", []):
+                    if step.get("name") != "Check CI admission":
+                        continue
+                    for result, skip, reason, expected in cases:
+                        env = {**os.environ, "ADMISSION_RESULT": result, "ADMISSION_SKIP": skip,
+                               "ADMISSION_REASON": reason}
+                        actual = subprocess.run(["bash", "-c", step["run"]], env=env,
+                                                text=True, capture_output=True)
+                        self.assertEqual(actual.returncode, expected, (slug, result, skip, reason))
+                        if reason == "draft" and result == "success":
+                            self.assertIn("push a commit", actual.stdout)
+                            self.assertIn("Re-run all jobs", actual.stdout)
+                            self.assertIn("Re-run failed jobs keeps draft admission outputs", actual.stdout)
+                            self.assertIn("ready_for_review in the caller pull_request.types", actual.stdout)
 
     def test_deferred_graph_always_reports_required_without_heavy_work(self):
         configs = [({}, "Required"), ({"checks-in-build": True, "preview-checks": "none"}, "Required"),
@@ -245,28 +262,27 @@ class AdmissionTests(unittest.TestCase):
                    ({"fast-scripts": "lint", "pr-fast-only": True, "e2e-full-paths": "src/**"}, "Fast")]
         for slug, doc in DOCS.items():
             for overrides, wanted in configs if slug == "nuxt-cloudflare" else [({}, "Required")]:
-                for reason in ("draft", "successful-head"):
-                    with self.subTest(slug=slug, inputs=overrides, reason=reason):
-                        ctx = context(doc, draft=reason == "draft", **overrides)
-                        state = graph(doc, ctx, reason)
-                        gates = [(jid, render(doc["jobs"][jid].get("name", jid), s["ctx"]))
-                                 for jid, s in state.items() if s["result"] == "success"]
-                        self.assertEqual(sum(name == "Required" for _, name in gates), 1, gates)
-                        self.assertTrue(any(name == wanted for _, name in gates), gates)
-                        self.assertTrue(all(jid in ("ci-admission", "required", "fast", "fast-escalable") for jid, _ in gates), gates)
-                        for jid, _ in gates:
-                            if jid == "ci-admission":
-                                continue
-                            job = doc["jobs"][jid]
-                            local = {**state[jid]["ctx"], "env": {}}
-                            local["env"] = {key: str(ev(value, local)).lower()
-                                            for key, value in job.get("env", {}).items()
-                                            if isinstance(value, str) and value.startswith("${{")}
-                            steps = [step for step in job["steps"] if truthy(ev(step.get("if", "true"), local))]
-                            self.assertEqual([step.get("name") for step in steps], ["Check CI admission"])
-                            env = {**os.environ, **{k: render(v, local) for k, v in steps[0]["env"].items()}}
-                            result = subprocess.run(["bash", "-c", steps[0]["run"]], env=env, capture_output=True)
-                            self.assertEqual(result.returncode, 1 if reason == "draft" else 0)
+                with self.subTest(slug=slug, inputs=overrides, reason="draft"):
+                    ctx = context(doc, draft=True, **overrides)
+                    state = graph(doc, ctx, "draft")
+                    gates = [(jid, render(doc["jobs"][jid].get("name", jid), s["ctx"]))
+                             for jid, s in state.items() if s["result"] == "success"]
+                    self.assertEqual(sum(name == "Required" for _, name in gates), 1, gates)
+                    self.assertTrue(any(name == wanted for _, name in gates), gates)
+                    self.assertTrue(all(jid in ("ci-admission", "required", "fast", "fast-escalable") for jid, _ in gates), gates)
+                    for jid, _ in gates:
+                        if jid == "ci-admission":
+                            continue
+                        job = doc["jobs"][jid]
+                        local = {**state[jid]["ctx"], "env": {}}
+                        local["env"] = {key: str(ev(value, local)).lower()
+                                        for key, value in job.get("env", {}).items()
+                                        if isinstance(value, str) and value.startswith("${{")}
+                        steps = [step for step in job["steps"] if truthy(ev(step.get("if", "true"), local))]
+                        self.assertEqual([step.get("name") for step in steps], ["Check CI admission"])
+                        env = {**os.environ, **{k: render(v, local) for k, v in steps[0]["env"].items()}}
+                        result = subprocess.run(["bash", "-c", steps[0]["run"]], env=env, capture_output=True)
+                        self.assertEqual(result.returncode, 1)
 
     def test_concurrency_separates_non_prs_invocations_and_matrix_lanes(self):
         for slug, doc in DOCS.items():

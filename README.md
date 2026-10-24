@@ -483,32 +483,28 @@ per the same doc, do not reuse the callable's group value there either.
 #### Draft PRs and metadata edits
 
 Apple, Node library, Python data, docs governance, Nuxt CI and reusable browser
-tests run a lightweight `CI admission` job only for draft PRs or `edited` PR
-events. Ordinary PR updates and non-PR events allocate no admission runner.
-Heavy draft jobs are deferred; `Required` (and Nuxt's applicable `Fast`) still
-reports a completed **failure** explaining how to run validation. This is
-deliberate: a draft must never leave an untested success that could satisfy
-protection after it becomes ready. Callers should include `ready_for_review`
-in their `pull_request.types`; otherwise manually rerun CI after marking ready.
-Nuxt's E2E, exact-candidate and post-deploy smoke invocations are excluded.
+tests run a lightweight `CI admission` job only for draft PRs. Ready PR updates
+and non-PR events allocate no admission runner. Heavy draft jobs are deferred;
+`Required` (and Nuxt's applicable `Fast`) still reports a completed **failure**
+explaining how to run validation. A draft must never leave an untested success
+that could satisfy protection after it becomes ready. Nuxt's E2E, exact-candidate
+and post-deploy smoke invocations are excluded. Deferred paths never publish
+build or gate proof artifacts.
 
-A title/body-only `edited` event reuses a successful run only when the workflow
-ID/path, run head, PR number, PR head/base, head repository, every referenced
-callable revision and the fingerprint of effective inputs and repository
-variables match. A successful `Required` or `Fast` context must contain the
-matching validation-contract step, with no failing gate in the complete job
-list. The invocation key is part of that fingerprint. Lookups inspect at most 20
-successful runs and 100 jobs per run; missing, denied or truncated evidence
-runs normal validation. Manual reruns always validate. Deferred paths never
-publish build or gate proof artifacts. Successful reuse still emits the gate
-context with the prior run ID in admission's log and output.
+After marking a PR ready, push a commit or choose **Re-run all jobs** to run
+validation. **Re-run failed jobs** preserves the succeeded admission job's draft
+outputs and leaves validation deferred. For automatic recovery on marking ready,
+callers must explicitly include `ready_for_review` in `pull_request.types` along
+with their other desired activity types; the default types do not receive it.
+A full rerun bypasses draft deferral even though its event payload still says draft.
 
-This does not widen caller grants: Nuxt and browser admission use their existing
-`actions: read` contracts; other CI callables retain `contents: read` and run
-normal validation if GitHub denies the Actions lookup. Enabling private-repo
-metadata reuse for those callables needs a separately coordinated caller grant
-and callable permission-contract change. This repository's own PR trigger
-already excludes metadata-only edits.
+Title/body edits run normal validation when the caller subscribes to `edited`.
+Admission does not reuse earlier successful runs: a workflow run's
+`pull_requests[]` reflects the PR's current head and base, so it cannot prove
+which base was validated at run time. This also avoids sharing validation
+between two PRs from one head branch targeting different bases. This repository's
+own default PR trigger excludes metadata-only edits. No caller permission or
+trigger change is required for draft deferral or normal validation.
 
 #### Path filtering: use the boolean inputs, never `paths` / `paths-ignore`
 
