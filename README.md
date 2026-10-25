@@ -638,6 +638,15 @@ Swift SourceKit runtime. The install step separately fails closed unless
 `LINUX_SOURCEKIT_LIB_PATH`, and still locates the unpacked `swiftlint` binary
 with `find` because upstream archive layouts have changed.
 
+Build and test share the host-wide Apple build lease
+(agent-infrastructure#965) and take it **once**, in one step, through the
+installed `apple_build_lock.py run`. The job queues inside that call with the
+same retry as every other caller, prints one `QUEUED` line and a heartbeat a
+minute, and has two separate budgets: `lease-wait-minutes` (default 60) for
+the queue, then `xcode-timeout-minutes` for the work, counted from the moment
+the lease is held. A busy host therefore fails as "lease still busy", never as
+a build timeout that ran no build.
+
 Archive/sign/notarize/TestFlight/Sparkle are **not** here, for the same reason
 `node-library.yml` omits publish: they need temporary keychains, the host-wide
 Apple build lock and per-repo credentials, and folding them in would put
@@ -2620,7 +2629,7 @@ direction that would have made a fine timeout look nearly breached.
 
 | Callable | Job | Timeout | p50 | p95 | max | n | repos | ×p95 |
 |---|---|---|---|---|---|---|---|---|
-| `apple.yml` | `xcode` | 45 (`xcode-timeout-minutes`) | 116s | 228s | 231s | 8 | 4 | 11.8× |
+| `apple.yml` | `xcode` | 45 work after the lease (`xcode-timeout-minutes`) + 60 queue (`lease-wait-minutes`); job backstop 360 | 116s | 228s | 231s | 8 | 4 | 11.8× |
 | `apple.yml` | `lint` | 15 (`lint-timeout-minutes`) | 8s | 12s | 12s | 4 | 2 | 75.9× |
 | `docs-governance.yml` | `check` | 15 | 10s | 18s | 22s | **39** | 1 | 49.7× |
 | `node-library.yml` | `package / <label>` | 30 | 78s | 289s | 298s | 17 | 4 | **6.2×** |
