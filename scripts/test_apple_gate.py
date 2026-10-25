@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Prove Apple routing stays split and the Xcode job cannot become echo-only.
 
-Also proves the agent-infrastructure#965 lease: extracts the "Wait for Apple
-build lease", "Build", and "Test" steps' real `run:` text straight out of the
+Also proves the agent-infrastructure#965 lease: extracts the "Build and test
+under Apple build lease" step's real `run:` text straight out of the
 workflow YAML -- like every other scripts/test_*.py in this repo -- and
 executes it under bash against a real stand-in lock tool. If someone edits
 the embedded lease logic or the steps around it, these tests either still
@@ -166,19 +166,21 @@ def run_named_step(
     )
 
 
-def read_github_env(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    if not path.exists():
-        return values
-    for line in path.read_text().splitlines():
-        if "=" in line:
-            key, _, value = line.partition("=")
-            values[key] = value
-    return values
+LEASED_STEP = "Build and test under Apple build lease"
+BUILD_EXPR = "${{ inputs.build-command }}"
+TEST_EXPR = "${{ inputs.test-command }}"
+
+
+def wait_ready(ready: Path) -> None:
+    deadline = time.monotonic() + 5
+    while not ready.exists():
+        if time.monotonic() >= deadline:
+            raise AssertionError("lock holder did not signal readiness")
+        time.sleep(0.05)
 
 
 def test_lease(document: dict) -> None:
-    """The Wait/Build/Test steps prove out agent-infrastructure#965 end to end."""
+    """The leased step proves out agent-infrastructure#965 end to end."""
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
         lock_tool = write_executable(root / "stub_lock_tool.py", STUB_LOCK_TOOL_SOURCE)
@@ -188,131 +190,155 @@ def test_lease(document: dict) -> None:
         runner_temp = root / "runner-temp"
         runner_temp.mkdir()
 
-        def base_env(**overrides: str) -> dict:
-            github_env = root / f"github-env-{overrides.get('_tag', 'default')}"
-            github_env.write_text("")
-            merged = {
+        def env_for(**overrides: str) -> dict:
+            return {
                 **os.environ,
                 "APPLE_BUILD_LOCK_TOOL": str(lock_tool),
                 "APPLE_BUILD_LOCK_PATH": str(lock_path),
-                "APPLE_BUILD_LEASE_POLL_SECONDS": "1",
+                "APPLE_BUILD_LEASE_HEARTBEAT_SECONDS": "1",
                 "RUNNER_TEMP": str(runner_temp),
-                "GITHUB_ENV": str(github_env),
+                "RUN_BUILD": "true",
+                "RUN_TESTS": "true",
+                "LEASE_WAIT_MINUTES": "60",
+                "WORK_TIMEOUT_MINUTES": "45",
+                "DEPENDENCY_SSH_KEY": "",
+                "DEPENDENCY_OWNER": "example",
+                **overrides,
             }
-            merged.update({k: v for k, v in overrides.items() if not k.startswith("_")})
-            return merged
 
-        marker_command = f'echo built >> "{marker}"'
+        def run_leased(env: dict, build: str, test: str, timeout: float = 30):
+            return run_named_step(
+                document, LEASED_STEP, env, timeout=timeout,
+                substitutions={BUILD_EXPR: build, TEST_EXPR: test},
+            )
+
+        def hold(seconds: str, tag: str) -> subprocess.Popen:
+            ready = root / f"holder-ready-{tag}"
+            holder = subprocess.Popen(
+                [sys.executable, str(holder_script), str(lock_path), str(ready), seconds]
+            )
+            wait_ready(ready)
+            return holder
+
+        build_ok = f'echo build >> "{marker}"'
+        test_ok = f'echo test >> "{marker}"'
 
         # 1. Refuses to run unleased when the lease tool is not installed.
-        env = base_env(_tag="missing", APPLE_BUILD_LOCK_TOOL=str(root / "absent.py"))
-        result = run_named_step(document, "Wait for Apple build lease", env)
+        result = run_leased(env_for(APPLE_BUILD_LOCK_TOOL=str(root / "absent.py")), build_ok, test_ok)
         assert result.returncode == 1, result.stderr
-        assert "not installed" in result.stdout
         assert "refusing to run build-command/test-command unleased" in result.stdout
+        assert not marker.exists()
 
-        # 2. Free lease: no waiting evidence, Build actually runs the command.
-        env = base_env(_tag="free")
-        wait_result = run_named_step(document, "Wait for Apple build lease", env)
-        assert wait_result.returncode == 0, wait_result.stderr
-        assert "WAITING ON LEASE" not in wait_result.stdout
-        env.update(read_github_env(Path(env["GITHUB_ENV"])))
-        build_result = run_named_step(
-            document,
-            "Build",
-            env,
-            substitutions={"${{ inputs.build-command }}": marker_command},
-        )
-        assert build_result.returncode == 0, build_result.stderr
-        assert "RUNNING UNDER LEASE" in build_result.stdout
-        assert marker.exists()
+        # 2. Free lease: no queue evidence; build then test run under ONE lease.
+        result = run_leased(env_for(), build_ok, test_ok)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "QUEUED" not in result.stdout
+        assert result.stdout.count("LEASE ACQUIRED") == 1
+        assert "RUNNING UNDER LEASE: build-command" in result.stdout
+        assert "RUNNING UNDER LEASE: test-command" in result.stdout
+        assert marker.read_text() == "build\ntest\n"
         marker.unlink()
 
-        # 3. Busy-then-free: visible waiting evidence precedes acquisition.
-        ready = root / "holder-ready"
-        holder = subprocess.Popen(
-            [sys.executable, str(holder_script), str(lock_path), str(ready), "2.5"]
-        )
+        # 3. run-tests false stages only the build command.
+        result = run_leased(env_for(RUN_TESTS="false"), build_ok, test_ok)
+        assert result.returncode == 0, result.stderr
+        assert marker.read_text() == "build\n"
+        marker.unlink()
+
+        # 4. Busy-then-free: one QUEUED line, a heartbeat, then acquisition.
+        #    The queue (3 s) uses the whole work budget (3 s) and 2 s of work
+        #    still succeeds: queue time never eats the build's own budget.
+        holder = hold("3", "waits")
         try:
-            deadline = time.monotonic() + 5
-            while not ready.exists():
-                if time.monotonic() >= deadline:
-                    raise AssertionError("lock holder did not signal readiness")
-                time.sleep(0.05)
-            env = base_env(_tag="waits", APPLE_BUILD_LEASE_TIMEOUT_SECONDS="20")
-            wait_result = run_named_step(document, "Wait for Apple build lease", env, timeout=30)
+            result = run_leased(env_for(APPLE_BUILD_WORK_TIMEOUT_SECONDS="3"), f"sleep 2; {build_ok}", test_ok)
         finally:
             holder.wait(timeout=10)
-        assert wait_result.returncode == 0, wait_result.stderr
-        assert "WAITING ON LEASE" in wait_result.stdout
-        assert "LEASE ACQUIRED" in wait_result.stdout
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert result.stdout.count("QUEUED: another Apple build holds") == 1
+        assert "QUEUED: still waiting" in result.stdout
+        assert "LEASE ACQUIRED after" in result.stdout
+        assert len(result.stdout.splitlines()) < 12, result.stdout
+        assert marker.read_text() == "build\ntest\n"
+        marker.unlink()
 
-        # 4. Timeout: busy forever times out visibly and never runs the command.
-        ready = root / "holder-ready-2"
-        holder = subprocess.Popen(
-            [sys.executable, str(holder_script), str(lock_path), str(ready), "30"]
-        )
+        # 5. Queue budget exhausted: fails visibly with 75, never runs work.
+        holder = hold("30", "timeout")
         try:
-            deadline = time.monotonic() + 5
-            while not ready.exists():
-                if time.monotonic() >= deadline:
-                    raise AssertionError("lock holder did not signal readiness")
-                time.sleep(0.05)
-            env = base_env(_tag="timeout", APPLE_BUILD_LEASE_TIMEOUT_SECONDS="2")
-            wait_result = run_named_step(document, "Wait for Apple build lease", env, timeout=15)
+            result = run_leased(env_for(APPLE_BUILD_LEASE_TIMEOUT_SECONDS="2"), build_ok, test_ok, timeout=15)
         finally:
             holder.kill()
             holder.wait(timeout=10)
-        assert wait_result.returncode == 75, wait_result.stderr
-        assert "WAITING ON LEASE" in wait_result.stdout
-        assert "still busy after" in wait_result.stdout
-        assert "refusing to run unleased" in wait_result.stdout
+        assert result.returncode == 75, result.stderr
+        assert "still busy after 2s" in result.stdout
+        assert "refusing to run unleased" in result.stdout
         assert not marker.exists()
 
-        # 5. Broker-held marker short-circuits the wait loop entirely.
-        env = base_env(_tag="broker", APPLE_BUILD_LOCK_HELD="1")
-        wait_result = run_named_step(document, "Wait for Apple build lease", env)
-        assert wait_result.returncode == 0, wait_result.stderr
-        assert "WAITING ON LEASE" not in wait_result.stdout
-        env.update(read_github_env(Path(env["GITHUB_ENV"])))
-        test_result = run_named_step(
-            document,
-            "Test",
-            env,
-            substitutions={"${{ inputs.test-command }}": marker_command},
-        )
-        assert test_result.returncode == 0, test_result.stderr
-        assert marker.exists()
+        # 6. Work budget exhausted after acquisition: the whole command tree is
+        #    stopped, the step exits 124 and test-command never runs.
+        pid_file = root / "sleeper.pid"
+        hung = f'sleep 60 & echo $! > "{pid_file}"; wait'
+        started = time.monotonic()
+        result = run_leased(env_for(APPLE_BUILD_WORK_TIMEOUT_SECONDS="2"), hung, test_ok, timeout=20)
+        assert result.returncode == 124, result.stdout + result.stderr
+        assert time.monotonic() - started < 15
+        assert "exceeded the 2s work budget" in result.stdout
+        assert not marker.exists()
+        sleeper = int(pid_file.read_text())
+        time.sleep(0.2)
+        try:
+            os.kill(sleeper, 0)
+            raise AssertionError("work-budget timeout left the build's child running")
+        except ProcessLookupError:
+            pass
 
-    print("Apple lease wait/timeout/broker-held contract passed (agent-infrastructure#965)")
+        # 7. A failing build-command forwards its exit code and skips tests.
+        result = run_leased(env_for(), "exit 17", test_ok)
+        assert result.returncode == 17, result.stderr
+        assert not marker.exists()
+
+        # 8. The caller's command text is staged verbatim, not re-parsed.
+        result = run_leased(env_for(RUN_TESTS="false"), f"echo \"quoted $HOME\" '$X' >> \"{marker}\"", test_ok)
+        assert result.returncode == 0, result.stderr
+        assert marker.read_text() == f"quoted {os.environ['HOME']} $X\n"
+        marker.unlink()
+
+        assert not list(runner_temp.iterdir()), "leased step left its stage directory behind"
+
+    print("Apple lease queue/work-budget/timeout contract passed (agent-infrastructure#965)")
 
 
 def test_dependency_auth(document: dict) -> None:
-    # Execute the shipped setup and both successful/failing child exits.
+    # Execute the shipped step and both successful/failing child exits.
     # Verify HTTPS rewriting is owner-scoped and the temporary key disappears.
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
+        lock_tool = write_executable(root / "stub_lock_tool.py", STUB_LOCK_TOOL_SOURCE)
+        runner_temp = root / "runner-temp"
+        runner_temp.mkdir()
         credential = "fake-read-only-deploy-key"
-        for name in ("Build", "Test"):
-            setup = step(document, name)["run"].split('lock_tool=')[0]
-            for value in ("", credential):
-                for code in (0, 17):
-                    script = setup + "\ngit config --get url.git@github.com:example/.insteadOf || :\n"
-                    if value:
-                        script += 'test "$(cat "$auth_dir/key")" = "fake-read-only-deploy-key"\npython3 -c \'import os,stat,sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600\' "$auth_dir/key"\n'
-                    script += f"exit {code}\n"
-                    env = {**os.environ, "HOME": temp, "RUNNER_TEMP": temp,
-                           "GIT_CONFIG_GLOBAL": str(root / "global"), "GIT_CONFIG_NOSYSTEM": "1",
-                           "DEPENDENCY_OWNER": "example", "DEPENDENCY_SSH_KEY": value}
-                    for key in list(env):
-                        if key.startswith("GIT_CONFIG_") and key not in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"):
-                            del env[key]
-                    result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
-                    assert result.returncode == code, result.stderr
-                    assert credential not in result.stdout + result.stderr
-                    assert result.stdout == ("https://github.com/example/\n" if value else "")
-                    assert not list(root.glob("swiftpm-auth.*"))
-                    assert not (root / "global").exists()
+        for value in ("", credential):
+            for code in (0, 17):
+                command = "git config --get url.git@github.com:example/.insteadOf || :\n"
+                if value:
+                    command += 'key="$(dirname "$0")/swiftpm-auth/key"\ntest "$(cat "$key")" = "fake-read-only-deploy-key"\npython3 -c \'import os,stat,sys; assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o600\' "$key"\n'
+                command += f"exit {code}"
+                env = {**os.environ, "HOME": temp, "RUNNER_TEMP": str(runner_temp),
+                       "GIT_CONFIG_GLOBAL": str(root / "global"), "GIT_CONFIG_NOSYSTEM": "1",
+                       "APPLE_BUILD_LOCK_TOOL": str(lock_tool),
+                       "APPLE_BUILD_LOCK_PATH": str(root / "apple-build.lock"),
+                       "RUN_BUILD": "true", "RUN_TESTS": "false",
+                       "LEASE_WAIT_MINUTES": "1", "WORK_TIMEOUT_MINUTES": "1",
+                       "DEPENDENCY_OWNER": "example", "DEPENDENCY_SSH_KEY": value}
+                for key in list(env):
+                    if key.startswith("GIT_CONFIG_") and key not in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"):
+                        del env[key]
+                result = run_named_step(document, LEASED_STEP, env, substitutions={BUILD_EXPR: command})
+                assert result.returncode == code, result.stdout + result.stderr
+                assert credential not in result.stdout + result.stderr
+                rewrite = "https://github.com/example/\n"
+                assert (rewrite in result.stdout) == bool(value), result.stdout
+                assert not list(runner_temp.iterdir())
+                assert not (root / "global").exists()
         for job in ("lint", "required"):
             assert "DEPENDENCY_SSH_KEY" not in str(document["jobs"][job])
     print("Private SwiftPM auth passed (owner scope, opt-in, success/failure cleanup)")
