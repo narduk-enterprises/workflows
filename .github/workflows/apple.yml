@@ -490,21 +490,20 @@ jobs:
           exit "$status"
           APPLE_WORKFLOWS_LEASED_EOF
 
+          # The heartbeat always runs: a free probe can still lose the lease to
+          # another waiter before `run` takes it. It says nothing if the lease
+          # is acquired within a second, and stops once it is.
           date +%s > "$stage/started"
-          set +e
-          run_lock_tool audit >/dev/null 2>&1
-          probe=$?
-          set -e
-          if [ "$probe" -eq 75 ]; then
+          (
+            sleep 1
+            [ -e "$stage/acquired" ] && exit 0
             echo "QUEUED: another Apple build holds this host's lease. Waiting up to ${wait_seconds}s (lease-wait-minutes); build/test has not started and its ${work_seconds}s budget is not running."
-            (
-              while sleep "$heartbeat_seconds"; do
-                [ -e "$stage/acquired" ] && exit 0
-                echo "QUEUED: still waiting for the Apple build lease -- $(( $(date +%s) - $(cat "$stage/started") ))s of ${wait_seconds}s"
-              done
-            ) &
-            heartbeat=$!
-          fi
+            while sleep "$heartbeat_seconds"; do
+              [ -e "$stage/acquired" ] && exit 0
+              echo "QUEUED: still waiting for the Apple build lease -- $(( $(date +%s) - $(cat "$stage/started") ))s of ${wait_seconds}s"
+            done
+          ) &
+          heartbeat=$!
 
           set +e
           run_lock_tool --timeout "$wait_seconds" run -- bash "$stage/leased.sh" "$stage" "$work_seconds"

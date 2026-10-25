@@ -13,6 +13,7 @@ test passes while the shipped callable silently stopped leasing.
 from __future__ import annotations
 
 import os
+import signal
 import stat
 import sys
 from pathlib import Path
@@ -34,6 +35,7 @@ STUB_LOCK_TOOL_SOURCE = '''\
 import argparse
 import fcntl
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -73,7 +75,18 @@ def main():
         if not command:
             print("ERROR: run requires a command after --", file=sys.stderr)
             return 2
-        child = subprocess.Popen(command)
+        # Same process model as the real run_child: the command leads its own
+        # tty-less session, and INT/TERM/HUP are forwarded to its group.
+        child = subprocess.Popen(command, start_new_session=True)
+
+        def forward(signum, _frame):
+            try:
+                os.killpg(child.pid, signum)
+            except ProcessLookupError:
+                pass
+
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(signum, forward)
         return child.wait()
     finally:
         try:
@@ -290,6 +303,32 @@ def test_lease(document: dict) -> None:
             raise AssertionError("work-budget timeout left the build's child running")
         except ProcessLookupError:
             pass
+
+        # 6b. Cancellation: the runner signals the lock tool, which forwards to
+        #     the leased script; the whole build tree stops and nothing leaks.
+        pid_file.unlink()
+        process = subprocess.Popen(
+            ["bash", "-c", step(document, LEASED_STEP)["run"].replace(BUILD_EXPR, hung).replace(TEST_EXPR, test_ok)],
+            env=env_for(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        deadline = time.monotonic() + 10
+        while not pid_file.exists() or not pid_file.read_text().strip():
+            if time.monotonic() >= deadline:
+                raise AssertionError("build-command never started")
+            time.sleep(0.05)
+        tool = subprocess.run(["pgrep", "-f", str(lock_tool)], capture_output=True, text=True).stdout.split()
+        assert len(tool) == 1, tool
+        os.kill(int(tool[0]), signal.SIGTERM)
+        output, _ = process.communicate(timeout=15)
+        assert process.returncode != 0, output
+        sleeper = int(pid_file.read_text())
+        time.sleep(0.2)
+        try:
+            os.kill(sleeper, 0)
+            raise AssertionError("cancellation left the build's child running")
+        except ProcessLookupError:
+            pass
+        assert not marker.exists(), output
 
         # 7. A failing build-command forwards its exit code and skips tests.
         result = run_leased(env_for(), "exit 17", test_ok)
