@@ -192,6 +192,12 @@ def wait_ready(ready: Path) -> None:
         time.sleep(0.05)
 
 
+def alive(pid: int) -> bool:
+    """A zombie (an unreaped child of a non-reaping PID 1) counts as gone."""
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
 def test_lease(document: dict) -> None:
     """The leased step proves out agent-infrastructure#965 end to end."""
     with tempfile.TemporaryDirectory() as temp:
@@ -259,11 +265,11 @@ def test_lease(document: dict) -> None:
         marker.unlink()
 
         # 4. Busy-then-free: one QUEUED line, a heartbeat, then acquisition.
-        #    The queue (3 s) uses the whole work budget (3 s) and 2 s of work
+        #    The queue (5 s) uses the whole work budget (5 s) and 3 s of work
         #    still succeeds: queue time never eats the build's own budget.
-        holder = hold("3", "waits")
+        holder = hold("5", "waits")
         try:
-            result = run_leased(env_for(APPLE_BUILD_WORK_TIMEOUT_SECONDS="3"), f"sleep 2; {build_ok}", test_ok)
+            result = run_leased(env_for(APPLE_BUILD_WORK_TIMEOUT_SECONDS="5"), f"sleep 3; {build_ok}", test_ok)
         finally:
             holder.wait(timeout=10)
         assert result.returncode == 0, result.stdout + result.stderr
@@ -296,13 +302,34 @@ def test_lease(document: dict) -> None:
         assert time.monotonic() - started < 15
         assert "exceeded the 2s work budget" in result.stdout
         assert not marker.exists()
-        sleeper = int(pid_file.read_text())
-        time.sleep(0.2)
-        try:
-            os.kill(sleeper, 0)
-            raise AssertionError("work-budget timeout left the build's child running")
-        except ProcessLookupError:
-            pass
+        assert not alive(int(pid_file.read_text())), "work-budget timeout left the build's child running"
+
+        # 6a. A child that ignores SIGTERM, and one that left the commands'
+        #     process group (SwiftPM starts children in new groups), are both
+        #     gone before the step exits -- i.e. before the lease is released.
+        stubborn = root / "stubborn.pid"
+        escaped = root / "escaped.pid"
+        tree = (
+            f'(trap "" TERM; sleep 60) & echo $! > "{stubborn}"; '
+            f'{sys.executable} -c "import os, sys, time; os.setpgid(0, 0); open(sys.argv[1], \'w\').write(str(os.getpid())); time.sleep(60)" "{escaped}" & '
+            'wait'
+        )
+        result = run_leased(
+            env_for(APPLE_BUILD_WORK_TIMEOUT_SECONDS="2", APPLE_BUILD_STOP_GRACE_SECONDS="2"),
+            tree, test_ok, timeout=25,
+        )
+        assert result.returncode == 124, result.stdout + result.stderr
+        assert "ignored SIGTERM" in result.stdout, result.stdout
+        assert not alive(int(stubborn.read_text())), "a SIGTERM-ignoring child outlived the lease"
+        assert not alive(int(escaped.read_text())), "a child outside the process group outlived the lease"
+
+        # 6c. A command that exits but leaves a background child behind: the
+        #     child is stopped before the lease is released, and the command's
+        #     own status stands.
+        leftover = root / "leftover.pid"
+        result = run_leased(env_for(RUN_TESTS="false"), f'sleep 60 & echo $! > "{leftover}"; exit 0', test_ok)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not alive(int(leftover.read_text())), "a leftover child outlived the lease"
 
         # 6b. Cancellation: the runner signals the lock tool, which forwards to
         #     the leased script; the whole build tree stops and nothing leaks.
@@ -321,14 +348,14 @@ def test_lease(document: dict) -> None:
         os.kill(int(tool[0]), signal.SIGTERM)
         output, _ = process.communicate(timeout=15)
         assert process.returncode != 0, output
-        sleeper = int(pid_file.read_text())
-        time.sleep(0.2)
-        try:
-            os.kill(sleeper, 0)
-            raise AssertionError("cancellation left the build's child running")
-        except ProcessLookupError:
-            pass
+        assert not alive(int(pid_file.read_text())), "cancellation left the build's child running"
         assert not marker.exists(), output
+
+        # 6d. Inputs are `number`: fractional minutes still work.
+        result = run_leased(env_for(RUN_TESTS="false", LEASE_WAIT_MINUTES="0.5", WORK_TIMEOUT_MINUTES="22.5"), build_ok, test_ok)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "1350s work budget" in result.stdout, result.stdout
+        marker.unlink()
 
         # 7. A failing build-command forwards its exit code and skips tests.
         result = run_leased(env_for(), "exit 17", test_ok)

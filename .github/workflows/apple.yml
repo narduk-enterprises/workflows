@@ -409,8 +409,9 @@ jobs:
             echo "::error::canonical Apple build lease tool is not installed at $lock_tool -- refusing to run build-command/test-command unleased"
             exit 1
           fi
-          wait_seconds="${APPLE_BUILD_LEASE_TIMEOUT_SECONDS:-$((LEASE_WAIT_MINUTES * 60))}"
-          work_seconds="${APPLE_BUILD_WORK_TIMEOUT_SECONDS:-$((WORK_TIMEOUT_MINUTES * 60))}"
+          # Inputs are `number` and may be fractional; shell arithmetic is not.
+          wait_seconds="${APPLE_BUILD_LEASE_TIMEOUT_SECONDS:-$(awk -v m="$LEASE_WAIT_MINUTES" 'BEGIN { printf "%d", m * 60 }')}"
+          work_seconds="${APPLE_BUILD_WORK_TIMEOUT_SECONDS:-$(awk -v m="$WORK_TIMEOUT_MINUTES" 'BEGIN { printf "%d", m * 60 }')}"
           heartbeat_seconds="${APPLE_BUILD_LEASE_HEARTBEAT_SECONDS:-60}"
           run_lock_tool() {
             /usr/bin/env -u PYTHONHOME -u PYTHONPATH -u PYTHONSTARTUP -u PYTHONUSERBASE -u __PYVENV_LAUNCHER__ \
@@ -419,7 +420,7 @@ jobs:
 
           stage="$(mktemp -d "${RUNNER_TEMP}/apple-leased.XXXXXX")"
           heartbeat=""
-          trap 'if [ -n "$heartbeat" ]; then kill "$heartbeat" 2>/dev/null || true; fi; rm -rf -- "$stage"' EXIT
+          trap 'if [ -n "$heartbeat" ]; then pkill -P "$heartbeat" 2>/dev/null || true; kill "$heartbeat" 2>/dev/null || true; fi; rm -rf -- "$stage"' EXIT
           if [ -n "${DEPENDENCY_SSH_KEY:-}" ]; then
             auth_dir="$stage/swiftpm-auth"
             mkdir -m 700 "$auth_dir"
@@ -449,14 +450,55 @@ jobs:
           APPLE_WORKFLOWS_TEST_COMMAND_EOF
           fi
 
-          # Runs under the lease. It owns the work budget: the commands get
-          # their own process group, so the deadline (and a cancellation the
-          # lock tool forwards) reaches xcodebuild and everything it spawned.
+          # Runs under the lease and owns the work budget. The commands get
+          # their own process group; stopping them (deadline or a cancellation
+          # the lock tool forwards) also reaches descendants that left that
+          # group -- SwiftPM starts its children in new groups -- and the
+          # script exits, releasing the lease, only once all of it is gone.
           cat > "$stage/leased.sh" <<'APPLE_WORKFLOWS_LEASED_EOF'
           stage="$1"
           work_seconds="$2"
+          grace_seconds="${APPLE_BUILD_STOP_GRACE_SECONDS:-30}"
+          commands=""
           : > "$stage/acquired"
           echo "LEASE ACQUIRED after $(( $(date +%s) - $(cat "$stage/started") ))s in queue; ${work_seconds}s work budget starts now"
+          # Live members of the commands' group, their live descendants, and
+          # every pid seen by an earlier call (a child whose parent died is
+          # reparented and only the earlier snapshot still knows it).
+          command_pids() {
+            ps -axo pid=,ppid=,pgid= | awk -v root="$commands" '
+              { parent[$1] = $2; if ($3 == root) print $1 }
+              END {
+                for (pid in parent) {
+                  up = pid
+                  for (hops = 0; hops < 64 && (up in parent) && up != root; hops++) up = parent[up]
+                  if (up == root) print pid
+                }
+              }' >> "$stage/pids"
+            sort -un "$stage/pids" | while read -r pid; do
+              kill -0 "$pid" 2>/dev/null && echo "$pid"
+            done
+          }
+          stop_commands() {
+            [ -n "$commands" ] || return 0
+            : >> "$stage/pids"
+            pids="$(command_pids)"
+            [ -n "$pids" ] || return 0
+            # shellcheck disable=SC2086
+            kill -TERM $pids 2>/dev/null
+            waited=0
+            while [ "$waited" -lt "$grace_seconds" ]; do
+              pids="$(command_pids)"
+              [ -n "$pids" ] || return 0
+              sleep 1
+              waited=$((waited + 1))
+            done
+            echo "::warning::build/test processes ignored SIGTERM for ${grace_seconds}s -- sending SIGKILL"
+            # shellcheck disable=SC2086
+            kill -KILL $(command_pids) 2>/dev/null
+            return 0
+          }
+          trap 'stop_commands' TERM INT HUP
           set -m
           run_commands() {
             for script in "$stage"/[0-9]-*.sh; do
@@ -469,21 +511,21 @@ jobs:
           run_commands &
           commands=$!
           (
+            trap - TERM INT HUP
             sleep "$work_seconds"
             : > "$stage/timed-out"
             echo "::error::build/test exceeded the ${work_seconds}s work budget (xcode-timeout-minutes) after acquiring the lease -- stopping it"
-            kill -TERM -- "-$commands" 2>/dev/null
-            sleep 30
-            kill -KILL -- "-$commands" 2>/dev/null
+            stop_commands
           ) &
           watchdog=$!
-          trap 'kill -TERM -- "-$commands" 2>/dev/null' TERM INT HUP
           while :; do
             wait "$commands"
             status=$?
             kill -0 "$commands" 2>/dev/null || break
           done
+          # The leader is gone; nothing it started may outlive the lease.
           kill -- "-$watchdog" 2>/dev/null
+          stop_commands
           if [ -e "$stage/timed-out" ]; then
             exit 124
           fi
