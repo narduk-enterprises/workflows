@@ -647,6 +647,12 @@ the queue, then `xcode-timeout-minutes` for the work, counted from the moment
 the lease is held. A busy host therefore fails as "lease still busy", never as
 a build timeout that ran no build.
 
+The one exception is an `apple-runner` whose labels include `apple-vm`
+(fleet#911): a one-job JIT macOS VM that is destroyed after the job, so no
+other build can share its host and its image ships no lock tool. There the
+step prints `UNLEASED` and runs build then test under the same work budget.
+Every other route still refuses to run without the lease tool.
+
 Archive/sign/notarize/TestFlight/Sparkle are **not** here, for the same reason
 `node-library.yml` omits publish: they need temporary keychains, the host-wide
 Apple build lock and per-repo credentials, and folding them in would put

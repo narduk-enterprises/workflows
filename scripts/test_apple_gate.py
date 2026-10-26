@@ -248,6 +248,32 @@ def test_lease(document: dict) -> None:
         assert "refusing to run build-command/test-command unleased" in result.stdout
         assert not marker.exists()
 
+        # 1b. ...and still refuses on any other route, even one naming apple labels.
+        imac = '{"group":"apple","labels":["self-hosted","macOS","apple-org","apple-imac"]}'
+        result = run_leased(
+            env_for(APPLE_BUILD_LOCK_TOOL=str(root / "absent.py"), APPLE_RUNNER=imac), build_ok, test_ok
+        )
+        assert result.returncode == 1, result.stderr
+        assert "refusing to run build-command/test-command unleased" in result.stdout
+        assert not marker.exists()
+
+        # 1c. An apple-vm runner (one-job JIT VM, fleet#911) has no host to share and
+        # no lock tool: build then test run unleased, under the same work budget.
+        vm = '{"group":"apple-vm","labels":["self-hosted","macOS","X64","apple-vm"]}'
+        result = run_leased(
+            env_for(APPLE_BUILD_LOCK_TOOL=str(root / "absent.py"), APPLE_RUNNER=vm), build_ok, test_ok
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "UNLEASED: apple-vm one-job runner" in result.stdout
+        assert "QUEUED" not in result.stdout
+        assert marker.read_text() == "build\ntest\n"
+        marker.unlink()
+        result = run_leased(
+            env_for(APPLE_BUILD_LOCK_TOOL=str(root / "absent.py"), APPLE_RUNNER=vm), build_ok, "exit 7"
+        )
+        assert result.returncode == 7, result.stdout + result.stderr
+        marker.unlink()
+
         # 2. Free lease: no queue evidence; build then test run under ONE lease.
         result = run_leased(env_for(), build_ok, test_ok)
         assert result.returncode == 0, result.stdout + result.stderr

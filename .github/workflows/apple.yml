@@ -401,11 +401,21 @@ jobs:
           RUN_TESTS: ${{ inputs.run-tests }}
           LEASE_WAIT_MINUTES: ${{ inputs.lease-wait-minutes }}
           WORK_TIMEOUT_MINUTES: ${{ inputs.xcode-timeout-minutes }}
+          APPLE_RUNNER: ${{ inputs.apple-runner }}
         run: |
           set -euo pipefail
           lock_tool="${APPLE_BUILD_LOCK_TOOL:-/Library/Application Support/NardukAppleRunner/bin/apple_build_lock.py}"
           lock_path="${APPLE_BUILD_LOCK_PATH:-/Library/Application Support/NardukAppleRunner/state/apple-build.lock}"
-          if [ ! -e "$lock_tool" ]; then
+          # An `apple-vm` runner (fleet#911, CI-RUNNER-POLICY section 5) is a
+          # one-job JIT macOS VM that is destroyed after this job: no other build
+          # can share its host, so there is no lease to take and its image ships
+          # no lock tool. `runs-on` is this same JSON, so the label can only
+          # match an apple-vm runner; every other route still refuses unleased.
+          unleased=false
+          if printf '%s' "$APPLE_RUNNER" | /usr/bin/python3 -I -c 'import json, sys; r = json.load(sys.stdin); labels = r.get("labels", []) if isinstance(r, dict) else r; sys.exit(0 if isinstance(labels, list) and "apple-vm" in labels else 1)' 2>/dev/null; then
+            unleased=true
+            echo "UNLEASED: apple-vm one-job runner; no host-wide Apple build lease to take"
+          elif [ ! -e "$lock_tool" ]; then
             echo "::error::canonical Apple build lease tool is not installed at $lock_tool -- refusing to run build-command/test-command unleased"
             exit 1
           fi
@@ -532,10 +542,16 @@ jobs:
           exit "$status"
           APPLE_WORKFLOWS_LEASED_EOF
 
+          date +%s > "$stage/started"
+          if [ "$unleased" = true ]; then
+            set +e
+            bash "$stage/leased.sh" "$stage" "$work_seconds"
+            exit $?
+          fi
+
           # The heartbeat always runs: a free probe can still lose the lease to
           # another waiter before `run` takes it. It says nothing if the lease
           # is acquired within a second, and stops once it is.
-          date +%s > "$stage/started"
           (
             sleep 1
             [ -e "$stage/acquired" ] && exit 0
