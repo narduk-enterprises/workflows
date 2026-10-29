@@ -641,6 +641,8 @@ jobs:
           const DIFF_SCOPED = /FAST_BASE_REF|--changed\b|--only-changed\b|--since\b|:changed\b/;
           // Bounded so a broken store or API costs seconds, never the job budget.
           const LOOKUP_TIMEOUT_MS = 10000;
+          // How long a task's pipes may stay open after its process exits.
+          const EXIT_DRAIN_MS = 3000;
 
           function sha256(text) {
             return crypto.createHash('sha256').update(text).digest('hex');
@@ -1223,12 +1225,27 @@ jobs:
                     continue;
                   }
                   const [bin, ...args] = command(name);
-                  const child = spawn(bin, args, { cwd: taskCwd, env: { ...env, TASKGRAPH_TASK: name }, stdio: ['ignore', 'pipe', 'pipe'] });
+                  // Its own process group, so a task's leftovers can be ended with it.
+                  const child = spawn(bin, args, { cwd: taskCwd, env: { ...env, TASKGRAPH_TASK: name }, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
                   child.stdout.on('data', d => chunks.push(d));
                   child.stderr.on('data', d => chunks.push(d));
                   let done = false;
-                  child.on('error', error => { if (done) return; done = true; chunks.push(Buffer.from(`taskgraph: ${error.message}\n`)); finish(127, null); });
-                  child.on('close', (code, signal) => { if (done) return; done = true; finish(code, signal); });
+                  const settle = (code, signal) => { if (done) return; done = true; finish(code, signal); };
+                  child.on('error', error => { chunks.push(Buffer.from(`taskgraph: ${error.message}\n`)); settle(127, null); });
+                  child.on('close', settle);
+                  // A task is over when its process exits, not when every pipe closes: a
+                  // server or watcher it left behind would hold stdout open forever (a
+                  // serial CI step never waited for those either). Drain briefly, then
+                  // end the task's process group and move on.
+                  child.on('exit', (code, signal) => {
+                    setTimeout(() => {
+                      if (done) return;
+                      try { process.kill(-child.pid, 'SIGTERM'); } catch { /* already gone */ }
+                      child.stdout.destroy();
+                      child.stderr.destroy();
+                      settle(code, signal);
+                    }, EXIT_DRAIN_MS).unref();
+                  });
                 }
                 if (active === 0 && [...state.values()].every(s => s !== 'pending' && s !== 'running')) resolve(results);
               };

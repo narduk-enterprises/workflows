@@ -174,9 +174,10 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
   sh('slow.sh', 'mkdir -p "$1" && node -p "Date.now()" > "$1/start" && sleep 1 && node -p "Date.now()" > "$1/end" && echo "$TASKGRAPH_TASK ok"');
   sh('needs-prepare.sh', 'test "$(cat .nuxt/marker)" = prepared && test -f node_modules/dep/index.js && test -f generated.txt && echo shared > shared.txt');
   sh('fail.sh', 'echo boom >&2; exit 3');
+  sh('linger.sh', 'sleep 60 & echo started');
   fs.writeFileSync(path.join(repo, 'package.json'), pkg({
     prepare: 'sh scripts/prepare.sh', a: 'sh scripts/slow.sh out-a', b: 'sh scripts/slow.sh out-b', c: 'sh scripts/slow.sh out-c',
-    uses: 'sh scripts/needs-prepare.sh', fails: 'sh scripts/fail.sh', after: 'echo never',
+    uses: 'sh scripts/needs-prepare.sh', fails: 'sh scripts/fail.sh', after: 'echo never', linger: 'sh scripts/linger.sh',
   }));
   fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\n.nuxt/\ngenerated.txt\nout-*/\nshared.txt\n');
   git('add', '-A');
@@ -230,6 +231,16 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     fs.rmSync(path.join(repo, 'out-a'), { recursive: true });
     assert.throws(() => planOf({ turbo: JSON.stringify({ tasks: { build: { outputs: ['.output/**'] }, test: { tags: ['ci', 'ci:shared'], dependsOn: ['build'] } } }) }), /ci:shared but depends on build/);
     assert.equal(planOf({ turbo: JSON.stringify({ tasks: { lint: { tags: ['ci', 'ci:shared'] } } }) }).tasks[0].shared, true);
+  });
+
+  await test('run: a task is over when its process exits, even if a leftover holds its output open', async () => {
+    const g = graph({ linger: {} });
+    const t0 = Date.now();
+    const outputs = {};
+    const r = await run(g, ['linger'], { onEvent: e => { if (e.type === 'end') outputs[e.task] = e.output; } });
+    assert.equal(r.linger.status, 'passed');
+    assert.ok(Date.now() - t0 < 20000, `took ${Date.now() - t0} ms`);
+    assert.match(outputs.linger, /started/);
   });
 
   await test('run: without isolation tasks share the checkout', async () => {
