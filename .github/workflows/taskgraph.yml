@@ -840,21 +840,22 @@ jobs:
               // `ci:shared`: a check that only reads the tree runs in the checkout
               // itself, skipping a worktree. It cannot read another task's outputs,
               // which live in that task's worktree.
+              const ancestors = [];
+              const climb = n => { for (const d of localDeps(n, tasks.get(n))) if (!ancestors.includes(d)) { ancestors.push(d); climb(d); } };
+              climb(name);
               if ((def.tags || []).includes('ci:shared')) {
-                const ancestors = [];
-                const climb = n => { for (const d of localDeps(n, tasks.get(n))) if (!ancestors.includes(d)) { ancestors.push(d); climb(d); } };
-                climb(name);
                 const producer = ancestors.find(d => (tasks.get(d).outputs || []).length > 0);
                 if (producer) throw new Error(`task ${name} is ci:shared but depends on ${producer}, whose outputs only reach isolated tasks`);
               }
               // `ci:machine`: a leg (a seat) of its own. Two machine tasks in one
-              // chain would each need the other's machine.
+              // chain would each need the other's machine, and a task behind two
+              // could run on only one of them.
+              const machinesBehind = ancestors.filter(d => (tasks.get(d).tags || []).includes('ci:machine'));
               if ((def.tags || []).includes('ci:machine')) {
-                const behind = [];
-                const climb = n => { for (const d of localDeps(n, tasks.get(n))) if (!behind.includes(d)) { behind.push(d); climb(d); } };
-                climb(name);
-                const other = behind.find(d => (tasks.get(d).tags || []).includes('ci:machine'));
-                if (other) throw new Error(`ci:machine task ${name} depends on ci:machine task ${other}; one chain runs on one machine, so tag only one of them`);
+                if (machinesBehind.length) throw new Error(`ci:machine task ${name} depends on ci:machine task ${machinesBehind[0]}; one chain runs on one machine, so tag only one of them`);
+                if (['shared', 'all'].includes(name)) throw new Error(`ci:machine task ${name} would share its leg's name with the shared leg; rename it`);
+              } else if (machinesBehind.length > 1) {
+                throw new Error(`task ${name} needs ci:machine tasks ${machinesBehind.join(' and ')}; it can run on only one machine`);
               }
               const key = sha256(JSON.stringify(material));
               keys.set(name, key);
@@ -1255,7 +1256,20 @@ jobs:
             let active = 0;
             const dirs = new Map();
             return new Promise(resolve => {
-              const depsOf = name => byName.get(name).dependsOn.filter(d => wanted.has(d));
+              // A dependency that does not run here (it passed) is looked through:
+              // the running tasks behind it still come first, and their outputs
+              // still reach this task.
+              const depsMemo = new Map();
+              const depsOf = name => {
+                if (!depsMemo.has(name)) {
+                  const out = [];
+                  const seen = new Set();
+                  const walk = n => { for (const d of byName.get(n).dependsOn) if (!seen.has(d)) { seen.add(d); if (wanted.has(d)) out.push(d); else walk(d); } };
+                  walk(name);
+                  depsMemo.set(name, out);
+                }
+                return depsMemo.get(name);
+              };
               // Dependencies first, so a nearer dependency's copy of a shared output wins.
               const ancestorsOf = name => {
                 const seen = [];

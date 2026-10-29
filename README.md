@@ -2211,9 +2211,10 @@ seat per leg: checkout, install, run that leg's tasks, record their passes.
 `Required` (lightweight) is the verdict and Caller lint. Untagged misses share
 one leg (`all`, or `shared` beside machine legs). A `ci:machine` task's leg
 holds it, the tasks that depend on it, and the dependencies they need, so a
-shared `nuxt:prepare` runs once per machine that needs it. A task that depends
-on two machine tasks is refused, and so is a machine task that depends on
-another. A run whose tasks all passed before has no legs: Plan, then Required.
+shared `nuxt:prepare` runs once per machine that needs it. Plan refuses a task
+that depends on two machine tasks, a machine task that depends on another, and
+a machine task named `shared` or `all`, whether or not those tasks would run.
+A run whose tasks all passed before has no legs: Plan, then Required.
 
 Why machines: operator-portal's `build`, `typecheck`, full `lint` and unit
 suite each ran past 20 minutes side by side on one linux-ci seat

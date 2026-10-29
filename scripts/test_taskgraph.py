@@ -198,10 +198,14 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
 
   await test('legs: a task behind two machine tasks, or a machine task behind another, is refused', () => {
     const two = JSON.stringify({ tasks: { a: { tags: ['ci', 'ci:machine'] }, b: { tags: ['ci', 'ci:machine'] }, c: { tags: ['ci'], dependsOn: ['a', 'b'] } } });
-    const p = tg.plan({ entries: entries(base), turboText: two, packageText: pkg({ a: 'a', b: 'b', c: 'c' }), nodeVersionText: '24', context: {} });
-    assert.throws(() => tg.legsOf(p.tasks, ['a', 'b', 'c']), /only one machine/);
+    const byHand = [{ task: 'a', dependsOn: [], machine: true }, { task: 'b', dependsOn: [], machine: true }, { task: 'c', dependsOn: ['a', 'b'], machine: false }];
+    assert.throws(() => tg.legsOf(byHand, ['a', 'b', 'c']), /only one machine/);
     const chain = JSON.stringify({ tasks: { a: { tags: ['ci', 'ci:machine'] }, b: { tags: ['ci', 'ci:machine'], dependsOn: ['a'] } } });
     assert.throws(() => tg.plan({ entries: entries(base), turboText: chain, packageText: pkg({ a: 'a', b: 'b' }), nodeVersionText: '24', context: {} }), /depends on ci:machine task a/);
+    // At plan time, whichever of them would hit: a cached machine task must not hide the conflict.
+    assert.throws(() => tg.plan({ entries: entries(base), turboText: two, packageText: pkg({ a: 'a', b: 'b', c: 'c' }), nodeVersionText: '24', context: {} }), /needs ci:machine tasks a and b/);
+    const named = JSON.stringify({ tasks: { shared: { tags: ['ci', 'ci:machine'] }, x: { tags: ['ci'] } } });
+    assert.throws(() => tg.plan({ entries: entries(base), turboText: named, packageText: pkg({ shared: 's', x: 'x' }), nodeVersionText: '24', context: {} }), /share its leg's name/);
   });
 
   await test('concurrency: cgroup limits win over host cores and memory', () => {
@@ -257,6 +261,14 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.equal(r.uses.status, 'passed', JSON.stringify(r));
     assert.ok(fs.lstatSync(path.join(cwds.uses, 'node_modules')).isSymbolicLink());
     assert.ok(!fs.existsSync(path.join(repo, 'shared.txt')));
+  });
+
+  await test('run: a dependent waits for a running task behind a passed one, and gets its outputs', async () => {
+    // uses -> middle (passed, not run) -> prepare (outputs, runs): uses must start after prepare ends.
+    const g = graph({ prepare: { outputs: ['.nuxt/**'] }, middle: { dependsOn: ['prepare'] }, uses: { dependsOn: ['middle'] } });
+    const r = await run(g, ['prepare', 'uses']);
+    assert.equal(r.prepare.status, 'passed');
+    assert.equal(r.uses.status, 'passed', JSON.stringify(r));
   });
 
   await test('run: a failure blocks its dependents and nothing else', async () => {
