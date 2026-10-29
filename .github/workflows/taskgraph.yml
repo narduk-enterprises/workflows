@@ -643,6 +643,9 @@ jobs:
           const LOOKUP_TIMEOUT_MS = 10000;
           // How long a task's pipes may stay open after its process exits.
           const EXIT_DRAIN_MS = 3000;
+          // "If we have a CI job that lasts 20 minutes there better be a damn good
+          // reason" (Logan, 2026-09-17): no one task may run longer.
+          const TASK_TIMEOUT_MS = 20 * 60 * 1000;
 
           function sha256(text) {
             return crypto.createHash('sha256').update(text).digest('hex');
@@ -1155,7 +1158,7 @@ jobs:
           // Run `names` in dependency order, at most `concurrency` CPUs at once (a
           // task's `ci:cpus:N` tag is its weight). A failed task blocks its dependents
           // and nothing else, so one push shows every independent failure.
-          function runTasks({ planTasks, names, command, cwd, concurrency, isolate, env = process.env, onEvent = () => {} }) {
+          function runTasks({ planTasks, names, command, cwd, concurrency, isolate, env = process.env, onEvent = () => {}, timeoutMs = TASK_TIMEOUT_MS }) {
             const byName = new Map(planTasks.map(t => [t.task, t]));
             const wanted = new Set(names);
             const state = new Map(names.map(n => [n, 'pending']));
@@ -1210,7 +1213,11 @@ jobs:
                     setupError = error;
                   }
                   onEvent({ type: 'start', task: name, cwd: taskCwd });
+                  let timer = null;
+                  let timedOut = false;
                   const finish = (code, signal) => {
+                    clearTimeout(timer);
+                    if (timedOut) signal = 'timeout';
                     free += weight;
                     active -= 1;
                     const status = code === 0 && !signal ? 'passed' : 'failed';
@@ -1231,6 +1238,15 @@ jobs:
                   child.stderr.on('data', d => chunks.push(d));
                   let done = false;
                   const settle = (code, signal) => { if (done) return; done = true; finish(code, signal); };
+                  // A task past the budget is stopped, so the job still reports every
+                  // other task (and its passes) inside its own timeout.
+                  timer = setTimeout(() => {
+                    timedOut = true;
+                    chunks.push(Buffer.from(`\ntaskgraph: ${name} ran past ${Math.round(timeoutMs / 60000)} min and was stopped\n`));
+                    try { process.kill(-child.pid, 'SIGTERM'); } catch { /* gone */ }
+                    setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } }, 5000).unref();
+                    setTimeout(() => { child.stdout.destroy(); child.stderr.destroy(); settle(null, 'timeout'); }, 6000).unref();
+                  }, timeoutMs);
                   child.on('error', error => { chunks.push(Buffer.from(`taskgraph: ${error.message}\n`)); settle(127, null); });
                   child.on('close', settle);
                   // A task is over when its process exits, not when every pipe closes: a
@@ -1273,12 +1289,23 @@ jobs:
             console.log(`taskgraph: ${names.length} task(s) on ${concurrency} CPU slot(s)${isolate ? ', one isolated worktree each' : ''}: ${names.join(', ')}`);
             const t0 = Date.now();
             const failures = [];
+            const running = new Map();
+            // A line a minute naming what is still running, so a slow task shows in the log while it runs.
+            const heartbeat = setInterval(() => {
+              const now = Date.now();
+              console.log(`taskgraph: ${seconds(now - t0)} in; running ${[...running].map(([n, at]) => `${n} (${seconds(now - at)})`).join(', ') || 'nothing'}`);
+            }, 60000);
+            heartbeat.unref();
+            const requestedTimeout = Number(env.TASKGRAPH_TASK_TIMEOUT_MS || 0);
             let results;
             try {
               results = await runTasks({
                 planTasks, names, cwd: process.cwd(), concurrency, isolate, env,
+                timeoutMs: requestedTimeout > 0 ? requestedTimeout : TASK_TIMEOUT_MS,
                 command: name => [pm, 'run', name],
                 onEvent: e => {
+                  if (e.type === 'start') running.set(e.task, Date.now());
+                  else running.delete(e.task);
                   if (e.type === 'start') console.log(`▶ ${e.task}`);
                   else if (e.type === 'blocked') console.log(`⊘ ${e.task}: not run, a dependency failed`);
                   else if (e.type === 'end') {
@@ -1291,6 +1318,7 @@ jobs:
                 },
               });
             } finally {
+              clearInterval(heartbeat);
               if (isolate) {
                 fs.rmSync(isolate, { recursive: true, force: true });
                 try { execFileSync('git', ['worktree', 'prune'], { stdio: 'ignore' }); } catch { /* best effort */ }
@@ -1310,6 +1338,11 @@ jobs:
             const ok = Object.values(results).every(r => r.status === 'passed');
             const wall = Date.now() - t0;
             console.log(`taskgraph: ${ok ? 'all passed' : 'FAILED'} in ${seconds(wall)}`);
+            // One annotation with the timings: it reaches the checks API even when the
+            // log cannot be read.
+            const slowest = names.map(n => [n, results[n]]).sort((a, b) => b[1].durationMs - a[1].durationMs).slice(0, 12)
+              .map(([n, r]) => `${n} ${seconds(r.durationMs)}${r.status === 'passed' ? '' : ` ${r.status}${r.signal === 'timeout' ? ' (timeout)' : ''}`}`);
+            console.log(`::notice title=taskgraph ${ok ? 'passed' : 'failed'} in ${seconds(wall)}::${names.length} task(s) on ${concurrency} slot(s); slowest: ${slowest.join(', ')}`);
             if (env.GITHUB_STEP_SUMMARY) {
               const mark = { passed: '✓ passed', failed: '✗ failed', blocked: '⊘ not run (a dependency failed)' };
               const rows = names.map(n => `| \`${n}\` | ${mark[results[n].status]} | ${seconds(results[n].durationMs)} |`);

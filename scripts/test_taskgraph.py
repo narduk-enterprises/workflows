@@ -175,9 +175,10 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
   sh('needs-prepare.sh', 'test "$(cat .nuxt/marker)" = prepared && test -f node_modules/dep/index.js && test -f generated.txt && echo shared > shared.txt');
   sh('fail.sh', 'echo boom >&2; exit 3');
   sh('linger.sh', 'sleep 60 & echo started');
+  sh('hang.sh', 'echo waiting; sleep 60');
   fs.writeFileSync(path.join(repo, 'package.json'), pkg({
     prepare: 'sh scripts/prepare.sh', a: 'sh scripts/slow.sh out-a', b: 'sh scripts/slow.sh out-b', c: 'sh scripts/slow.sh out-c',
-    uses: 'sh scripts/needs-prepare.sh', fails: 'sh scripts/fail.sh', after: 'echo never', linger: 'sh scripts/linger.sh',
+    uses: 'sh scripts/needs-prepare.sh', fails: 'sh scripts/fail.sh', after: 'echo never', linger: 'sh scripts/linger.sh', hang: 'sh scripts/hang.sh',
   }));
   fs.writeFileSync(path.join(repo, '.gitignore'), 'node_modules/\n.nuxt/\ngenerated.txt\nout-*/\nshared.txt\n');
   git('add', '-A');
@@ -187,7 +188,7 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
   fs.writeFileSync(path.join(repo, 'node_modules', 'dep', 'index.js'), '');
   fs.writeFileSync(path.join(repo, 'generated.txt'), 'gen');
   const graph = tasks => ({ tasks: Object.entries(tasks).map(([task, t]) => ({ task, key: tg.sha256(task), dependsOn: t.dependsOn || [], outputs: t.outputs || [], cache: t.cache !== false, cpus: t.cpus || 1, tagged: true, inputFiles: 0 })) });
-  const run = (g, names, opts = {}) => tg.runTasks({ planTasks: g.tasks, names, command: n => ['npm', 'run', '--silent', n], cwd: repo, concurrency: opts.concurrency || 4, isolate: opts.isolate === false ? null : path.join(tmp, `iso-${results.length}`), env: process.env, onEvent: opts.onEvent });
+  const run = (g, names, opts = {}) => tg.runTasks({ planTasks: g.tasks, names, command: n => ['npm', 'run', '--silent', n], cwd: repo, concurrency: opts.concurrency || 4, isolate: opts.isolate === false ? null : path.join(tmp, `iso-${results.length}`), env: process.env, onEvent: opts.onEvent, timeoutMs: opts.timeoutMs });
 
   await test('run: independent tasks overlap within the CPU budget, each in its own worktree', async () => {
     const g = graph({ a: {}, b: {}, c: { cpus: 2 } });
@@ -241,6 +242,18 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.equal(r.linger.status, 'passed');
     assert.ok(Date.now() - t0 < 20000, `took ${Date.now() - t0} ms`);
     assert.match(outputs.linger, /started/);
+  });
+
+  await test('run: a task past its time budget is stopped and fails; the rest still report', async () => {
+    const g = graph({ hang: {}, after: {} });
+    const t0 = Date.now();
+    const outputs = {};
+    const r = await run(g, ['hang', 'after'], { timeoutMs: 1500, onEvent: e => { if (e.type === 'end') outputs[e.task] = e.output; } });
+    assert.equal(r.hang.status, 'failed');
+    assert.equal(r.hang.signal, 'timeout');
+    assert.match(outputs.hang, /was stopped/);
+    assert.equal(r.after.status, 'passed', outputs.after);
+    assert.ok(Date.now() - t0 < 20000, `took ${Date.now() - t0} ms`);
   });
 
   await test('run: without isolation tasks share the checkout', async () => {
