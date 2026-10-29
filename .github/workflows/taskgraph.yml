@@ -123,6 +123,7 @@ jobs:
       plan: ${{ steps.plan.outputs.plan }}
       run: ${{ steps.plan.outputs.run }}
       legs: ${{ steps.plan.outputs.legs }}
+      restores: ${{ steps.plan.outputs.restores }}
     steps:
       - name: Install CI artifact store client
         working-directory: ${{ github.workspace }}
@@ -637,6 +638,10 @@ jobs:
 
           // Bump when the meaning of a key changes, so no older pass is honoured.
           const ENGINE = 'narduk-taskgraph-v1';
+          const SHA256 = /^[0-9a-f]{64}$/;
+          // An output tarball bigger than this is not stored; its dependents rebuild it.
+          const OUTPUT_MAX_BYTES = 1024 ** 3;
+          const OUTPUT_TIMEOUT_MS = 180000;
           const POINTER_SCHEMA = 'narduk-taskgraph-proof-v1';
           const PUBLISH_STEP = 'Publish task proofs';
           const TASK_NAME = /^[A-Za-z0-9:_./@-]+$/;
@@ -878,16 +883,18 @@ jobs:
           }
 
           // What must execute: every miss, plus every dependency of a miss that
-          // declares outputs (a proof restores no files, so a test that reads the
-          // build's output gets a fresh build).
-          function executionSet(planTasks, misses) {
+          // declares outputs and whose outputs cannot be restored (`restorable`: a
+          // passed task whose proof carries its output tarball). A test that reads
+          // the build's output gets the stored build, or a fresh one.
+          function executionSet(planTasks, misses, restorable = new Set()) {
             const byName = new Map(planTasks.map(t => [t.task, t]));
             const run = new Set();
             // A passed dependency with no outputs is not re-run, but the outputs of
             // the tasks behind it are still needed, so look through it.
             const through = (name, seen) => {
               for (const dep of byName.get(name).dependsOn) {
-                if (misses.has(dep) || byName.get(dep).outputs.length > 0) visit(dep);
+                if (misses.has(dep)) visit(dep);
+                else if (byName.get(dep).outputs.length > 0) { if (!restorable.has(dep)) visit(dep); }
                 else if (!seen.has(dep)) { seen.add(dep); through(dep, seen); }
               }
             };
@@ -901,6 +908,24 @@ jobs:
               visit(name);
             }
             return planTasks.map(t => t.task).filter(n => run.has(n));
+          }
+
+          // The restorable producers that `names` read: walk each one's dependencies,
+          // looking through the passed ones that do not run, and stop at a producer.
+          function restoresFor(planTasks, names, restorable) {
+            const byName = new Map(planTasks.map(t => [t.task, t]));
+            const running = new Set(names);
+            const need = new Set();
+            const walk = (name, seen) => {
+              for (const dep of byName.get(name).dependsOn) {
+                if (seen.has(dep) || running.has(dep)) continue;
+                seen.add(dep);
+                if (restorable.has(dep)) need.add(dep);
+                else walk(dep, seen);
+              }
+            };
+            for (const name of names) walk(name, new Set());
+            return planTasks.map(t => t.task).filter(n => need.has(n));
           }
 
           // The legs, one machine each: every task tagged `ci:machine` that must run,
@@ -946,8 +971,18 @@ jobs:
             return legs;
           }
 
-          function manifestDigest(keys) {
-            return sha256([...keys].sort().join('\n'));
+          // The publish step's name carries this digest, so GitHub's record of that
+          // step attests every key and the SHA-256 of every output tarball with it.
+          function manifestDigest(keys, outputs = {}) {
+            return sha256([...keys].sort().map(k => (outputs[k] ? `${k} ${outputs[k]}` : k)).join('\n'));
+          }
+
+          // Output tarballs live under the store's 7-day `prebuilt/` prefix, scoped by
+          // the run that wrote them. Past that the proof still holds, the tarball is
+          // gone, and the producer runs again.
+          function outputObjectKey(store, repository, runId, runAttempt, key) {
+            if (!KEY.test(String(key))) throw new Error(`not a task key: ${JSON.stringify(key)}`);
+            return store.prebuiltKey(repository, runId, runAttempt, `taskout-${key}`);
           }
 
           // ---- Proofs -----------------------------------------------------------------
@@ -959,7 +994,7 @@ jobs:
 
           // Honour a proof only when GitHub confirms the attempt it names (see the
           // header). `attempts` caches one confirmation per run attempt.
-          async function findTaskProof({ github, context, store, cfg, key, workflowPath, attempts }) {
+          async function findTaskProof({ github, context, store, cfg, key, workflowPath, callerBlob = null, attempts }) {
             const repository = `${context.repo.owner}/${context.repo.repo}`;
             const repositoryId = context.payload.repository.id;
             const objectKey = proofKey(store, repository, key);
@@ -974,10 +1009,12 @@ jobs:
             if (!pointer || pointer.schema !== POINTER_SCHEMA || pointer.key !== key || pointer.repository_id !== repositoryId
                 || !Number.isSafeInteger(pointer.run_id) || pointer.run_id <= 0
                 || !Number.isSafeInteger(pointer.run_attempt) || pointer.run_attempt <= 0
-                || !Array.isArray(pointer.manifest) || !pointer.manifest.includes(key) || !pointer.manifest.every(k => KEY.test(String(k)))) {
+                || !Array.isArray(pointer.manifest) || !pointer.manifest.includes(key) || !pointer.manifest.every(k => KEY.test(String(k)))
+                || (pointer.outputs !== undefined && (!pointer.outputs || typeof pointer.outputs !== 'object' || Array.isArray(pointer.outputs)
+                  || !Object.entries(pointer.outputs).every(([k, h]) => pointer.manifest.includes(k) && SHA256.test(String(h)))))) {
               return { found: false, reason: 'proof does not describe this key and repository' };
             }
-            const digest = manifestDigest(pointer.manifest);
+            const digest = manifestDigest(pointer.manifest, pointer.outputs || {});
             const id = `${pointer.run_id}:${pointer.run_attempt}:${digest}`;
             if (!attempts.has(id)) {
               attempts.set(id, (async () => {
@@ -987,6 +1024,12 @@ jobs:
                 if (run.id !== pointer.run_id || run.run_attempt !== pointer.run_attempt || run.path !== workflowPath
                     || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) {
                   return { ok: false, reason: `run ${pointer.run_id} is not this repository's own run of ${workflowPath}` };
+                }
+                // The same caller workflow text, not just its path: a branch that edits
+                // the workflow to fake a publish step cannot vouch for this one's keys.
+                if (callerBlob) {
+                  const { data: file } = await github.rest.repos.getContent({ ...context.repo, path: workflowPath, ref: run.head_sha, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) } });
+                  if (!file || file.sha !== callerBlob) return { ok: false, reason: `run ${pointer.run_id} ran another version of ${workflowPath}` };
                 }
                 const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
                   ...context.repo, run_id: run.id, attempt_number: pointer.run_attempt, per_page: 100, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) },
@@ -998,14 +1041,17 @@ jobs:
               })());
             }
             const verdict = await attempts.get(id);
-            return verdict.ok ? { found: true, run: verdict.run } : { found: false, reason: verdict.reason };
+            if (!verdict.ok) return { found: false, reason: verdict.reason };
+            const output = pointer.outputs?.[key] ? { sha256: pointer.outputs[key], run_id: pointer.run_id, run_attempt: pointer.run_attempt } : null;
+            return { found: true, run: verdict.run, output };
           }
 
-          async function publishTaskProofs({ store, cfg, context, planTasks, results, env = process.env }) {
+          async function publishTaskProofs({ store, cfg, context, planTasks, results, outputs = {}, outputDir = '', env = process.env, warn = () => {} }) {
             const repository = `${context.repo.owner}/${context.repo.repo}`;
             const passed = planTasks.filter(t => t.cache && results[t.task]?.status === 'passed').map(t => t.key);
             if (passed.length === 0) return [];
             const manifest = [...new Set(passed)].sort();
+            const recorded = Object.fromEntries(Object.entries(outputs).filter(([k, h]) => manifest.includes(k) && SHA256.test(String(h))));
             const pointer = {
               schema: POINTER_SCHEMA,
               repository,
@@ -1014,10 +1060,25 @@ jobs:
               run_attempt: Number(env.GITHUB_RUN_ATTEMPT),
               sha: context.sha,
               manifest,
+              ...(Object.keys(recorded).length ? { outputs: recorded } : {}),
               written_at: new Date().toISOString(),
             };
             if (!Number.isSafeInteger(pointer.run_id) || !Number.isSafeInteger(pointer.run_attempt)) throw new Error('GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT must be numbers');
             const written = [];
+            // The tarballs first. One that fails to upload stays in the pointer (the
+            // step name already attests it): a later run finds no tarball and runs
+            // the producer, as it would without this cache.
+            for (const [key, hash] of Object.entries(recorded)) {
+              try {
+                const body = fs.readFileSync(path.join(outputDir, `${key}.tar.gz`));
+                if (sha256(body) !== hash) throw new Error('tarball changed after it was hashed');
+                const objectKey = outputObjectKey(store, repository, pointer.run_id, pointer.run_attempt, key);
+                await store.putObject(cfg, objectKey, body, { contentType: 'application/gzip', timeoutMs: OUTPUT_TIMEOUT_MS, attempts: 3 });
+                written.push(objectKey);
+              } catch (error) {
+                warn(`output of ${key.slice(0, 12)} not stored, so its dependents rebuild it: ${error.message}`);
+              }
+            }
             for (const key of manifest) {
               const objectKey = proofKey(store, repository, key);
               await store.putObject(cfg, objectKey, Buffer.from(JSON.stringify({ ...pointer, key })), { contentType: 'application/json', timeoutMs: LOOKUP_TIMEOUT_MS, attempts: 2 });
@@ -1096,16 +1157,21 @@ jobs:
               if (!reuse) return { hit: false, reason: 'reuse: false' };
               if (!cfg) return { hit: false, reason: 'no store credentials' };
               try {
-                const proof = await findTaskProof({ github, context, store, cfg, key: t.key, workflowPath, attempts });
-                return proof.found ? { hit: true, run: proof.run } : { hit: false, reason: proof.reason };
+                const proof = await findTaskProof({ github, context, store, cfg, key: t.key, workflowPath, callerBlob: caller?.sha || null, attempts });
+                return proof.found ? { hit: true, run: proof.run, output: proof.output } : { hit: false, reason: proof.reason };
               } catch (error) {
                 core.warning(`${t.task}: proof lookup failed, so it runs: ${error.message}`);
                 return { hit: false, reason: 'lookup failed' };
               }
             }));
             const misses = result.tasks.filter((t, i) => !verdicts[i].hit).map(t => t.task);
-            const executes = misses.length ? executionSet(result.tasks, new Set(misses)) : [];
+            // A passed producer whose proof carries its output tarball is restored
+            // into its dependents' worktrees instead of run again.
+            const stored = new Map(result.tasks.flatMap((t, i) => (verdicts[i].hit && verdicts[i].output && t.outputs.length ? [[t.task, { key: t.key, ...verdicts[i].output }]] : [])));
+            const executes = misses.length ? executionSet(result.tasks, new Set(misses), new Set(stored.keys())) : [];
+            const restores = Object.fromEntries(restoresFor(result.tasks, executes, new Set(stored.keys())).map(n => [n, stored.get(n)]));
             core.setOutput('plan', JSON.stringify(result));
+            core.setOutput('restores', JSON.stringify(restores));
             core.setOutput('misses', misses.join(','));
             core.setOutput('run', executes.length ? 'true' : 'false');
             const legs = executes.length ? legsOf(result.tasks, executes) : [];
@@ -1113,13 +1179,13 @@ jobs:
             if (legs.length) core.info(`legs: ${legs.map(l => `${l.id} (${l.names.split(',').length})`).join(', ')}`);
             const rows = result.tasks.map((t, i) => {
               const v = verdicts[i];
-              const state = v.hit ? `passed before ([run ${v.run.id}](${v.run.html_url}))` : executes.includes(t.task) ? `runs (${misses.includes(t.task) ? v.reason : 'its outputs are needed'})` : 'runs';
+              const state = v.hit ? `passed before ([run ${v.run.id}](${v.run.html_url}))${restores[t.task] ? '; outputs restored' : ''}` : executes.includes(t.task) ? `runs (${misses.includes(t.task) ? v.reason : 'its outputs are needed'})` : 'runs';
               core.info(`${t.task.padEnd(28)} ${t.key.slice(0, 12)}  ${v.hit ? `reused from run ${v.run.id}` : `runs: ${v.reason}`}`);
               return `| \`${t.task}\` | \`${t.key.slice(0, 12)}\` | ${t.inputFiles} | ${state} |`;
             });
             const reused = result.tasks.length - misses.length;
             await core.summary.addRaw(`### taskgraph plan: ${reused} of ${result.tasks.length} task(s) already passed on this content\n\n| Task | Key | Input files | |\n|---|---|---:|---|\n${rows.join('\n')}\n`).write();
-            return { result, misses, executes };
+            return { result, misses, executes, restores };
           }
 
           // `Publish task proofs <digest>`: one pointer per passed cacheable task.
@@ -1142,6 +1208,9 @@ jobs:
                 store, cfg, context, env,
                 planTasks: JSON.parse(env.TASKGRAPH_PLAN).tasks,
                 results: JSON.parse(env.TASKGRAPH_RESULTS || '{}'),
+                outputs: JSON.parse(env.TASKGRAPH_OUTPUTS || '{}'),
+                outputDir: outputTarballDir(env),
+                warn: message => core.warning(message),
               });
               core.info(`Recorded ${written.length} task pass(es): ${written.join(', ')}`);
               return written;
@@ -1149,6 +1218,50 @@ jobs:
               core.warning(`Could not record task passes in the CI artifact store; the next run of this content runs them again: ${error.message}`);
               return [];
             }
+          }
+
+          function outputTarballDir(env) {
+            return path.join(env.RUNNER_TEMP || os.tmpdir(), 'taskgraph-outputs');
+          }
+
+          function restoreTarballDir(env) {
+            return path.join(env.RUNNER_TEMP || os.tmpdir(), 'taskgraph-restore');
+          }
+
+          // The restores this leg needs, from the plan's map: the stored producers its
+          // tasks read.
+          function legRestores(planTasks, names, restores) {
+            return restoresFor(planTasks, names, new Set(Object.keys(restores))).map(task => ({ task, ...restores[task] }));
+          }
+
+          // `Restore task outputs`: download this leg's tarballs and check each against
+          // the hash its attested proof names. Never fails the job: a tarball that is
+          // missing or wrong is left out, and `Run tasks` runs its producer instead.
+          async function restoreStep({ context, core, store, env = process.env }) {
+            const planTasks = JSON.parse(env.TASKGRAPH_PLAN).tasks;
+            const names = String(env.TASKGRAPH_RUN || '').split(',').filter(Boolean);
+            const wanted = legRestores(planTasks, names, JSON.parse(env.TASKGRAPH_RESTORES || '{}'));
+            if (!wanted.length) return [];
+            let cfg = null;
+            try { cfg = store.storeConfig(env); } catch (error) { core.warning(`${error.message}; producers run instead`); }
+            if (!cfg) return [];
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            const dir = restoreTarballDir(env);
+            fs.mkdirSync(dir, { recursive: true });
+            const got = [];
+            await Promise.all(wanted.map(async r => {
+              try {
+                const body = await store.getObject(cfg, outputObjectKey(store, repository, r.run_id, r.run_attempt, r.key), { timeoutMs: OUTPUT_TIMEOUT_MS, attempts: 3 });
+                if (!body) throw new Error('no tarball (expired or never stored)');
+                if (sha256(body) !== r.sha256) throw new Error('tarball does not match its proof');
+                fs.writeFileSync(path.join(dir, `${r.key}.tar.gz`), body);
+                got.push(r.task);
+              } catch (error) {
+                core.warning(`${r.task}: outputs not restored, so it runs here: ${error.message}`);
+              }
+            }));
+            core.info(`Restored the outputs of ${got.length} of ${wanted.length} task(s): ${got.join(', ') || 'none'}`);
+            return got;
           }
 
           // ---- Execution ----------------------------------------------------------------
@@ -1218,6 +1331,19 @@ jobs:
           // first glob character (".nuxt/**" -> ".nuxt", "dist/*.js" -> "dist"). A glob
           // with no literal directory ("**/*.d.ts") cannot be carried and is refused at
           // plan time.
+          // A producer's worktree also holds the outputs it was handed (its own
+          // producers', copied in before it ran), and its dependents read those too:
+          // a restored build must bring the codegen it built from. Nearest last.
+          function carriedOutputDirs(planTasks, name) {
+            const byName = new Map(planTasks.map(t => [t.task, t]));
+            const order = [];
+            const seen = new Set();
+            const visit = n => { for (const d of byName.get(n).dependsOn) if (!seen.has(d)) { seen.add(d); visit(d); order.push(d); } };
+            visit(name);
+            order.push(name);
+            return [...new Set(order.flatMap(n => outputDirs(byName.get(n).outputs)))];
+          }
+
           function outputDirs(outputs) {
             const dirs = [];
             for (const raw of outputs || []) {
@@ -1247,14 +1373,16 @@ jobs:
           // Run `names` in dependency order, at most `concurrency` CPUs at once (a
           // task's `ci:cpus:N` tag is its weight). A failed task blocks its dependents
           // and nothing else, so one push shows every independent failure.
-          function runTasks({ planTasks, names, command, cwd, concurrency, isolate, env = process.env, onEvent = () => {}, timeoutMs = TASK_TIMEOUT_MS }) {
+          function runTasks({ planTasks, names, command, cwd, concurrency, isolate, restored = new Map(), env = process.env, onEvent = () => {}, timeoutMs = TASK_TIMEOUT_MS }) {
             const byName = new Map(planTasks.map(t => [t.task, t]));
-            const wanted = new Set(names);
-            const state = new Map(names.map(n => [n, 'pending']));
+            // A restored producer passed in an earlier run; its outputs sit in its own
+            // directory and reach its dependents like a producer's that ran here.
+            const wanted = new Set([...names, ...restored.keys()]);
+            const state = new Map([...[...restored.keys()].map(n => [n, 'passed']), ...names.map(n => [n, 'pending'])]);
             const results = {};
             let free = concurrency;
             let active = 0;
-            const dirs = new Map();
+            const dirs = new Map(restored);
             return new Promise(resolve => {
               // A dependency that does not run here (it passed) is looked through:
               // the running tasks behind it still come first, and their outputs
@@ -1301,7 +1429,7 @@ jobs:
                       // What turbo restores from cache before a dependent runs: the
                       // declared `outputs` of every dependency that ran here.
                       for (const dep of ancestorsOf(name)) {
-                        for (const rel of outputDirs(byName.get(dep).outputs)) {
+                        for (const rel of restored.has(dep) ? carriedOutputDirs(planTasks, dep) : outputDirs(byName.get(dep).outputs)) {
                           const from = path.join(dirs.get(dep), rel);
                           if (fs.existsSync(from)) {
                             fs.rmSync(path.join(taskCwd, rel), { recursive: true, force: true });
@@ -1379,14 +1507,61 @@ jobs:
           // from the environment `Plan tasks` handed over, prints each task's log in its
           // own group as it finishes, and writes `digest` (the manifest a proof step
           // names) and `results` to $GITHUB_OUTPUT.
+          // One tarball per passed cacheable producer (its existing `outputs`
+          // directories), named by its key, with the SHA-256 the proof will carry.
+          // Too big, empty or unreadable: not stored, and dependents rebuild it.
+          function archiveOutputs({ planTasks, results, cwds, dir }) {
+            const out = {};
+            for (const t of planTasks) {
+              if (!t.cache || !t.outputs.length || results[t.task]?.status !== 'passed' || !cwds.has(t.task)) continue;
+              const base = cwds.get(t.task);
+              const present = carriedOutputDirs(planTasks, t.task).filter(rel => fs.existsSync(path.join(base, rel)));
+              if (!present.length) continue;
+              try {
+                fs.mkdirSync(dir, { recursive: true });
+                const file = path.join(dir, `${t.key}.tar.gz`);
+                execFileSync('tar', ['-czf', file, '-C', base, ...present], { stdio: ['ignore', 'ignore', 'inherit'] });
+                if (fs.statSync(file).size > OUTPUT_MAX_BYTES) { fs.rmSync(file); continue; }
+                out[t.key] = sha256(fs.readFileSync(file));
+              } catch { /* not stored: its dependents rebuild it */ }
+            }
+            return out;
+          }
+
           async function main(env = process.env) {
             const planTasks = JSON.parse(env.TASKGRAPH_PLAN).tasks;
             // A leg names exactly what it runs; without one, the misses and what they need.
             const known = new Set(planTasks.map(t => t.task));
             for (const n of String(env.TASKGRAPH_RUN || '').split(',').filter(Boolean)) if (!known.has(n)) throw new Error(`leg names unknown task ${n}`);
-            const names = env.TASKGRAPH_RUN
+            const planned = env.TASKGRAPH_RUN
               ? planTasks.map(t => t.task).filter(n => String(env.TASKGRAPH_RUN).split(',').includes(n))
               : executionSet(planTasks, new Set(String(env.TASKGRAPH_MISSES || '').split(',').filter(Boolean)));
+            // Stored outputs `Restore task outputs` fetched and checked: extract each
+            // into its own directory. A producer whose tarball did not arrive runs
+            // here instead, with whatever it needs in turn.
+            const restored = new Map();
+            const missing = new Set();
+            for (const r of legRestores(planTasks, planned, JSON.parse(env.TASKGRAPH_RESTORES || '{}'))) {
+              const file = path.join(restoreTarballDir(env), `${r.key}.tar.gz`);
+              try {
+                const body = fs.existsSync(file) ? fs.readFileSync(file) : null;
+                if (!body || sha256(body) !== r.sha256) throw new Error('no checked tarball');
+                const dir = path.join(env.RUNNER_TEMP || os.tmpdir(), 'taskgraph-restored', r.key);
+                fs.rmSync(dir, { recursive: true, force: true });
+                fs.mkdirSync(dir, { recursive: true });
+                // The bytes just checked, not the file again.
+                execFileSync('tar', ['-xzf', '-', '-C', dir, '--no-same-owner'], { input: body, stdio: ['pipe', 'ignore', 'inherit'] });
+                restored.set(r.task, dir);
+              } catch {
+                missing.add(r.task);
+              }
+            }
+            const names = missing.size
+              ? planTasks.map(t => t.task).filter(n => planned.includes(n) || executionSet(planTasks, missing, new Set(restored.keys())).includes(n))
+              : planned;
+            for (const n of names) restored.delete(n);
+            if (restored.size) console.log(`taskgraph: outputs restored for ${[...restored.keys()].join(', ')}`);
+            if (missing.size) console.log(`taskgraph: no stored outputs for ${[...missing].join(', ')}, so they run here`);
             const pm = env.TASKGRAPH_PM === 'npm' ? 'npm' : 'pnpm';
             const requested = Number(env.TASKGRAPH_CONCURRENCY || 0);
             const concurrency = Number.isSafeInteger(requested) && requested > 0 ? requested : defaultConcurrency();
@@ -1403,13 +1578,16 @@ jobs:
             }, 60000);
             heartbeat.unref();
             const requestedTimeout = Number(env.TASKGRAPH_TASK_TIMEOUT_MS || 0);
+            const cwds = new Map();
+            const outputs = {};
             let results;
             try {
               results = await runTasks({
-                planTasks, names, cwd: process.cwd(), concurrency, isolate, env,
+                planTasks, names, cwd: process.cwd(), concurrency, isolate, restored, env,
                 timeoutMs: requestedTimeout > 0 ? requestedTimeout : TASK_TIMEOUT_MS,
                 command: name => [pm, 'run', name],
                 onEvent: e => {
+                  if (e.type === 'start') cwds.set(e.task, e.cwd);
                   if (e.type === 'start') running.set(e.task, Date.now());
                   else running.delete(e.task);
                   if (e.type === 'start') console.log(`▶ ${e.task}`);
@@ -1423,6 +1601,9 @@ jobs:
                   }
                 },
               });
+              // Each passed producer's outputs, as one tarball for `Publish task
+              // proofs` to store, before the worktrees go.
+              Object.assign(outputs, archiveOutputs({ planTasks, results, cwds, dir: outputTarballDir(env) }));
             } finally {
               clearInterval(heartbeat);
               if (isolate) {
@@ -1437,9 +1618,9 @@ jobs:
               process.stdout.write('\n');
             }
             const passedKeys = planTasks.filter(t => t.cache && results[t.task]?.status === 'passed').map(t => t.key);
-            const digest = passedKeys.length ? manifestDigest(passedKeys) : '';
+            const digest = passedKeys.length ? manifestDigest(passedKeys, outputs) : '';
             if (env.GITHUB_OUTPUT) {
-              fs.appendFileSync(env.GITHUB_OUTPUT, `digest=${digest}\nresults=${JSON.stringify(results)}\n`);
+              fs.appendFileSync(env.GITHUB_OUTPUT, `digest=${digest}\nresults=${JSON.stringify(results)}\noutputs=${JSON.stringify(outputs)}\n`);
             }
             const ok = Object.values(results).every(r => r.status === 'passed');
             const wall = Date.now() - t0;
@@ -1464,8 +1645,8 @@ jobs:
           module.exports = {
             ENGINE, POINTER_SCHEMA, PUBLISH_STEP, LOCKFILES, NODE_VERSION_FILES,
             sha256, parseJsonc, globToRegExp, entriesFromApi, entriesFromLsTree, fingerprint,
-            selectTasks, plan, executionSet, legsOf, manifestDigest, proofKey, findTaskProof, publishTaskProofs,
-            normalizeDir, planStep, publishStep,
+            selectTasks, plan, executionSet, restoresFor, legsOf, manifestDigest, proofKey, outputObjectKey, findTaskProof, publishTaskProofs,
+            normalizeDir, planStep, publishStep, restoreStep, archiveOutputs, carriedOutputDirs,
             isolatedWorkspace, outputDirs, cgroupLimits, defaultConcurrency, runTasks, main,
           };
 
@@ -1546,6 +1727,26 @@ jobs:
       - name: Install taskgraph engine
         working-directory: ${{ github.workspace }}
         run: *install_taskgraph_engine
+
+      # RESTORE: the stored outputs of passed producers this leg's tasks read
+      # (a build whose content did not change), each checked against the
+      # SHA-256 its attested proof names. Runs before any caller code, so the
+      # store credential never shares a step with it.
+      - name: Restore task outputs
+        if: needs.plan.outputs.restores != '{}' && needs.plan.outputs.restores != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          TASKGRAPH_PLAN: ${{ needs.plan.outputs.plan }}
+          TASKGRAPH_RUN: ${{ matrix.leg.names }}
+          TASKGRAPH_RESTORES: ${{ needs.plan.outputs.restores }}
+          CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+          CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
+          CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
+        with:
+          script: |
+            const tg = require(`${process.env.RUNNER_TEMP}/taskgraph.cjs`);
+            const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
+            await tg.restoreStep({ context, core, store });
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         if: inputs.package-manager == 'pnpm'
@@ -1721,6 +1922,7 @@ jobs:
         env:
           TASKGRAPH_PLAN: ${{ needs.plan.outputs.plan }}
           TASKGRAPH_RUN: ${{ matrix.leg.names }}
+          TASKGRAPH_RESTORES: ${{ needs.plan.outputs.restores }}
           TASKGRAPH_PM: ${{ inputs.package-manager }}
           TASKGRAPH_CONCURRENCY: ${{ inputs.concurrency }}
         run: node "$RUNNER_TEMP/taskgraph.cjs"
@@ -1735,6 +1937,7 @@ jobs:
         env:
           TASKGRAPH_PLAN: ${{ needs.plan.outputs.plan }}
           TASKGRAPH_RESULTS: ${{ steps.run.outputs.results }}
+          TASKGRAPH_OUTPUTS: ${{ steps.run.outputs.outputs }}
           CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
           CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
           CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}

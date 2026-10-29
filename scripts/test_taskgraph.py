@@ -240,7 +240,7 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
   fs.writeFileSync(path.join(repo, 'node_modules', 'dep', 'index.js'), '');
   fs.writeFileSync(path.join(repo, 'generated.txt'), 'gen');
   const graph = tasks => ({ tasks: Object.entries(tasks).map(([task, t]) => ({ task, key: tg.sha256(task), dependsOn: t.dependsOn || [], outputs: t.outputs || [], cache: t.cache !== false, cpus: t.cpus || 1, tagged: true, inputFiles: 0 })) });
-  const run = (g, names, opts = {}) => tg.runTasks({ planTasks: g.tasks, names, command: n => ['npm', 'run', '--silent', n], cwd: repo, concurrency: opts.concurrency || 4, isolate: opts.isolate === false ? null : path.join(tmp, `iso-${results.length}`), env: process.env, onEvent: opts.onEvent, timeoutMs: opts.timeoutMs });
+  const run = (g, names, opts = {}) => tg.runTasks({ planTasks: g.tasks, names, command: n => ['npm', 'run', '--silent', n], cwd: repo, concurrency: opts.concurrency || 4, isolate: opts.isolate === false ? null : path.join(tmp, `iso-${results.length}`), restored: opts.restored, env: process.env, onEvent: opts.onEvent, timeoutMs: opts.timeoutMs });
 
   await test('run: independent tasks overlap within the CPU budget, each in its own worktree', async () => {
     const g = graph({ a: {}, b: {}, c: { cpus: 2 } });
@@ -384,6 +384,8 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     rest: { actions: {
       getWorkflowRunAttempt: async ({ run_id, attempt_number }) => ({ data: { id: run_id, run_attempt: attempt_number, path: over.path || '.github/workflows/ci.yml', html_url: `https://x/${run_id}`, repository: { id: repoId }, head_repository: { id: over.headRepo || repoId } } }),
       listJobsForWorkflowRunAttempt: async () => ({ data: [{ name: over.job || 'ci / Tasks (all)', steps: [{ name: over.step || `Publish task proofs ${digest}`, conclusion: over.conclusion || 'success' }] }] }),
+    }, repos: {
+      getContent: async () => ({ data: { sha: over.blob || 'f'.repeat(40) } }),
     } },
   });
   const pointer = (over = {}) => JSON.stringify({ schema: tg.POINTER_SCHEMA, key, repository_id: repoId, run_id: 7, run_attempt: 1, manifest: [key, other], ...over });
@@ -407,6 +409,10 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
       ['another workflow', fakeGithub({ path: '.github/workflows/e2e.yml' })],
       ['a fork run', fakeGithub({ headRepo: 1 })],
     ]) assert.equal((await lookup(gh)).found, false, why);
+    // The attested run must have run this caller workflow's text, not only its path.
+    const withBlob = (gh, blob) => tg.findTaskProof({ github: gh, context, store: fakeStore, cfg, key, workflowPath: '.github/workflows/ci.yml', callerBlob: blob, attempts: new Map() });
+    assert.equal((await withBlob(fakeGithub(), 'f'.repeat(40))).found, true);
+    assert.equal((await withBlob(fakeGithub({ blob: 'e'.repeat(40) }), 'f'.repeat(40))).found, false, 'another version of the workflow');
     for (const [why, p] of [
       ['key not in manifest', pointer({ manifest: [other] })],
       ['another repository', pointer({ repository_id: 1 })],
@@ -432,6 +438,103 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     objects.clear();
   });
 
+  // ---- output cache: a passed producer's outputs, stored and restored ----
+  await test('outputs: a stored producer is restored, not re-run, and the digest attests its tarball', () => {
+    const g = graph({ build: { outputs: ['.output/**'] }, test: { dependsOn: ['build'] }, mid: { dependsOn: ['build'] }, e2e: { dependsOn: ['mid'] } });
+    assert.deepEqual(tg.executionSet(g.tasks, new Set(['test'])), ['build', 'test'], 'without a stored tarball the build runs');
+    assert.deepEqual(tg.executionSet(g.tasks, new Set(['test']), new Set(['build'])), ['test']);
+    assert.deepEqual(tg.restoresFor(g.tasks, ['test'], new Set(['build'])), ['build']);
+    // Looked up through a passed task with no outputs.
+    assert.deepEqual(tg.executionSet(g.tasks, new Set(['e2e']), new Set(['build'])), ['e2e']);
+    assert.deepEqual(tg.restoresFor(g.tasks, ['e2e'], new Set(['build'])), ['build']);
+    assert.deepEqual(tg.restoresFor(g.tasks, ['build', 'test'], new Set(['build'])), [], 'a producer that runs is not restored');
+    // A restored producer carries what it was built from.
+    const chain = graph({ codegen: { outputs: ['gen/**'] }, build: { outputs: ['dist/**'], dependsOn: ['codegen'] } });
+    assert.deepEqual(tg.carriedOutputDirs(chain.tasks, 'build'), ['gen', 'dist']);
+    const h = 'd'.repeat(64);
+    assert.equal(tg.manifestDigest([key, other]), tg.manifestDigest([key, other], {}), 'no outputs: the digest is unchanged');
+    assert.notEqual(tg.manifestDigest([key, other], { [key]: h }), tg.manifestDigest([key, other]));
+    assert.equal(tg.outputObjectKey(store, 'narduk-enterprises/app', 7, 1, key), `prebuilt/narduk-enterprises/app/7-1-taskout-${key}.tar.gz`);
+  });
+
+  await test('outputs: the proof carries the tarball hash only when the attested digest covers it', async () => {
+    const h = 'd'.repeat(64);
+    const withOut = tg.manifestDigest([key, other], { [key]: h });
+    objects.set(objectKey, pointer({ outputs: { [key]: h } }));
+    const ok = await lookup(fakeGithub({ step: `Publish task proofs ${withOut}` }));
+    assert.equal(ok.found, true);
+    assert.deepEqual(ok.output, { sha256: h, run_id: 7, run_attempt: 1 });
+    assert.equal((await lookup(fakeGithub())).found, false, 'a hash the step name does not attest');
+    for (const [why, outs] of [['not a hash', { [key]: 'x' }], ['a key outside the manifest', { ['e'.repeat(64)]: h }], ['an array', [h]]]) {
+      objects.set(objectKey, pointer({ outputs: outs }));
+      assert.equal((await lookup(fakeGithub({ step: `Publish task proofs ${withOut}` }))).found, false, why);
+    }
+    objects.set(objectKey, pointer());
+    assert.equal((await lookup(fakeGithub())).output, null, 'an old proof restores nothing');
+    objects.delete(objectKey);
+  });
+
+  await test('outputs: archived after a pass, stored, fetched, checked and restored into a dependent', async () => {
+    const bins = new Map();
+    const binStore = { ...store, storeConfig: () => cfg, getObject: async (c, k) => bins.get(k) || null, putObject: async (c, k, body) => { bins.set(k, Buffer.from(body)); } };
+    const g = graph({ prepare: { outputs: ['.nuxt/**'] }, uses: { dependsOn: ['prepare'] } });
+    const rt = path.join(tmp, 'rt-out');
+    fs.rmSync(rt, { recursive: true, force: true });
+    const cwds = new Map();
+    const r1 = await run(g, ['prepare'], { onEvent: e => { if (e.type === 'start') cwds.set(e.task, e.cwd); } });
+    assert.equal(r1.prepare.status, 'passed');
+    const outs = tg.archiveOutputs({ planTasks: g.tasks, results: r1, cwds, dir: path.join(rt, 'taskgraph-outputs') });
+    const pk = tg.sha256('prepare');
+    assert.match(outs[pk], /^[0-9a-f]{64}$/);
+    const warnings = [];
+    await tg.publishTaskProofs({ store: binStore, cfg, context, planTasks: g.tasks, results: r1, outputs: outs, outputDir: path.join(rt, 'taskgraph-outputs'), env: { GITHUB_RUN_ID: '9', GITHUB_RUN_ATTEMPT: '2' }, warn: m => warnings.push(m) });
+    assert.deepEqual(warnings, []);
+    const tarKey = tg.outputObjectKey(store, 'narduk-enterprises/app', 9, 2, pk);
+    assert.ok(bins.has(tarKey));
+    const proof = JSON.parse(bins.get(tg.proofKey(store, 'narduk-enterprises/app', pk)).toString());
+    assert.deepEqual(proof.outputs, { [pk]: outs[pk] });
+    // A later leg: `uses` misses, `prepare` passed with its tarball stored.
+    const restores = { prepare: { key: pk, sha256: outs[pk], run_id: 9, run_attempt: 2 } };
+    const core = { warning: m => warnings.push(m), info: () => {} };
+    const env = { RUNNER_TEMP: rt, TASKGRAPH_PLAN: JSON.stringify(g), TASKGRAPH_RUN: 'uses', TASKGRAPH_RESTORES: JSON.stringify(restores), CI_ARTIFACTS_R2_ACCOUNT_ID: 'a', CI_ARTIFACTS_R2_ACCESS_KEY_ID: 'b', CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: 'c' };
+    assert.deepEqual(await tg.restoreStep({ context, core, store: binStore, env }), ['prepare']);
+    const out = path.join(tmp, 'gh-output-restore');
+    fs.writeFileSync(out, '');
+    const quiet = async fn => { const log = console.log; const w = process.stdout.write; const c = process.cwd(); console.log = () => {}; process.stdout.write = () => true; process.chdir(repo); try { return await fn(); } finally { console.log = log; process.stdout.write = w; process.chdir(c); } };
+    fs.rmSync(path.join(repo, '.nuxt'), { recursive: true, force: true });
+    assert.equal(await quiet(() => tg.main({ ...process.env, ...env, TASKGRAPH_PM: 'npm', GITHUB_OUTPUT: out })), 0, 'uses reads the restored .nuxt');
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(out, 'utf8').match(/^results=(.*)$/m)[1])), ['uses'], 'prepare did not run');
+    // A tarball that does not match its proof is refused, and the producer runs instead.
+    bins.set(tarKey, Buffer.from('tampered'));
+    fs.rmSync(path.join(rt, 'taskgraph-restore'), { recursive: true, force: true });
+    assert.deepEqual(await tg.restoreStep({ context, core, store: binStore, env }), []);
+    assert.match(warnings.join('\n'), /does not match its proof/);
+    fs.writeFileSync(out, '');
+    assert.equal(await quiet(() => tg.main({ ...process.env, ...env, TASKGRAPH_PM: 'npm', GITHUB_OUTPUT: out })), 0);
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(out, 'utf8').match(/^results=(.*)$/m)[1])), ['prepare', 'uses'], 'no checked tarball: prepare runs here');
+    fs.rmSync(rt, { recursive: true, force: true });
+  });
+
+  await test('outputs: a restored producer brings the outputs it was built from (two levels)', async () => {
+    // prepare (.nuxt) -> a (out-a) -> uses, which reads .nuxt: restoring `a` alone must bring .nuxt.
+    const g = graph({ prepare: { outputs: ['.nuxt/**'] }, a: { outputs: ['out-a/**'], dependsOn: ['prepare'] }, uses: { dependsOn: ['a'] } });
+    const cwds = new Map();
+    const r1 = await run(g, ['prepare', 'a'], { onEvent: e => { if (e.type === 'start') cwds.set(e.task, e.cwd); } });
+    assert.equal(r1.a.status, 'passed');
+    const dir = path.join(tmp, 'two-level');
+    const outs = tg.archiveOutputs({ planTasks: g.tasks, results: r1, cwds, dir });
+    const ak = tg.sha256('a');
+    const x = path.join(dir, 'x');
+    fs.mkdirSync(x, { recursive: true });
+    execFileSync('tar', ['-xzf', path.join(dir, `${ak}.tar.gz`), '-C', x]);
+    assert.ok(fs.existsSync(path.join(x, '.nuxt', 'marker')) && fs.existsSync(path.join(x, 'out-a', 'end')), 'a\'s tarball holds .nuxt and out-a');
+    assert.match(outs[ak], /^[0-9a-f]{64}$/);
+    fs.rmSync(path.join(repo, '.nuxt'), { recursive: true, force: true });
+    const r2 = await run(g, ['uses'], { restored: new Map([['a', x]]) });
+    assert.equal(r2.uses.status, 'passed', JSON.stringify(r2));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   // ---- the github-script steps ----
   const notes = [];
   const core = () => {
@@ -443,7 +546,7 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     const gh = fakeGithub(over);
     gh.rest.repos = {
       getCommit: async () => ({ data: { commit: { tree: { sha: 't'.repeat(40) } } } }),
-      getContent: async ({ path: p }) => { if (!(p in files)) { const e = new Error('404'); e.status = 404; throw e; } return { data: files[p] }; },
+      getContent: async ({ path: p }) => { if (p === '.github/workflows/ci.yml') return { data: { sha: '3'.repeat(40) } }; if (!(p in files)) { const e = new Error('404'); e.status = 404; throw e; } return { data: files[p] }; },
     };
     gh.rest.git = { getTree: async () => ({ data: { truncated: false, tree: [{ path: 'package.json', mode: '100644', type: 'blob', sha: '1'.repeat(40) }, { path: 'src/a.ts', mode: '100644', type: 'blob', sha: '2'.repeat(40) }, { path: '.github/workflows/ci.yml', mode: '100644', type: 'blob', sha: '3'.repeat(40) }] } }) };
     return gh;
