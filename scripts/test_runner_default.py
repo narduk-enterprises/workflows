@@ -59,7 +59,10 @@ DEFAULT_TAIL = f"github.event.repository.private == true && '{LINUX_CI}' || '\"u
 # overflow can engage on a caller that pins a runner. Private callers only;
 # unset is identical to the pre-variable expression, which check_callable
 # proves by evaluating both.
-LINUX_VAR_SITES = {"nuxt-cloudflare.yml": {"build", "checks", "extra-gate", "deploy-dry-run", "fast", "fast-escalable", "fast-lanes"}}
+LINUX_VAR_SITES = {
+    "nuxt-cloudflare.yml": {"build", "checks", "extra-gate", "deploy-dry-run", "fast", "fast-escalable", "fast-lanes"},
+    "taskgraph.yml": {"tasks"},
+}
 
 # callable -> the input that carries the caller's route
 CALLABLES = {
@@ -72,6 +75,7 @@ CALLABLES = {
     "flake-digest.yml": "runner",
     "design-ledger.yml": "runs-on",
     "design-publish.yml": "runs-on",
+    "taskgraph.yml": "runner",
 }
 BLACKSMITH_LABEL = "blacksmith-2vcpu-ubuntu-2404"
 

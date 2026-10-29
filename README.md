@@ -78,8 +78,9 @@ in their app-class workflow.
 | `design-ledger.yml` | **New 2026-09-27** (agent-infrastructure#1804). **Advisory, never required.** Runs the design ledger checker (`scripts/dc_ledger.py`, a byte copy of agent-infrastructure's canonical file) against a product's `design/<canvas>/ledger.json`. `mode: check` goes red while a canvas screen and its code have drifted and writes the table to the job summary; `mode: flag` keeps one `Design drift: <canvas>` issue. See [Design ledger](#design-ledgeryml) |
 | `design-publish.yml` | **New 2026-10-13** (operator-portal#727, design-portal-sync phase 2). Uploads a caller's `design/<slug>/` git mirror to the Operator Portal's designs Worker with the run's own OIDC token, no stored credential. Not a gate. See [Design publish](#design-publishyml) |
 | `flake-digest.yml` | **New 2026-09-24** (narduk-reboot P3-C2). Weekly, advisory: scans a caller's completed runs of one workflow, counts failures in jobs matching `quarantine-job-pattern` (nuxt-cloudflare.yml's `e2e-quarantine` by default), and files or refreshes one digest issue per ISO week. Never gates `main`, never opens `red-main` |
+| `taskgraph.yml` | **New 2026-10-29.** Vercel CI's model (beta 2026-10-28) for any `package.json`-script repo: the caller's `turbo.json` tags the CI tasks, each task gets a content key from Git's blob hashes, a task whose key already passed is never run again (a pointer in the R2 CI artifact store that GitHub's API must confirm), and the rest run side by side after one install per machine, each in its own worktree; a `ci:machine` task gets its own seat. Plan, Tasks legs, Required; nine inputs. See [taskgraph.yml](#taskgraphyml) |
 
-All ten shipped callables are `on: workflow_call` only — none of them declare their own
+All eleven shipped callables are `on: workflow_call` only — none of them declare their own
 triggers, and none declare workflow-level `concurrency:` (see "How to consume"
 below for job-level cancellation and the caller's workflow group).
 
@@ -106,6 +107,7 @@ branch, read back from the API — not that the caller parses.
 | `flake-digest.yml` | none yet — no adopter here has a quarantine lane of its own; `nuxt-cloudflare.yml` adopters with `e2e-quarantine-args` set are the natural first callers | not yet |
 | `design-ledger.yml` | `narduk-enterprises/mybo-at-v2` (planned) | never — advisory by design (Logan, 2026-09-27: "Red check + drift issue (Recommended)") |
 | `design-publish.yml` | any app the portal registers (`operator-portal` first; `cloudflarestat-us` is the pilot) | never — a delivery step that runs after merge |
+| `taskgraph.yml` | `narduk-enterprises/operator-portal` (canary) | not yet |
 
 ## The `ci / Required` convention
 
@@ -2180,6 +2182,235 @@ manifest digests, browser revisions, and the upgrade choice, then exits
 non-zero without invoking an installer. Hosted browser jobs may still opt into
 the explicit installer because they own their toolchain rather than consuming
 this pool.
+
+### `taskgraph.yml`
+
+**New 2026-10-29.** Vercel shipped [Vercel CI](https://vercel.com/docs/ci) in
+beta on 2026-10-28 and reports 2-6x faster push-to-green on its own
+repositories. That figure is Vercel's, measured against its own previous
+setup. The design is what transfers, and this callable takes the three parts
+that make it fast:
+
+1. **Never run the same work twice.** Every task gets a content key. A task
+   whose key has already passed is not run again. Vercel uses Turborepo's
+   remote cache. Here the key comes from Git's own blob hashes, and a pass is
+   a pointer in the [CI artifact store](#the-ci-artifact-store-2026-09-26)
+   that GitHub's API must confirm before it counts.
+2. **The task graph is the config.** The caller's `turbo.json` tags what CI
+   runs (`"tags": ["ci"]`), the same file and the same tag Vercel CI reads. A
+   caller passes no flag per gate.
+3. **Install once per machine, then run tasks side by side.** Every task
+   that has to run starts as soon as its dependencies pass. Vercel gives each
+   task its own machine started from a post-install copy of the repository.
+   Here each task gets its own Git worktree started from that copy, and a
+   task tagged `ci:machine` gets a machine (a seat) of its own.
+
+**Three jobs.** `Plan` (lightweight) keys every task from the GitHub API with
+no checkout and splits the misses into legs. `Tasks (<leg>)` is a matrix, one
+seat per leg: checkout, install, run that leg's tasks, record their passes.
+`Required` (lightweight) is the verdict and Caller lint. Untagged misses share
+one leg (`all`, or `shared` beside machine legs). A `ci:machine` task's leg
+holds it, the tasks that depend on it, and the dependencies they need, so a
+shared `nuxt:prepare` runs once per machine that needs it. Plan refuses a task
+that depends on two machine tasks, a machine task that depends on another, and
+a machine task named `shared` or `all`, whether or not those tasks would run.
+A run whose tasks all passed before has no legs: Plan, then Required.
+
+Why machines: operator-portal's `build`, `typecheck`, full `lint` and unit
+suite each ran past 20 minutes side by side on one linux-ci seat
+(2026-10-29), against 163-258 s each on a larger machine. One seat cannot
+hold four heavy Node tools at once.
+
+**Why this, measured.** The estate's CI over 2026-10-21..28 (17 busiest
+repositories, read-only from the Actions API):
+
+- Of 169 merged pull requests, 85% landed a main tree byte-identical to the
+  PR head that had just passed. Every merge still ran a full CI on main, and
+  Promote waits for it. About 65% of push seat-hours re-ran jobs that had
+  already passed on that exact tree.
+- On a `pr-fast-only` Nuxt PR, the one Fast job runs `lint`, `typecheck` and
+  `test` one after another. `Run fast scripts` is 57-80% of the job. No caller
+  used `fast-parallel`.
+- Repeated per-job setup (checkout, toolchain, install) is 20-25% of seat
+  time. Nuxt push runs paid for `pnpm install` 3.1 times per run.
+
+With taskgraph, a merge whose tree passed on its PR is two short
+lightweight jobs: `Plan` (GitHub API only) finds every task already passed,
+and `Required` runs Caller lint on a sparse `.github` checkout. A pull request
+runs its whole task set side by side, so main has nothing left to do.
+
+#### Adopting it
+
+`turbo.json` at the package root (Vercel CI's format; this engine reads the
+subset below, and `turbo` itself is not installed or needed):
+
+```jsonc
+{
+  "tasks": {
+    // A prerequisite that writes files its dependents read. It is not tagged,
+    // so it runs only because tagged tasks depend on it. `outputs` names what
+    // gets carried into each dependent's worktree.
+    "nuxt:prepare": { "outputs": [".nuxt/**"] },
+    "lint": { "tags": ["ci"], "dependsOn": ["nuxt:prepare"] },
+    "typecheck": { "tags": ["ci"], "dependsOn": ["nuxt:prepare"] },
+    "test": { "tags": ["ci"], "dependsOn": ["nuxt:prepare"] },
+    "build:ci": { "tags": ["ci"], "outputs": [".output/**"] },
+    // Fresh advisories every day: never reused.
+    "audit": { "tags": ["ci"], "cache": false }
+  }
+}
+```
+
+Every task name must be a `package.json` script. A task with no script fails
+the plan, so a task never passes having run nothing. The caller:
+
+```yaml
+jobs:
+  ci: # the job id stays `ci`, so the check is `ci / Required`
+    uses: narduk-enterprises/workflows/.github/workflows/taskgraph.yml@<sha> # v2
+    permissions:
+      contents: read  # the tree and turbo.json the plan reads; checkout
+      actions: read   # confirm the run a task proof names
+      packages: read  # the private package bundle
+      id-token: write # portal-served app config for caller scripts
+    with:
+      node-version-file: .node-version
+    secrets:
+      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+      CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+      CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
+      CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
+```
+
+The inputs are `runner`, `lightweight-runner`, `node-version`,
+`node-version-file`, `package-manager`, `install-script`,
+`working-directory`, `concurrency` and `reuse`. They mean what they mean in
+`nuxt-cloudflare.yml`, except the last two. `concurrency` is a leg's CPU
+budget. By default it comes from the runner's cores and cgroup
+(`cpu.max`, `memory.max` and `memory.high`, which throttles rather than
+kills), capped at one slot per 3 GiB. The run's timing annotation reports
+what was detected. `reuse: false` runs every task, for a scheduled full
+check, and still records the passes.
+
+Tag a heavy task (a Nuxt build, `vue-tsc`, a full ESLint, a large unit
+suite) `ci:machine` so it gets a seat of its own. Leave light checks untagged
+(or `ci:shared`); they share one leg.
+
+**Moving from `nuxt-cloudflare.yml`.** Tag the scripts you passed as
+`fast-scripts`, `build-script`, `extra-scripts`, `extra-gate-scripts` and
+`test-script`. The `quality-level` gates become tasks too: dependency audit
+with `"cache": false`, `foundation:check`, and the performance budget after
+`build:ci`. Three things do not move:
+
+- **Diff-scoped scripts.** A task is refused when its script picks its checks
+  from a diff. That covers reading `FAST_BASE_REF` or a `*BASE_REF`, using
+  `--changed`, `--changedSince`, `--onlyChanged`, `--only-changed`, `--since`,
+  `affected`, `git diff` or `merge-base`, and running any script whose name
+  ends `:changed`. Its pass depends on the base branch, so it is not a fact
+  about the tree. Tag the full script instead (`test`, not `test:changed`).
+  The keys do the selecting.
+- **Browser E2E, preview checks and deploy dry runs.** Keep them where they
+  are: an `e2e.yml` and the Workers Builds preview.
+- **Hidden ordering.** Each task runs in its own worktree, so a task that
+  only passed because an earlier serial script left files behind fails.
+  gonogo's `test` needed the `.nuxt` that `lint` had written. Declare that
+  prerequisite as a task with `outputs`.
+
+#### Keys
+
+A task's key is the SHA-256 of everything that decides its result and can be
+read without running it:
+
+- its `package.json` script and its `pre`/`post` hooks;
+- its `turbo.json` definition;
+- the path, mode and blob hash of every tracked file its `inputs` select.
+  The default is `$TURBO_DEFAULT$`, every tracked file. Negations (`!docs/**`)
+  and `globalDependencies` work as in turbo. A list that selects no file is
+  refused (a typo such as `scr/**` would otherwise freeze the key), and so is
+  any turbo token other than `$TURBO_DEFAULT$`;
+- the lockfile blob, `packageManager`, `engines` and the Node version (input
+  or file);
+- the caller workflow file's blob, which carries this callable's pinned SHA;
+- `package-manager`, `install-script` and `working-directory`;
+- the keys of the tasks it depends on;
+- the engine version.
+
+A change to any of these is a new key. Two consequences:
+
+- **Narrowed inputs only skip work when the prerequisites are narrowed too.**
+  A dependency's key is part of its dependents' keys, so a `prepare` that
+  reads every file re-keys everything that depends on it.
+- **`env` and `passThroughEnv` names are hashed, not their values.** The
+  callable passes no caller environment to tasks, so a task sees only the
+  runner's.
+
+#### Proofs and trust
+
+A pass is `proof/<owner>/<repo>/task-proof-v1-<key>.json`. It points at a run
+and attempt, and at the manifest of keys that attempt passed. It is honoured
+only when GitHub's API confirms all of the following:
+
+- the attempt belongs to this repository's own run (head repository included,
+  so no fork run counts) of the same caller workflow;
+- one of its `Tasks (<leg>)` jobs has a successful step named exactly
+  `Publish task proofs <SHA-256 of the manifest>`;
+- the manifest holds the key.
+
+**This differs from the `Required` and E2E proofs above.** Those need the
+whole PR run to have succeeded. A task proof needs only the publish step to
+have succeeded. That step runs after a partial failure too, and records only
+the tasks that passed, because a passing `lint` stays a fact about its
+content when `test` fails beside it. It is the per-task cache Vercel CI keeps.
+The engine (`findTaskProof`) is where to review this rule.
+
+Without store credentials (a fork, Dependabot, or a caller missing from the
+`CI_ARTIFACTS_R2_*` secrets' repository lists), the plan says so in a notice,
+every task runs, and nothing is recorded. A lookup that fails or times out
+(10 s) is a miss with a warning. The store can cost a run, never coverage.
+
+#### Execution
+
+`Run tasks` runs the misses. It also runs any dependency that declares
+`outputs`, since a proof restores no files: a `test` that reads the build's
+output gets a fresh build.
+
+- **Order and budget.** Tasks start in dependency order, at most
+  `concurrency` CPUs at once. A `ci:cpus:N` tag sets a task's weight.
+- **Failures.** A failed task blocks only its dependents, so one push shows
+  every independent failure.
+- **Shared checkout.** A task tagged `ci:shared` skips its worktree and
+  runs in the checkout itself. Use it for checks that only read the tree,
+  such as operator-portal's 34 one-second guards. A worktree costs one checkout of the tracked
+  files (about 1-4 s for 3,900 files). A `ci:shared` task may not depend
+  on a task with `outputs`, because those outputs exist only in that task's
+  worktree.
+- **Isolation.** Each other task runs in a detached worktree. The install's
+  `node_modules` directories are linked in, any other files the install left
+  are copied in, and each dependency's `outputs` directories are copied from
+  that dependency's worktree.
+- **Ending.** A task is over when its process exits. If a server or watcher
+  it left behind still holds its output open, the engine waits 3 s and then
+  ends the task's process group. No task may run longer than 20 minutes
+  ("if we have a CI job that lasts 20 minutes there better be a damn good
+  reason", Logan, 2026-09-17): one that does is stopped and fails, and the
+  others still report.
+- **Logs.** Each task's log is printed in its own group when the task
+  finishes. A line every minute names what is still running. One notice
+  annotation per run lists the slowest tasks, so the timings reach the
+  checks API even when the log cannot be read. Failures are repeated at the end, ungrouped. The job summary
+  shows the plan (reused or run, with a link to the run that proved each
+  reused task) and the wall time against summed task time.
+
+**Measured on gonogo** (a 14-core Mac, the same five tasks plus
+`nuxt:prepare`, isolated): see the PR that added this file for the
+1-, 2- and 4-slot timings. A default `linux-ci` seat is declared as 4 CPU /
+8 GiB (fleet `runnerSizes`). Do not count on running more than two heavy
+tasks on one: tag them `ci:machine` instead.
+
+`scripts/test_taskgraph.py` runs the shipped engine against a real Git
+repository and fake GitHub and store doubles. It also holds the steps copied
+from `nuxt-cloudflare.yml` byte-equal: the store client, registry auth,
+store placement, install and Caller lint.
 
 ### `docs-governance.yml`
 

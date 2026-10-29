@@ -1,0 +1,1956 @@
+name: taskgraph
+
+# TASKGRAPH: Vercel CI's model on GitHub Actions (README "taskgraph.yml").
+#
+# Vercel CI (beta, 2026-10-28, vercel.com/docs/ci) is fast for three reasons,
+# and this callable takes all three:
+#
+#   1. NEVER RUN THE SAME WORK TWICE. Each task gets a content key; a task
+#      whose key already passed is not run again. Here the key is computed
+#      from Git's own blob hashes (no file is read) and a pass is a pointer in
+#      the estate's CI artifact store that GitHub's API must confirm. 85% of
+#      estate merges land a tree identical to the PR head that just passed
+#      (measured 2026-10-28, 169 merges), so main's run is mostly lookups.
+#   2. CONFIG IS THE TASK GRAPH. The caller's turbo.json tags what CI runs
+#      ("tags": ["ci"]), the same file Vercel CI reads; this callable has
+#      nine inputs, not a flag per gate.
+#   3. INSTALL ONCE PER MACHINE, THEN RUN SIDE BY SIDE. Every task that must
+#      run starts as soon as its dependencies pass, each in its own worktree
+#      (Vercel gives each task its own machine started from the post-install
+#      copy; a worktree is that copy on one machine). A task tagged
+#      `ci:machine` gets a machine of its own, as on Vercel.
+#
+# THREE JOBS. `Plan` (light) keys every task from the GitHub API, no
+# checkout. `Tasks (<leg>)` runs the misses, one leg per machine. `Required`
+# (light) is the verdict and Caller lint. A run whose tasks all passed before
+# has no legs: Plan, then Required.
+#
+# What it does not do (yet): browser E2E on the isolated pool, preview checks,
+# deploy dry runs. Callers keep those where they are today (an `e2e.yml`, the
+# Workers Builds preview). See README "taskgraph.yml" for the adoption steps.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: >-
+          JSON runs-on value for the job. Empty (default): a private caller
+          gets the fleet manifest's linux-ci group route, a public or
+          visibility-unknown caller gets GitHub-hosted ubuntu-latest, exactly
+          as nuxt-cloudflare.yml's default route (README "Runner routing").
+        type: string
+        required: false
+        default: ""
+      lightweight-runner:
+        description: >-
+          JSON runs-on value for the Plan and Required jobs (API reads and
+          Caller lint). Empty: org CI_LIGHTWEIGHT_RUNNER, then the runner
+          route, as nuxt-cloudflare.yml's planners.
+        type: string
+        required: false
+        default: ""
+      node-version:
+        description: Node.js version for actions/setup-node. Ignored when node-version-file is set.
+        type: string
+        required: false
+        default: "24"
+      node-version-file:
+        description: Path to a Node version file (.node-version, .nvmrc); wins over node-version.
+        type: string
+        required: false
+        default: ""
+      package-manager:
+        description: pnpm or npm. Tasks run as `<package-manager> run <task>`.
+        type: string
+        required: false
+        default: pnpm
+      install-script:
+        description: >-
+          Optional package.json script that performs the whole install (an
+          nVault-backed wrapper), as in nuxt-cloudflare.yml. Empty: the
+          callable installs with the lockfile.
+        type: string
+        required: false
+        default: ""
+      working-directory:
+        description: Directory holding turbo.json and package.json, relative to the repository root.
+        type: string
+        required: false
+        default: "."
+      concurrency:
+        description: >-
+          CPU slots for side-by-side tasks. 0 (default): the runner's CPUs,
+          capped by its cgroup and by 2 GiB of memory per slot. A task's
+          `ci:cpus:N` tag is its weight.
+        type: number
+        required: false
+        default: 0
+      reuse:
+        description: >-
+          Honour passes from earlier runs. false runs every task (a scheduled
+          full check); passes are still recorded.
+        type: boolean
+        required: false
+        default: true
+    secrets:
+      NARDUK_PLATFORM_GH_PACKAGES_READ:
+        required: false
+      NVAULT_TOKEN:
+        required: false
+      CI_ARTIFACTS_R2_ACCOUNT_ID:
+        required: false
+      CI_ARTIFACTS_R2_ACCESS_KEY_ID:
+        required: false
+      CI_ARTIFACTS_R2_SECRET_ACCESS_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan
+    # A few API reads: the lightweight route, as nuxt-cloudflare.yml's planners.
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
+    # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
+    timeout-minutes: 20
+    permissions:
+      # the trees and contents API the plan reads
+      contents: read
+      # confirm the run a task proof names (getWorkflowRunAttempt, its jobs)
+      actions: read
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+      run: ${{ steps.plan.outputs.run }}
+      legs: ${{ steps.plan.outputs.legs }}
+    steps:
+      - name: Install CI artifact store client
+        working-directory: ${{ github.workspace }}
+        run: &install_ci_artifact_store |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/ci-artifact-store.cjs" <<'CI_ARTIFACT_STORE'
+          'use strict';
+          // CI ARTIFACT STORE CLIENT. GitHub's org artifact storage quota turned estate
+          // CI red on 2026-09-26, and the owner chose to move CI handoffs to an R2
+          // bucket the estate owns. This file is the whole client: AWS Signature V4
+          // over Node's fetch, no dependencies, loaded by github-script steps with
+          // require(). The `Install CI artifact store client` step writes it from the
+          // workflow's own text, so a caller cannot substitute it.
+          //
+          // One bucket, lifecycle rules by prefix, every key scoped by the calling
+          // repository:
+          //   prebuilt/<owner>/<repo>/<run>-<attempt>-<scope>.tar.gz   E2E handoff, 7 days
+          //   proof/<owner>/<repo>/<proof key>.json                    reuse pointers, 30 days
+          //   probe/<owner>/<repo>/<name>                              credential probes, 1 day
+          //
+          // TRUST. The bucket credential is one token for the whole estate, so an
+          // object proves nothing about who wrote it. Each reader checks what it reads
+          // against something GitHub vouches for instead:
+          //   - a prebuilt application must match the SHA-256 and size that its own
+          //     run's Build job reported through job outputs, or the E2E job fails;
+          //   - a proof object is only a POINTER to a run. It is honoured only when
+          //     GitHub reports that run as this repository's successful pull-request
+          //     run of the same caller workflow, whose Required job ran the publish
+          //     step carrying this exact key in its name.
+          // A missing, unreadable or unconfirmed object means "run it": the gate runs
+          // in full and E2E builds its own application. Nothing here can turn a check
+          // green on its own.
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const { execFileSync } = require('node:child_process');
+
+          const BUCKET = 'narduk-ci-artifacts';
+          const REGION = 'auto';
+          const SERVICE = 's3';
+          // Long enough to outlast queueing on the browser pool and a same-day rerun of
+          // failed E2E jobs. Past it, E2E builds its own application.
+          const PRESIGN_SECONDS = 24 * 60 * 60;
+          // A stalled tarball transfer must give up well inside the 30-minute job
+          // limit, so Build still finishes and each E2E job still has time to build
+          // its own application: 3 attempts of 120 s plus backoff is about 6 minutes.
+          const TRANSFER_TIMEOUT_MS = 120 * 1000;
+          const TRANSFER_ATTEMPTS = 3;
+          const POINTER_SCHEMA = 'narduk-ci-proof-pointer-v1';
+          const PROOF_STEP = { required: 'Publish Required proof', e2e: 'Publish full E2E proof' };
+          const PROOF_KEY = { required: /^required-proof-v1-[0-9a-f]{64}$/, e2e: /^e2e-proof-v1-[0-9a-f]{64}$/ };
+          const SEGMENT = /^[A-Za-z0-9._-]+$/;
+          const HEX32 = /^[0-9a-f]{32}$/;
+          const HEX64 = /^[0-9a-f]{64}$/;
+
+          class IntegrityError extends Error {}
+
+          const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+          const sha256Hex = data => crypto.createHash('sha256').update(data).digest('hex');
+          const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest();
+
+          // RFC 3986 encoding, as SigV4 requires: encodeURIComponent leaves !'()* alone.
+          function encode(value) {
+            return encodeURIComponent(value).replace(/[!'()*]/g, c => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+          }
+
+          function canonicalUri(bucket, key) {
+            return `/${bucket}/${key.split('/').map(encode).join('/')}`;
+          }
+
+          function amzDate(date) {
+            return date.toISOString().replace(/\.\d{3}Z$/, 'Z').replace(/[-:]/g, '');
+          }
+
+          function canonicalQuery(query) {
+            return Object.entries(query)
+              .map(([name, value]) => [encode(name), encode(String(value))])
+              .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+              .map(([name, value]) => `${name}=${value}`)
+              .join('&');
+          }
+
+          function scopeOf(stamp, region = REGION, service = SERVICE) {
+            return `${stamp.slice(0, 8)}/${region}/${service}/aws4_request`;
+          }
+
+          // `uri` is the canonical (already encoded) path; the request uses the same text.
+          function sign({ method, uri, query = {}, headers, payloadHash, secretAccessKey, stamp, region = REGION, service = SERVICE }) {
+            const normalized = Object.fromEntries(Object.entries(headers)
+              .map(([name, value]) => [name.toLowerCase(), String(value).trim().replace(/ +/g, ' ')]));
+            const names = Object.keys(normalized).sort();
+            const canonicalRequest = [
+              method, uri, canonicalQuery(query),
+              names.map(name => `${name}:${normalized[name]}\n`).join(''),
+              names.join(';'), payloadHash,
+            ].join('\n');
+            const scope = scopeOf(stamp, region, service);
+            const stringToSign = ['AWS4-HMAC-SHA256', stamp, scope, sha256Hex(canonicalRequest)].join('\n');
+            let key = hmac(`AWS4${secretAccessKey}`, stamp.slice(0, 8));
+            for (const part of [region, service, 'aws4_request']) key = hmac(key, part);
+            const signature = crypto.createHmac('sha256', key).update(stringToSign).digest('hex');
+            return { signature, scope, signedHeaders: names.join(';') };
+          }
+
+          function presignQuery({ accessKeyId, stamp, expires, region = REGION, service = SERVICE }) {
+            return {
+              'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+              'X-Amz-Credential': `${accessKeyId}/${scopeOf(stamp, region, service)}`,
+              'X-Amz-Date': stamp,
+              'X-Amz-Expires': String(expires),
+              'X-Amz-SignedHeaders': 'host',
+            };
+          }
+
+          function presign({ host, uri, accessKeyId, secretAccessKey, stamp, expires = PRESIGN_SECONDS, region = REGION, service = SERVICE }) {
+            const query = presignQuery({ accessKeyId, stamp, expires, region, service });
+            return sign({ method: 'GET', uri, query, headers: { host }, payloadHash: 'UNSIGNED-PAYLOAD', secretAccessKey, stamp, region, service }).signature;
+          }
+
+          // Rebuilds a presigned URL from its parts. The Build job hands E2E only the
+          // parts that are not secrets (GitHub drops a job output that contains a
+          // secret's value, and the URL carries the account and access key IDs).
+          function presignedUrl({ origin, uri, accessKeyId, stamp, expires, signature, region = REGION, service = SERVICE }) {
+            const query = presignQuery({ accessKeyId, stamp, expires, region, service });
+            return `${origin}${uri}?${canonicalQuery(query)}&X-Amz-Signature=${signature}`;
+          }
+
+          function endpoint(accountId) {
+            if (!HEX32.test(accountId)) throw new Error('CI artifact store account ID is malformed (expected 32 hex characters)');
+            const host = `${accountId}.r2.cloudflarestorage.com`;
+            return { origin: `https://${host}`, host };
+          }
+
+          // null when the run has no credentials (fork, Dependabot, public repository,
+          // or a caller that does not pass them). Never echoes a value.
+          function storeConfig(env = process.env) {
+            const accountId = (env.CI_ARTIFACTS_R2_ACCOUNT_ID || '').trim();
+            const accessKeyId = (env.CI_ARTIFACTS_R2_ACCESS_KEY_ID || '').trim();
+            const secretAccessKey = (env.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY || '').trim();
+            if (!accountId || !accessKeyId || !secretAccessKey) return null;
+            if (!HEX32.test(accountId) || !HEX32.test(accessKeyId) || !HEX64.test(secretAccessKey)) {
+              throw new Error('CI artifact store credentials are malformed: expected a 32-hex account ID, a 32-hex access key ID and a 64-hex secret access key');
+            }
+            return { ...endpoint(accountId), bucket: BUCKET, accessKeyId, secretAccessKey };
+          }
+
+          function repositoryOf(value) {
+            const parts = String(value || '').split('/');
+            if (parts.length !== 2 || !parts.every(part => SEGMENT.test(part) && part !== '.' && part !== '..')) {
+              throw new Error(`not an owner/name repository: ${JSON.stringify(value)}`);
+            }
+            return parts.join('/');
+          }
+
+          function assertKey(key) {
+            const parts = String(key).split('/');
+            if (parts.length !== 4 || !['prebuilt', 'proof', 'probe'].includes(parts[0])
+                || !parts.every(part => SEGMENT.test(part) && part !== '.' && part !== '..')) {
+              throw new Error(`refusing CI artifact store key ${JSON.stringify(key)}`);
+            }
+            return key;
+          }
+
+          function prebuiltKey(repository, runId, runAttempt, scope) {
+            if (!/^\d+$/.test(String(runId)) || !/^\d+$/.test(String(runAttempt))) throw new Error('run ID and attempt must be numbers');
+            return assertKey(`prebuilt/${repositoryOf(repository)}/${runId}-${runAttempt}-${scope}.tar.gz`);
+          }
+
+          function proofObjectKey(repository, kind, key) {
+            if (!PROOF_KEY[kind] || !PROOF_KEY[kind].test(String(key))) throw new Error(`not a ${kind} proof key: ${JSON.stringify(key)}`);
+            return assertKey(`proof/${repositoryOf(repository)}/${key}.json`);
+          }
+
+          function describe(error) {
+            const cause = error && error.cause ? ` (${error.cause.code || error.cause.message})` : '';
+            return `${error && error.message ? error.message : error}${cause}`;
+          }
+
+          function s3Code(body) {
+            const match = /<Code>([^<]{1,64})<\/Code>/.exec(body.toString('utf8'));
+            return match ? ` ${match[1]}` : '';
+          }
+
+          // Retries network errors, 5xx and 429. `retryAuthMs` also retries 401/403 for
+          // that long: a freshly minted R2 token is refused for a few seconds.
+          async function attempt(url, init, { timeoutMs, attempts, retryAuthMs = 0 }) {
+            const started = Date.now();
+            for (let n = 1; ; n += 1) {
+              let failure;
+              try {
+                const response = await fetch(url, { ...init(), signal: AbortSignal.timeout(timeoutMs) });
+                const body = Buffer.from(await response.arrayBuffer());
+                const auth = (response.status === 401 || response.status === 403) && Date.now() - started < retryAuthMs;
+                if (!(response.status >= 500 || response.status === 429 || auth)) return { status: response.status, body };
+                failure = `HTTP ${response.status}${s3Code(body)}`;
+              } catch (error) {
+                failure = describe(error);
+              }
+              if (n >= attempts) throw new Error(`${failure} after ${n} attempt(s)`);
+              await sleep(Math.min(1000 * 2 ** n, 15000));
+            }
+          }
+
+          async function request(cfg, method, key, { body, contentType, timeoutMs = 30000, attempts = 4, retryAuthMs = 0 } = {}) {
+            const uri = canonicalUri(cfg.bucket, assertKey(key));
+            const payload = body === undefined ? Buffer.alloc(0) : body;
+            const payloadHash = sha256Hex(payload);
+            return attempt(`${cfg.origin}${uri}`, () => {
+              const stamp = amzDate(new Date());
+              const headers = { host: cfg.host, 'x-amz-content-sha256': payloadHash, 'x-amz-date': stamp };
+              if (contentType) headers['content-type'] = contentType;
+              const { signature, scope, signedHeaders } = sign({ method, uri, headers, payloadHash, secretAccessKey: cfg.secretAccessKey, stamp });
+              const { host, ...sent } = headers;
+              return {
+                method,
+                headers: {
+                  ...sent,
+                  'accept-encoding': 'identity',
+                  authorization: `AWS4-HMAC-SHA256 Credential=${cfg.accessKeyId}/${scope}, SignedHeaders=${signedHeaders}, Signature=${signature}`,
+                },
+                body: method === 'PUT' ? payload : undefined,
+              };
+            }, { timeoutMs, attempts, retryAuthMs });
+          }
+
+          async function putObject(cfg, key, body, options = {}) {
+            const response = await request(cfg, 'PUT', key, { ...options, body });
+            if (response.status !== 200) throw new Error(`R2 put ${key}: HTTP ${response.status}${s3Code(response.body)}`);
+          }
+
+          async function getObject(cfg, key, options = {}) {
+            const response = await request(cfg, 'GET', key, options);
+            if (response.status === 404) return null;
+            if (response.status !== 200) throw new Error(`R2 get ${key}: HTTP ${response.status}${s3Code(response.body)}`);
+            return response.body;
+          }
+
+          async function deleteObject(cfg, key, options = {}) {
+            const response = await request(cfg, 'DELETE', key, options);
+            if (![200, 204, 404].includes(response.status)) throw new Error(`R2 delete ${key}: HTTP ${response.status}${s3Code(response.body)}`);
+          }
+
+          function tar(args) {
+            execFileSync('tar', args, { stdio: ['ignore', 'ignore', 'inherit'] });
+          }
+
+          // ---- Prebuilt E2E application (Build -> E2E) -------------------------------
+
+          async function publishPrebuilt({ cfg, sourceDir, key, tmpDir, now = new Date(), expires = PRESIGN_SECONDS, timeoutMs = TRANSFER_TIMEOUT_MS }) {
+            if (!fs.statSync(sourceDir).isDirectory()) throw new Error(`${sourceDir} is not a directory`);
+            const tarball = path.join(tmpDir, `ci-artifact-${crypto.randomBytes(6).toString('hex')}.tar.gz`);
+            try {
+              tar(['-czf', tarball, '-C', sourceDir, '.']);
+              const body = fs.readFileSync(tarball);
+              const sha256 = sha256Hex(body);
+              await putObject(cfg, key, body, { contentType: 'application/gzip', timeoutMs, attempts: TRANSFER_ATTEMPTS });
+              const date = amzDate(now);
+              const signature = presign({ host: cfg.host, uri: canonicalUri(cfg.bucket, key), accessKeyId: cfg.accessKeyId, secretAccessKey: cfg.secretAccessKey, stamp: date, expires });
+              return { key, sha256, bytes: body.length, date, expires, signature };
+            } finally {
+              fs.rmSync(tarball, { force: true });
+            }
+          }
+
+          function parsePrebuilt(text) {
+            let object;
+            try {
+              object = JSON.parse(text);
+            } catch {
+              throw new Error('the prebuilt application reference is not JSON');
+            }
+            const valid = object && typeof object === 'object'
+              && typeof object.key === 'string' && object.key.startsWith('prebuilt/')
+              && HEX64.test(String(object.sha256)) && Number.isSafeInteger(object.bytes) && object.bytes > 0
+              && /^\d{8}T\d{6}Z$/.test(String(object.date))
+              && Number.isSafeInteger(object.expires) && object.expires > 0 && object.expires <= 604800
+              && HEX64.test(String(object.signature));
+            if (!valid) throw new Error('the prebuilt application reference is malformed');
+            assertKey(object.key);
+            return object;
+          }
+
+          async function fetchPrebuilt({ object, accountId, accessKeyId, destDir, tmpDir, origin, timeoutMs = TRANSFER_TIMEOUT_MS }) {
+            if (!HEX32.test(accessKeyId)) throw new Error('CI artifact store access key ID is malformed (expected 32 hex characters)');
+            const base = origin || endpoint(accountId).origin;
+            const url = presignedUrl({ origin: base, uri: canonicalUri(BUCKET, object.key), accessKeyId, stamp: object.date, expires: object.expires, signature: object.signature });
+            const response = await attempt(url, () => ({ method: 'GET', headers: { 'accept-encoding': 'identity' } }), { timeoutMs, attempts: TRANSFER_ATTEMPTS });
+            if (response.status !== 200) return { ok: false, reason: `HTTP ${response.status}${s3Code(response.body)}` };
+            if (response.body.length !== object.bytes || sha256Hex(response.body) !== object.sha256) {
+              throw new IntegrityError(`R2 object ${object.key} does not match the SHA-256 and size its Build job reported (${response.body.length} bytes read, ${object.bytes} expected); refusing to test it`);
+            }
+            const tarball = path.join(tmpDir, `ci-artifact-${crypto.randomBytes(6).toString('hex')}.tar.gz`);
+            try {
+              fs.writeFileSync(tarball, response.body);
+              fs.rmSync(destDir, { recursive: true, force: true });
+              fs.mkdirSync(destDir, { recursive: true });
+              tar(['-xzf', tarball, '-C', destDir]);
+            } finally {
+              fs.rmSync(tarball, { force: true });
+            }
+            return { ok: true, bytes: response.body.length };
+          }
+
+          // github-script glue for the Build job. Never fails the job: without a
+          // published object each E2E job builds its own application.
+          async function publishPrebuiltStep({ core, env = process.env }) {
+            core.setOutput('object', '');
+            let cfg;
+            try {
+              cfg = storeConfig(env);
+            } catch (error) {
+              core.warning(`${error.message}; each E2E job builds its own application instead`);
+              return;
+            }
+            if (!cfg) {
+              // A warning, not a notice (ci-reset W10, W8 item 1): every E2E
+              // shard then pays for its own build and E2E proof reuse cannot
+              // engage, and a notice was read by nobody.
+              core.warning('No CI artifact store credentials in this run (fork, Dependabot, public repository, or a caller that does not pass CI_ARTIFACTS_R2_ACCOUNT_ID, CI_ARTIFACTS_R2_ACCESS_KEY_ID and CI_ARTIFACTS_R2_SECRET_ACCESS_KEY in its secrets: block); each E2E job builds its own application instead.');
+              return;
+            }
+            try {
+              const key = prebuiltKey(env.GITHUB_REPOSITORY, env.GITHUB_RUN_ID, env.GITHUB_RUN_ATTEMPT, env.BUILD_SCOPE);
+              const object = await publishPrebuilt({ cfg, sourceDir: env.BUILD_DIR, key, tmpDir: env.RUNNER_TEMP });
+              core.info(`R2 put ${object.key}: ${object.bytes} bytes, sha256 ${object.sha256}`);
+              core.setOutput('object', JSON.stringify(object));
+            } catch (error) {
+              core.warning(`Could not publish the prebuilt E2E application to the CI artifact store; each E2E job builds its own instead: ${describe(error)}`);
+            }
+          }
+
+          function buildDir(env) {
+            const relative = String(env.BUILD_PATH || '');
+            const root = path.resolve(env.GITHUB_WORKSPACE || '.', env.WORKING_DIRECTORY || '.');
+            const target = path.resolve(root, relative);
+            if (!relative || path.isAbsolute(relative) || relative.split(/[\\/]/).includes('..') || !target.startsWith(root + path.sep)) {
+              throw new Error('the prebuilt application path must be a relative directory inside working-directory');
+            }
+            return target;
+          }
+
+          // github-script glue for each E2E job. Output `mode`: `r2` when the verified
+          // application is in place, `build` when this job must build its own. Only a
+          // SHA-256 or size mismatch fails the job.
+          async function fetchPrebuiltStep({ core, env = process.env }) {
+            core.setOutput('mode', 'build');
+            const destDir = buildDir(env);
+            if (!env.PREBUILT_OBJECT) {
+              core.notice('Build published no prebuilt application to the CI artifact store; this job builds its own.');
+              return;
+            }
+            let object;
+            try {
+              object = parsePrebuilt(env.PREBUILT_OBJECT);
+            } catch (error) {
+              core.warning(`${error.message}; this job builds its own application`);
+              return;
+            }
+            const accountId = (env.CI_ARTIFACTS_R2_ACCOUNT_ID || '').trim();
+            const accessKeyId = (env.CI_ARTIFACTS_R2_ACCESS_KEY_ID || '').trim();
+            if (!accountId || !accessKeyId) {
+              core.warning('CI artifact store identifiers are not available to this job; it builds its own application');
+              return;
+            }
+            try {
+              const result = await fetchPrebuilt({ object, accountId, accessKeyId, destDir, tmpDir: env.RUNNER_TEMP });
+              if (!result.ok) {
+                core.warning(`R2 get ${object.key} failed (${result.reason}); this job builds its own application`);
+                return;
+              }
+              core.info(`R2 get ${object.key}: ${result.bytes} bytes, sha256 ${object.sha256} verified; extracted into ${env.BUILD_PATH}`);
+              core.setOutput('mode', 'r2');
+            } catch (error) {
+              if (error instanceof IntegrityError) {
+                core.setFailed(error.message);
+                return;
+              }
+              core.warning(`R2 get ${object.key} failed (${describe(error)}); this job builds its own application`);
+            }
+          }
+
+          // ---- Reuse proofs (Required on a pull request -> the default-branch push) --
+
+          async function publishProof({ cfg, kind, key, context, env = process.env }) {
+            const repository = repositoryOf(`${context.repo.owner}/${context.repo.repo}`);
+            const objectKey = proofObjectKey(repository, kind, key);
+            const pointer = {
+              schema: POINTER_SCHEMA,
+              kind,
+              key,
+              repository,
+              repository_id: context.payload.repository.id,
+              run_id: Number(env.GITHUB_RUN_ID),
+              run_attempt: Number(env.GITHUB_RUN_ATTEMPT),
+              sha: context.sha,
+              written_at: new Date().toISOString(),
+            };
+            if (!Number.isSafeInteger(pointer.run_id) || !Number.isSafeInteger(pointer.run_attempt)) throw new Error('GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT must be numbers');
+            const body = Buffer.from(`${JSON.stringify(pointer)}\n`);
+            await putObject(cfg, objectKey, body, { contentType: 'application/json', timeoutMs: 15000, attempts: 3 });
+            const back = await getObject(cfg, objectKey, { timeoutMs: 15000, attempts: 3 });
+            if (!back || !back.equals(body)) throw new Error(`R2 get ${objectKey}: the read-back does not match what was written`);
+            return { objectKey, pointer };
+          }
+
+          // github-script glue for Required. Never fails the job: an unpublished proof
+          // only means the default-branch push runs the work again.
+          async function publishProofStep({ core, context, kind, env = process.env }) {
+            let cfg;
+            try {
+              cfg = storeConfig(env);
+            } catch (error) {
+              core.warning(`${error.message}; no ${kind} proof published, so the default-branch push runs it in full`);
+              return;
+            }
+            if (!cfg) {
+              core.notice(`No CI artifact store credentials in this run; no ${kind} proof published, so the default-branch push runs it in full.`);
+              return;
+            }
+            try {
+              const { objectKey, pointer } = await publishProof({ cfg, kind, key: env.PROOF_KEY, context, env });
+              core.info(`R2 put ${objectKey}: pointer to run ${pointer.run_id} attempt ${pointer.run_attempt}`);
+              core.info(`R2 get ${objectKey}: read-back matches`);
+            } catch (error) {
+              core.warning(`Could not publish the ${kind} proof to the CI artifact store; the default-branch push runs it in full: ${describe(error)}`);
+            }
+          }
+
+          // Returns { found: true, run } only when GitHub itself confirms the pointer.
+          async function findProof({ github, context, kind, key, workflowPath, env = process.env }) {
+            const cfg = storeConfig(env);
+            if (!cfg) return { found: false, reason: 'no CI artifact store credentials in this run' };
+            const repositoryId = context.payload.repository.id;
+            const objectKey = proofObjectKey(`${context.repo.owner}/${context.repo.repo}`, kind, key);
+            const raw = await getObject(cfg, objectKey, { timeoutMs: 10000, attempts: 2 });
+            if (!raw) return { found: false, reason: `no pointer at ${objectKey}` };
+            let pointer;
+            try {
+              pointer = JSON.parse(raw.toString('utf8'));
+            } catch {
+              return { found: false, reason: `${objectKey} is not JSON` };
+            }
+            if (!pointer || pointer.schema !== POINTER_SCHEMA || pointer.kind !== kind || pointer.key !== key
+                || pointer.repository_id !== repositoryId
+                || !Number.isSafeInteger(pointer.run_id) || pointer.run_id <= 0
+                || !Number.isSafeInteger(pointer.run_attempt) || pointer.run_attempt <= 0) {
+              return { found: false, reason: `${objectKey} does not describe this key and repository` };
+            }
+            const { data: run } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: pointer.run_id, request: { timeout: 10000 } });
+            if (run.id !== pointer.run_id || run.event !== 'pull_request' || run.status !== 'completed' || run.conclusion !== 'success'
+                || run.path !== workflowPath || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) {
+              return { found: false, reason: `run ${pointer.run_id} is not a successful same-repository pull-request run of ${workflowPath}` };
+            }
+            // A rerun must publish fresh proof, not inherit an older attempt's.
+            if (run.run_attempt !== pointer.run_attempt) {
+              return { found: false, reason: `run ${run.id} is on attempt ${run.run_attempt}, but attempt ${pointer.run_attempt} published the pointer` };
+            }
+            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+              ...context.repo, run_id: run.id, attempt_number: pointer.run_attempt, per_page: 100, request: { timeout: 10000 },
+            });
+            const stepName = `${PROOF_STEP[kind]} ${key}`;
+            const attested = jobs.some(job => /(^| \/ )Required$/.test(String(job.name)) && job.conclusion === 'success'
+              && (job.steps || []).some(step => step.name === stepName && step.conclusion === 'success'));
+            if (!attested) return { found: false, reason: `run ${run.html_url} shows no successful "${stepName}" step in a Required job` };
+            return { found: true, run };
+          }
+
+          module.exports = {
+            BUCKET, PRESIGN_SECONDS, TRANSFER_TIMEOUT_MS, TRANSFER_ATTEMPTS, PROOF_STEP, IntegrityError,
+            sha256Hex, amzDate, canonicalUri, canonicalQuery, sign, presign, presignedUrl,
+            storeConfig, endpoint, repositoryOf, assertKey, prebuiltKey, proofObjectKey,
+            putObject, getObject, deleteObject,
+            publishPrebuilt, parsePrebuilt, fetchPrebuilt, publishPrebuiltStep, fetchPrebuiltStep, buildDir,
+            publishProof, publishProofStep, findProof,
+          };
+          CI_ARTIFACT_STORE
+
+      - name: Install taskgraph engine
+        working-directory: ${{ github.workspace }}
+        run: &install_taskgraph_engine |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/taskgraph.cjs" <<'TASKGRAPH_ENGINE'
+          'use strict';
+          // TASKGRAPH ENGINE. Vercel CI's model (vercel.com/docs/ci, 2026-10-28) on
+          // GitHub Actions: the caller's turbo.json tags the tasks CI runs, each task
+          // gets a content key, a task whose key already passed is never run again,
+          // and the rest run side by side on one machine, in dependency order, after
+          // one checkout and one install. The `Install taskgraph engine` step writes
+          // this file from the workflow's own text, so a caller cannot substitute it.
+          //
+          // A KEY is the SHA-256 of everything that decides a task's result and can be
+          // read without running it: the task's package.json script (and its pre/post
+          // hooks), its turbo.json definition, the Git blob hash of every file its
+          // `inputs` select (all tracked files by default), the lockfile, the declared
+          // Node version and package manager, the callable inputs that change how it
+          // runs, the keys of the tasks it depends on, and ENGINE. No file is read to
+          // hash it: Git already hashed every blob.
+          //
+          // A PROOF is a pointer in the CI artifact store, never a result on its own:
+          // `proof/<owner>/<repo>/task-proof-v1-<key>.json` names a run, an attempt
+          // and the manifest of keys that attempt passed. It is honoured only when
+          // GitHub's API shows that attempt is this repository's own run of the same
+          // caller workflow and that its Required job ran the step named
+          // `Publish task proofs <sha256 of the manifest>` successfully. A missing,
+          // unreadable or unconfirmed proof means "run it". It can cost a run, never
+          // coverage.
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const path = require('node:path');
+          const { spawn, execFileSync } = require('node:child_process');
+
+          // Bump when the meaning of a key changes, so no older pass is honoured.
+          const ENGINE = 'narduk-taskgraph-v1';
+          const POINTER_SCHEMA = 'narduk-taskgraph-proof-v1';
+          const PUBLISH_STEP = 'Publish task proofs';
+          const TASK_NAME = /^[A-Za-z0-9:_./@-]+$/;
+          const KEY = /^[0-9a-f]{64}$/;
+          const LOCKFILES = ['pnpm-lock.yaml', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'bun.lock', 'bun.lockb'];
+          const NODE_VERSION_FILES = ['.node-version', '.nvmrc', '.tool-versions'];
+          // Flags and refs that make a script choose its checks from a diff, and a
+          // script token (a name, `pnpm run x:changed`) ending in `:changed`.
+          const DIFF_SCOPED = /FAST_BASE_REF|BASE_REF\b|--changed\b|--changedSince\b|--only-?[cC]hanged\b|--since\b|--affected\b|\baffected\b|merge-base|git diff\b|(?:^|\s)[\w:./@-]*:changed(?=\s|$)/;
+          // Bounded so a broken store or API costs seconds, never the job budget.
+          const LOOKUP_TIMEOUT_MS = 10000;
+          // How long a task's pipes may stay open after its process exits.
+          const EXIT_DRAIN_MS = 3000;
+          // "If we have a CI job that lasts 20 minutes there better be a damn good
+          // reason" (Logan, 2026-09-17): no one task may run longer.
+          const TASK_TIMEOUT_MS = 20 * 60 * 1000;
+
+          function sha256(text) {
+            return crypto.createHash('sha256').update(text).digest('hex');
+          }
+
+          // turbo.json is JSONC: comments and trailing commas are legal.
+          function parseJsonc(text) {
+            let out = '';
+            let inString = false;
+            for (let i = 0; i < text.length; i += 1) {
+              const c = text[i];
+              if (inString) {
+                out += c;
+                if (c === '\\') { out += text[i + 1] ?? ''; i += 1; } else if (c === '"') inString = false;
+              } else if (c === '"') { inString = true; out += c; }
+              else if (c === '/' && text[i + 1] === '/') { while (i < text.length && text[i] !== '\n') i += 1; out += '\n'; }
+              else if (c === '/' && text[i + 1] === '*') {
+                const end = text.indexOf('*/', i + 2);
+                if (end < 0) throw new Error('turbo.json: unterminated comment');
+                i = end + 1;
+              } else out += c;
+            }
+            return JSON.parse(out.replace(/,(\s*[}\]])/g, '$1'));
+          }
+
+          // Turbo's `inputs` glob dialect: `**` crosses directories, `*` and `?` do
+          // not, `{a,b}` alternates. A glob that names a directory selects what is in it.
+          function globToRegExp(glob) {
+            const esc = s => s.replace(/[.+^$()|[\]\\]/g, '\\$&');
+            let re = '';
+            for (let i = 0; i < glob.length; i += 1) {
+              const c = glob[i];
+              if (c === '*' && glob[i + 1] === '*') {
+                i += 1;
+                if (glob[i + 1] === '/') { i += 1; re += '(?:.*/)?'; } else re += '.*';
+              } else if (c === '*') re += '[^/]*';
+              else if (c === '?') re += '[^/]';
+              else if (c === '{') {
+                const end = glob.indexOf('}', i);
+                if (end < 0) throw new Error(`input glob ${JSON.stringify(glob)}: unclosed {`);
+                re += `(?:${glob.slice(i + 1, end).split(',').map(alt => esc(alt).replace(/\*/g, '[^/]*')).join('|')})`;
+                i = end;
+              } else re += esc(c);
+            }
+            return new RegExp(`^${re}(?:/.*)?$`);
+          }
+
+          // Tree rows, from the trees API or `git ls-tree -r -z --full-tree`.
+          function entriesFromApi(tree, prefix) {
+            const base = prefix ? `${prefix}/` : '';
+            return tree
+              .filter(e => (e.type === 'blob' || e.type === 'commit') && e.path.startsWith(base))
+              .map(e => ({ path: e.path.slice(base.length), mode: e.mode, sha: e.sha }))
+              .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+          }
+
+          function entriesFromLsTree(text, prefix) {
+            const rows = text.split('\0').filter(Boolean).map(row => {
+              const tab = row.indexOf('\t');
+              const [mode, type, sha] = row.slice(0, tab).split(' ');
+              return { path: row.slice(tab + 1), mode, type, sha };
+            });
+            return entriesFromApi(rows, prefix);
+          }
+
+          function fingerprint(entries, inputs) {
+            const positive = [];
+            const negative = [];
+            for (const raw of inputs) {
+              if (typeof raw !== 'string' || raw === '') throw new Error(`input ${JSON.stringify(raw)} is not a glob`);
+              // Only `$TURBO_DEFAULT$` is understood. Any other turbo token would
+              // select nothing, silently, and freeze the key.
+              if (/\$TURBO_(?!DEFAULT\$$)[A-Z_]*\$/.test(raw)) throw new Error(`input ${JSON.stringify(raw)}: only $TURBO_DEFAULT$ is supported; write the path relative to the package`);
+              if (raw === '$TURBO_DEFAULT$') positive.push(/^/);
+              else if (raw.startsWith('!')) negative.push(globToRegExp(raw.slice(1).replace(/^\.\//, '')));
+              else positive.push(globToRegExp(raw.replace(/^\.\//, '')));
+            }
+            const hash = crypto.createHash('sha256');
+            let files = 0;
+            for (const e of entries) {
+              if (!positive.some(re => re.test(e.path)) || negative.some(re => re.test(e.path))) continue;
+              hash.update(`${e.path}\0${e.mode}\0${e.sha}\n`);
+              files += 1;
+            }
+            return { digest: hash.digest('hex'), files };
+          }
+
+          function cpusOf(tags) {
+            const tag = tags.find(t => /^ci:cpus:\d+$/.test(t));
+            return tag ? Math.max(1, Math.min(32, Number(tag.split(':')[2]))) : 1;
+          }
+
+          function localDeps(name, def) {
+            const deps = [];
+            for (const dep of def.dependsOn || []) {
+              if (typeof dep !== 'string') throw new Error(`task ${name}: dependsOn entries must be strings`);
+              // A root package has no workspace dependencies for `^task` to reach.
+              if (dep.startsWith('^')) continue;
+              const bare = dep.replace(/^\$TURBO_ROOT\$\//, '').replace(/^\/\/#/, '');
+              if (bare.includes('#')) throw new Error(`task ${name}: dependency ${dep} names another package; this engine runs the root package's scripts only`);
+              deps.push(bare);
+            }
+            return [...new Set(deps)].sort();
+          }
+
+          // Tasks tagged "ci" (and not "!ci"), plus everything they depend on, as
+          // Vercel CI selects them.
+          function selectTasks(turbo) {
+            const defs = turbo.tasks || {};
+            if (turbo.pipeline && !turbo.tasks) throw new Error('turbo.json uses the turbo 1 `pipeline` key; rename it to `tasks`');
+            const tasks = new Map();
+            for (const [rawName, def] of Object.entries(defs)) {
+              const name = rawName.replace(/^\/\/#/, '');
+              if (name.includes('#')) throw new Error(`task ${rawName}: package#task needs a turbo workspace; this engine runs the root package's scripts only`);
+              if (!TASK_NAME.test(name)) throw new Error(`task ${JSON.stringify(rawName)}: names may use only ${TASK_NAME.source}`);
+              tasks.set(name, def || {});
+            }
+            const tagged = [...tasks].filter(([, d]) => (d.tags || []).includes('ci') && !(d.tags || []).includes('!ci')).map(([n]) => n);
+            const selected = [];
+            const seen = new Set();
+            const visit = (name, trail) => {
+              if (trail.includes(name)) throw new Error(`dependency cycle: ${[...trail, name].join(' -> ')}`);
+              if (seen.has(name)) return;
+              if (!tasks.has(name)) throw new Error(`${trail.at(-1)} depends on ${name}, which turbo.json does not define`);
+              for (const dep of localDeps(name, tasks.get(name))) visit(dep, [...trail, name]);
+              seen.add(name);
+              selected.push(name);
+            };
+            for (const name of tagged) visit(name, []);
+            return { tasks, tagged, selected };
+          }
+
+          // The whole plan: every selected task, dependencies first, with its key.
+          function plan({ entries, turboText, packageText, nodeVersionText, rootLockfile, context }) {
+            if (turboText == null) throw new Error('no turbo.json: tag the tasks CI should run, e.g. {"tasks": {"lint": {"tags": ["ci"]}}}');
+            if (packageText == null) throw new Error('no package.json beside turbo.json');
+            const turbo = parseJsonc(turboText);
+            const pkg = JSON.parse(packageText);
+            const scripts = pkg.scripts || {};
+            const { tasks, tagged, selected } = selectTasks(turbo);
+            if (tagged.length === 0) throw new Error('turbo.json tags no task with "ci"; add "tags": ["ci"] to the tasks CI should run');
+            const lock = entries.find(e => LOCKFILES.includes(e.path)) || rootLockfile || null;
+            const toolchain = {
+              packageManager: pkg.packageManager || null,
+              engines: pkg.engines || null,
+              lockfile: lock ? `${lock.path}:${lock.sha}` : null,
+              node: nodeVersionText == null ? null : nodeVersionText.trim(),
+              globalDependencies: fingerprint(entries, turbo.globalDependencies || []).digest,
+              globalEnv: [...(turbo.globalEnv || [])].sort(),
+            };
+            const keys = new Map();
+            const out = [];
+            for (const name of selected) {
+              const def = tasks.get(name);
+              if (typeof scripts[name] !== 'string' || scripts[name] === '') {
+                throw new Error(`turbo.json task ${name} has no package.json script of that name; a task with no script would pass having run nothing`);
+              }
+              // A key says "this content passed". A script that decides what to check
+              // from the diff (vitest --changed, a FAST_BASE_REF subset) can pass on a
+              // tree whose full check fails, so its pass is not a fact about the tree.
+              const text = [name, scripts[name], scripts[`pre${name}`] || '', scripts[`post${name}`] || ''].join('\n');
+              if (def.cache !== false && DIFF_SCOPED.test(text)) {
+                throw new Error(`turbo.json task ${name} looks diff-scoped (${text.match(DIFF_SCOPED)[0]}); its result depends on the base branch, not the tree. Tag the full script (e.g. "test", not "test:changed") or set "cache": false`);
+              }
+              const deps = localDeps(name, def);
+              outputDirs(def.outputs);
+              const inputs = Array.isArray(def.inputs) && def.inputs.length ? def.inputs : ['$TURBO_DEFAULT$'];
+              const fp = fingerprint(entries, inputs);
+              // An `inputs` list that selects no file gives a key no change can
+              // move, so one old pass would be reused for ever (a typo such as
+              // `scr/**`, or only negations).
+              if (fp.files === 0) throw new Error(`turbo.json task ${name}: inputs ${JSON.stringify(inputs)} select no tracked file, so no change could ever re-run it`);
+              const material = {
+                engine: ENGINE,
+                context,
+                task: name,
+                script: scripts[name],
+                pre: scripts[`pre${name}`] ?? null,
+                post: scripts[`post${name}`] ?? null,
+                definition: { dependsOn: deps, inputs, outputs: def.outputs || [], env: [...(def.env || [])].sort(), passThroughEnv: [...(def.passThroughEnv || [])].sort(), cache: def.cache !== false },
+                toolchain,
+                inputsDigest: fp.digest,
+                dependencies: deps.map(d => [d, keys.get(d)]),
+              };
+              // `ci:shared`: a check that only reads the tree runs in the checkout
+              // itself, skipping a worktree. It cannot read another task's outputs,
+              // which live in that task's worktree.
+              const ancestors = [];
+              const climb = n => { for (const d of localDeps(n, tasks.get(n))) if (!ancestors.includes(d)) { ancestors.push(d); climb(d); } };
+              climb(name);
+              if ((def.tags || []).includes('ci:shared')) {
+                const producer = ancestors.find(d => (tasks.get(d).outputs || []).length > 0);
+                if (producer) throw new Error(`task ${name} is ci:shared but depends on ${producer}, whose outputs only reach isolated tasks`);
+              }
+              // `ci:machine`: a leg (a seat) of its own. Two machine tasks in one
+              // chain would each need the other's machine, and a task behind two
+              // could run on only one of them.
+              const machinesBehind = ancestors.filter(d => (tasks.get(d).tags || []).includes('ci:machine'));
+              if ((def.tags || []).includes('ci:machine')) {
+                if (machinesBehind.length) throw new Error(`ci:machine task ${name} depends on ci:machine task ${machinesBehind[0]}; one chain runs on one machine, so tag only one of them`);
+                if (['shared', 'all'].includes(name)) throw new Error(`ci:machine task ${name} would share its leg's name with the shared leg; rename it`);
+              } else if (machinesBehind.length > 1) {
+                throw new Error(`task ${name} needs ci:machine tasks ${machinesBehind.join(' and ')}; it can run on only one machine`);
+              }
+              const key = sha256(JSON.stringify(material));
+              keys.set(name, key);
+              out.push({
+                task: name,
+                key,
+                dependsOn: deps,
+                outputs: def.outputs || [],
+                // `cache: false` (an audit against today's advisories, a live probe):
+                // always runs and never mints a proof.
+                cache: def.cache !== false,
+                tagged: tagged.includes(name),
+                inputFiles: fp.files,
+                cpus: cpusOf(def.tags || []),
+                shared: (def.tags || []).includes('ci:shared'),
+                machine: (def.tags || []).includes('ci:machine'),
+              });
+            }
+            return { engine: ENGINE, tasks: out };
+          }
+
+          // What must execute: every miss, plus every dependency of a miss that
+          // declares outputs (a proof restores no files, so a test that reads the
+          // build's output gets a fresh build).
+          function executionSet(planTasks, misses) {
+            const byName = new Map(planTasks.map(t => [t.task, t]));
+            const run = new Set();
+            // A passed dependency with no outputs is not re-run, but the outputs of
+            // the tasks behind it are still needed, so look through it.
+            const through = (name, seen) => {
+              for (const dep of byName.get(name).dependsOn) {
+                if (misses.has(dep) || byName.get(dep).outputs.length > 0) visit(dep);
+                else if (!seen.has(dep)) { seen.add(dep); through(dep, seen); }
+              }
+            };
+            const visit = name => {
+              if (run.has(name)) return;
+              run.add(name);
+              through(name, new Set());
+            };
+            for (const name of misses) {
+              if (!byName.has(name)) throw new Error(`unknown task ${name}`);
+              visit(name);
+            }
+            return planTasks.map(t => t.task).filter(n => run.has(n));
+          }
+
+          // The legs, one machine each: every task tagged `ci:machine` that must run,
+          // with the tasks behind it in the run (a dependent reads its outputs or
+          // waits for it) and whatever those need from the shared run set; and one
+          // shared leg for the rest. A task behind two machine tasks is refused: it
+          // could run on only one of them.
+          function legsOf(planTasks, executes) {
+            const byName = new Map(planTasks.map(t => [t.task, t]));
+            const running = new Set(executes);
+            const memo = new Map();
+            const behind = name => {
+              if (!memo.has(name)) {
+                const all = new Set();
+                for (const d of byName.get(name).dependsOn) { all.add(d); for (const x of behind(d)) all.add(x); }
+                memo.set(name, all);
+              }
+              return memo.get(name);
+            };
+            const machines = executes.filter(n => byName.get(n).machine);
+            const owner = new Map();
+            for (const n of executes) {
+              if (byName.get(n).machine) { owner.set(n, n); continue; }
+              const on = machines.filter(m => behind(n).has(m));
+              if (on.length > 1) throw new Error(`task ${n} needs ci:machine tasks ${on.join(' and ')}; it can run on only one machine`);
+              if (on.length === 1) owner.set(n, on[0]);
+            }
+            const legs = [];
+            const onMachines = new Set();
+            const leg = (id, members) => {
+              // A member's running dependencies run on its machine too (a shared
+              // `nuxt:prepare` runs once per machine that needs it).
+              const set = new Set(members);
+              for (const n of members) for (const d of behind(n)) if (running.has(d) && (owner.get(d) ?? null) === null) set.add(d);
+              legs.push({ id, names: executes.filter(n => set.has(n)).join(',') });
+              return set;
+            };
+            for (const m of machines) for (const n of leg(m, executes.filter(n => owner.get(n) === m))) onMachines.add(n);
+            // The shared leg: the rest, less what only machine legs needed.
+            const unowned = executes.filter(n => !owner.has(n));
+            const wanted = unowned.filter(n => !onMachines.has(n) || unowned.some(u => !onMachines.has(u) && behind(u).has(n)));
+            if (wanted.length) leg(machines.length ? 'shared' : 'all', wanted);
+            return legs;
+          }
+
+          function manifestDigest(keys) {
+            return sha256([...keys].sort().join('\n'));
+          }
+
+          // ---- Proofs -----------------------------------------------------------------
+
+          function proofKey(store, repository, key) {
+            if (!KEY.test(String(key))) throw new Error(`not a task key: ${JSON.stringify(key)}`);
+            return store.assertKey(`proof/${store.repositoryOf(repository)}/task-proof-v1-${key}.json`);
+          }
+
+          // Honour a proof only when GitHub confirms the attempt it names (see the
+          // header). `attempts` caches one confirmation per run attempt.
+          async function findTaskProof({ github, context, store, cfg, key, workflowPath, attempts }) {
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            const repositoryId = context.payload.repository.id;
+            const objectKey = proofKey(store, repository, key);
+            const raw = await store.getObject(cfg, objectKey, { timeoutMs: LOOKUP_TIMEOUT_MS, attempts: 2 });
+            if (!raw) return { found: false, reason: 'no proof' };
+            let pointer;
+            try {
+              pointer = JSON.parse(raw.toString('utf8'));
+            } catch {
+              return { found: false, reason: 'proof is not JSON' };
+            }
+            if (!pointer || pointer.schema !== POINTER_SCHEMA || pointer.key !== key || pointer.repository_id !== repositoryId
+                || !Number.isSafeInteger(pointer.run_id) || pointer.run_id <= 0
+                || !Number.isSafeInteger(pointer.run_attempt) || pointer.run_attempt <= 0
+                || !Array.isArray(pointer.manifest) || !pointer.manifest.includes(key) || !pointer.manifest.every(k => KEY.test(String(k)))) {
+              return { found: false, reason: 'proof does not describe this key and repository' };
+            }
+            const digest = manifestDigest(pointer.manifest);
+            const id = `${pointer.run_id}:${pointer.run_attempt}:${digest}`;
+            if (!attempts.has(id)) {
+              attempts.set(id, (async () => {
+                const { data: run } = await github.rest.actions.getWorkflowRunAttempt({
+                  ...context.repo, run_id: pointer.run_id, attempt_number: pointer.run_attempt, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) },
+                });
+                if (run.id !== pointer.run_id || run.run_attempt !== pointer.run_attempt || run.path !== workflowPath
+                    || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) {
+                  return { ok: false, reason: `run ${pointer.run_id} is not this repository's own run of ${workflowPath}` };
+                }
+                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+                  ...context.repo, run_id: run.id, attempt_number: pointer.run_attempt, per_page: 100, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) },
+                });
+                const stepName = `${PUBLISH_STEP} ${digest}`;
+                const attested = jobs.some(job => /(^| \/ )Tasks \([A-Za-z0-9:_.\/@-]+\)$/.test(String(job.name))
+                  && (job.steps || []).some(step => step.name === stepName && step.conclusion === 'success'));
+                return attested ? { ok: true, run } : { ok: false, reason: `${run.html_url} shows no successful "${stepName}" step in a Tasks leg` };
+              })());
+            }
+            const verdict = await attempts.get(id);
+            return verdict.ok ? { found: true, run: verdict.run } : { found: false, reason: verdict.reason };
+          }
+
+          async function publishTaskProofs({ store, cfg, context, planTasks, results, env = process.env }) {
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            const passed = planTasks.filter(t => t.cache && results[t.task]?.status === 'passed').map(t => t.key);
+            if (passed.length === 0) return [];
+            const manifest = [...new Set(passed)].sort();
+            const pointer = {
+              schema: POINTER_SCHEMA,
+              repository,
+              repository_id: context.payload.repository.id,
+              run_id: Number(env.GITHUB_RUN_ID),
+              run_attempt: Number(env.GITHUB_RUN_ATTEMPT),
+              sha: context.sha,
+              manifest,
+              written_at: new Date().toISOString(),
+            };
+            if (!Number.isSafeInteger(pointer.run_id) || !Number.isSafeInteger(pointer.run_attempt)) throw new Error('GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT must be numbers');
+            const written = [];
+            for (const key of manifest) {
+              const objectKey = proofKey(store, repository, key);
+              await store.putObject(cfg, objectKey, Buffer.from(JSON.stringify({ ...pointer, key })), { contentType: 'application/json', timeoutMs: LOOKUP_TIMEOUT_MS, attempts: 2 });
+              written.push(objectKey);
+            }
+            return written;
+          }
+
+          // ---- The workflow's github-script steps ------------------------------------------
+
+          function normalizeDir(dir) {
+            const parts = String(dir || '.').replace(/\\/g, '/').split('/').filter(part => part !== '' && part !== '.');
+            if (parts.includes('..') || String(dir || '').startsWith('/')) throw new Error(`working-directory ${JSON.stringify(dir)} leaves the repository`);
+            return parts.join('/');
+          }
+
+          // `Plan tasks`: key every task from the GitHub API (no checkout), look each
+          // key's proof up, and hand the misses to `Run tasks`. Any lookup problem is a
+          // miss with a warning; only a broken turbo.json or package.json fails here.
+          async function planStep({ github, context, core, store, env = process.env }) {
+            // The fetch-based Octokit honours an AbortSignal, not a `timeout` option;
+            // one fresh signal per call.
+            const request = () => ({ signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) });
+            if (!['pnpm', 'npm'].includes(env.PACKAGE_MANAGER || 'pnpm')) throw new Error(`package-manager ${JSON.stringify(env.PACKAGE_MANAGER)}: taskgraph runs tasks with pnpm or npm`);
+            const repo = context.repo;
+            const repository = `${repo.owner}/${repo.repo}`;
+            const wd = normalizeDir(env.WORKING_DIRECTORY);
+            const workflowPath = String(env.CALLER_WORKFLOW_REF || '').split('@')[0].slice(`${repository}/`.length);
+            const { data: commit } = await github.rest.repos.getCommit({ ...repo, ref: context.sha, request: request() });
+            const treeSha = commit.commit.tree.sha;
+            const { data: tree } = await github.rest.git.getTree({ ...repo, tree_sha: treeSha, recursive: 'true', request: request() });
+            if (tree.truncated) throw new Error(`the trees API truncated tree ${treeSha} (over 100,000 entries or 7 MB); taskgraph cannot key this repository`);
+            const read = async file => {
+              try {
+                const { data } = await github.rest.repos.getContent({ ...repo, path: file, ref: context.sha, mediaType: { format: 'raw' }, request: request() });
+                return typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
+              } catch (error) {
+                if (error.status === 404) return null;
+                throw error;
+              }
+            };
+            const inDir = file => (wd ? `${wd}/${file}` : file);
+            const nodeFile = String(env.NODE_VERSION_FILE || '').replace(/^\.\//, '');
+            const [turboText, packageText, nodeText] = await Promise.all([
+              read(inDir('turbo.json')), read(inDir('package.json')), nodeFile ? read(nodeFile) : Promise.resolve(null),
+            ]);
+            if (nodeFile && nodeText == null) throw new Error(`node-version-file ${nodeFile} does not exist at ${context.sha}`);
+            const caller = tree.tree.find(e => e.path === workflowPath);
+            const result = plan({
+              entries: entriesFromApi(tree.tree, wd),
+              turboText,
+              packageText,
+              nodeVersionText: nodeFile ? `${nodeFile}:${nodeText}` : `node-version:${env.NODE_VERSION || ''}`,
+              rootLockfile: tree.tree.find(e => e.type === 'blob' && LOCKFILES.includes(e.path)),
+              context: {
+                // The caller workflow pins this callable's SHA, so its blob carries the
+                // callable's identity into every key, even with narrowed `inputs`.
+                callerWorkflow: caller ? `${caller.path}:${caller.sha}` : workflowPath,
+                packageManager: env.PACKAGE_MANAGER || 'pnpm',
+                installScript: env.INSTALL_SCRIPT || '',
+                workingDirectory: wd,
+              },
+            });
+
+            let cfg = null;
+            try {
+              cfg = store.storeConfig(env);
+            } catch (error) {
+              core.warning(`${error.message}; every task runs and no pass is reused`);
+            }
+            const reuse = env.REUSE !== 'false';
+            if (!cfg) core.notice('No CI artifact store credentials in this run (fork, Dependabot, or a caller missing from the CI_ARTIFACTS_R2_* secrets\' repository lists): every task runs and no pass is recorded.');
+            const attempts = new Map();
+            const verdicts = await Promise.all(result.tasks.map(async t => {
+              if (!t.cache) return { hit: false, reason: 'cache: false' };
+              if (!reuse) return { hit: false, reason: 'reuse: false' };
+              if (!cfg) return { hit: false, reason: 'no store credentials' };
+              try {
+                const proof = await findTaskProof({ github, context, store, cfg, key: t.key, workflowPath, attempts });
+                return proof.found ? { hit: true, run: proof.run } : { hit: false, reason: proof.reason };
+              } catch (error) {
+                core.warning(`${t.task}: proof lookup failed, so it runs: ${error.message}`);
+                return { hit: false, reason: 'lookup failed' };
+              }
+            }));
+            const misses = result.tasks.filter((t, i) => !verdicts[i].hit).map(t => t.task);
+            const executes = misses.length ? executionSet(result.tasks, new Set(misses)) : [];
+            core.setOutput('plan', JSON.stringify(result));
+            core.setOutput('misses', misses.join(','));
+            core.setOutput('run', executes.length ? 'true' : 'false');
+            const legs = executes.length ? legsOf(result.tasks, executes) : [];
+            core.setOutput('legs', JSON.stringify(legs));
+            if (legs.length) core.info(`legs: ${legs.map(l => `${l.id} (${l.names.split(',').length})`).join(', ')}`);
+            const rows = result.tasks.map((t, i) => {
+              const v = verdicts[i];
+              const state = v.hit ? `passed before ([run ${v.run.id}](${v.run.html_url}))` : executes.includes(t.task) ? `runs (${misses.includes(t.task) ? v.reason : 'its outputs are needed'})` : 'runs';
+              core.info(`${t.task.padEnd(28)} ${t.key.slice(0, 12)}  ${v.hit ? `reused from run ${v.run.id}` : `runs: ${v.reason}`}`);
+              return `| \`${t.task}\` | \`${t.key.slice(0, 12)}\` | ${t.inputFiles} | ${state} |`;
+            });
+            const reused = result.tasks.length - misses.length;
+            await core.summary.addRaw(`### taskgraph plan: ${reused} of ${result.tasks.length} task(s) already passed on this content\n\n| Task | Key | Input files | |\n|---|---|---:|---|\n${rows.join('\n')}\n`).write();
+            return { result, misses, executes };
+          }
+
+          // `Publish task proofs <digest>`: one pointer per passed cacheable task.
+          // Never fails the job: an unrecorded pass costs the next run time, never
+          // coverage.
+          async function publishStep({ context, core, store, env = process.env }) {
+            let cfg;
+            try {
+              cfg = store.storeConfig(env);
+            } catch (error) {
+              core.warning(`${error.message}; no task pass recorded`);
+              return [];
+            }
+            if (!cfg) {
+              core.notice('No CI artifact store credentials in this run; no task pass recorded, so the next run of this content runs it again.');
+              return [];
+            }
+            try {
+              const written = await publishTaskProofs({
+                store, cfg, context, env,
+                planTasks: JSON.parse(env.TASKGRAPH_PLAN).tasks,
+                results: JSON.parse(env.TASKGRAPH_RESULTS || '{}'),
+              });
+              core.info(`Recorded ${written.length} task pass(es): ${written.join(', ')}`);
+              return written;
+            } catch (error) {
+              core.warning(`Could not record task passes in the CI artifact store; the next run of this content runs them again: ${error.message}`);
+              return [];
+            }
+          }
+
+          // ---- Execution ----------------------------------------------------------------
+
+          // Vercel CI starts each task on its own machine from a copy of the
+          // repository taken after install, so no task sees another's build state. The
+          // same isolation on one machine: a detached worktree per task for the tracked
+          // files, the install's node_modules directories linked in, and everything else
+          // the install left behind (a postinstall `nuxt prepare`, a generated client)
+          // copied. A task that rewrites `.nuxt` or `.output` then rewrites its own.
+          function isolatedWorkspace(cwd, root, name) {
+            const git = args => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+            const top = git(['rev-parse', '--show-toplevel']).trim();
+            const prefix = git(['rev-parse', '--show-prefix']).trim();
+            // The hash keeps `a:b` and `a_b` apart.
+            const dir = path.join(root, `${name.replace(/[^A-Za-z0-9._-]/g, '_')}-${sha256(name).slice(0, 8)}`);
+            fs.rmSync(dir, { recursive: true, force: true });
+            // A persistent runner can hold a registration from an earlier job whose
+            // directory is gone; prune it so `add` never refuses the path.
+            execFileSync('git', ['-C', top, 'worktree', 'prune'], { stdio: 'ignore' });
+            execFileSync('git', ['-C', top, 'worktree', 'add', '--detach', '--quiet', dir, 'HEAD'], { stdio: ['ignore', 'ignore', 'inherit'] });
+            const others = execFileSync('git', ['-C', top, 'ls-files', '-z', '--others', '--directory', '--no-empty-directory'], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+              .split('\0').filter(Boolean).map(rel => rel.replace(/\/$/, ''));
+            for (const rel of others) place(path.join(top, rel), path.join(dir, rel));
+            return path.join(dir, prefix);
+          }
+
+          function place(from, to) {
+            fs.mkdirSync(path.dirname(to), { recursive: true });
+            const stat = fs.lstatSync(from);
+            if (path.basename(from) === 'node_modules') fs.symlinkSync(from, to, 'dir');
+            else if (stat.isDirectory() && holdsNodeModules(from)) {
+              fs.mkdirSync(to, { recursive: true });
+              for (const entry of fs.readdirSync(from)) place(path.join(from, entry), path.join(to, entry));
+            } else fs.cpSync(from, to, { recursive: true, verbatimSymlinks: true });
+          }
+
+          function holdsNodeModules(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (!entry.isDirectory()) continue;
+              if (entry.name === 'node_modules' || holdsNodeModules(path.join(dir, entry.name))) return true;
+            }
+            return false;
+          }
+
+          // A container guest can report the host's cores and memory while its cgroup
+          // grants far less (a 4-CPU / 8 GiB linux-ci seat on a 64-core host), so the
+          // cgroup v2 limits win when they are set.
+          function cgroupLimits(read = file => fs.readFileSync(file, 'utf8')) {
+            const limits = { cpus: Infinity, memory: Infinity };
+            try {
+              const [quota, period] = read('/sys/fs/cgroup/cpu.max').trim().split(/\s+/);
+              if (quota !== 'max' && Number(period) > 0) limits.cpus = Math.max(1, Math.floor(Number(quota) / Number(period)));
+            } catch { /* no cgroup v2 CPU limit */ }
+            // memory.high throttles instead of killing: past it a task crawls
+            // (four heavy tasks ran 20 minutes on one seat), so it counts as a limit.
+            for (const file of ['memory.max', 'memory.high']) {
+              try {
+                const memory = read(`/sys/fs/cgroup/${file}`).trim();
+                if (memory !== 'max' && Number(memory) > 0) limits.memory = Math.min(limits.memory, Number(memory));
+              } catch { /* no cgroup v2 limit of that kind */ }
+            }
+            return limits;
+          }
+
+          // The directories a task's `outputs` globs name: the literal path before the
+          // first glob character (".nuxt/**" -> ".nuxt", "dist/*.js" -> "dist"). A glob
+          // with no literal directory ("**/*.d.ts") cannot be carried and is refused at
+          // plan time.
+          function outputDirs(outputs) {
+            const dirs = [];
+            for (const raw of outputs || []) {
+              if (raw.startsWith('!')) continue;
+              const parts = raw.replace(/^\.\//, '').split('/');
+              const literal = [];
+              for (const part of parts) {
+                if (/[*?{[]/.test(part)) break;
+                literal.push(part);
+              }
+              if (literal.length === 0) throw new Error(`output ${JSON.stringify(raw)} names no directory; write it as "<dir>/**"`);
+              if (literal.includes('..')) throw new Error(`output ${JSON.stringify(raw)} leaves the package`);
+              dirs.push(literal.join('/'));
+            }
+            return [...new Set(dirs)];
+          }
+
+          function defaultConcurrency(limits = cgroupLimits()) {
+            const cpus = Math.min(os.availableParallelism ? os.availableParallelism() : os.cpus().length, limits.cpus);
+            // About 3 GiB per concurrent Node tool (a Nuxt build, vue-tsc, ESLint),
+            // so a seat stays under its memory limit; a heavier task takes a
+            // machine of its own (`ci:machine`).
+            const byMemory = Math.floor(Math.min(os.totalmem(), limits.memory) / (3 * 1024 ** 3));
+            return Math.max(1, Math.min(cpus, byMemory));
+          }
+
+          // Run `names` in dependency order, at most `concurrency` CPUs at once (a
+          // task's `ci:cpus:N` tag is its weight). A failed task blocks its dependents
+          // and nothing else, so one push shows every independent failure.
+          function runTasks({ planTasks, names, command, cwd, concurrency, isolate, env = process.env, onEvent = () => {}, timeoutMs = TASK_TIMEOUT_MS }) {
+            const byName = new Map(planTasks.map(t => [t.task, t]));
+            const wanted = new Set(names);
+            const state = new Map(names.map(n => [n, 'pending']));
+            const results = {};
+            let free = concurrency;
+            let active = 0;
+            const dirs = new Map();
+            return new Promise(resolve => {
+              // A dependency that does not run here (it passed) is looked through:
+              // the running tasks behind it still come first, and their outputs
+              // still reach this task.
+              const depsMemo = new Map();
+              const depsOf = name => {
+                if (!depsMemo.has(name)) {
+                  const out = [];
+                  const seen = new Set();
+                  const walk = n => { for (const d of byName.get(n).dependsOn) if (!seen.has(d)) { seen.add(d); if (wanted.has(d)) out.push(d); else walk(d); } };
+                  walk(name);
+                  depsMemo.set(name, out);
+                }
+                return depsMemo.get(name);
+              };
+              // Dependencies first, so a nearer dependency's copy of a shared output wins.
+              const ancestorsOf = name => {
+                const seen = [];
+                const visit = n => { for (const d of depsOf(n)) { if (!seen.includes(d)) { visit(d); seen.push(d); } } };
+                visit(name);
+                return seen;
+              };
+              const pump = () => {
+                for (const name of names) {
+                  if (state.get(name) !== 'pending') continue;
+                  if (depsOf(name).some(d => ['failed', 'blocked'].includes(state.get(d)))) {
+                    state.set(name, 'blocked');
+                    results[name] = { status: 'blocked', key: byName.get(name).key, durationMs: 0 };
+                    onEvent({ type: 'blocked', task: name });
+                    continue;
+                  }
+                  const weight = Math.min(byName.get(name).cpus, concurrency);
+                  if (!depsOf(name).every(d => state.get(d) === 'passed') || (active > 0 && weight > free)) continue;
+                  free -= weight;
+                  active += 1;
+                  state.set(name, 'running');
+                  const started = Date.now();
+                  const chunks = [];
+                  let taskCwd = cwd;
+                  let setupError = null;
+                  try {
+                    if (isolate && !byName.get(name).shared) {
+                      taskCwd = isolatedWorkspace(cwd, isolate, name);
+                      // What turbo restores from cache before a dependent runs: the
+                      // declared `outputs` of every dependency that ran here.
+                      for (const dep of ancestorsOf(name)) {
+                        for (const rel of outputDirs(byName.get(dep).outputs)) {
+                          const from = path.join(dirs.get(dep), rel);
+                          if (fs.existsSync(from)) {
+                            fs.rmSync(path.join(taskCwd, rel), { recursive: true, force: true });
+                            fs.cpSync(from, path.join(taskCwd, rel), { recursive: true, verbatimSymlinks: true });
+                          }
+                        }
+                      }
+                    }
+                    dirs.set(name, taskCwd);
+                  } catch (error) {
+                    setupError = error;
+                  }
+                  onEvent({ type: 'start', task: name, cwd: taskCwd });
+                  let timer = null;
+                  let timedOut = false;
+                  const finish = (code, signal) => {
+                    clearTimeout(timer);
+                    if (timedOut) signal = 'timeout';
+                    free += weight;
+                    active -= 1;
+                    const status = code === 0 && !signal ? 'passed' : 'failed';
+                    state.set(name, status);
+                    results[name] = { status, key: byName.get(name).key, exitCode: code, signal: signal || null, durationMs: Date.now() - started };
+                    onEvent({ type: 'end', task: name, status, durationMs: results[name].durationMs, output: Buffer.concat(chunks).toString('utf8') });
+                    setImmediate(pump);
+                  };
+                  if (setupError) {
+                    chunks.push(Buffer.from(`taskgraph: could not prepare the task's workspace: ${setupError.message}\n`));
+                    setImmediate(() => finish(1, null));
+                    continue;
+                  }
+                  const [bin, ...args] = command(name);
+                  // Its own process group, so a task's leftovers can be ended with it.
+                  const child = spawn(bin, args, { cwd: taskCwd, env: { ...env, TASKGRAPH_TASK: name }, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+                  child.stdout.on('data', d => chunks.push(d));
+                  child.stderr.on('data', d => chunks.push(d));
+                  let done = false;
+                  const settle = (code, signal) => { if (done) return; done = true; finish(code, signal); };
+                  // A task past the budget is stopped, so the job still reports every
+                  // other task (and its passes) inside its own timeout.
+                  timer = setTimeout(() => {
+                    timedOut = true;
+                    chunks.push(Buffer.from(`\ntaskgraph: ${name} ran past ${Math.round(timeoutMs / 60000)} min and was stopped\n`));
+                    try { process.kill(-child.pid, 'SIGTERM'); } catch { /* gone */ }
+                    setTimeout(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } }, 5000).unref();
+                    setTimeout(() => { child.stdout.destroy(); child.stderr.destroy(); settle(null, 'timeout'); }, 6000).unref();
+                  }, timeoutMs);
+                  child.on('error', error => { chunks.push(Buffer.from(`taskgraph: ${error.message}\n`)); settle(127, null); });
+                  child.on('close', settle);
+                  // A task is over when its process exits, not when every pipe closes: a
+                  // server or watcher it left behind would hold stdout open forever (a
+                  // serial CI step never waited for those either). Drain briefly, then
+                  // end the task's process group and move on.
+                  child.on('exit', (code, signal) => {
+                    setTimeout(() => {
+                      if (done) return;
+                      try { process.kill(-child.pid, 'SIGTERM'); } catch { /* already gone */ }
+                      child.stdout.destroy();
+                      child.stderr.destroy();
+                      settle(code, signal);
+                    }, EXIT_DRAIN_MS).unref();
+                  });
+                }
+                if (active === 0 && [...state.values()].every(s => s !== 'pending' && s !== 'running')) resolve(results);
+              };
+              pump();
+            });
+          }
+
+          function seconds(ms) {
+            return `${(ms / 1000).toFixed(1)}s`;
+          }
+
+          // `node taskgraph.cjs`: the `Run tasks` step. Reads the plan and the misses
+          // from the environment `Plan tasks` handed over, prints each task's log in its
+          // own group as it finishes, and writes `digest` (the manifest a proof step
+          // names) and `results` to $GITHUB_OUTPUT.
+          async function main(env = process.env) {
+            const planTasks = JSON.parse(env.TASKGRAPH_PLAN).tasks;
+            // A leg names exactly what it runs; without one, the misses and what they need.
+            const known = new Set(planTasks.map(t => t.task));
+            for (const n of String(env.TASKGRAPH_RUN || '').split(',').filter(Boolean)) if (!known.has(n)) throw new Error(`leg names unknown task ${n}`);
+            const names = env.TASKGRAPH_RUN
+              ? planTasks.map(t => t.task).filter(n => String(env.TASKGRAPH_RUN).split(',').includes(n))
+              : executionSet(planTasks, new Set(String(env.TASKGRAPH_MISSES || '').split(',').filter(Boolean)));
+            const pm = env.TASKGRAPH_PM === 'npm' ? 'npm' : 'pnpm';
+            const requested = Number(env.TASKGRAPH_CONCURRENCY || 0);
+            const concurrency = Number.isSafeInteger(requested) && requested > 0 ? requested : defaultConcurrency();
+            const isolate = env.TASKGRAPH_ISOLATE === 'false' ? null : path.join(env.RUNNER_TEMP || os.tmpdir(), 'taskgraph');
+            if (isolate) fs.mkdirSync(isolate, { recursive: true });
+            console.log(`taskgraph: ${names.length} task(s) on ${concurrency} CPU slot(s)${isolate ? ', one isolated worktree each' : ''}: ${names.join(', ')}`);
+            const t0 = Date.now();
+            const failures = [];
+            const running = new Map();
+            // A line a minute naming what is still running, so a slow task shows in the log while it runs.
+            const heartbeat = setInterval(() => {
+              const now = Date.now();
+              console.log(`taskgraph: ${seconds(now - t0)} in; running ${[...running].map(([n, at]) => `${n} (${seconds(now - at)})`).join(', ') || 'nothing'}`);
+            }, 60000);
+            heartbeat.unref();
+            const requestedTimeout = Number(env.TASKGRAPH_TASK_TIMEOUT_MS || 0);
+            let results;
+            try {
+              results = await runTasks({
+                planTasks, names, cwd: process.cwd(), concurrency, isolate, env,
+                timeoutMs: requestedTimeout > 0 ? requestedTimeout : TASK_TIMEOUT_MS,
+                command: name => [pm, 'run', name],
+                onEvent: e => {
+                  if (e.type === 'start') running.set(e.task, Date.now());
+                  else running.delete(e.task);
+                  if (e.type === 'start') console.log(`▶ ${e.task}`);
+                  else if (e.type === 'blocked') console.log(`⊘ ${e.task}: not run, a dependency failed`);
+                  else if (e.type === 'end') {
+                    const mark = e.status === 'passed' ? '✓' : '✗';
+                    console.log(`::group::${mark} ${e.task} (${seconds(e.durationMs)})`);
+                    process.stdout.write(e.output.endsWith('\n') || e.output === '' ? e.output : `${e.output}\n`);
+                    console.log('::endgroup::');
+                    if (e.status !== 'passed') failures.push(e);
+                  }
+                },
+              });
+            } finally {
+              clearInterval(heartbeat);
+              if (isolate) {
+                fs.rmSync(isolate, { recursive: true, force: true });
+                try { execFileSync('git', ['worktree', 'prune'], { stdio: 'ignore' }); } catch { /* best effort */ }
+              }
+            }
+            // Failures again, ungrouped, so the error is the last thing in the log.
+            for (const e of failures) {
+              console.log(`::error title=${e.task} failed::${e.task} exited non-zero after ${seconds(e.durationMs)}; its full log is in the "✗ ${e.task}" group above`);
+              process.stdout.write(e.output.split('\n').slice(-60).join('\n'));
+              process.stdout.write('\n');
+            }
+            const passedKeys = planTasks.filter(t => t.cache && results[t.task]?.status === 'passed').map(t => t.key);
+            const digest = passedKeys.length ? manifestDigest(passedKeys) : '';
+            if (env.GITHUB_OUTPUT) {
+              fs.appendFileSync(env.GITHUB_OUTPUT, `digest=${digest}\nresults=${JSON.stringify(results)}\n`);
+            }
+            const ok = Object.values(results).every(r => r.status === 'passed');
+            const wall = Date.now() - t0;
+            console.log(`taskgraph: ${ok ? 'all passed' : 'FAILED'} in ${seconds(wall)}`);
+            // One annotation with the timings: it reaches the checks API even when the
+            // log cannot be read.
+            const slowest = names.map(n => [n, results[n]]).sort((a, b) => b[1].durationMs - a[1].durationMs).slice(0, 12)
+              .map(([n, r]) => `${n} ${seconds(r.durationMs)}${r.status === 'passed' ? '' : ` ${r.status}${r.signal === 'timeout' ? ' (timeout)' : ''}`}`);
+            const lim = cgroupLimits();
+            const gib = b => (Number.isFinite(b) ? `${(b / 1024 ** 3).toFixed(1)} GiB` : 'none');
+            const machine = `${os.availableParallelism ? os.availableParallelism() : os.cpus().length} cpus, ${gib(os.totalmem())} RAM, cgroup cpus ${Number.isFinite(lim.cpus) ? lim.cpus : 'none'}, cgroup memory ${gib(lim.memory)}`;
+            console.log(`::notice title=taskgraph ${ok ? 'passed' : 'failed'} in ${seconds(wall)}::${names.length} task(s) on ${concurrency} slot(s) (${machine}); slowest: ${slowest.join(', ')}`);
+            if (env.GITHUB_STEP_SUMMARY) {
+              const mark = { passed: '✓ passed', failed: '✗ failed', blocked: '⊘ not run (a dependency failed)' };
+              const rows = names.map(n => `| \`${n}\` | ${mark[results[n].status]} | ${seconds(results[n].durationMs)} |`);
+              const serial = Object.values(results).reduce((sum, r) => sum + r.durationMs, 0);
+              fs.appendFileSync(env.GITHUB_STEP_SUMMARY, `### taskgraph run: ${seconds(wall)} wall for ${seconds(serial)} of task time on ${concurrency} slot(s)\n\n| Task | Result | Time |\n|---|---|---:|\n${rows.join('\n')}\n`);
+            }
+            return ok ? 0 : 1;
+          }
+
+          module.exports = {
+            ENGINE, POINTER_SCHEMA, PUBLISH_STEP, LOCKFILES, NODE_VERSION_FILES,
+            sha256, parseJsonc, globToRegExp, entriesFromApi, entriesFromLsTree, fingerprint,
+            selectTasks, plan, executionSet, legsOf, manifestDigest, proofKey, findTaskProof, publishTaskProofs,
+            normalizeDir, planStep, publishStep,
+            isolatedWorkspace, outputDirs, cgroupLimits, defaultConcurrency, runTasks, main,
+          };
+
+          if (require.main === module) {
+            main().then(code => process.exit(code), error => {
+              console.log(`::error::taskgraph: ${error.stack || error.message}`);
+              process.exit(1);
+            });
+          }
+          TASKGRAPH_ENGINE
+
+      # PLAN, from the GitHub API alone: the tested commit's tree (every
+      # blob hash), turbo.json, package.json and the Node version file. No
+      # checkout. Then one store lookup per task; GitHub must confirm each.
+      # The misses are split into legs, one machine each (see `tasks`).
+      - name: Plan tasks
+        id: plan
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          WORKING_DIRECTORY: ${{ inputs.working-directory }}
+          NODE_VERSION: ${{ inputs.node-version }}
+          NODE_VERSION_FILE: ${{ inputs.node-version-file }}
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+          INSTALL_SCRIPT: ${{ inputs.install-script }}
+          REUSE: ${{ inputs.reuse }}
+          CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+          CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
+          CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
+        with:
+          script: |
+            const tg = require(`${process.env.RUNNER_TEMP}/taskgraph.cjs`);
+            const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
+            await tg.planStep({ github, context, core, store });
+
+
+  # One machine per leg (Vercel CI gives every task its own). Untagged misses
+  # share one leg; a task tagged `ci:machine` gets a leg of its own, with the
+  # tasks that read its outputs, because one seat cannot hold several heavy
+  # Node tools at once (operator-portal's build, typecheck, lint and unit
+  # suite each ran past 20 minutes side by side on one linux-ci seat,
+  # 2026-10-29, and took 163-258 s each on a larger machine).
+  tasks:
+    name: Tasks (${{ matrix.leg.id }})
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.plan.outputs.legs) }}
+    # Blacksmith overflow and CI_LINUX_RUNNER exactly as nuxt-cloudflare.yml's
+    # ordinary route (README "Runner routing", D-CI-CAP-1 (c)/D-BLACKSMITH-2).
+    runs-on: ${{ fromJSON(github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+    # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
+    timeout-minutes: 30
+    permissions:
+      # checkout
+      contents: read
+      # private GitHub Packages bundle (install)
+      packages: read
+      # portal-served app config for caller scripts (D-PORTAL-APP-CONFIG-1),
+      # as nuxt-cloudflare.yml's caller-code jobs
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Depth 1: keys replace diff-based selection, so nothing reads HEAD^1.
+          fetch-depth: 1
+
+      - name: Install CI artifact store client
+        working-directory: ${{ github.workspace }}
+        run: *install_ci_artifact_store
+
+      - name: Install taskgraph engine
+        working-directory: ${{ github.workspace }}
+        run: *install_taskgraph_engine
+
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        if: inputs.package-manager == 'pnpm'
+        # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
+        # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic).
+        env:
+          PNPM_CONFIG_LOGLEVEL: error
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          # Mutually exclusive on setup-node: node-version-file wins when set.
+          node-version-file: ${{ inputs.node-version-file }}
+          node-version: ${{ inputs.node-version-file == '' && inputs.node-version || '' }}
+          package-manager-cache: false
+
+      # Restore-only dependency cache on GitHub-hosted runners, keyed and
+      # placed exactly as nuxt-cloudflare.yml's (README "Dependency caching").
+      # A self-hosted guest's store is persistent and shared (R8).
+      - name: Resolve dependency cache directory
+        id: dep-cache-dir
+        if: (runner.environment == 'github-hosted')
+        run: |
+          set -euo pipefail
+          # Beside the checkout, not in it, and absolute with no `..`
+          # (actions/cache rejects relative patterns; workflows#177).
+          cache_root="$(dirname "$GITHUB_WORKSPACE")/.ci-cache"
+          if [ "${{ inputs.package-manager }}" = "pnpm" ]; then
+            pnpm config set store-dir "$cache_root/pnpm-store"
+            echo "path=$cache_root/pnpm-store" >> "$GITHUB_OUTPUT"
+          else
+            npm config set cache "$cache_root/npm"
+            echo "path=$cache_root/npm" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore dependency cache
+        id: dep-cache
+        if: (runner.environment == 'github-hosted')
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.dep-cache-dir.outputs.path }}
+          key: node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-${{ hashFiles(format('{0}/pnpm-lock.yaml', inputs.working-directory), format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
+
+      - name: Configure package registry auth
+        if: inputs.install-script == ''
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+        run: |
+          set -euo pipefail
+          set +x
+          if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
+            if ! package_scope=$(node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          try {
+            const pkg = fs.existsSync('package.json') ? JSON.parse(fs.readFileSync('package.json', 'utf8')) : {};
+            const dependencies = Object.assign({}, pkg.dependencies, pkg.devDependencies, pkg.optionalDependencies, pkg.peerDependencies);
+            const uses = scope => Object.entries(dependencies).some(([name, spec]) => new RegExp(`@narduk-${scope}/`).test(`${name} ${spec}`));
+            const locked = ['pnpm-lock.yaml', 'package-lock.json', 'yarn.lock', 'bun.lock'].some(file => fs.existsSync(file) && fs.readFileSync(file, 'utf8').includes('npm.pkg.github.com'));
+            // workflows#106: a committed project .npmrc that routes the
+            // @narduk-enterprises scope to the anonymous npm.nard.uk mirror
+            // (company-hq D-PKG-6) needs no credential. The mirror serves only
+            // that scope, so @narduk-geo stays private; a lockfile or .npmrc
+            // pointed back at GitHub Packages is private again (break-glass).
+            const npmrc = fs.existsSync('.npmrc') ? fs.readFileSync('.npmrc', 'utf8') : '';
+            const routes = [...npmrc.matchAll(/^[ \t]*@narduk-enterprises:registry[ \t]*=[ \t]*"?([^"\s]*)"?[ \t]*$/gm)].map(match => match[1]);
+            const mirrored = routes.length > 0 && /^https:\/\/npm\.nard\.uk\/?$/.test(routes.at(-1));
+            console.log(locked || uses('geo') || (uses('enterprises') && !mirrored) ? 'private' : 'public');
+          } catch {
+            console.error('Cannot determine package registry requirements from repository metadata.');
+            process.exitCode = 1;
+          }
+          NODE
+            ); then
+              exit 1
+            fi
+            if [ "$package_scope" = private ]; then
+              echo '::error::Private packages require the org NARDUK_PLATFORM_GH_PACKAGES_READ secret forwarded to this workflow. It maps to GH_PACKAGES_READ; do not substitute a GitHub App or write token.'
+              exit 1
+            fi
+            echo 'No GitHub Packages dependencies (none, or @narduk-enterprises via npm.nard.uk) and no package-read secret; skipping registry auth.'
+            exit 0
+          fi
+          if [[ "$NARDUK_PLATFORM_GH_PACKAGES_READ" == *[[:space:]]* ]]; then
+            echo '::error::Package-read credential contains whitespace; repair the mapped secret.'
+            exit 1
+          fi
+          if [ -f ./scripts/package-registry-auth.mjs ]; then
+            node ./scripts/package-registry-auth.mjs
+          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
+            node ./tools/configure-package-registry-auth.mjs
+          else
+            # Direct org PAT path; legacy caller bootstraps keep their existing contract.
+            umask 077
+            # Variable reference stays literal; the token never enters this file.
+            # shellcheck disable=SC2016
+            printf '@narduk-enterprises:registry=https://npm.pkg.github.com\n@narduk-geo:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=${GH_PACKAGES_READ}\n' > .npmrc.auth
+          fi
+
+      # The pnpm store must sit on the workspace's own filesystem or pnpm
+      # copies every file instead of hard-linking it (R9; nuxt-cloudflare.yml
+      # "SELF-HOSTED: THE PNPM STORE MUST SIT ON THE WORKSPACE'S OWN FILESYSTEM").
+      - name: Point pnpm at a workspace-local store (self-hosted)
+        if: (runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm')
+        run: |
+          set -euo pipefail
+          mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
+          if [ "$mount_point" = "/" ]; then
+            echo "workspace is on the root filesystem; pnpm's default store already shares its device"
+            exit 0
+          fi
+          store="$mount_point/pnpm-store"
+          if [ ! -d "$store" ] || [ ! -w "$store" ]; then
+            echo "no writable store at $store; keeping pnpm's default store (installs will copy, not link)"
+            exit 0
+          fi
+          echo "npm_config_store_dir=$store" >> "$GITHUB_ENV"
+          echo "pnpm store -> $store (same filesystem as $GITHUB_WORKSPACE)"
+      - name: Install dependencies (pnpm)
+        if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
+        run: pnpm install --frozen-lockfile
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      - name: Install dependencies (npm)
+        if: inputs.install-script == '' && inputs.package-manager == 'npm'
+        run: npm ci
+        env:
+          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
+          NPM_CONFIG_GLOBALCONFIG: /dev/null
+      # Exact-path cleanup: a persistent self-hosted workspace must not keep
+      # registry credentials after install (success, failure or cancel), and
+      # no task may read them.
+      - name: Remove package auth materialization
+        if: always() && inputs.install-script == ''
+        working-directory: ${{ github.workspace }}
+        run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
+      - name: Install dependencies (caller script)
+        if: inputs.install-script != ''
+        env:
+          INSTALL_SCRIPT: ${{ inputs.install-script }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
+          # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
+          # org package-read secret to GH_PACKAGES_READ (workflows#98).
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          PM: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          case "$INSTALL_SCRIPT" in
+            ''|*[!A-Za-z0-9:_-]*)
+              echo "::error::install-script must be one package.json script name"
+              exit 1
+              ;;
+          esac
+          raw=$(npm pkg get "scripts.$INSTALL_SCRIPT" 2>/dev/null || echo '{}')
+          present=$(printf '%s' "$raw" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v;try{v=JSON.parse(s)}catch{return process.stdout.write("no")}const vals=(v&&typeof v==="object"&&!Array.isArray(v))?Object.values(v):[v];process.stdout.write(vals.some(x=>typeof x==="string"&&x.length>0)?"yes":"no")})')
+          if [ "$present" != "yes" ]; then
+            echo "::error::install-script names \"$INSTALL_SCRIPT\" but no such script exists"
+            exit 1
+          fi
+          "$PM" run "$INSTALL_SCRIPT"
+
+      # RUN: this leg's tasks (its misses plus any dependency whose outputs
+      # they need), side by side in dependency order, each in its own
+      # worktree. Every task's log is its own group; failures are repeated,
+      # ungrouped, at the end.
+      - name: Run tasks
+        id: run
+        env:
+          TASKGRAPH_PLAN: ${{ needs.plan.outputs.plan }}
+          TASKGRAPH_RUN: ${{ matrix.leg.names }}
+          TASKGRAPH_PM: ${{ inputs.package-manager }}
+          TASKGRAPH_CONCURRENCY: ${{ inputs.concurrency }}
+        run: node "$RUNNER_TEMP/taskgraph.cjs"
+
+      # One pointer per passed task. Its NAME carries the digest of the passed
+      # manifest, which is what a later run's plan asks GitHub to confirm, so
+      # it runs after a partial failure too (the passes are still passes). A
+      # fork pull request has no store credentials and writes nothing.
+      - name: Publish task proofs ${{ steps.run.outputs.digest }}
+        if: always() && steps.run.outputs.digest != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          TASKGRAPH_PLAN: ${{ needs.plan.outputs.plan }}
+          TASKGRAPH_RESULTS: ${{ steps.run.outputs.results }}
+          CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+          CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
+          CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
+        with:
+          script: |
+            const tg = require(`${process.env.RUNNER_TEMP}/taskgraph.cjs`);
+            const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
+            await tg.publishStep({ context, core, store });
+
+
+  required:
+    name: Required
+    needs: [plan, tasks]
+    if: "!cancelled()"
+    # A verdict and Caller lint: the lightweight route.
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      # Green only when the plan succeeded and, if it found work, every leg
+      # passed; a run whose tasks all passed before has no legs at all.
+      - name: Require the plan and every leg to pass
+        working-directory: ${{ github.workspace }}
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          RUN: ${{ needs.plan.outputs.run }}
+          TASKS_RESULT: ${{ needs.tasks.result }}
+        run: |
+          set -euo pipefail
+          echo "plan: $PLAN_RESULT (work to run: ${RUN:-unknown}); legs: $TASKS_RESULT"
+          if [ "$PLAN_RESULT" != success ]; then
+            echo "::error::Plan did not succeed ($PLAN_RESULT)"
+            exit 1
+          fi
+          if [ "$RUN" = true ] && [ "$TASKS_RESULT" != success ]; then
+            echo "::error::A task leg did not pass ($TASKS_RESULT)"
+            exit 1
+          fi
+          if [ "$RUN" != true ] && [ "$TASKS_RESULT" != skipped ]; then
+            echo "::error::Plan found nothing to run, but the legs report $TASKS_RESULT"
+            exit 1
+          fi
+
+      # Caller lint reads only `.github` (and local action metadata).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: "!cancelled()"
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github
+            action.yml
+            action.yaml
+          sparse-checkout-cone-mode: false
+
+      # CALLER LINT, as nuxt-cloudflare.yml's `Required` runs it (byte-equal
+      # step text; scripts/test_taskgraph.py holds the copies together):
+      # actionlint plus the hygiene audit over the CALLER's own
+      # .github/workflows. `!cancelled()`, so a failed leg and a lint finding
+      # are both reported in one run.
+      - name: Ensure PyYAML is available
+        if: "!cancelled()"
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          if python3 -c "import yaml" 2>/dev/null; then
+            echo "PyYAML already available"
+          else
+            echo "PyYAML missing on this guest; installing into user site-packages"
+            python3 -m pip install --user --quiet pyyaml
+            python3 -c "import yaml" || { echo "::error::PyYAML still unavailable after install"; exit 1; }
+          fi
+
+      - name: Cache actionlint
+        if: "!cancelled() && runner.environment == 'github-hosted'"
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.tool_cache }}/actionlint-native-alerts
+          key: actionlint-native-alerts-1.7.12-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install actionlint
+        if: "!cancelled()"
+        working-directory: ${{ github.workspace }}
+        env:
+          ACTIONLINT_INSTALLER_SHA: 8876c3ae06c937b11cb5a5d3acb3fe63ba6b18d3
+          ACTIONLINT_INSTALLER_SHA256: 5be3eff1deb7e8237ae72f7f38a77216de0f2b550350e5a4c3dc796049822039
+        run: |
+          set -euo pipefail
+          # Same reviewed installer as ci.yml. Fetch immutable public source,
+          # verify its checksum before execution, and retain all lint rules.
+          installer=$(mktemp "${RUNNER_TEMP}/actionlint-installer.XXXXXX")
+          trap 'rm -f "$installer"' EXIT
+          curl -sSfL --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 20 --max-time 60 \
+            "https://raw.githubusercontent.com/narduk-enterprises/workflows/${ACTIONLINT_INSTALLER_SHA}/scripts/install-actionlint-native-alerts.sh" \
+            -o "$installer"
+          echo "${ACTIONLINT_INSTALLER_SHA256}  ${installer}" | sha256sum -c -
+          bash "$installer" ./actionlint
+
+      - name: actionlint (caller's own workflows)
+        if: "!cancelled()"
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(.github/workflows/*.yml .github/workflows/*.yaml)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no workflow files found under .github/workflows; nothing to lint"
+            exit 0
+          fi
+          ./actionlint -no-color "${files[@]}"
+
+      - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
+        if: "!cancelled()"
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF_AUDIT'
+          import glob
+          import re
+          import sys
+
+          import yaml
+
+          SHA_PIN = re.compile(r"^[0-9a-f]{40}$")
+          USES_LINE = re.compile(r"^\s*(?:-\s*)?uses:\s*(\S+)\s*(#.*)?$")
+          LOCAL_USES = ("./", "docker://")
+
+          files = sorted(
+              glob.glob(".github/workflows/*.yml") + glob.glob(".github/workflows/*.yaml")
+          )
+          if not files:
+              print("no caller workflow files found under .github/workflows; nothing to audit")
+              sys.exit(0)
+
+          findings = []
+
+          for path in files:
+              text = open(path, encoding="utf-8").read()
+              try:
+                  doc = yaml.safe_load(text)
+              except yaml.YAMLError as exc:
+                  findings.append(f"{path}: does not parse as YAML ({exc})")
+                  continue
+              if not isinstance(doc, dict):
+                  findings.append(f"{path}: does not parse as a YAML mapping")
+                  continue
+
+              # PyYAML parses the bare key `on:` as the boolean True.
+              on = doc.get("on", doc.get(True))
+              if isinstance(on, str):
+                  on_keys = {on}
+              elif isinstance(on, list):
+                  on_keys = set(on)
+              elif isinstance(on, dict):
+                  on_keys = set(on.keys())
+              else:
+                  on_keys = set()
+              # A workflow_call-only file is a callable, not a caller: its concurrency
+              # group would be evaluated in ITS OWN caller's context and could cancel
+              # that caller's run, so it must not declare one (the reason this repo's
+              # own callables never do -- see README "Concurrency is the caller's job").
+              is_callable_only = bool(on_keys) and on_keys.issubset({"workflow_call"})
+
+              if not is_callable_only and doc.get("concurrency") is None:
+                  findings.append(
+                      f"{path}: no workflow-level concurrency: block (repeated "
+                      "pushes/PR updates queue redundant runs instead of superseding "
+                      "them)"
+                  )
+
+              if doc.get("permissions") is None:
+                  findings.append(f"{path}: no top-level permissions: block")
+
+              for job_id, job in (doc.get("jobs") or {}).items():
+                  if not isinstance(job, dict):
+                      continue
+                  # A job whose only step is `uses:` a reusable workflow cannot
+                  # declare timeout-minutes at all -- the called workflow's own jobs
+                  # own that. Report it as information, not a finding.
+                  if "uses" in job:
+                      print(
+                          f"::notice::{path}: job '{job_id}' uses {job['uses']!r} -- "
+                          "its timeout lives in the called workflow, not here"
+                      )
+                  elif job.get("timeout-minutes") is None:
+                      findings.append(
+                          f"{path}: job '{job_id}' has no timeout-minutes (would "
+                          "inherit GitHub's 6-hour default)"
+                      )
+                  if job.get("permissions") is None:
+                      findings.append(
+                          f"{path}: job '{job_id}' has no permissions: block (job "
+                          "level replaces, never merges, the workflow level)"
+                      )
+
+              for lineno, line in enumerate(text.splitlines(), start=1):
+                  m = USES_LINE.match(line)
+                  if not m:
+                      continue
+                  ref = m.group(1)
+                  if ref.startswith(LOCAL_USES):
+                      continue
+                  if "@" not in ref:
+                      findings.append(f"{path}:{lineno}: `uses: {ref}` has no ref at all")
+                      continue
+                  pin = ref.rsplit("@", 1)[1]
+                  if not SHA_PIN.match(pin):
+                      findings.append(
+                          f"{path}:{lineno}: `uses: {ref}` is not pinned to a full "
+                          "40-character commit SHA"
+                      )
+
+          for item in findings:
+              print(f"::error::{item}")
+
+          print(f"\ncaller-lint: {len(files)} file(s) checked, {len(findings)} finding(s)")
+          sys.exit(1 if findings else 0)
+          PYEOF_AUDIT

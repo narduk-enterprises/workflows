@@ -2,12 +2,13 @@
 
 workflows holds the shared reusable GitHub Actions workflows that the rest of
 the `narduk-enterprises` estate calls instead of blob-copying YAML — fix CI in
-one place, not in a hundred repos. Ten callables live in
+one place, not in a hundred repos. Eleven callables live in
 [`.github/workflows/`](./.github/workflows/), all `on: workflow_call` only
 (`apple.yml`,
 `docs-governance.yml`, `node-library.yml`, `nuxt-cloudflare.yml`,
 `python-data.yml`, `reusable-browser-tests.yml`, `red-main-listener.yml`,
-`flake-digest.yml`, `design-ledger.yml`, `design-publish.yml`); `closing-syntax-check.yml`, `code-review.yml` and
+`flake-digest.yml`, `design-ledger.yml`, `design-publish.yml`,
+`taskgraph.yml`); `closing-syntax-check.yml`, `code-review.yml` and
 `reusable-node-ci.yml` were retired (narduk-reboot P3-C2 / O-D8, zero live
 callers/adopters re-verified, see README's Catalog and Adopters tables).
 `ci.yml` and `red-main-self.yml` are the two non-callables: this repo's own
@@ -45,7 +46,7 @@ kinds of check:
   shellcheck over every `run:` block. It needs `shellcheck` on PATH; without it
   actionlint skips run-block linting silently and still exits 0, so the workflow
   asserts its presence.
-- **`scripts/lint_callables.py` plus twelve `scripts/test_*.py`** — is the
+- **`scripts/lint_callables.py` plus the `scripts/test_*.py` suite** — is the
   callable *safe to ship*? Timeouts, permissions, SHA pins, `Required`
   completeness, concurrency, and behavior tests that extract the shipped `run:`
   text out of the callables and execute it against fixtures, so the tests cannot
