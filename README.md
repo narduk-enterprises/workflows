@@ -2351,7 +2351,8 @@ and attempt, and at the manifest of keys that attempt passed. It is honoured
 only when GitHub's API confirms all of the following:
 
 - the attempt belongs to this repository's own run (head repository included,
-  so no fork run counts) of the same caller workflow;
+  so no fork run counts) of the same caller workflow, at the same blob (a
+  branch that edits the workflow cannot vouch for this one's keys);
 - one of its `Tasks (<leg>)` jobs has a successful step named exactly
   `Publish task proofs <SHA-256 of the manifest>`;
 - the manifest holds the key.
@@ -2387,7 +2388,9 @@ checks the hash again and extracts the tarball into the producer's own
 directory, and the dependent gets those files exactly as from a producer that
 ran there.
 
-A tarball that is missing, expired or does not match is never used: that
+A tarball also holds the outputs its producer was handed: a restored build
+brings the codegen it was built from, so a dependent two levels down still
+gets every file it read before. A tarball that is missing, expired or does not match is never used: that
 producer runs in the leg instead. Proofs written before this cache carry no
 `outputs`, so their producers run as before.
 

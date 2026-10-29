@@ -994,7 +994,7 @@ jobs:
 
           // Honour a proof only when GitHub confirms the attempt it names (see the
           // header). `attempts` caches one confirmation per run attempt.
-          async function findTaskProof({ github, context, store, cfg, key, workflowPath, attempts }) {
+          async function findTaskProof({ github, context, store, cfg, key, workflowPath, callerBlob = null, attempts }) {
             const repository = `${context.repo.owner}/${context.repo.repo}`;
             const repositoryId = context.payload.repository.id;
             const objectKey = proofKey(store, repository, key);
@@ -1024,6 +1024,12 @@ jobs:
                 if (run.id !== pointer.run_id || run.run_attempt !== pointer.run_attempt || run.path !== workflowPath
                     || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) {
                   return { ok: false, reason: `run ${pointer.run_id} is not this repository's own run of ${workflowPath}` };
+                }
+                // The same caller workflow text, not just its path: a branch that edits
+                // the workflow to fake a publish step cannot vouch for this one's keys.
+                if (callerBlob) {
+                  const { data: file } = await github.rest.repos.getContent({ ...context.repo, path: workflowPath, ref: run.head_sha, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) } });
+                  if (!file || file.sha !== callerBlob) return { ok: false, reason: `run ${pointer.run_id} ran another version of ${workflowPath}` };
                 }
                 const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
                   ...context.repo, run_id: run.id, attempt_number: pointer.run_attempt, per_page: 100, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) },
@@ -1151,7 +1157,7 @@ jobs:
               if (!reuse) return { hit: false, reason: 'reuse: false' };
               if (!cfg) return { hit: false, reason: 'no store credentials' };
               try {
-                const proof = await findTaskProof({ github, context, store, cfg, key: t.key, workflowPath, attempts });
+                const proof = await findTaskProof({ github, context, store, cfg, key: t.key, workflowPath, callerBlob: caller?.sha || null, attempts });
                 return proof.found ? { hit: true, run: proof.run, output: proof.output } : { hit: false, reason: proof.reason };
               } catch (error) {
                 core.warning(`${t.task}: proof lookup failed, so it runs: ${error.message}`);
@@ -1325,6 +1331,19 @@ jobs:
           // first glob character (".nuxt/**" -> ".nuxt", "dist/*.js" -> "dist"). A glob
           // with no literal directory ("**/*.d.ts") cannot be carried and is refused at
           // plan time.
+          // A producer's worktree also holds the outputs it was handed (its own
+          // producers', copied in before it ran), and its dependents read those too:
+          // a restored build must bring the codegen it built from. Nearest last.
+          function carriedOutputDirs(planTasks, name) {
+            const byName = new Map(planTasks.map(t => [t.task, t]));
+            const order = [];
+            const seen = new Set();
+            const visit = n => { for (const d of byName.get(n).dependsOn) if (!seen.has(d)) { seen.add(d); visit(d); order.push(d); } };
+            visit(name);
+            order.push(name);
+            return [...new Set(order.flatMap(n => outputDirs(byName.get(n).outputs)))];
+          }
+
           function outputDirs(outputs) {
             const dirs = [];
             for (const raw of outputs || []) {
@@ -1410,7 +1429,7 @@ jobs:
                       // What turbo restores from cache before a dependent runs: the
                       // declared `outputs` of every dependency that ran here.
                       for (const dep of ancestorsOf(name)) {
-                        for (const rel of outputDirs(byName.get(dep).outputs)) {
+                        for (const rel of restored.has(dep) ? carriedOutputDirs(planTasks, dep) : outputDirs(byName.get(dep).outputs)) {
                           const from = path.join(dirs.get(dep), rel);
                           if (fs.existsSync(from)) {
                             fs.rmSync(path.join(taskCwd, rel), { recursive: true, force: true });
@@ -1496,7 +1515,7 @@ jobs:
             for (const t of planTasks) {
               if (!t.cache || !t.outputs.length || results[t.task]?.status !== 'passed' || !cwds.has(t.task)) continue;
               const base = cwds.get(t.task);
-              const present = outputDirs(t.outputs).filter(rel => fs.existsSync(path.join(base, rel)));
+              const present = carriedOutputDirs(planTasks, t.task).filter(rel => fs.existsSync(path.join(base, rel)));
               if (!present.length) continue;
               try {
                 fs.mkdirSync(dir, { recursive: true });
@@ -1525,11 +1544,13 @@ jobs:
             for (const r of legRestores(planTasks, planned, JSON.parse(env.TASKGRAPH_RESTORES || '{}'))) {
               const file = path.join(restoreTarballDir(env), `${r.key}.tar.gz`);
               try {
-                if (!fs.existsSync(file) || sha256(fs.readFileSync(file)) !== r.sha256) throw new Error('no checked tarball');
+                const body = fs.existsSync(file) ? fs.readFileSync(file) : null;
+                if (!body || sha256(body) !== r.sha256) throw new Error('no checked tarball');
                 const dir = path.join(env.RUNNER_TEMP || os.tmpdir(), 'taskgraph-restored', r.key);
                 fs.rmSync(dir, { recursive: true, force: true });
                 fs.mkdirSync(dir, { recursive: true });
-                execFileSync('tar', ['-xzf', file, '-C', dir, '--no-same-owner'], { stdio: ['ignore', 'ignore', 'inherit'] });
+                // The bytes just checked, not the file again.
+                execFileSync('tar', ['-xzf', '-', '-C', dir, '--no-same-owner'], { input: body, stdio: ['pipe', 'ignore', 'inherit'] });
                 restored.set(r.task, dir);
               } catch {
                 missing.add(r.task);
@@ -1625,7 +1646,7 @@ jobs:
             ENGINE, POINTER_SCHEMA, PUBLISH_STEP, LOCKFILES, NODE_VERSION_FILES,
             sha256, parseJsonc, globToRegExp, entriesFromApi, entriesFromLsTree, fingerprint,
             selectTasks, plan, executionSet, restoresFor, legsOf, manifestDigest, proofKey, outputObjectKey, findTaskProof, publishTaskProofs,
-            normalizeDir, planStep, publishStep, restoreStep, archiveOutputs,
+            normalizeDir, planStep, publishStep, restoreStep, archiveOutputs, carriedOutputDirs,
             isolatedWorkspace, outputDirs, cgroupLimits, defaultConcurrency, runTasks, main,
           };
 

@@ -240,7 +240,7 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
   fs.writeFileSync(path.join(repo, 'node_modules', 'dep', 'index.js'), '');
   fs.writeFileSync(path.join(repo, 'generated.txt'), 'gen');
   const graph = tasks => ({ tasks: Object.entries(tasks).map(([task, t]) => ({ task, key: tg.sha256(task), dependsOn: t.dependsOn || [], outputs: t.outputs || [], cache: t.cache !== false, cpus: t.cpus || 1, tagged: true, inputFiles: 0 })) });
-  const run = (g, names, opts = {}) => tg.runTasks({ planTasks: g.tasks, names, command: n => ['npm', 'run', '--silent', n], cwd: repo, concurrency: opts.concurrency || 4, isolate: opts.isolate === false ? null : path.join(tmp, `iso-${results.length}`), env: process.env, onEvent: opts.onEvent, timeoutMs: opts.timeoutMs });
+  const run = (g, names, opts = {}) => tg.runTasks({ planTasks: g.tasks, names, command: n => ['npm', 'run', '--silent', n], cwd: repo, concurrency: opts.concurrency || 4, isolate: opts.isolate === false ? null : path.join(tmp, `iso-${results.length}`), restored: opts.restored, env: process.env, onEvent: opts.onEvent, timeoutMs: opts.timeoutMs });
 
   await test('run: independent tasks overlap within the CPU budget, each in its own worktree', async () => {
     const g = graph({ a: {}, b: {}, c: { cpus: 2 } });
@@ -384,6 +384,8 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     rest: { actions: {
       getWorkflowRunAttempt: async ({ run_id, attempt_number }) => ({ data: { id: run_id, run_attempt: attempt_number, path: over.path || '.github/workflows/ci.yml', html_url: `https://x/${run_id}`, repository: { id: repoId }, head_repository: { id: over.headRepo || repoId } } }),
       listJobsForWorkflowRunAttempt: async () => ({ data: [{ name: over.job || 'ci / Tasks (all)', steps: [{ name: over.step || `Publish task proofs ${digest}`, conclusion: over.conclusion || 'success' }] }] }),
+    }, repos: {
+      getContent: async () => ({ data: { sha: over.blob || 'f'.repeat(40) } }),
     } },
   });
   const pointer = (over = {}) => JSON.stringify({ schema: tg.POINTER_SCHEMA, key, repository_id: repoId, run_id: 7, run_attempt: 1, manifest: [key, other], ...over });
@@ -407,6 +409,10 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
       ['another workflow', fakeGithub({ path: '.github/workflows/e2e.yml' })],
       ['a fork run', fakeGithub({ headRepo: 1 })],
     ]) assert.equal((await lookup(gh)).found, false, why);
+    // The attested run must have run this caller workflow's text, not only its path.
+    const withBlob = (gh, blob) => tg.findTaskProof({ github: gh, context, store: fakeStore, cfg, key, workflowPath: '.github/workflows/ci.yml', callerBlob: blob, attempts: new Map() });
+    assert.equal((await withBlob(fakeGithub(), 'f'.repeat(40))).found, true);
+    assert.equal((await withBlob(fakeGithub({ blob: 'e'.repeat(40) }), 'f'.repeat(40))).found, false, 'another version of the workflow');
     for (const [why, p] of [
       ['key not in manifest', pointer({ manifest: [other] })],
       ['another repository', pointer({ repository_id: 1 })],
@@ -442,6 +448,9 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.deepEqual(tg.executionSet(g.tasks, new Set(['e2e']), new Set(['build'])), ['e2e']);
     assert.deepEqual(tg.restoresFor(g.tasks, ['e2e'], new Set(['build'])), ['build']);
     assert.deepEqual(tg.restoresFor(g.tasks, ['build', 'test'], new Set(['build'])), [], 'a producer that runs is not restored');
+    // A restored producer carries what it was built from.
+    const chain = graph({ codegen: { outputs: ['gen/**'] }, build: { outputs: ['dist/**'], dependsOn: ['codegen'] } });
+    assert.deepEqual(tg.carriedOutputDirs(chain.tasks, 'build'), ['gen', 'dist']);
     const h = 'd'.repeat(64);
     assert.equal(tg.manifestDigest([key, other]), tg.manifestDigest([key, other], {}), 'no outputs: the digest is unchanged');
     assert.notEqual(tg.manifestDigest([key, other], { [key]: h }), tg.manifestDigest([key, other]));
@@ -506,6 +515,26 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     fs.rmSync(rt, { recursive: true, force: true });
   });
 
+  await test('outputs: a restored producer brings the outputs it was built from (two levels)', async () => {
+    // prepare (.nuxt) -> a (out-a) -> uses, which reads .nuxt: restoring `a` alone must bring .nuxt.
+    const g = graph({ prepare: { outputs: ['.nuxt/**'] }, a: { outputs: ['out-a/**'], dependsOn: ['prepare'] }, uses: { dependsOn: ['a'] } });
+    const cwds = new Map();
+    const r1 = await run(g, ['prepare', 'a'], { onEvent: e => { if (e.type === 'start') cwds.set(e.task, e.cwd); } });
+    assert.equal(r1.a.status, 'passed');
+    const dir = path.join(tmp, 'two-level');
+    const outs = tg.archiveOutputs({ planTasks: g.tasks, results: r1, cwds, dir });
+    const ak = tg.sha256('a');
+    const x = path.join(dir, 'x');
+    fs.mkdirSync(x, { recursive: true });
+    execFileSync('tar', ['-xzf', path.join(dir, `${ak}.tar.gz`), '-C', x]);
+    assert.ok(fs.existsSync(path.join(x, '.nuxt', 'marker')) && fs.existsSync(path.join(x, 'out-a', 'end')), 'a\'s tarball holds .nuxt and out-a');
+    assert.match(outs[ak], /^[0-9a-f]{64}$/);
+    fs.rmSync(path.join(repo, '.nuxt'), { recursive: true, force: true });
+    const r2 = await run(g, ['uses'], { restored: new Map([['a', x]]) });
+    assert.equal(r2.uses.status, 'passed', JSON.stringify(r2));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   // ---- the github-script steps ----
   const notes = [];
   const core = () => {
@@ -517,7 +546,7 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     const gh = fakeGithub(over);
     gh.rest.repos = {
       getCommit: async () => ({ data: { commit: { tree: { sha: 't'.repeat(40) } } } }),
-      getContent: async ({ path: p }) => { if (!(p in files)) { const e = new Error('404'); e.status = 404; throw e; } return { data: files[p] }; },
+      getContent: async ({ path: p }) => { if (p === '.github/workflows/ci.yml') return { data: { sha: '3'.repeat(40) } }; if (!(p in files)) { const e = new Error('404'); e.status = 404; throw e; } return { data: files[p] }; },
     };
     gh.rest.git = { getTree: async () => ({ data: { truncated: false, tree: [{ path: 'package.json', mode: '100644', type: 'blob', sha: '1'.repeat(40) }, { path: 'src/a.ts', mode: '100644', type: 'blob', sha: '2'.repeat(40) }, { path: '.github/workflows/ci.yml', mode: '100644', type: 'blob', sha: '3'.repeat(40) }] } }) };
     return gh;
