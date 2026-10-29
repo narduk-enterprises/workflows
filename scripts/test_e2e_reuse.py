@@ -209,7 +209,7 @@ def main() -> None:
     assert "store.publishProofStep({ core, context, kind: 'e2e' })" in publish['with']['script']
     required_install = next(step for step in required if step.get('name') == INSTALL_STEP)
     assert required.index(required_install) < required.index(publish)
-    assert required_install['if'] == "success() && github.event_name == 'pull_request'"
+    assert required_install['if'] == "needs.ci-admission.outputs.skip != 'true' && (success() && github.event_name == 'pull_request')"
     print('PASS  only an actually successful full PR gate can publish proof, under a name that carries its key')
 
     baseline = run_lookup(script, {})

@@ -41,6 +41,8 @@ class ExactCandidate(unittest.TestCase):
                         condition = f"!cancelled() && inputs.mode != 'e2e' && {condition}"
                     if name == 'fast-escalated':
                         condition = f"env.FAST_ENABLED == 'true' && !cancelled() && {condition}"
+                    if name in ('fast', 'fast-escalable', 'fast-lanes', 'required', 'fast-escalated'):
+                        condition = "needs.ci-admission.outputs.skip != 'true' && (" + condition + ")"
                     self.assertEqual(guard['if'], condition, name)
                     self.assertEqual(guard['working-directory'], '${{ github.workspace }}')
         self.assertGreaterEqual(checked, 8)
@@ -115,7 +117,8 @@ class ExactCandidate(unittest.TestCase):
             steps = {step.get('name'): step for step in job['steps']}
             for name in caller_lint:
                 with self.subTest(job=job.get('name'), step=name):
-                    self.assertEqual(steps[name].get('if'), expected)
+                    self.assertEqual(steps[name].get('if'),
+                                     "needs.ci-admission.outputs.skip != 'true' && (" + expected + ")")
         gate = next(step for step in required['steps'] if step.get('name') ==
                     'Require enabled gates to succeed and disabled gates to skip')
         script = gate['run'].replace('${{ inputs.extra-gate-scripts }}', '')

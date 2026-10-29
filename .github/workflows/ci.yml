@@ -40,8 +40,8 @@ permissions:
 # "Concurrency is the caller's job". Note this workflow is NOT a callable, so
 # unlike the files it lints it may (and should) set this.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != format('refs/heads/{0}', github.event.repository.default_branch) }}
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   empty-selection:
@@ -122,6 +122,9 @@ jobs:
 
       - name: Structural gate (timeouts, permissions, pins, Required, concurrency)
         run: python3 scripts/lint_callables.py
+
+      - name: PR admission and cancellation regression tests
+        run: python3 scripts/test_ci_admission.py
 
       # R10: `| tee` without pipefail reintroduces exit-code masking. The live
       # workflows currently have zero `| tee` uses; this keeps it that way.

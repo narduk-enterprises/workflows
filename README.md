@@ -81,7 +81,8 @@ in their app-class workflow.
 | `taskgraph.yml` | **New 2026-10-29.** Vercel CI's model (beta 2026-10-28) for any `package.json`-script repo: the caller's `turbo.json` tags the CI tasks, each task gets a content key from Git's blob hashes, a task whose key already passed is never run again (a pointer in the R2 CI artifact store that GitHub's API must confirm), and the rest run side by side in one job after one install, each in its own worktree. One `Required` job, eight inputs. See [taskgraph.yml](#taskgraphyml) |
 
 All eleven shipped callables are `on: workflow_call` only — none of them declare their own
-triggers, and none declare `concurrency:` (see "How to consume" below for why).
+triggers, and none declare workflow-level `concurrency:` (see "How to consume"
+below for job-level cancellation and the caller's workflow group).
 
 ### Adopters
 
@@ -461,14 +462,51 @@ group and **cancel the run that is calling us**. Seven repos would start
 cancelling their own CI the moment `v1` moved, and the symptom (a run that
 cancels itself for no visible reason) points at the adopter, not at here.
 
-A callable-level group that was carefully uniquified to avoid the collision
-would still buy nothing: `cancel-in-progress` on the caller's workflow-level
-group already supersedes the *entire* previous run, jobs of this callable
-included. A second gate underneath it can only add a way to be wrong.
+The six CI callables also apply **job-level** concurrency as a fallback for
+callers whose workflow group does not cancel superseded PR work. Groups have
+a reserved `workflows-<callable>-<job>-` prefix, the caller workflow name,
+working directory, optional `ci-concurrency-key`, PR number and matrix identity.
+They never share the caller's workflow group. Give each invocation a distinct
+`ci-concurrency-key` when calling the same callable more than once from one
+workflow. Reserve the `workflows-` prefix for the shared workflows.
+
+Only `pull_request` work is cancelled. Every other event gets a unique
+run-id/attempt group, so even a *pending* default-branch push cannot be
+superseded by another push. Nuxt E2E mode, exact-candidate validation and
+post-deploy journey smoke also use unique groups and never cancel. Job-level
+groups cancel work when its replacement job starts; retain caller-level PR
+concurrency to cancel the entire old run immediately, including jobs omitted
+by a changed plan. Deployment workflows must retain their own safe policy.
 
 `concurrency` **is** a permitted key on a job that calls a reusable workflow,
 so a caller with an unusual need can scope it at `jobs.ci.concurrency` — but
 per the same doc, do not reuse the callable's group value there either.
+
+#### Draft PRs and metadata edits
+
+Apple, Node library, Python data, docs governance, Nuxt CI and reusable browser
+tests run a lightweight `CI admission` job only for draft PRs. Ready PR updates
+and non-PR events allocate no admission runner. Heavy draft jobs are deferred;
+`Required` (and Nuxt's applicable `Fast`) still reports a completed **failure**
+explaining how to run validation. A draft must never leave an untested success
+that could satisfy protection after it becomes ready. Nuxt's E2E, exact-candidate
+and post-deploy smoke invocations are excluded. Deferred paths never publish
+build or gate proof artifacts.
+
+After marking a PR ready, push a commit or choose **Re-run all jobs** to run
+validation. **Re-run failed jobs** preserves the succeeded admission job's draft
+outputs and leaves validation deferred. For automatic recovery on marking ready,
+callers must explicitly include `ready_for_review` in `pull_request.types` along
+with their other desired activity types; the default types do not receive it.
+A full rerun bypasses draft deferral even though its event payload still says draft.
+
+Title/body edits run normal validation when the caller subscribes to `edited`.
+Admission does not reuse earlier successful runs: a workflow run's
+`pull_requests[]` reflects the PR's current head and base, so it cannot prove
+which base was validated at run time. This also avoids sharing validation
+between two PRs from one head branch targeting different bases. This repository's
+own default PR trigger excludes metadata-only edits. No caller permission or
+trigger change is required for draft deferral or normal validation.
 
 #### Path filtering: use the boolean inputs, never `paths` / `paths-ignore`
 
@@ -601,6 +639,15 @@ Swift SourceKit runtime. The install step separately fails closed unless
 `/usr/lib/libsourcekitdInProc.so` is readable, exports that exact path through
 `LINUX_SOURCEKIT_LIB_PATH`, and still locates the unpacked `swiftlint` binary
 with `find` because upstream archive layouts have changed.
+
+Build and test share the host-wide Apple build lease
+(agent-infrastructure#965) and take it **once**, in one step, through the
+installed `apple_build_lock.py run`. The job queues inside that call with the
+same retry as every other caller, prints one `QUEUED` line and a heartbeat a
+minute, and has two separate budgets: `lease-wait-minutes` (default 60) for
+the queue, then `xcode-timeout-minutes` for the work, counted from the moment
+the lease is held. A busy host therefore fails as "lease still busy", never as
+a build timeout that ran no build.
 
 Archive/sign/notarize/TestFlight/Sparkle are **not** here, for the same reason
 `node-library.yml` omits publish: they need temporary keychains, the host-wide
@@ -1244,7 +1291,7 @@ jobs:
 Format the stamped file with the app's own Prettier config: apps that run `format:check` over `.github/workflows` (cloudflarestat-us, single quotes) fail a double-quoted cron.
 
 The calling job id stays `ci` so the composed context reads `E2E / ci / Required`.
-`concurrency` sits in the caller, never in the callable (R6). Pass the same
+Workflow-level `concurrency` sits in the caller (R6). Pass the same
 `permissions:` block the app's `ci` job grants: a job in the callable may only
 use what its caller granted (R12).
 
@@ -2778,7 +2825,7 @@ direction that would have made a fine timeout look nearly breached.
 
 | Callable | Job | Timeout | p50 | p95 | max | n | repos | ×p95 |
 |---|---|---|---|---|---|---|---|---|
-| `apple.yml` | `xcode` | 45 (`xcode-timeout-minutes`) | 116s | 228s | 231s | 8 | 4 | 11.8× |
+| `apple.yml` | `xcode` | 45 work after the lease (`xcode-timeout-minutes`) + 60 queue (`lease-wait-minutes`); job backstop 360 | 116s | 228s | 231s | 8 | 4 | 11.8× |
 | `apple.yml` | `lint` | 15 (`lint-timeout-minutes`) | 8s | 12s | 12s | 4 | 2 | 75.9× |
 | `docs-governance.yml` | `check` | 15 | 10s | 18s | 22s | **39** | 1 | 49.7× |
 | `node-library.yml` | `package / <label>` | 30 | 78s | 289s | 298s | 17 | 4 | **6.2×** |

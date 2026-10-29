@@ -83,15 +83,17 @@ def check_job_wiring() -> None:
     # The leading status guard replaces the implicit success() that a skipped
     # `Reuse plan` ancestor would turn false (scripts/test_fast_path.py).
     assert e2e["if"] == (
+        "!cancelled() && needs.ci-admission.outputs.skip != 'true' && ("
         "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' "
         "&& (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' "
         "|| inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) "
-        "&& needs.e2e-plan.outputs.skipped != 'true'"
+        "&& needs.e2e-plan.outputs.skipped != 'true')"
     )
     assert "e2e-plan" in e2e["needs"]
 
     required = jobs["required"]
-    step = required["steps"][0]
+    assert required["steps"][0]["name"] == "Check CI admission"
+    step = named_step(required, "Require enabled gates to succeed and disabled gates to skip")
     assert step["env"]["E2E_PLAN_SKIPPED"] == "${{ needs.e2e-plan.outputs.skipped }}"
     assert "E2E_PLAN_SKIPPED" in step["run"]
     print("PASS  E2E / Required both gate on e2e-plan's skipped output")

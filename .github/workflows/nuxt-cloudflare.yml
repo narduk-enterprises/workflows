@@ -206,6 +206,11 @@ permissions:
 on:
   workflow_call:
     inputs:
+      ci-concurrency-key:
+        description: "Stable unique key per invocation when this callable is used more than once in the same caller workflow."
+        required: false
+        type: string
+        default: ''
       expected-candidate-sha:
         description: >-
           Optional full 40-character commit SHA for explicitly requested release
@@ -1172,6 +1177,34 @@ env:
   NUXT_TELEMETRY_DISABLED: 1
 
 jobs:
+  ci-admission:
+    name: CI admission
+    if: "(github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.draft"
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+      reason: ${{ steps.plan.outputs.reason }}
+    steps:
+      - name: Plan PR validation
+        id: plan
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            core.setOutput('skip', 'false');
+            core.setOutput('reason', 'validate');
+            const pr = context.payload.pull_request;
+            if (context.eventName !== 'pull_request' || !pr) return;
+            if (Number(process.env.GITHUB_RUN_ATTEMPT || '1') > 1) return;
+            if (pr.draft) {
+              core.setOutput('skip', 'true');
+              core.setOutput('reason', 'draft');
+              return;
+            }
+
   # TREE-MATCH REUSE OF THE WHOLE GATE (`required-reuse-pr-results`, P3-C1).
   # Runs only on a default-branch push of a caller that opted in. It never
   # fails the run on a lookup problem: any error leaves `reused` unset, and
@@ -1191,14 +1224,12 @@ jobs:
   # rule and fails when any pre-existing job runs or skips differently from
   # the previous revision's graph.
   reuse-plan:
+    needs: [ci-admission]
+    concurrency:
+      group: workflows-nuxt-cloudflare-reuse-plan-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Reuse plan
-    if: >-
-      inputs.mode != 'e2e'
-      && inputs.required-reuse-pr-results
-      && inputs.journey-smoke-url == ''
-      && github.event_name == 'push'
-      && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    # CI lightweight route (company-hq CI policy); caller override takes precedence.
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))"
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
     timeout-minutes: 20
@@ -1771,14 +1802,17 @@ jobs:
             }
 
   build:
+    concurrency:
+      group: workflows-nuxt-cloudflare-build-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     # Named `Required` when it is the only lane for this event (REQUIRED
     # FOLDED INTO BUILD in the header); `Build` otherwise, as before.
-    name: ${{ (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results) && 'Required' || 'Build' }}
+    name: ${{ (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results && needs.ci-admission.outputs.skip != 'true') && 'Required' || 'Build' }}
     # P3-C1: skipped only when `Reuse plan` proved this exact tree, or in
     # journey-smoke mode. `!cancelled()` keeps it running when `Reuse plan`
     # was skipped (the default) or could not decide.
-    needs: [reuse-plan, fast-plan]
-    if: "!cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')))"
+    needs: ["reuse-plan", "fast-plan", "ci-admission"]
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && !cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')) && needs.ci-admission.outputs.skip != 'true')"
     outputs:
       e2e-build-path: ${{ steps.e2e-build-path.outputs.path }}
       # JSON naming the CI artifact store object with its SHA-256, size and
@@ -3198,7 +3232,7 @@ jobs:
       # remove a required parser (mirrors ci.yml's own "Ensure PyYAML is
       # available" step).
       - name: Ensure PyYAML is available
-        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results && needs.ci-admission.outputs.skip != 'true')"
         working-directory: ${{ github.workspace }}
         run: &caller_lint_pyyaml |
           set -euo pipefail
@@ -3211,14 +3245,14 @@ jobs:
           fi
 
       - name: Cache actionlint
-        if: "(!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)) && runner.environment == 'github-hosted'"
+        if: "(!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results && needs.ci-admission.outputs.skip != 'true')) && runner.environment == 'github-hosted'"
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.tool_cache }}/actionlint-native-alerts
           key: actionlint-native-alerts-1.7.12-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install actionlint
-        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results && needs.ci-admission.outputs.skip != 'true')"
         working-directory: ${{ github.workspace }}
         env: &caller_lint_actionlint_env
           ACTIONLINT_INSTALLER_SHA: 8876c3ae06c937b11cb5a5d3acb3fe63ba6b18d3
@@ -3237,7 +3271,7 @@ jobs:
           bash "$installer" ./actionlint
 
       - name: actionlint (caller's own workflows)
-        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results && needs.ci-admission.outputs.skip != 'true')"
         working-directory: ${{ github.workspace }}
         run: &caller_lint_actionlint |
           set -euo pipefail
@@ -3250,7 +3284,7 @@ jobs:
           ./actionlint -no-color "${files[@]}"
 
       - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
-        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results)"
+        if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results && needs.ci-admission.outputs.skip != 'true')"
         working-directory: ${{ github.workspace }}
         run: &caller_lint_audit |
           set -euo pipefail
@@ -3367,12 +3401,14 @@ jobs:
   # is "after build-script, same lane"; scripts that do not need build output
   # belong in `extra-gate-scripts`, which already runs in parallel.
   checks:
+    concurrency:
+      group: workflows-nuxt-cloudflare-checks-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Checks
     # P3-C1: same reuse/smoke gating as `Build`. `checks-in-build` runs these
     # steps in `Build` instead, and this job is skipped.
-    needs: [reuse-plan, fast-plan]
-    if: "!cancelled() && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !inputs.checks-in-build && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')))"
-    # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
+    needs: ["reuse-plan", "fast-plan", "ci-admission"]
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !inputs.checks-in-build && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false'))))"
     runs-on: ${{ fromJSON(github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
     permissions:
@@ -3535,11 +3571,13 @@ jobs:
         run: *checks_ut_script
 
   extra-gate:
+    concurrency:
+      group: workflows-nuxt-cloudflare-extra-gate-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Extra gate
     # P3-C1: same reuse/smoke gating as `Build`.
-    needs: [reuse-plan, fast-plan]
-    if: "!cancelled() && inputs.mode != 'e2e' && inputs.extra-gate-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')))"
-    # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
+    needs: ["reuse-plan", "fast-plan", "ci-admission"]
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.mode != 'e2e' && inputs.extra-gate-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false'))))"
     runs-on: ${{ fromJSON(github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
     permissions:
@@ -3680,11 +3718,13 @@ jobs:
   # `build` for the prebuilt application, and Required still fails a run
   # whose build failed.
   e2e-plan:
+    concurrency:
+      group: workflows-nuxt-cloudflare-e2e-plan-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: E2E plan
     # P3-C1: same reuse/smoke gating as `Build`.
-    needs: [reuse-plan]
-    if: "!cancelled() && (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && inputs.e2e-full-paths == '')"
-    # CI lightweight route (company-hq CI policy); caller override takes precedence.
+    needs: ["reuse-plan", "ci-admission"]
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (!cancelled() && (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && inputs.e2e-full-paths == ''))"
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
@@ -4105,9 +4145,12 @@ jobs:
   # `success` and `full == 'false'`). `Required` needs it (R5) but does not
   # judge it: on any run where `Required` runs, the full gate ran.
   fast-plan:
+    needs: [ci-admission]
+    concurrency:
+      group: workflows-nuxt-cloudflare-fast-plan-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Fast plan
-    if: "!cancelled() && inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && inputs.e2e-full-paths != ''"
-    # CI lightweight route, the same as `E2E plan`.
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && inputs.e2e-full-paths != '')"
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     timeout-minutes: 20
     # The compare endpoint is a Contents read (see `E2E plan`).
@@ -4131,6 +4174,9 @@ jobs:
         run: *e2e_path_decision
 
   e2e:
+    concurrency:
+      group: workflows-nuxt-cloudflare-e2e-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}-${{ toJSON(matrix) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     # Just `E2E` — GitHub appends the matrix value itself (`E2E (1)`,
     # `E2E (2)`, ...). A hand-written `E2E ${{ matrix.shard }}/...` renders
     # the raw template text in the checks list when the job is SKIPPED,
@@ -4140,8 +4186,8 @@ jobs:
     # opt-in and off by default.
     name: E2E
     # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
-    if: "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && needs.e2e-plan.outputs.skipped != 'true'"
-    needs: [build, e2e-plan]
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && needs.e2e-plan.outputs.skipped != 'true')"
+    needs: ["build", "e2e-plan", "ci-admission"]
     # `e2e-runner` when the caller routes browsers to an isolated pool,
     # otherwise `runner` — same guest as the build, the previous behaviour.
     runs-on: ${{ fromJSON(inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
@@ -4821,10 +4867,13 @@ jobs:
   # run. The matrix exists only so the shared steps see
   # `matrix.shard == 'quarantine'`; GitHub renders the name `E2E (quarantine)`.
   e2e-quarantine:
+    concurrency:
+      group: workflows-nuxt-cloudflare-e2e-quarantine-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}-${{ toJSON(matrix) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: E2E
     # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
-    if: "!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.e2e-quarantine-args != '' && needs.e2e-plan.outputs.skipped != 'true'"
-    needs: [build, e2e-plan]
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (!cancelled() && needs.build.result == 'success' && needs.e2e-plan.result == 'success' && (inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.e2e-quarantine-args != '' && needs.e2e-plan.outputs.skipped != 'true')"
+    needs: ["build", "e2e-plan", "ci-admission"]
     runs-on: ${{ fromJSON(inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 30
     continue-on-error: true
@@ -4883,14 +4932,13 @@ jobs:
   # is why `preview-timeout-minutes` is a caller input and why `og` is the
   # default.
   preview:
+    concurrency:
+      group: workflows-nuxt-cloudflare-preview-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Preview
     # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
-    if: >-
-      !cancelled() && needs.build.result == 'success'
-      && inputs.mode != 'e2e'
-      && inputs.preview-checks != 'none'
-      && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
-    needs: build
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (!cancelled() && needs.build.result == 'success' && inputs.mode != 'e2e' && inputs.preview-checks != 'none' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target'))"
+    needs: ["build", "ci-admission"]
     runs-on: ${{ fromJSON(contains(inputs.preview-checks, 'e2e-subset') && (inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) || (github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')))) }}
     timeout-minutes: ${{ inputs.preview-timeout-minutes }}
     # `pull-requests: write` is a WIDENING of this callable's caller grant and
@@ -5495,10 +5543,13 @@ jobs:
           PYEOF_COMMENT
 
   deploy-dry-run:
+    concurrency:
+      group: workflows-nuxt-cloudflare-deploy-dry-run-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Deploy dry run
     # P3-C1: explicit status guard (see SKIP PROPAGATION at `reuse-plan`).
-    if: "!cancelled() && needs.build.result == 'success' && inputs.mode != 'e2e' && inputs.wrangler-dry-run"
-    needs: build
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (!cancelled() && needs.build.result == 'success' && inputs.mode != 'e2e' && inputs.wrangler-dry-run)"
+    needs: ["build", "ci-admission"]
     # Blacksmith overflow (see the block above this file's first routed job) -- D-CI-CAP-1 (c)/D-BLACKSMITH-2, fleet#337.
     runs-on: ${{ fromJSON(github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 15
@@ -5757,8 +5808,11 @@ jobs:
   # plan's `full` never applies to Fast, and `Required` still demands the
   # plan succeed.
   fast:
+    concurrency:
+      group: workflows-nuxt-cloudflare-fast-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: ${{ (inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != ''))) && 'Fast' || 'Fast (not run)' }}
-    needs: [reuse-plan, fast-lanes-plan, fast-lanes]
+    needs: ["reuse-plan", "fast-lanes-plan", "fast-lanes", "ci-admission"]
     # !cancelled() runs Fast after a failed or skipped need, and never after
     # the run is cancelled: GitHub reports a job whose `if:` is false in a
     # cancelled run as CANCELLED (not skipped, so never a passing check), and
@@ -5792,13 +5846,37 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory }}
     steps: &fast_steps
+      - name: Check CI admission
+        if: env.FAST_ENABLED == 'true'
+        env:
+          ADMISSION_RESULT: ${{ needs.ci-admission.result }}
+          ADMISSION_REASON: ${{ needs.ci-admission.outputs.reason }}
+          ADMISSION_SKIP: ${{ needs.ci-admission.outputs.skip }}
+        run: |
+          set -euo pipefail
+          if [ "$ADMISSION_RESULT" = skipped ] && [ -z "$ADMISSION_SKIP$ADMISSION_REASON" ]; then
+            exit 0
+          fi
+          if [ "$ADMISSION_RESULT" != success ]; then
+            echo "::error::CI admission failed; no validation proof is available"
+            exit 1
+          fi
+          case "$ADMISSION_SKIP:$ADMISSION_REASON" in
+            false:validate) exit 0 ;;
+            true:draft)
+              echo "::error::Expensive validation deferred for draft PR. Mark ready, then push a commit or choose Re-run all jobs (Re-run failed jobs keeps draft admission outputs). Automatic recovery requires ready_for_review in the caller pull_request.types."
+              exit 1
+              ;;
+          esac
+          echo "::error::Invalid CI admission result; validation cannot be skipped"
+          exit 1
       # Escalation is only as good as the `E2E plan` decision it reads. When
       # the caller configured `e2e-full-paths` and that plan did not succeed,
       # whether this PR touches a protected path is unknown: fail closed. That
       # includes `run-e2e: false`, where `E2E plan` never runs, so protected
       # paths could never escalate and `Fast` would pass on lint/unit alone.
       - name: Resolve protected-path escalation
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'lane'
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'lane')"
         working-directory: ${{ github.workspace }}
         # FAST_ESCALABLE, E2E_PLAN_RESULT and ESCALATED come from the job's
         # `env:` (this step list is shared by `fast` and `fast-escalable`).
@@ -5827,7 +5905,7 @@ jobs:
       # missing lane is a skipped or failed matrix) can never leave this
       # check, `ci / Fast`, green.
       - name: Require the parallel fast lanes to succeed
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE == 'aggregate'
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE == 'aggregate')"
         working-directory: ${{ github.workspace }}
         # LANES_PLAN_RESULT and LANES_RESULT come from the job's `env:` (this
         # step list is shared with the lanes, which do not need themselves).
@@ -5847,7 +5925,7 @@ jobs:
           fi
           exit "$status"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate'
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate')"
         with:
           persist-credentials: false
           ref: ${{ inputs.expected-candidate-sha }}
@@ -5858,7 +5936,7 @@ jobs:
           fetch-depth: 2
 
       - name: Verify exact validation candidate
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.expected-candidate-sha != '')
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.expected-candidate-sha != ''))"
         working-directory: ${{ github.workspace }}
         shell: bash
         env:
@@ -5878,14 +5956,11 @@ jobs:
             exit 1
           fi
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.package-manager == 'pnpm')
-        # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
-        # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
-        # a clean directory too). Errors still print.
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.package-manager == 'pnpm'))"
         env:
           PNPM_CONFIG_LOGLEVEL: error
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate'
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate')"
         with:
           # node-version and node-version-file are mutually exclusive on
           # setup-node (passing both is rejected), so resolve them as two
@@ -5899,7 +5974,7 @@ jobs:
       # the default-branch save; a second writer here would only race it.
       - name: Resolve dependency cache directory
         id: dep-cache-dir
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (runner.environment == 'github-hosted')
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (runner.environment == 'github-hosted'))"
         run: |
           set -euo pipefail
           # Beside the checkout, not in it: an app's own `prettier "**/*"` or
@@ -5919,7 +5994,7 @@ jobs:
 
       - name: Restore dependency cache
         id: dep-cache
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (runner.environment == 'github-hosted')
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (runner.environment == 'github-hosted'))"
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.dep-cache-dir.outputs.path }}
@@ -5927,14 +6002,14 @@ jobs:
           restore-keys: |
             node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
       - name: Configure package registry auth
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script == '')
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script == ''))"
         env:
           GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
           NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
         run: *configure_package_registry_auth
 
       - name: Point pnpm at a workspace-local store (self-hosted)
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm')
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm'))"
         run: |
           set -euo pipefail
           mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
@@ -5942,7 +6017,7 @@ jobs:
             echo "npm_config_store_dir=$mount_point/pnpm-store" >> "$GITHUB_ENV"
           fi
       - name: Install dependencies (pnpm)
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script == '' && inputs.package-manager == 'pnpm')
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script == '' && inputs.package-manager == 'pnpm'))"
         run: pnpm install --frozen-lockfile
         env:
           GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
@@ -5950,7 +6025,7 @@ jobs:
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       - name: Install dependencies (npm)
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script == '' && inputs.package-manager == 'npm')
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script == '' && inputs.package-manager == 'npm'))"
         run: npm ci
         env:
           GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
@@ -5960,13 +6035,11 @@ jobs:
       # Exact-path cleanup only: persistent self-hosted workspaces must not keep
       # registry credentials after install (success, failure, or cancel).
       - name: Remove package auth materialization
-        if: always() && inputs.install-script == '' && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'
-        # The aggregate role never checks out, so the job's default working
-        # directory may not exist; the path below is absolute anyway.
+        if: "needs.ci-admission.outputs.skip != 'true' && (always() && inputs.install-script == '' && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true')"
         working-directory: ${{ github.workspace }}
         run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
       - name: Install dependencies (caller script)
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script != '')
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script != ''))"
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
           NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
@@ -6002,7 +6075,7 @@ jobs:
       # leaves the lint uncached rather than failing it.
       - name: Enable ESLint cache
         id: eslint-cache-dir
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && inputs.eslint-cache
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && inputs.eslint-cache)"
         env:
           PM: ${{ inputs.package-manager }}
         run: |
@@ -6058,7 +6131,7 @@ jobs:
       # the SELF-HOSTED RUNNERS DO NOT CACHE DEPENDENCIES block at `build`.
       - name: Restore ESLint cache
         id: eslint-cache
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (runner.environment == 'github-hosted') && steps.eslint-cache-dir.outputs.path != ''
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (runner.environment == 'github-hosted') && steps.eslint-cache-dir.outputs.path != '')"
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.eslint-cache-dir.outputs.path }}
@@ -6071,11 +6144,11 @@ jobs:
       # from one that did not. This mark, taken after the restore, lets the
       # save step ask for files written by this lane's own scripts.
       - name: Mark the ESLint cache before the lane runs
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE == 'lane' && steps.eslint-cache-dir.outputs.path != ''
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE == 'lane' && steps.eslint-cache-dir.outputs.path != '')"
         working-directory: ${{ github.workspace }}
         run: touch "$RUNNER_TEMP/narduk-eslint-cache.mark"
       - name: Run fast scripts
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate'
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate')"
         env:
           # The whole `fast-scripts` list when run serially, one entry per
           # `Fast lane (<script>)` job under `fast-parallel` (job env).
@@ -6118,7 +6191,7 @@ jobs:
       # to the directory after the mark above saves.
       - name: Check ESLint cache content
         id: eslint-cache-content
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE == 'lane' && steps.eslint-cache-dir.outputs.path != ''
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE == 'lane' && steps.eslint-cache-dir.outputs.path != '')"
         working-directory: ${{ github.workspace }}
         env:
           ESLINT_CACHE_PATH: ${{ steps.eslint-cache-dir.outputs.path }}
@@ -6130,12 +6203,7 @@ jobs:
             echo "nonempty=false" >> "$GITHUB_OUTPUT"
           fi
       - name: Save ESLint cache
-        if: >-
-          env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate'
-          && (env.FAST_ROLE != 'lane' || steps.eslint-cache-content.outputs.nonempty == 'true')
-          && (runner.environment == 'github-hosted')
-          && steps.eslint-cache-dir.outputs.path != ''
-          && github.ref_name == github.event.repository.default_branch
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (env.FAST_ROLE != 'lane' || steps.eslint-cache-content.outputs.nonempty == 'true') && (runner.environment == 'github-hosted') && steps.eslint-cache-dir.outputs.path != '' && github.ref_name == github.event.repository.default_branch)"
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.eslint-cache-dir.outputs.path }}
@@ -6147,7 +6215,7 @@ jobs:
       # `fast-escalated` runs this same script when it holds the name `Fast`,
       # after the full gate.
       - name: Publish Fast escalation
-        if: env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'lane' && (success())
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'lane' && (success()))"
         working-directory: ${{ github.workspace }}
         # ESCALATED comes from the job's `env:` (shared step list).
         run: &fast_escalation_publish |
@@ -6176,8 +6244,11 @@ jobs:
   # it keeps that `needs:` and today's behaviour exactly: named `Fast`, or
   # `Fast lanes (escalated)` when `fast-escalated` takes the name.
   fast-escalable:
+    concurrency:
+      group: workflows-nuxt-cloudflare-fast-escalable-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: ${{ !(inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && 'Fast (not run)' || ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true') && 'Fast lanes (escalated)' || 'Fast' }}
-    needs: [reuse-plan, e2e-plan, fast-lanes-plan, fast-lanes]
+    needs: ["reuse-plan", "e2e-plan", "fast-lanes-plan", "fast-lanes", "ci-admission"]
     if: "!cancelled() && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')"
     env:
       FAST_ENABLED: ${{ inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') }}
@@ -6228,10 +6299,12 @@ jobs:
   # artifact store, which is slower than the install it saves, and the lanes
   # would also wait for it. N concurrent installs take as long as one.
   fast-lanes-plan:
+    concurrency:
+      group: workflows-nuxt-cloudflare-fast-lanes-plan-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Fast lanes plan
-    needs: [reuse-plan]
-    if: "!cancelled() && inputs.fast-parallel && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true'"
-    # CI lightweight route, the same as `Fast plan`.
+    needs: ["reuse-plan", "ci-admission"]
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.fast-parallel && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true')"
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     timeout-minutes: 20
     permissions:
@@ -6278,12 +6351,15 @@ jobs:
           echo "$count fast lane(s): ${list//\"/}"
 
   fast-lanes:
+    concurrency:
+      group: workflows-nuxt-cloudflare-fast-lanes-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}-${{ toJSON(matrix) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Fast lane (${{ matrix.script }})
-    needs: [reuse-plan, fast-lanes-plan]
+    needs: ["reuse-plan", "fast-lanes-plan", "ci-admission"]
     # Starts only when the plan succeeded. !cancelled() keeps a failed or
     # skipped `Reuse plan` need from skipping it, as for `fast`; a cancelled
     # run reports it CANCELLED without a runner.
-    if: "!cancelled() && inputs.fast-parallel && needs.fast-lanes-plan.result == 'success'"
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.fast-parallel && needs.fast-lanes-plan.result == 'success')"
     strategy:
       # Every lane reports, so one push shows lint and typecheck failures
       # together instead of the first one hiding the rest.
@@ -6326,8 +6402,12 @@ jobs:
   # production, so a misconfigured or slow smoke can never roll a healthy
   # deploy back.
   journey-smoke:
+    needs: [ci-admission]
+    concurrency:
+      group: workflows-nuxt-cloudflare-journey-smoke-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Journey smoke
-    if: inputs.journey-smoke-url != '' && inputs.mode != 'e2e'
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (inputs.journey-smoke-url != '' && inputs.mode != 'e2e')"
     runs-on: ${{ fromJSON(inputs.e2e-runner != '' && inputs.e2e-runner || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 15
     permissions:
@@ -6625,28 +6705,55 @@ jobs:
         run: *probe_security_headers
 
   required:
+    concurrency:
+      group: workflows-nuxt-cloudflare-required-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     # REQUIRED FOLDED INTO BUILD (see the header): when `Build` is the only
     # lane for this event, `Build` is named `Required` and this job is
     # skipped. A skipped job shows its raw name expression, and even
     # evaluated this name is not `Required` then, so it can never produce a
     # second, skipped (passing) `ci / Required`. The condition is the one in
     # `build`'s name, verbatim (R5 in scripts/lint_callables.py).
-    name: ${{ (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results) && 'Required (folded into Build)' || 'Required' }}
+    name: ${{ (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results && needs.ci-admission.outputs.skip != 'true') && 'Required (folded into Build)' || 'Required' }}
     # !cancelled(), not always(): it still runs after any failed or skipped
     # need, and a cancelled run reports it CANCELLED -- a non-passing check --
     # without queueing for a runner that would hold the caller's concurrency
     # group (operator-portal run 36494070028 waited ~14 min for one).
-    if: "!cancelled() && !(inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results) && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')))"
-    needs: [reuse-plan, fast-plan, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run, fast, fast-escalable, fast-escalated, fast-lanes-plan, fast-lanes, journey-smoke]
+    if: "!cancelled() && !(inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results && needs.ci-admission.outputs.skip != 'true') && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')) && needs.ci-admission.outputs.skip != 'true')"
+    needs: ["reuse-plan", "fast-plan", "build", "checks", "extra-gate", "e2e-plan", "e2e", "preview", "deploy-dry-run", "fast", "fast-escalable", "fast-escalated", "fast-lanes-plan", "fast-lanes", "journey-smoke", "ci-admission"]
     # Organization-wide lightweight route; unset preserves the caller fallback.
     runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     timeout-minutes: 20
     permissions:
       contents: read
     steps:
+      - name: Check CI admission
+        env:
+          ADMISSION_RESULT: ${{ needs.ci-admission.result }}
+          ADMISSION_REASON: ${{ needs.ci-admission.outputs.reason }}
+          ADMISSION_SKIP: ${{ needs.ci-admission.outputs.skip }}
+        run: |
+          set -euo pipefail
+          if [ "$ADMISSION_RESULT" = skipped ] && [ -z "$ADMISSION_SKIP$ADMISSION_REASON" ]; then
+            exit 0
+          fi
+          if [ "$ADMISSION_RESULT" != success ]; then
+            echo "::error::CI admission failed; no validation proof is available"
+            exit 1
+          fi
+          case "$ADMISSION_SKIP:$ADMISSION_REASON" in
+            false:validate) exit 0 ;;
+            true:draft)
+              echo "::error::Expensive validation deferred for draft PR. Mark ready, then push a commit or choose Re-run all jobs (Re-run failed jobs keeps draft admission outputs). Automatic recovery requires ready_for_review in the caller pull_request.types."
+              exit 1
+              ;;
+          esac
+          echo "::error::Invalid CI admission result; validation cannot be skipped"
+          exit 1
       # Anchored: `fast-escalated` (the `Fast` check on a protected-path pull
       # request) runs this exact step, not a copy of it.
       - name: Require enabled gates to succeed and disabled gates to skip
+        if: "needs.ci-admission.outputs.skip != 'true'"
         env: &required_gate_env
           BUILD_RESULT: ${{ needs.build.result }}
           CHECKS_RESULT: ${{ needs.checks.result }}
@@ -6809,6 +6916,7 @@ jobs:
           fi
           exit "$status"
       - name: Require fast-path and journey-smoke lanes
+        if: "needs.ci-admission.outputs.skip != 'true'"
         env:
           REUSE_APPLIES: ${{ inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
           REUSE_PLAN_RESULT: ${{ needs.reuse-plan.result }}
@@ -6896,7 +7004,7 @@ jobs:
       # `Required` before any proof-publishing step (those need `success()`).
       # `fast-escalated` runs the same anchored scripts when it holds `Fast`.
       - name: Check out the caller for Caller lint
-        if: "!cancelled() && inputs.mode != 'e2e'"
+        if: "needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.mode != 'e2e')"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -6912,7 +7020,7 @@ jobs:
           sparse-checkout-cone-mode: false
 
       - name: Verify exact validation candidate
-        if: "!cancelled() && inputs.mode != 'e2e' && inputs.expected-candidate-sha != ''"
+        if: "needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.mode != 'e2e' && inputs.expected-candidate-sha != '')"
         working-directory: ${{ github.workspace }}
         shell: bash
         env: &caller_lint_candidate_env
@@ -6935,27 +7043,27 @@ jobs:
       # This step imports PyYAML (the anchored scripts are defined in `build`,
       # which runs them when Required is folded into it).
       - name: Ensure PyYAML is available
-        if: "!cancelled() && inputs.mode != 'e2e'"
+        if: "needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.mode != 'e2e')"
         run: *caller_lint_pyyaml
 
       - name: Cache actionlint
-        if: "(!cancelled() && inputs.mode != 'e2e') && runner.environment == 'github-hosted'"
+        if: "needs.ci-admission.outputs.skip != 'true' && ((!cancelled() && inputs.mode != 'e2e') && runner.environment == 'github-hosted')"
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.tool_cache }}/actionlint-native-alerts
           key: actionlint-native-alerts-1.7.12-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install actionlint
-        if: "!cancelled() && inputs.mode != 'e2e'"
+        if: "needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.mode != 'e2e')"
         env: *caller_lint_actionlint_env
         run: *caller_lint_install_actionlint
 
       - name: actionlint (caller's own workflows)
-        if: "!cancelled() && inputs.mode != 'e2e'"
+        if: "needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.mode != 'e2e')"
         run: *caller_lint_actionlint
 
       - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
-        if: "!cancelled() && inputs.mode != 'e2e'"
+        if: "needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.mode != 'e2e')"
         run: *caller_lint_audit
       # `required-reuse-pr-results` proof: minted only on a same-repository
       # pull request whose Required passed with every enabled lane RUN, and
@@ -6968,13 +7076,7 @@ jobs:
         # E2E because `CI_E2E_IN_CI` was false must mint no proof, or the
         # variable's later removal (rollback) or a repo override would let the
         # push reuse it and turn main green without E2E ever having run.
-        if: >-
-          success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == ''
-          && github.event_name == 'pull_request'
-          && github.event.pull_request.head.repo.full_name == github.repository
-          && needs.build.result == 'success'
-          && (needs.checks.result == 'success' || (inputs.checks-in-build && needs.checks.result == 'skipped'))
-          && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards))
+        if: "needs.ci-admission.outputs.skip != 'true' && (success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.build.result == 'success' && (needs.checks.result == 'success' || (inputs.checks-in-build && needs.checks.result == 'skipped')) && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards)))"
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
@@ -6984,7 +7086,7 @@ jobs:
       # Both proofs below are pointers in the CI artifact store (see THE CI
       # ARTIFACT STORE at `reuse-plan`), written only on a pull request.
       - name: Install CI artifact store client
-        if: success() && github.event_name == 'pull_request'
+        if: "needs.ci-admission.outputs.skip != 'true' && (success() && github.event_name == 'pull_request')"
         run: *install_ci_artifact_store
       # The step NAME carries the key on purpose. GitHub's jobs API reports
       # it, and the push honours a stored pointer only when the run it names
@@ -6992,7 +7094,7 @@ jobs:
       # job. Never fails Required: an unpublished proof only costs the push a
       # full run.
       - name: Publish Required proof ${{ steps.required-key.outputs.key }}
-        if: success() && steps.required-key.outputs.key != ''
+        if: "needs.ci-admission.outputs.skip != 'true' && (success() && steps.required-key.outputs.key != '')"
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PROOF_KEY: ${{ steps.required-key.outputs.key }}
@@ -7008,7 +7110,7 @@ jobs:
       # Named with its key for the same reason as the Required proof above.
       - name: Publish full E2E proof ${{ needs.e2e-plan.outputs.proof-key }}
         id: e2e-proof
-        if: success() && inputs.e2e-reuse-pr-results && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.e2e.result == 'success' && needs.e2e-plan.outputs.proof-key != '' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards
+        if: "needs.ci-admission.outputs.skip != 'true' && (success() && inputs.e2e-reuse-pr-results && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.e2e.result == 'success' && needs.e2e-plan.outputs.proof-key != '' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards)"
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           PROOF_KEY: ${{ needs.e2e-plan.outputs.proof-key }}
@@ -7033,8 +7135,11 @@ jobs:
   # A job waiting on its needs has no check run yet, so the `Fast` context stays pending, which blocks the
   # merge, until the full gate has finished.
   fast-escalated:
+    concurrency:
+      group: workflows-nuxt-cloudflare-fast-escalated-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: ${{ (inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true') && ((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true') && 'Fast' || 'Fast (escalation not needed)' }}
-    needs: [reuse-plan, fast-escalable, build, checks, extra-gate, e2e-plan, e2e, preview, deploy-dry-run]
+    needs: ["reuse-plan", "fast-escalable", "build", "checks", "extra-gate", "e2e-plan", "e2e", "preview", "deploy-dry-run", "ci-admission"]
     # Starts only when this run escalates (the same condition as FAST_ENABLED);
     # !cancelled() keeps a failed or skipped lane from skipping it, because it
     # is then the check named `Fast` and must report that failure. A cancelled
@@ -7048,10 +7153,34 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Check CI admission
+        if: env.FAST_ENABLED == 'true'
+        env:
+          ADMISSION_RESULT: ${{ needs.ci-admission.result }}
+          ADMISSION_REASON: ${{ needs.ci-admission.outputs.reason }}
+          ADMISSION_SKIP: ${{ needs.ci-admission.outputs.skip }}
+        run: |
+          set -euo pipefail
+          if [ "$ADMISSION_RESULT" = skipped ] && [ -z "$ADMISSION_SKIP$ADMISSION_REASON" ]; then
+            exit 0
+          fi
+          if [ "$ADMISSION_RESULT" != success ]; then
+            echo "::error::CI admission failed; no validation proof is available"
+            exit 1
+          fi
+          case "$ADMISSION_SKIP:$ADMISSION_REASON" in
+            false:validate) exit 0 ;;
+            true:draft)
+              echo "::error::Expensive validation deferred for draft PR. Mark ready, then push a commit or choose Re-run all jobs (Re-run failed jobs keeps draft admission outputs). Automatic recovery requires ready_for_review in the caller pull_request.types."
+              exit 1
+              ;;
+          esac
+          echo "::error::Invalid CI admission result; validation cannot be skipped"
+          exit 1
       # Escalation only happens in `fast-escalable`'s domain (see TWO JOBS,
       # ONE STEP LIST at `fast`), so the lint/unit lanes it demands are there.
       - name: Require the fast lanes to succeed
-        if: env.FAST_ENABLED == 'true'
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true')"
         env:
           FAST_RESULT: ${{ needs.fast-escalable.result }}
         run: |
@@ -7061,13 +7190,13 @@ jobs:
             exit 1
           fi
       - name: Require enabled gates to succeed and disabled gates to skip
-        if: env.FAST_ENABLED == 'true'
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true')"
         env: *required_gate_env
         run: *required_gate_script
       # Caller lint, the same anchored scripts `Required` runs, so the check
       # named `Fast` on a protected-path pull request still covers it.
       - name: Check out the caller for Caller lint
-        if: env.FAST_ENABLED == 'true' && !cancelled()
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && !cancelled())"
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -7082,33 +7211,33 @@ jobs:
             action.yaml
           sparse-checkout-cone-mode: false
       - name: Verify exact validation candidate
-        if: env.FAST_ENABLED == 'true' && !cancelled() && inputs.expected-candidate-sha != ''
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && !cancelled() && inputs.expected-candidate-sha != '')"
         working-directory: ${{ github.workspace }}
         shell: bash
         env: *caller_lint_candidate_env
         run: *caller_lint_candidate_script
       - name: Ensure PyYAML is available
-        if: env.FAST_ENABLED == 'true' && !cancelled()
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && !cancelled())"
         run: *caller_lint_pyyaml
       - name: Cache actionlint
-        if: "(env.FAST_ENABLED == 'true' && !cancelled()) && runner.environment == 'github-hosted'"
+        if: "needs.ci-admission.outputs.skip != 'true' && ((env.FAST_ENABLED == 'true' && !cancelled()) && runner.environment == 'github-hosted')"
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.tool_cache }}/actionlint-native-alerts
           key: actionlint-native-alerts-1.7.12-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install actionlint
-        if: env.FAST_ENABLED == 'true' && !cancelled()
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && !cancelled())"
         env: *caller_lint_actionlint_env
         run: *caller_lint_install_actionlint
       - name: actionlint (caller's own workflows)
-        if: env.FAST_ENABLED == 'true' && !cancelled()
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && !cancelled())"
         run: *caller_lint_actionlint
       - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
-        if: env.FAST_ENABLED == 'true' && !cancelled()
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && !cancelled())"
         run: *caller_lint_audit
       - name: Publish Fast escalation
-        if: env.FAST_ENABLED == 'true' && (success())
+        if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && (success()))"
         env:
           ESCALATED: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '') && needs.e2e-plan.outputs.full == 'true' }}
         run: *fast_escalation_publish

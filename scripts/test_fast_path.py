@@ -284,7 +284,7 @@ OLD_GRAPH = {
     "required": {"needs": ["build", "checks", "extra-gate", "e2e-plan", "e2e", "preview",
                            "deploy-dry-run"], "if": "always()"},
 }
-NEW_JOBS = {"reuse-plan", "fast-plan", "fast", "fast-escalable", "fast-escalated", "fast-lanes-plan", "fast-lanes",
+NEW_JOBS = {"ci-admission", "reuse-plan", "fast-plan", "fast", "fast-escalable", "fast-escalated", "fast-lanes-plan", "fast-lanes",
             "journey-smoke"}
 CI_LANES = ["build", "checks", "extra-gate", "e2e-plan", "e2e", "e2e-quarantine",
             "preview", "deploy-dry-run"]
@@ -624,7 +624,7 @@ def test_required_fast_path_step() -> None:
     lanes = step("required", FAST_STEP)["env"]["FAST_LANES_APPLIES"]
     assert lanes == "${{ inputs.fast-parallel && " + step("required", FAST_STEP)["env"]["FAST_APPLIES"][4:-3].replace(
         " && !((github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && (inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != ''))", "") + " }}", lanes
-    assert JOBS["fast-lanes-plan"]["if"] == f"!cancelled() && {lanes[4:-3]}", JOBS["fast-lanes-plan"]["if"]
+    assert JOBS["fast-lanes-plan"]["if"] == f"!cancelled() && needs.ci-admission.outputs.skip != 'true' && (!cancelled() && {lanes[4:-3]})", JOBS["fast-lanes-plan"]["if"]
     assert JOBS["fast-lanes"]["env"]["FAST_ENABLED"] == "${{ " + lanes[len("${{ inputs.fast-parallel && "):-3] + " }}"
     print(f"PASS  Required fast-path/smoke aggregation ({len(cases)} cases)")
 
@@ -673,7 +673,8 @@ def test_fast_escalated_reuses_the_required_gate() -> None:
     # failure cannot skip the full-suite proof. The gate step itself is the
     # Required step, not a copy.
     gate = next(s for s in job["steps"] if s.get("name") == GATE_STEP)
-    assert {k: v for k, v in gate.items() if k != "if"} == step("required", GATE_STEP), \
+    assert {k: v for k, v in gate.items() if k != "if"} == {
+        k: v for k, v in step("required", GATE_STEP).items() if k != "if"}, \
         "escalated Fast must run the Required gate environment and script"
     assert job["steps"][-1].get("name") == "Publish Fast escalation"
     # Escalated Fast still covers Caller lint: the same anchored scripts as Required.
@@ -683,9 +684,10 @@ def test_fast_escalated_reuses_the_required_gate() -> None:
     referenced = set(re.findall(r"needs\.([a-z0-9-]+)\.", json.dumps(gate)))
     assert referenced <= set(job["needs"]), referenced - set(job["needs"])
     assert "fast-escalable" in job["needs"] and "fast" not in job["needs"] and "required" not in job["needs"]
-    # Its first step demands the escalable lane (the only one that can
+    # After admission, demand the escalable lane (the only one that can
     # precede an escalation) succeeded.
-    first = job["steps"][0]
+    assert job["steps"][0]["name"] == "Check CI admission"
+    first = step("fast-escalated", "Require the fast lanes to succeed")
     assert first["name"] == "Require the fast lanes to succeed"
     assert first["env"]["FAST_RESULT"] == "${{ needs.fast-escalable.result }}", first["env"]
     assert "fast-escalated" in JOBS["required"]["needs"]
@@ -732,7 +734,7 @@ def test_fast_escalation_is_published_on_the_check_named_fast() -> None:
         # The shared list also feeds the `fast-parallel` lanes, which never
         # publish: escalation is the aggregate's business.
         lane_guard = " && env.FAST_ROLE != 'lane'" if job != "fast-escalated" else ""
-        assert publish["if"] == f"env.FAST_ENABLED == 'true'{lane_guard} && (success())"
+        assert publish["if"] == f"needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true'{lane_guard} && (success()))"
         # `fast`/`fast-escalable` share one step list and read ESCALATED from
         # their job env; the escalated job binds it on the step.
         escalated = (publish.get("env") or {}).get("ESCALATED", JOBS[job]["env"].get("ESCALATED"))
@@ -918,7 +920,7 @@ def test_fast_parallel() -> None:
         assert JOBS[job]["env"]["FAST_SCRIPTS"] == "${{ inputs.fast-scripts }}"
         assert JOBS[job]["env"]["LANES_PLAN_RESULT"] == "${{ needs.fast-lanes-plan.result }}"
         assert JOBS[job]["env"]["LANES_RESULT"] == "${{ needs.fast-lanes.result }}"
-    assert set(needs_of(JOBS["fast-lanes"])) == {"reuse-plan", "fast-lanes-plan"}
+    assert set(needs_of(JOBS["fast-lanes"])) == {"reuse-plan", "fast-lanes-plan", "ci-admission"}
     assert {"fast-lanes-plan", "fast-lanes"} <= set(needs_of(JOBS["required"]))
     # The strategy matrix is the plan's output, with a harmless fallback that
     # is never reached when the job starts.
@@ -961,7 +963,7 @@ def test_fast_parallel() -> None:
 
     aggregate = ran_steps("aggregate")
     assert aggregate == {"Resolve protected-path escalation", LANES_GATE, "Remove package auth materialization",
-                         "Publish Fast escalation"}, aggregate
+                         "Publish Fast escalation", "Check CI admission"}, aggregate
     serial = ran_steps("serial")
     assert {"Run fast scripts", "Install dependencies (pnpm)", "Resolve protected-path escalation",
             "Publish Fast escalation"} <= serial and not {LANES_GATE, "Check ESLint cache content"} & serial, serial
@@ -1240,7 +1242,7 @@ def test_required_reuse_lookup() -> None:
     # The publish step carries the key in its NAME (the attestation the push
     # checks) and runs only when the key was minted.
     publish = step("required", "Publish Required proof ${{ steps.required-key.outputs.key }}")
-    assert publish["if"] == "success() && steps.required-key.outputs.key != ''"
+    assert publish["if"] == "needs.ci-admission.outputs.skip != 'true' && (success() && steps.required-key.outputs.key != '')"
     assert publish["env"]["PROOF_KEY"] == "${{ steps.required-key.outputs.key }}"
     assert "store.publishProofStep({ core, context, kind: 'required' })" in publish["with"]["script"]
     names = [s.get("name") for s in JOBS["required"]["steps"]]

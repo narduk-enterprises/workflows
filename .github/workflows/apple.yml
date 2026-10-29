@@ -94,6 +94,11 @@ on:
         description: Optional read-only GitHub deploy key for a private SwiftPM dependency in the caller's organization.
         required: false
     inputs:
+      ci-concurrency-key:
+        description: "Stable unique key per invocation when this callable is used more than once in the same caller workflow."
+        required: false
+        type: string
+        default: ''
       apple-runner:
         description: >-
           JSON-encoded runner for the Xcode/Swift job. REQUIRED and
@@ -156,10 +161,21 @@ on:
         type: boolean
         default: true
       xcode-timeout-minutes:
-        description: "Timeout for the Xcode/Swift job. The Mac slot is scarce; size this to real work."
+        description: >-
+          Work budget for build-command plus test-command, counted from the
+          moment the host-wide Apple build lease is acquired. Queue time
+          behind another Apple build does not count; that is
+          lease-wait-minutes. The Mac slot is scarce; size this to real work.
         required: false
         type: number
         default: 45
+      lease-wait-minutes:
+        description: >-
+          How long the Xcode job may queue for the host-wide Apple build
+          lease before failing. Separate from xcode-timeout-minutes.
+        required: false
+        type: number
+        default: 60
       run-swiftlint:
         description: >-
           Run SwiftLint on the Linux runner, using the official Linux release
@@ -209,11 +225,42 @@ on:
         default: 15
 
 jobs:
+  ci-admission:
+    name: CI admission
+    if: "(github.event_name == 'pull_request') && github.event.pull_request.draft"
+    runs-on: ${{ fromJSON(inputs.lint-runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.plan.outputs.skip }}
+      reason: ${{ steps.plan.outputs.reason }}
+    steps:
+      - name: Plan PR validation
+        id: plan
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            core.setOutput('skip', 'false');
+            core.setOutput('reason', 'validate');
+            const pr = context.payload.pull_request;
+            if (context.eventName !== 'pull_request' || !pr) return;
+            if (Number(process.env.GITHUB_RUN_ATTEMPT || '1') > 1) return;
+            if (pr.draft) {
+              core.setOutput('skip', 'true');
+              core.setOutput('reason', 'draft');
+              return;
+            }
+
   lint:
+    needs: [ci-admission]
+    concurrency:
+      group: workflows-apple-lint-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     name: lint
     # Skipped entirely when the caller opted out of both Linux gates, which
     # `Required` below treats as an intentional skip rather than a pass.
-    if: inputs.run-swiftlint || inputs.linux-checks != ''
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (inputs.run-swiftlint || inputs.linux-checks != '')"
     runs-on: ${{ fromJSON(inputs.lint-runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
     timeout-minutes: ${{ inputs.lint-timeout-minutes }}
     permissions:
@@ -271,9 +318,18 @@ jobs:
         run: ${{ inputs.linux-checks }}
 
   xcode:
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (true)"
+    needs: [ci-admission]
+    concurrency:
+      group: workflows-apple-xcode-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     name: xcode
     runs-on: ${{ fromJSON(inputs.apple-runner) }}
-    timeout-minutes: ${{ inputs.xcode-timeout-minutes }}
+    # Backstop only. Expressions have no arithmetic, so the real limits live
+    # in the leased step: lease-wait-minutes for the queue, then
+    # xcode-timeout-minutes for the work once the lease is held. Each setup
+    # step carries its own small timeout.
+    timeout-minutes: 360
     permissions:
       contents: read
     defaults:
@@ -283,10 +339,12 @@ jobs:
       DEVELOPER_DIR: ${{ inputs.developer-dir }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 10
         with:
           persist-credentials: false
 
       - name: Validate Apple toolchain and gate configuration
+        timeout-minutes: 5
         env:
           BUILD_COMMAND: ${{ inputs.build-command }}
           RUN_BUILD: ${{ inputs.run-build }}
@@ -323,70 +381,49 @@ jobs:
       # entry point (the local wrapper
       # skills/apple-release-pipeline/scripts/xcodebuild_leased.sh, and the
       # broker-provisioned CI/release templates). A JIT-broker-provisioned
-      # job already holds the lease (APPLE_BUILD_LOCK_HELD=1) and skips
-      # straight to running; the standard apple-imac/apple-laptop runner does
-      # not, so it waits here instead.
-      - name: Wait for Apple build lease
+      # job already holds the lease (APPLE_BUILD_LOCK_HELD=1) and the tool
+      # runs the command straight away.
+      #
+      # Build and test run in ONE `apple_build_lock.py run`, so the job
+      # queues once and nothing can take the host between build and test.
+      # The wait happens inside the tool (the same 0.1 s retry every other
+      # caller uses; a separate audit-then-run probe released the lock
+      # between probe and run and lost every handoff to those callers).
+      # Queue time and work time are separate budgets: `lease-wait-minutes`
+      # bounds the queue, and `xcode-timeout-minutes` starts only once the
+      # lease is held, so a busy host never eats the build's own budget.
+      - name: Build and test under Apple build lease
         if: inputs.run-build || inputs.run-tests
+        env:
+          DEPENDENCY_SSH_KEY: ${{ secrets.DEPENDENCY_SSH_KEY }}
+          DEPENDENCY_OWNER: ${{ github.repository_owner }}
+          RUN_BUILD: ${{ inputs.run-build }}
+          RUN_TESTS: ${{ inputs.run-tests }}
+          LEASE_WAIT_MINUTES: ${{ inputs.lease-wait-minutes }}
+          WORK_TIMEOUT_MINUTES: ${{ inputs.xcode-timeout-minutes }}
         run: |
           set -euo pipefail
           lock_tool="${APPLE_BUILD_LOCK_TOOL:-/Library/Application Support/NardukAppleRunner/bin/apple_build_lock.py}"
           lock_path="${APPLE_BUILD_LOCK_PATH:-/Library/Application Support/NardukAppleRunner/state/apple-build.lock}"
-          timeout_seconds="${APPLE_BUILD_LEASE_TIMEOUT_SECONDS:-3600}"
-          poll_seconds="${APPLE_BUILD_LEASE_POLL_SECONDS:-5}"
           if [ ! -e "$lock_tool" ]; then
             echo "::error::canonical Apple build lease tool is not installed at $lock_tool -- refusing to run build-command/test-command unleased"
             exit 1
           fi
+          # Inputs are `number` and may be fractional; shell arithmetic is not.
+          wait_seconds="${APPLE_BUILD_LEASE_TIMEOUT_SECONDS:-$(awk -v m="$LEASE_WAIT_MINUTES" 'BEGIN { printf "%d", m * 60 }')}"
+          work_seconds="${APPLE_BUILD_WORK_TIMEOUT_SECONDS:-$(awk -v m="$WORK_TIMEOUT_MINUTES" 'BEGIN { printf "%d", m * 60 }')}"
+          heartbeat_seconds="${APPLE_BUILD_LEASE_HEARTBEAT_SECONDS:-60}"
           run_lock_tool() {
             /usr/bin/env -u PYTHONHOME -u PYTHONPATH -u PYTHONSTARTUP -u PYTHONUSERBASE -u __PYVENV_LAUNCHER__ \
               /usr/bin/python3 -I "$lock_tool" --lock-path "$lock_path" "$@"
           }
-          # `audit` with the tool's own default zero timeout IS the
-          # busy/available probe: exit 0 means free, 75 means held, anything
-          # else is a hard configuration error a wait loop must not mask.
-          waited=0
-          if [ "${APPLE_BUILD_LOCK_HELD:-}" != "1" ]; then
-            while :; do
-              set +e
-              run_lock_tool audit >/dev/null
-              status=$?
-              set -e
-              if [ "$status" -eq 0 ]; then
-                break
-              fi
-              if [ "$status" -ne 75 ]; then
-                echo "::error::Apple build lease audit failed unexpectedly (exit $status)"
-                exit "$status"
-              fi
-              if [ "$waited" -ge "$timeout_seconds" ]; then
-                echo "::error::Apple build lease still busy after ${waited}s (budget ${timeout_seconds}s) -- refusing to run unleased"
-                exit 75
-              fi
-              echo "WAITING ON LEASE: Apple build lease busy -- ${waited}s elapsed of ${timeout_seconds}s budget (this is queue wait, not build/test running)"
-              sleep "$poll_seconds"
-              waited=$((waited + poll_seconds))
-            done
-            if [ "$waited" -gt 0 ]; then
-              echo "LEASE ACQUIRED after ${waited}s waiting"
-            fi
-          fi
-          remaining=$((timeout_seconds - waited))
-          if [ "$remaining" -lt 60 ]; then
-            remaining=60
-          fi
-          echo "APPLE_BUILD_LEASE_REMAINING_SECONDS=$remaining" >> "$GITHUB_ENV"
 
-      - name: Build
-        if: inputs.run-build
-        env:
-          DEPENDENCY_SSH_KEY: ${{ secrets.DEPENDENCY_SSH_KEY }}
-          DEPENDENCY_OWNER: ${{ github.repository_owner }}
-        run: |
-          set -euo pipefail
+          stage="$(mktemp -d "${RUNNER_TEMP}/apple-leased.XXXXXX")"
+          heartbeat=""
+          trap 'if [ -n "$heartbeat" ]; then pkill -P "$heartbeat" 2>/dev/null || true; kill "$heartbeat" 2>/dev/null || true; fi; rm -rf -- "$stage"' EXIT
           if [ -n "${DEPENDENCY_SSH_KEY:-}" ]; then
-            auth_dir="$(mktemp -d "${RUNNER_TEMP}/swiftpm-auth.XXXXXX")"
-            trap 'rm -rf -- "$auth_dir"' EXIT
+            auth_dir="$stage/swiftpm-auth"
+            mkdir -m 700 "$auth_dir"
             printf '%s\n' "$DEPENDENCY_SSH_KEY" > "$auth_dir/key"
             chmod 600 "$auth_dir/key"
             printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$auth_dir/known_hosts"
@@ -396,58 +433,140 @@ jobs:
             export GIT_SSH_COMMAND="ssh -i \"$auth_dir/key\" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\"$auth_dir/known_hosts\""
             unset DEPENDENCY_SSH_KEY
           fi
-          lock_tool="${APPLE_BUILD_LOCK_TOOL:-/Library/Application Support/NardukAppleRunner/bin/apple_build_lock.py}"
-          lock_path="${APPLE_BUILD_LOCK_PATH:-/Library/Application Support/NardukAppleRunner/state/apple-build.lock}"
-          # Stage the caller's command as a real script file rather than
-          # interpolating it into a nested `bash -c "..."` string -- the
+
+          # Stage the caller's commands as real script files rather than
+          # interpolating them into a nested `bash -c "..."` string -- the
           # latter re-parses caller-supplied text through a second layer of
           # shell quoting/expansion and breaks on any command containing a
           # double quote or an unintended `$expansion`.
-          script="${RUNNER_TEMP}/apple-build-command.sh"
-          cat > "$script" <<'APPLE_WORKFLOWS_BUILD_COMMAND_EOF'
+          if [ "$RUN_BUILD" = "true" ]; then
+            cat > "$stage/1-build-command.sh" <<'APPLE_WORKFLOWS_BUILD_COMMAND_EOF'
           ${{ inputs.build-command }}
           APPLE_WORKFLOWS_BUILD_COMMAND_EOF
-          echo "RUNNING UNDER LEASE: build-command"
-          /usr/bin/env -u PYTHONHOME -u PYTHONPATH -u PYTHONSTARTUP -u PYTHONUSERBASE -u __PYVENV_LAUNCHER__ \
-            /usr/bin/python3 -I "$lock_tool" --lock-path "$lock_path" \
-            --timeout "${APPLE_BUILD_LEASE_REMAINING_SECONDS:-60}" run -- \
-            bash "$script"
-
-      - name: Test
-        if: inputs.run-tests
-        env:
-          DEPENDENCY_SSH_KEY: ${{ secrets.DEPENDENCY_SSH_KEY }}
-          DEPENDENCY_OWNER: ${{ github.repository_owner }}
-        run: |
-          set -euo pipefail
-          if [ -n "${DEPENDENCY_SSH_KEY:-}" ]; then
-            auth_dir="$(mktemp -d "${RUNNER_TEMP}/swiftpm-auth.XXXXXX")"
-            trap 'rm -rf -- "$auth_dir"' EXIT
-            printf '%s\n' "$DEPENDENCY_SSH_KEY" > "$auth_dir/key"
-            chmod 600 "$auth_dir/key"
-            printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$auth_dir/known_hosts"
-            export GIT_CONFIG_COUNT=1
-            export GIT_CONFIG_KEY_0="url.git@github.com:${DEPENDENCY_OWNER}/.insteadOf"
-            export GIT_CONFIG_VALUE_0="https://github.com/${DEPENDENCY_OWNER}/"
-            export GIT_SSH_COMMAND="ssh -i \"$auth_dir/key\" -o IdentitiesOnly=yes -o IdentityAgent=none -o StrictHostKeyChecking=yes -o UserKnownHostsFile=\"$auth_dir/known_hosts\""
-            unset DEPENDENCY_SSH_KEY
           fi
-          lock_tool="${APPLE_BUILD_LOCK_TOOL:-/Library/Application Support/NardukAppleRunner/bin/apple_build_lock.py}"
-          lock_path="${APPLE_BUILD_LOCK_PATH:-/Library/Application Support/NardukAppleRunner/state/apple-build.lock}"
-          script="${RUNNER_TEMP}/apple-test-command.sh"
-          cat > "$script" <<'APPLE_WORKFLOWS_TEST_COMMAND_EOF'
+          if [ "$RUN_TESTS" = "true" ]; then
+            cat > "$stage/2-test-command.sh" <<'APPLE_WORKFLOWS_TEST_COMMAND_EOF'
           ${{ inputs.test-command }}
           APPLE_WORKFLOWS_TEST_COMMAND_EOF
-          echo "RUNNING UNDER LEASE: test-command"
-          /usr/bin/env -u PYTHONHOME -u PYTHONPATH -u PYTHONSTARTUP -u PYTHONUSERBASE -u __PYVENV_LAUNCHER__ \
-            /usr/bin/python3 -I "$lock_tool" --lock-path "$lock_path" \
-            --timeout "${APPLE_BUILD_LEASE_REMAINING_SECONDS:-60}" run -- \
-            bash "$script"
+          fi
+
+          # Runs under the lease and owns the work budget. The commands get
+          # their own process group; stopping them (deadline or a cancellation
+          # the lock tool forwards) also reaches descendants that left that
+          # group -- SwiftPM starts its children in new groups -- and the
+          # script exits, releasing the lease, only once all of it is gone.
+          cat > "$stage/leased.sh" <<'APPLE_WORKFLOWS_LEASED_EOF'
+          stage="$1"
+          work_seconds="$2"
+          grace_seconds="${APPLE_BUILD_STOP_GRACE_SECONDS:-30}"
+          commands=""
+          : > "$stage/acquired"
+          echo "LEASE ACQUIRED after $(( $(date +%s) - $(cat "$stage/started") ))s in queue; ${work_seconds}s work budget starts now"
+          # Live members of the commands' group, their live descendants, and
+          # every pid seen by an earlier call (a child whose parent died is
+          # reparented and only the earlier snapshot still knows it).
+          command_pids() {
+            ps -axo pid=,ppid=,pgid= | awk -v root="$commands" '
+              { parent[$1] = $2; if ($3 == root) print $1 }
+              END {
+                for (pid in parent) {
+                  up = pid
+                  for (hops = 0; hops < 64 && (up in parent) && up != root; hops++) up = parent[up]
+                  if (up == root) print pid
+                }
+              }' >> "$stage/pids"
+            sort -un "$stage/pids" | while read -r pid; do
+              kill -0 "$pid" 2>/dev/null && echo "$pid"
+            done
+          }
+          stop_commands() {
+            [ -n "$commands" ] || return 0
+            : >> "$stage/pids"
+            pids="$(command_pids)"
+            [ -n "$pids" ] || return 0
+            # shellcheck disable=SC2086
+            kill -TERM $pids 2>/dev/null
+            waited=0
+            while [ "$waited" -lt "$grace_seconds" ]; do
+              pids="$(command_pids)"
+              [ -n "$pids" ] || return 0
+              sleep 1
+              waited=$((waited + 1))
+            done
+            echo "::warning::build/test processes ignored SIGTERM for ${grace_seconds}s -- sending SIGKILL"
+            # shellcheck disable=SC2086
+            kill -KILL $(command_pids) 2>/dev/null
+            return 0
+          }
+          trap 'stop_commands' TERM INT HUP
+          set -m
+          run_commands() {
+            for script in "$stage"/[0-9]-*.sh; do
+              [ -e "$script" ] || continue
+              label="$(basename "$script" .sh)"
+              echo "RUNNING UNDER LEASE: ${label#?-}"
+              bash "$script" || return
+            done
+          }
+          run_commands &
+          commands=$!
+          (
+            trap - TERM INT HUP
+            sleep "$work_seconds"
+            : > "$stage/timed-out"
+            echo "::error::build/test exceeded the ${work_seconds}s work budget (xcode-timeout-minutes) after acquiring the lease -- stopping it"
+            stop_commands
+          ) &
+          watchdog=$!
+          while :; do
+            wait "$commands"
+            status=$?
+            kill -0 "$commands" 2>/dev/null || break
+          done
+          # The leader is gone; nothing it started may outlive the lease.
+          kill -- "-$watchdog" 2>/dev/null
+          stop_commands
+          if [ -e "$stage/timed-out" ]; then
+            exit 124
+          fi
+          exit "$status"
+          APPLE_WORKFLOWS_LEASED_EOF
+
+          # The heartbeat always runs: a free probe can still lose the lease to
+          # another waiter before `run` takes it. It says nothing if the lease
+          # is acquired within a second, and stops once it is.
+          date +%s > "$stage/started"
+          (
+            sleep 1
+            [ -e "$stage/acquired" ] && exit 0
+            echo "QUEUED: another Apple build holds this host's lease. Waiting up to ${wait_seconds}s (lease-wait-minutes); build/test has not started and its ${work_seconds}s budget is not running."
+            while sleep "$heartbeat_seconds"; do
+              [ -e "$stage/acquired" ] && exit 0
+              echo "QUEUED: still waiting for the Apple build lease -- $(( $(date +%s) - $(cat "$stage/started") ))s of ${wait_seconds}s"
+            done
+          ) &
+          heartbeat=$!
+
+          set +e
+          run_lock_tool --timeout "$wait_seconds" run -- bash "$stage/leased.sh" "$stage" "$work_seconds"
+          status=$?
+          set -e
+          if [ ! -e "$stage/acquired" ]; then
+            if [ "$status" -eq 75 ]; then
+              echo "::error::Apple build lease still busy after ${wait_seconds}s (lease-wait-minutes) -- refusing to run unleased"
+            else
+              echo "::error::Apple build lease tool failed before acquiring the lease (exit $status)"
+            fi
+          fi
+          exit "$status"
 
   required:
+    concurrency:
+      group: workflows-apple-required-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     name: Required
     if: always()
-    needs: [lint, xcode]
+    needs: ["lint", "xcode", "ci-admission"]
     # Aggregation is pure shell; use the organization lightweight route first.
     runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || (inputs.lint-runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
@@ -455,7 +574,31 @@ jobs:
     permissions:
       contents: read
     steps:
+      - name: Check CI admission
+        env:
+          ADMISSION_RESULT: ${{ needs.ci-admission.result }}
+          ADMISSION_REASON: ${{ needs.ci-admission.outputs.reason }}
+          ADMISSION_SKIP: ${{ needs.ci-admission.outputs.skip }}
+        run: |
+          set -euo pipefail
+          if [ "$ADMISSION_RESULT" = skipped ] && [ -z "$ADMISSION_SKIP$ADMISSION_REASON" ]; then
+            exit 0
+          fi
+          if [ "$ADMISSION_RESULT" != success ]; then
+            echo "::error::CI admission failed; no validation proof is available"
+            exit 1
+          fi
+          case "$ADMISSION_SKIP:$ADMISSION_REASON" in
+            false:validate) exit 0 ;;
+            true:draft)
+              echo "::error::Expensive validation deferred for draft PR. Mark ready, then push a commit or choose Re-run all jobs (Re-run failed jobs keeps draft admission outputs). Automatic recovery requires ready_for_review in the caller pull_request.types."
+              exit 1
+              ;;
+          esac
+          echo "::error::Invalid CI admission result; validation cannot be skipped"
+          exit 1
       - name: Require the Xcode job to succeed and the Linux gate to succeed-or-skip
+        if: "needs.ci-admission.outputs.skip != 'true'"
         env:
           LINT_RESULT: ${{ needs.lint.result }}
           XCODE_RESULT: ${{ needs.xcode.result }}
