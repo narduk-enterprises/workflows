@@ -1,36 +1,9 @@
 #!/usr/bin/env python3
-"""Behaviour tests for the visibility-gated default runner route.
+"""Evaluate shipped runner expressions across visibility and override inputs.
 
-Row 18 Q3 (Logan, 2026-09-18, "Flip the default (Recommended)"): a caller that
-passes NO runner input used to land on GitHub-hosted `ubuntu-latest` whether it
-was private or public, which put every private caller that forgot the input on
-hosted capacity -- drift from agent-infrastructure docs/standards/CI-RUNNER-POLICY.md Sec 1. The default
-input is now EMPTY and each `runs-on:` resolves it per run:
-
-  explicit input                       -> that input, exactly as before (on
-                                          nuxt-cloudflare's ordinary route a
-                                          SET vars.CI_LINUX_RUNNER on a private
-                                          caller wins over it, W8 item 8)
-  empty + repository.private == true   -> the linux-ci organization-group route
-  empty + anything else                -> "ubuntu-latest" (Sec 3: public repos)
-
-These tests extract every shipped `runs-on:` expression from the callables and
-EVALUATE it with a small GitHub-expression interpreter over a matrix of caller
-visibility x runner input x org variables, so they cannot drift from the YAML.
-They prove:
-
-  1. a public or visibility-unknown caller never resolves to a self-hosted or
-     Blacksmith route when it passes nothing or passes "ubuntu-latest", even
-     with BLACKSMITH_RUNNERS_ENABLED=true (that variable is visible to public
-     repos);
-  2. a private caller passing nothing lands on the linux-ci group route, group
-     AND labels, and every such literal in the repo is the same string;
-  3. an explicit caller value resolves exactly as the pre-flip expression did
-     (parity, derived by substituting the old bare `inputs.<name>` back in);
-  4. Blacksmith overflow and CI_LIGHTWEIGHT_RUNNER keep working.
-
-nuxt-cloudflare.yml joined CALLABLES after workflows#110 added its `checks`
-job, so all ten of its runner-reading `runs-on:` lines are covered.
+Only an explicitly public caller may select GitHub-hosted capacity. Private or
+unknown callers ignore hosted overrides and keep existing fleet/Blacksmith
+routes, including required/lightweight jobs and platform-specific inputs.
 """
 
 from __future__ import annotations
@@ -50,22 +23,9 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 # labels). Verified against the manifest when this test was written; the test
 # asserts the callables agree with each other and with this one value.
 LINUX_CI = '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}'
-DEFAULT_TAIL = f"github.event.repository.private == true && '{LINUX_CI}' || '\"ubuntu-latest\"'"
-# The ORDINARY private route (nuxt-cloudflare.yml's Build/Checks/Extra gate/
-# Deploy dry run/Fast) also honours a per-repo `vars.CI_LINUX_RUNNER` (ci-reset
-# W4 addendum, 2026-09-28): a controller sets or deletes that repo variable to
-# move one burst repo's ordinary CI. Since ci-reset W10 (W8 item 8) a SET
-# variable wins over an explicit `inputs.runner` too, so the Blacksmith
-# overflow can engage on a caller that pins a runner. Private callers only;
-# unset is identical to the pre-variable expression, which check_callable
-# proves by evaluating both.
-LINUX_VAR_SITES = {
-    "nuxt-cloudflare.yml": {"build", "checks", "extra-gate", "deploy-dry-run", "fast", "fast-escalable", "fast-lanes"},
-    "taskgraph.yml": {"tasks"},
-}
-
 # callable -> the input that carries the caller's route
 CALLABLES = {
+    "reusable-browser-tests.yml": "linux-runner",
     "apple.yml": "lint-runner",
     "docs-governance.yml": "runner",
     "node-library.yml": "runner",
@@ -77,7 +37,6 @@ CALLABLES = {
     "design-publish.yml": "runs-on",
     "taskgraph.yml": "runner",
 }
-BLACKSMITH_LABEL = "blacksmith-2vcpu-ubuntu-2404"
 
 
 # --------------------------------------------------------------------------
@@ -209,6 +168,8 @@ class Evaluator:
 
     @staticmethod
     def call(name, args):
+        if name == "toJSON":
+            return json.dumps(args[0])
         if name == "fromJSON":
             return json.loads(args[0])
         if name == "format":
@@ -216,6 +177,8 @@ class Evaluator:
             for n, a in enumerate(args[1:]):
                 out = out.replace("{%d}" % n, str(a))
             return out
+        if name == "startsWith":
+            return str(args[0]).lower().startswith(str(args[1]).lower())
         if name == "contains":
             return str(args[1]).lower() in str(args[0]).lower()
         raise ValueError(f"unsupported function {name}")
@@ -227,177 +190,75 @@ def evaluate(template: str, ctx: dict):
     return Evaluator(ctx).run(m.group(1)) if m else template
 
 
-def ctx_for(private, input_name, value, blacksmith="", lightweight="", extra_inputs=None, linux=""):
-    repo = None if private is None else {"private": private}
-    inputs = {input_name: value, "required-runner": "", "lightweight-runner": "", "e2e-runner": ""}
-    inputs.update(extra_inputs or {})
-    # CI_LIGHTWEIGHT_RUNNER has org visibility `private`, so a public caller
-    # never sees it; BLACKSMITH_RUNNERS_ENABLED has visibility `all`.
-    vars_ = {"BLACKSMITH_RUNNERS_ENABLED": blacksmith,
-             "CI_LIGHTWEIGHT_RUNNER": lightweight if private else "",
-             # A repo-level variable: a public caller can hold one too.
-             "CI_LINUX_RUNNER": linux}
-    return {"github": {"event": {"repository": repo} if repo else {}},
-            "inputs": inputs, "vars": vars_}
+def runner_context(private, inputs, variables):
+    return {"github": {"event": {"repository": {"private": private}}},
+            "inputs": inputs, "vars": variables}
 
 
-def runs_on_sites(doc: dict, input_name: str):
-    for jid, job in doc["jobs"].items():
-        ro = job.get("runs-on")
-        if isinstance(ro, str) and f"inputs.{input_name}" in ro:
-            if "inputs.fast-parallel &&" in ro:
-                # `fast-parallel` (nuxt-cloudflare.yml): `fast` and
-                # `fast-escalable` become the aggregate of the lane matrix and
-                # take the lightweight route, exactly `fast-escalated`'s. With
-                # it off they are the ordinary route, which is what the rest of
-                # this check proves; the lightweight half is asserted equal to
-                # the sibling it is copied from, whose own checks cover it.
-                light = doc["jobs"]["fast-escalated"]["runs-on"]
-                inner = re.fullmatch(r"\$\{\{ fromJSON\((.*)\) \}\}", light, re.S).group(1)
-                prefix = "${{ fromJSON(inputs.fast-parallel && (" + inner + ") || ("
-                assert ro.startswith(prefix) and ro.endswith(")) }}"), f"{jid}: aggregate route drifted from fast-escalated"
-                ro = "${{ fromJSON(" + ro[len(prefix):-len(")) }}")] + ") }}"
-            yield jid, ro
+def is_private_route(route):
+    if isinstance(route, str):
+        return route.lower().startswith("blacksmith-") or route.lower() == "self-hosted"
+    labels = route.get("labels", []) if isinstance(route, dict) else route
+    if isinstance(labels, str):
+        labels = [labels]
+    return isinstance(labels, list) and "self-hosted" in [x.lower() for x in labels]
 
 
-def is_hosted_ubuntu_latest(route) -> bool:
-    return route == "ubuntu-latest"
-
-
-def check_callable(fname: str, name: str) -> int:
-    text = (WORKFLOWS / fname).read_text()
-    doc = yaml.safe_load(text)
-    inp = doc[True]["workflow_call"]["inputs"][name]  # `on:` parses as True
-    assert inp.get("default") == "", f"{fname}: {name} default must be '' (got {inp.get('default')!r})"
-    assert inp.get("required") is False, f"{fname}: {name} must stay optional"
-
-    default_effective = f"(inputs.{name} || {DEFAULT_TAIL})"
-    var_effective = f"(github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.{name} || {DEFAULT_TAIL})"
-    var_sites = LINUX_VAR_SITES.get(fname, set())
-    sites = list(runs_on_sites(doc, name))
-    assert sites, f"{fname}: no runs-on site reads inputs.{name}"
+def check_callable(fname, _name=None):
+    doc = yaml.safe_load((WORKFLOWS / fname).read_text())
+    definitions = doc[True]["workflow_call"]["inputs"]
+    inputs = {key: value.get("default", "") for key, value in definitions.items()}
+    runner_names = [key for key in definitions if key.endswith("runner") or key == "runs-on"]
+    variables = {"CI_LIGHTWEIGHT_RUNNER": "", "CI_LINUX_RUNNER": "",
+                 "BLACKSMITH_RUNNERS_ENABLED": "", "BLACKSMITH_LINUX_LABEL": ""}
+    hosted = ['"ubuntu-latest"', '"ubuntu-24.04"', '"ubuntu-slim"',
+              '"windows-latest"', '"macos-latest"', '["ubuntu-latest"]',
+              '{"labels":"ubuntu-latest"}', '{"group":"large","labels":["ubuntu-latest"]}']
     checks = 0
-    seen_var_sites = set()
-    for jid, ro in sites:
-        if jid in var_sites:
-            assert var_effective in ro and "CI_LINUX_RUNNER" in ro, f"{fname}:{jid}: ordinary route must honour vars.CI_LINUX_RUNNER"
-            seen_var_sites.add(jid)
-            # Unset CI_LINUX_RUNNER: identical to the pre-variable expression.
-            legacy = ro.replace(var_effective, default_effective)
-            assert "CI_LINUX_RUNNER" not in legacy, f"{fname}:{jid}: CI_LINUX_RUNNER outside the effective route"
-            for bs in ("", "false", "true"):
-                for vis in (True, False, None):
-                    for val in ("", '"ubuntu-latest"', LINUX_CI):
-                        c = ctx_for(vis, name, val, blacksmith=bs)
-                        assert evaluate(ro, c) == evaluate(legacy, c), f"{fname}:{jid} unset CI_LINUX_RUNNER changed the route"
-                        checks += 1
-                        # Set: it wins on a private caller, over an explicit
-                        # input too (W8 item 8); a public or visibility-unknown
-                        # caller never uses it.
-                        c = ctx_for(vis, name, val, blacksmith=bs, linux='"blacksmith-4vcpu-ubuntu-2404"')
-                        got = evaluate(ro, c)
-                        if vis is not True:
-                            assert got == evaluate(legacy, c), f"{fname}:{jid} public caller took CI_LINUX_RUNNER -> {got!r}"
-                            if not val:
-                                assert is_hosted_ubuntu_latest(got), f"{fname}:{jid} public caller left hosted -> {got!r}"
-                        elif bs == "true":
-                            # Blacksmith logic unchanged and not widened: a
-                            # non-hosted effective route becomes the Blacksmith label.
-                            assert got == BLACKSMITH_LABEL, f"{fname}:{jid} -> {got!r}"
-                        else:
-                            assert got == "blacksmith-4vcpu-ubuntu-2404", f"{fname}:{jid} private CI_LINUX_RUNNER -> {got!r}"
-                        checks += 1
-            # A hosted value in the variable keeps Blacksmith off, like an explicit hosted input.
-            got = evaluate(ro, ctx_for(True, name, "", blacksmith="true", linux='"ubuntu-latest"'))
-            assert is_hosted_ubuntu_latest(got), f"{fname}:{jid} hosted CI_LINUX_RUNNER + blacksmith -> {got!r}"
-            ro = legacy
-        else:
-            assert "CI_LINUX_RUNNER" not in ro, f"{fname}:{jid}: only the ordinary route reads CI_LINUX_RUNNER"
-        effective = default_effective
-        assert effective in ro, f"{fname}:{jid}: runs-on does not use the effective-default expression"
-        assert f"inputs.{name}" not in ro.replace(effective, ""), (
-            f"{fname}:{jid}: a bare inputs.{name} remains outside the effective-default expression"
-        )
-        old = ro.replace(effective, f"(inputs.{name})")
-        has_bs = "BLACKSMITH_RUNNERS_ENABLED" in ro
-        has_lw = "CI_LIGHTWEIGHT_RUNNER" in ro
-
-        for bs in ("", "false", "true"):
-            # (1) public / unknown visibility: never self-hosted, never Blacksmith.
-            for vis in (False, None):
-                for val in ("", '"ubuntu-latest"'):
-                    got = evaluate(ro, ctx_for(vis, name, val, blacksmith=bs, lightweight='"ubuntu-slim"'))
-                    assert is_hosted_ubuntu_latest(got), f"{fname}:{jid} public={vis} input={val!r} bs={bs} -> {got!r}"
+    for jid, job in doc["jobs"].items():
+        expression = job.get("runs-on")
+        if not isinstance(expression, str):
+            continue
+        # Exercise ordinary, lightweight, preview-browser, and parallel routes.
+        for extra in ({}, {"fast-parallel": True}, {"preview-checks": "e2e-subset"}):
+            base_inputs = {**inputs, **extra}
+            for visibility in (True, None):
+                for blacksmith in ("", "true"):
+                    base_vars = {**variables, "BLACKSMITH_RUNNERS_ENABLED": blacksmith}
+                    for value in hosted:
+                        # One bad override at a time, and all together, catch precedence leaks.
+                        variants = [({**base_inputs, key: value}, base_vars) for key in runner_names]
+                        variants += [(base_inputs, {**base_vars, key: value})
+                                     for key in ("CI_LIGHTWEIGHT_RUNNER", "CI_LINUX_RUNNER")]
+                        variants += [({**base_inputs, **dict.fromkeys(runner_names, value)},
+                                      {**base_vars, "CI_LIGHTWEIGHT_RUNNER": value, "CI_LINUX_RUNNER": value,
+                                       "BLACKSMITH_LINUX_LABEL": "ubuntu-latest"})]
+                        for trial_inputs, trial_vars in variants:
+                            got = evaluate(expression, runner_context(visibility, trial_inputs, trial_vars))
+                            assert is_private_route(got), (fname, jid, visibility, value, got)
+                            checks += 1
+            # Valid explicit fleet routes retain precedence when this job reads them.
+            for key in runner_names:
+                if f"inputs.{key}" not in expression:
+                    continue
+                for route in (LINUX_CI, '["self-hosted","Linux","X64","proxmox","linux-ci"]',
+                              '"blacksmith-4vcpu-ubuntu-2404"'):
+                    got = evaluate(expression, runner_context(True, {**base_inputs, key: route}, variables))
+                    assert is_private_route(got), (fname, jid, key, route, got)
+                    # Conditional preview/parallel branches need not select this
+                    # particular input. Direct input jobs must preserve its value.
+                    if len(runner_names) == 1:
+                        assert got == json.loads(route), (fname, jid, key, route, got)
                     checks += 1
-
-            # (1b) public / unknown visibility with an explicit self-hosted
-            # input and the switch ON: never Blacksmith (a public repository
-            # runs free on GitHub-hosted capacity; Logan 2026-10-05).
-            if has_bs:
-                for vis in (False, None):
-                    for val in (LINUX_CI, '["self-hosted","Linux","X64","proxmox","linux-ci"]'):
-                        got = evaluate(ro, ctx_for(vis, name, val, blacksmith=bs, lightweight='"ubuntu-slim"'))
-                        assert "blacksmith" not in json.dumps(got), f"{fname}:{jid} public={vis} input={val!r} bs={bs} landed on Blacksmith -> {got!r}"
-                        checks += 1
-
-            for lw in ("", '"ubuntu-slim"'):
-                # (2) private, nothing passed.
-                got = evaluate(ro, ctx_for(True, name, "", blacksmith=bs, lightweight=lw))
-                if has_lw and lw:
-                    want = "ubuntu-slim"
-                elif has_bs and bs == "true":
-                    want = BLACKSMITH_LABEL
-                else:
-                    want = json.loads(LINUX_CI)
-                assert got == want, f"{fname}:{jid} private empty bs={bs} lw={lw!r} -> {got!r}, want {want!r}"
-                checks += 1
-
-                # (3) explicit caller value: identical to the pre-flip expression.
-                for val in ('"ubuntu-latest"', LINUX_CI, '"ubuntu-24.04"',
-                            '["self-hosted","Linux","X64","proxmox","linux-ci"]'):
-                    for vis in (True, False, None):
-                        c = ctx_for(vis, name, val, blacksmith=bs, lightweight=lw)
-                        got, before = evaluate(ro, c), evaluate(old, c)
-                        assert got == before, f"{fname}:{jid} explicit {val} vis={vis}: {got!r} != pre-flip {before!r}"
-                        checks += 1
-
-        # explicit hosted value on a private caller with Blacksmith on stays hosted.
-        got = evaluate(ro, ctx_for(True, name, '"ubuntu-latest"', blacksmith="true"))
-        assert is_hosted_ubuntu_latest(got), f"{fname}:{jid} explicit hosted + blacksmith -> {got!r}"
-    assert seen_var_sites == var_sites, f"{fname}: CI_LINUX_RUNNER sites {sorted(seen_var_sites)} != {sorted(var_sites)}"
-    print(f"ok  {fname}: {len(sites)} runs-on site(s), {checks} evaluations")
+            # Empty public inputs retain free GitHub-hosted Linux routing. Required
+            # platform inputs may specify a public macOS/browser runner explicitly.
+            public_inputs = {**base_inputs, **dict.fromkeys(runner_names, '"ubuntu-latest"')}
+            got = evaluate(expression, runner_context(False, public_inputs,
+                           {**variables, "BLACKSMITH_RUNNERS_ENABLED": "true"}))
+            assert got == "ubuntu-latest", (fname, jid, "public", got)
+            checks += 1
+    print(f"ok  {fname}: {checks} routing evaluations")
     return checks
-
-
-def check_browser_tests() -> None:
-    doc = yaml.safe_load((WORKFLOWS / "reusable-browser-tests.yml").read_text())
-    jobs = doc["jobs"]
-    for jid in ("contract", "required"):
-        ro = jobs[jid]["runs-on"]
-        assert "inputs." not in ro, f"reusable-browser-tests:{jid} must not read a caller input"
-        for vis in (False, None):
-            got = evaluate(ro, ctx_for(vis, "linux-runner", LINUX_CI, lightweight='"ubuntu-slim"'))
-            assert is_hosted_ubuntu_latest(got), f"browser-tests:{jid} public={vis} -> {got!r}"
-        got = evaluate(ro, ctx_for(True, "linux-runner", ""))
-        assert got == json.loads(LINUX_CI), f"browser-tests:{jid} private -> {got!r}"
-    got = evaluate(jobs["required"]["runs-on"], ctx_for(True, "linux-runner", "", lightweight='"ubuntu-slim"'))
-    assert got == "ubuntu-slim", f"browser-tests:required keeps CI_LIGHTWEIGHT_RUNNER first -> {got!r}"
-    print("ok  reusable-browser-tests.yml: contract + required")
-
-
-def check_python_data_required() -> None:
-    # CI reset 2026-09-28: python-data's Required runs on the caller's own
-    # lint/test route, never the org lightweight route, so a caller that runs
-    # lint and test hosted (narduk-data earth-data-ci) takes no linux-ci seat.
-    jobs = yaml.safe_load((WORKFLOWS / "python-data.yml").read_text())["jobs"]
-    ro = jobs["required"]["runs-on"]
-    # ci-reset W10 (W8 item 10) folded the `lint` job into `test`.
-    assert "lint" not in jobs, "python-data: ruff runs inside `test`, not a job of its own"
-    assert ro == jobs["test"]["runs-on"], "python-data:required must share test's route"
-    assert "CI_LIGHTWEIGHT_RUNNER" not in ro, "python-data:required must not read CI_LIGHTWEIGHT_RUNNER"
-    got = evaluate(ro, ctx_for(True, "runner", '"ubuntu-24.04"', lightweight=LINUX_CI))
-    assert got == "ubuntu-24.04", f"python-data:required hosted caller -> {got!r}"
-    print("ok  python-data.yml: Required follows the caller route")
 
 
 def check_single_literal() -> None:
@@ -420,8 +281,6 @@ def self_test() -> None:
 def main() -> int:
     self_test()
     total = sum(check_callable(f, n) for f, n in CALLABLES.items())
-    check_browser_tests()
-    check_python_data_required()
     check_single_literal()
     print(f"test_runner_default: all passed ({total} evaluations)")
     return 0

@@ -25,20 +25,14 @@ name: Reusable Docs Governance Check
 # private, manifest-routed callers may pass a self-hosted runs-on value,
 # resolved via `python3 scripts/github_runner_fleet.py route` in
 # agent-infrastructure. This repository is public. Private callers retain
-# reusable-workflow compatibility; public callers use hosted capacity. `runner` is a free-form
-# caller-supplied value and this workflow cannot police it.
+# reusable-workflow compatibility; public callers use hosted capacity. private hosted overrides are ignored by the route guard.
 #
 # DEFAULT ROUTE (workflows row 18 Q3, Logan 2026-09-18 "Flip the default"):
 # an EMPTY runner input (the default) resolves per run from the caller's own
-# visibility. `github.event.repository.private == true` selects the fleet
-# manifest's linux-ci organization-group route, group AND labels (fleet
-# Config/github-runner-fleet.json; agent-infrastructure docs/standards/CI-RUNNER-POLICY.md Sec 1 and
-# Sec 4); anything else (public, or an event with no repository payload)
-# selects GitHub-hosted "ubuntu-latest" (Sec 3). An explicit caller value
-# always wins. Because visibility is read at run time, a caller that goes
-# public falls back to hosted on its next run without editing anything. A
-# private caller the manifest does not admit to the linux-ci group must be
-# added there, or pass '"ubuntu-latest"' explicitly, or its jobs queue.
+# visibility. Only an explicitly public caller may use GitHub-hosted capacity.
+# Private or unknown callers ignore hosted inputs and variables and fall back
+# to the fleet; explicit self-hosted and Blacksmith routes keep their precedence.
+# See README "Runner routing" and scripts/test_runner_default.py.
 
 # Least-privilege baseline for every job in this workflow. A called workflow's
 # token is capped by the caller's grant and can only be narrowed from here,
@@ -75,21 +69,11 @@ on:
         type: string
       runner:
         description: >-
-          JSON-encoded runner for the jobs in this workflow: a plain string
-          ("ubuntu-latest"), a JSON array, or a JSON object
-          ({"group":"linux-ci","labels":[...]}) matching the runner-fleet
-          manifest's `runsOn` shape. Decoded with fromJSON(), so the value
-          must be valid JSON — a bare string needs its own quotes. Empty (the
-          default) routes a PRIVATE caller to the fleet manifest's linux-ci
-          organization-group route (group AND labels) and a public or
-          visibility-unknown caller to GitHub-hosted ubuntu-latest; an
-          explicit value always wins. A private caller outside the manifest's
-          linux-ci group must be added to it (or pass '"ubuntu-latest"'
-          explicitly), or its jobs queue with no eligible runner. A PUBLIC (or
-          possibly-future-public) CALLER MUST NEVER PASS A SELF-HOSTED LABEL:
-          a fork PR would run attacker-controlled code on estate self-hosted
-          infrastructure. The constraint is the caller's visibility; this
-          repository is public while private callers retain compatibility.
+          JSON runner string, labels array, or group/labels object.
+          Only public callers may use GitHub-hosted runners. Private or
+          unknown callers ignore hosted overrides and fall back to linux-ci.
+          Explicit routes must contain the self-hosted label or be a
+          Blacksmith label. See README "Runner routing".
         required: false
         type: string
         default: ''
@@ -129,7 +113,7 @@ jobs:
   ci-admission:
     name: CI admission
     if: "(github.event_name == 'pull_request') && github.event.pull_request.draft"
-    runs-on: ${{ fromJSON(github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+    runs-on: ${{ fromJSON(github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (((toJSON(github.event.repository.private) == 'false' || contains(inputs.runner, '"self-hosted"') || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', startsWith(vars.BLACKSMITH_LINUX_LABEL, 'blacksmith-') && vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (((toJSON(github.event.repository.private) == 'false' || contains(inputs.runner, '"self-hosted"') || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -183,7 +167,7 @@ jobs:
     # pinned here. The route compared and used is the EFFECTIVE one: an
     # explicit `inputs.runner`, else (empty default) the linux-ci group route
     # for a private caller and `"ubuntu-latest"` for a public or
-    # visibility-unknown one. Any effective `"ubuntu-latest"` keeps that
+    # explicitly public one. Any effective `"ubuntu-latest"` keeps that
     # hosted route -- this never touches a public repo's runner. This is a
     # MANUAL switch, not automatic provider fallback: GitHub does not move an
     # already-queued job to another runs-on target, so the fallback is
@@ -196,7 +180,7 @@ jobs:
     # expanded by D-CI-CAP-1 (c)): a job landing on Blacksmith here is
     # exercising that named exception, not drift.
     # ---------------------------------------------------------------------
-    runs-on: ${{ fromJSON(github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+    runs-on: ${{ fromJSON(github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (((toJSON(github.event.repository.private) == 'false' || contains(inputs.runner, '"self-hosted"') || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', startsWith(vars.BLACKSMITH_LINUX_LABEL, 'blacksmith-') && vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (((toJSON(github.event.repository.private) == 'false' || contains(inputs.runner, '"self-hosted"') || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 15
     permissions:
       contents: read

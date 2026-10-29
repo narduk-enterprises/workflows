@@ -87,13 +87,11 @@ on:
         default: false
       runs-on:
         description: >-
-          JSON-encoded runner for this job: a plain string ("ubuntu-latest"),
-          a JSON array, or a JSON object matching the runner-fleet manifest's
-          `runsOn` shape. Decoded with fromJSON(). Empty (the default) routes
-          a PRIVATE caller to the fleet manifest's linux-ci organization-group
-          route and a public or visibility-unknown caller to GitHub-hosted
-          ubuntu-latest; an explicit value always wins. A PUBLIC (or
-          possibly-future-public) CALLER MUST NEVER PASS A SELF-HOSTED LABEL.
+          JSON runner string, labels array, or group/labels object.
+          Only public callers may use GitHub-hosted runners. Private or
+          unknown callers ignore hosted overrides and fall back to linux-ci.
+          Explicit routes must contain the self-hosted label or be a
+          Blacksmith label. See README "Runner routing".
         required: false
         type: string
         default: ''
@@ -101,7 +99,7 @@ on:
 jobs:
   publish:
     name: publish
-    runs-on: ${{ fromJSON(inputs.runs-on || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(((toJSON(github.event.repository.private) == 'false' || contains(inputs.runs-on, '"self-hosted"') || startsWith(inputs.runs-on, '"blacksmith-')) && inputs.runs-on) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
     timeout-minutes: 15
     permissions:
       contents: read

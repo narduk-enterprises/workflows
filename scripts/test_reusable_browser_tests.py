@@ -74,15 +74,13 @@ def validate_structure(document: dict) -> None:
     }
 
     jobs = document["jobs"]
-    # Route chosen by this file, never by a caller input: private -> linux-ci
-    # group route, public/unknown -> hosted (row 18 Q3; test_runner_default.py).
-    visibility_route = 'github.event.repository.private == true && \'{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}\' || \'"ubuntu-latest"\''
-    assert jobs["contract"]["runs-on"] == "${{ fromJSON(" + visibility_route + ") }}"
-    assert jobs["chromium"]["runs-on"] == "${{ fromJSON(inputs.browser-runner) }}"
-    assert jobs["webkit"]["runs-on"] == "${{ fromJSON(inputs.browser-runner) }}"
-    assert jobs["validate"]["runs-on"] == "${{ fromJSON(inputs.linux-runner) }}"
+    # Shipped expressions are evaluated across hosted and fleet inputs by test_runner_default.
+    assert "inputs." not in jobs["contract"]["runs-on"]
+    assert "inputs.browser-runner" in jobs["chromium"]["runs-on"]
+    assert jobs["webkit"]["runs-on"] == jobs["chromium"]["runs-on"]
+    assert "inputs.linux-runner" in jobs["validate"]["runs-on"]
     assert "report" not in jobs
-    assert jobs["required"]["runs-on"] == "${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || " + visibility_route + ") }}"
+    assert "CI_LIGHTWEIGHT_RUNNER" in jobs["required"]["runs-on"]
     assert jobs["validate"]["needs"] == ["contract", "ci-admission"]
     assert jobs["chromium"]["needs"] == ["contract", "validate", "ci-admission"]
     assert jobs["webkit"]["needs"] == ["contract", "validate", "chromium", "ci-admission"]
