@@ -597,9 +597,9 @@ jobs:
   ci:
     uses: narduk-enterprises/workflows/.github/workflows/apple.yml@<sha-of-v2> # v2
     with:
-      # Repo-scoped Mac from Config/github-runner-fleet.json `appleRepositories`.
-      # REQUIRED — there is no default, on purpose.
-      apple-runner: '["self-hosted","macOS","apple-imac"]'
+      # The apple-vm class (every Apple build since 2026-10-29; the repo must be in
+      # org runner group apple-vm). REQUIRED — there is no default, on purpose.
+      apple-runner: '{"group":"apple-vm","labels":["self-hosted","macOS","X64","apple-vm"]}'
       run-swiftlint: true
       build-command: swift build
       test-command: swift test

@@ -103,10 +103,10 @@ on:
         description: >-
           JSON-encoded runner for the Xcode/Swift job. REQUIRED and
           deliberately without a default — resolve it from the runner-fleet
-          manifest's `appleRepositories` entry for your repo (normally
-          '["self-hosted","macOS","apple-imac"]'; the laptop is an on-demand
-          fallback that needs a stated reason). Decoded with fromJSON(), so
-          the value must be valid JSON.
+          manifest for your repo (normally the apple-vm class,
+          '{"group":"apple-vm","labels":["self-hosted","macOS","X64","apple-vm"]}';
+          the laptop runs no CI). Decoded with fromJSON(), so the value must
+          be valid JSON.
         required: true
         type: string
       lint-runner:
