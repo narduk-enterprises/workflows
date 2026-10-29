@@ -252,54 +252,36 @@ which is why the explicit hosted value is the four-character JSON string
 
 ### Default route (empty `runner`)
 
-The `runner` inputs of `docs-governance.yml`, `node-library.yml`,
-`python-data.yml`, `red-main-listener.yml` and `flake-digest.yml`, and
-`apple.yml`'s `lint-runner`, default to the empty
-string (row 18 Q3, Logan 2026-09-18, "Flip the default (Recommended)"). Every
-`runs-on:` resolves the **effective route** as:
+Only an explicitly public caller may select GitHub-hosted capacity. Private
+callers ignore hosted runner inputs and
+variables, including `CI_LIGHTWEIGHT_RUNNER`, `CI_LINUX_RUNNER`,
+`required-runner`, `lightweight-runner`, and platform-specific runner inputs.
+This prevents stale `"ubuntu-latest"` overrides from spending Actions minutes.
 
-```
-inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'
-```
+Unknown visibility selects the unschedulable
+`missing-repository-visibility-do-not-run` sentinel; it never gets fleet access
+or paid hosted capacity.
 
-| Caller | Before | After |
-|---|---|---|
-| private, passes nothing | GitHub-hosted `ubuntu-latest` (policy drift, agent-infrastructure `docs/standards/CI-RUNNER-POLICY.md` §1) | `linux-ci` organization group, group **and** labels (§4) |
-| public, or an event with no `repository` payload, passes nothing | `ubuntu-latest` | `ubuntu-latest` (§3) |
-| any caller, explicit value | that value | that value — unchanged, proven by `scripts/test_runner_default.py` |
+Accepted private overrides require an actual `self-hosted` label in the parsed
+JSON string, array, or object labels, or a
+JSON string beginning `"blacksmith-`. Existing precedence is preserved among
+accepted overrides. A rejected value falls through to the next accepted route,
+then to the `linux-ci` group. Xcode and browser shard inputs instead fall back
+to their existing `apple-vm` and `playwright-isolated` fleet classes. Public
+callers retain their explicit runner input and free hosted default.
 
-The comparison is `== true`, so an unknown visibility falls to hosted, the safe
-direction. Because visibility is read at run time, a caller that goes public
-lands on hosted on its next run with no edit. Blacksmith overflow and
-`CI_LIGHTWEIGHT_RUNNER` apply to the effective route exactly as they applied to
-`inputs.runner` before; an effective `"ubuntu-latest"` is never sent to
-Blacksmith. `reusable-browser-tests.yml`'s `contract` job and its `Required`
-fallback use the same visibility gate with no caller input at all, so the
-route contract is still validated on a runner this file chose.
+The existing Blacksmith switch remains opt-in and private-only. Its label
+variable must begin `blacksmith-`; a hosted value cannot redirect that branch.
+No provider, paid plan, or allowance is added by this routing contract.
 
-The route literal is the fleet manifest's `linux-ci` class
-(`fleet/Config/github-runner-fleet.json`, organization group `linux-ci`). It is
-one string repeated at each site; `test_runner_default.py` fails if any copy
-diverges, but nothing here re-reads the manifest, so a manifest label change
-must be mirrored here.
+A public caller must never pass a self-hosted route: public fork code must not
+reach the private fleet. Resolve private routes from the fleet manifest and
+copy the returned group and labels verbatim; a missing fleet grant queues
+until onboarding, it does not justify a hosted override.
 
-**The `linux-ci` group is `selected`-visibility.** A private caller the
-manifest does not list in that group gets a job that queues with no eligible
-runner when it passes nothing. Such a repo must be added to the manifest group
-(the policy fix) or pass `'"ubuntu-latest"'` explicitly, and a repo holding a
-§2 hosted exception (for example `package-delivery`, exception 5) must pass
-`'"ubuntu-latest"'` explicitly. See the versioning note on this change below.
-
-**A PUBLIC CALLER MUST NEVER PASS A SELF-HOSTED LABEL.** A fork PR on a public
-caller can run attacker-controlled code, so a self-hosted `runner` value hands
-that PR estate infrastructure. A repo can also become public later, and `runner` is a
-free-form string these workflows cannot police. Only private, manifest-routed
-callers may pass a self-hosted value — resolve it first with
-`python3 scripts/github_runner_fleet.py route` (or
-`scripts/onboard-proxmox-runner.sh --route-only`) in the `agent-infrastructure`
-checkout, then copy the returned `runsOn` object verbatim. Every workflow file
-in this repo repeats this rule in a loud top-of-file comment; don't rely on
-this README alone when adding the next one.
+`scripts/test_runner_default.py` evaluates every shipped callable's routing
+expressions against hosted inputs, variable overrides, public/private/unknown
+visibility, valid fleet and Blacksmith values, and conditional job routes.
 
 ### Blacksmith overflow (`BLACKSMITH_RUNNERS_ENABLED`)
 

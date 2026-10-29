@@ -167,7 +167,7 @@ jobs:
   ci-admission:
     name: CI admission
     if: "(github.event_name == 'pull_request') && github.event.pull_request.draft"
-    runs-on: ${{ fromJSON(github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 20
     permissions:
       contents: read
@@ -204,9 +204,9 @@ jobs:
     # chooses, never on one the caller chose: private callers get the fixed
     # linux-ci organization-group route (group AND labels, from fleet
     # Config/github-runner-fleet.json; CI-RUNNER-POLICY.md Sec 1/Sec 4), and a
-    # public or visibility-unknown context keeps GitHub-hosted ubuntu-latest
+    # explicitly public context keeps GitHub-hosted ubuntu-latest
     # (Sec 3). Neither value reads an input, so the fail-closed property holds.
-    runs-on: ${{ fromJSON(github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 5
     permissions:
       contents: read
@@ -317,7 +317,7 @@ jobs:
     name: Validate same-run production build
     if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && needs.contract.result == 'success'"
     needs: ["contract", "ci-admission"]
-    runs-on: ${{ fromJSON(inputs.linux-runner) }}
+    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (((toJSON(github.event.repository.private) == 'false' || inputs.linux-runner == '"self-hosted"' || startsWith(inputs.linux-runner, '[') && contains(fromJSON(inputs.linux-runner || '[]'), 'self-hosted') || startsWith(inputs.linux-runner, '{') && (fromJSON(inputs.linux-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.linux-runner || '[]').labels), '[') && contains(fromJSON(inputs.linux-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.linux-runner, '"blacksmith-')) && inputs.linux-runner) || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}')) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
     timeout-minutes: 20
     permissions:
@@ -349,7 +349,7 @@ jobs:
     name: Chromium
     if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && needs.contract.result == 'success' && needs.validate.result == 'success'"
     needs: ["contract", "validate", "ci-admission"]
-    runs-on: ${{ fromJSON(inputs.browser-runner) }}
+    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (((toJSON(github.event.repository.private) == 'false' || inputs.browser-runner == '"self-hosted"' || startsWith(inputs.browser-runner, '[') && contains(fromJSON(inputs.browser-runner || '[]'), 'self-hosted') || startsWith(inputs.browser-runner, '{') && (fromJSON(inputs.browser-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.browser-runner || '[]').labels), '[') && contains(fromJSON(inputs.browser-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.browser-runner, '"blacksmith-')) && inputs.browser-runner) || '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}')) }}
     timeout-minutes: ${{ inputs.browser-timeout-minutes }}
     permissions:
       contents: read
@@ -693,7 +693,7 @@ jobs:
     name: WebKit
     if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && inputs.run-webkit && needs.contract.result == 'success' && needs.validate.result == 'success' && needs.chromium.result == 'success'"
     needs: ["contract", "validate", "chromium", "ci-admission"]
-    runs-on: ${{ fromJSON(inputs.browser-runner) }}
+    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (((toJSON(github.event.repository.private) == 'false' || inputs.browser-runner == '"self-hosted"' || startsWith(inputs.browser-runner, '[') && contains(fromJSON(inputs.browser-runner || '[]'), 'self-hosted') || startsWith(inputs.browser-runner, '{') && (fromJSON(inputs.browser-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.browser-runner || '[]').labels), '[') && contains(fromJSON(inputs.browser-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.browser-runner, '"blacksmith-')) && inputs.browser-runner) || '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}')) }}
     timeout-minutes: ${{ inputs.browser-timeout-minutes }}
     permissions:
       contents: read
@@ -827,7 +827,7 @@ jobs:
     needs: ["contract", "validate", "chromium", "webkit", "ci-admission"]
     # The organization lightweight route is independent of browser inputs.
     # Invalid browser inputs must still produce a visible Required failure.
-    runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (((toJSON(github.event.repository.private) == 'false' || vars.CI_LIGHTWEIGHT_RUNNER == '"self-hosted"' || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]'), 'self-hosted') || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '{') && (fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels), '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels, 'self-hosted')) || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '"blacksmith-')) && vars.CI_LIGHTWEIGHT_RUNNER) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 5
     permissions:
       contents: read
