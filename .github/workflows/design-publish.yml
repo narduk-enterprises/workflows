@@ -89,7 +89,8 @@ on:
         description: >-
           JSON runner string, labels array, or group/labels object.
           Only public callers may use GitHub-hosted runners. Private or
-          unknown callers ignore hosted overrides and fall back to linux-ci.
+          unknown visibility is blocked; private hosted overrides fall back
+          to linux-ci.
           Explicit routes must contain the self-hosted label or be a
           Blacksmith label. See README "Runner routing".
         required: false
@@ -99,7 +100,7 @@ on:
 jobs:
   publish:
     name: publish
-    runs-on: ${{ fromJSON(((toJSON(github.event.repository.private) == 'false' || contains(inputs.runs-on, '"self-hosted"') || startsWith(inputs.runs-on, '"blacksmith-')) && inputs.runs-on) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (((toJSON(github.event.repository.private) == 'false' || inputs.runs-on == '"self-hosted"' || startsWith(inputs.runs-on, '[') && contains(fromJSON(inputs.runs-on || '[]'), 'self-hosted') || startsWith(inputs.runs-on, '{') && (fromJSON(inputs.runs-on || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runs-on || '[]').labels), '[') && contains(fromJSON(inputs.runs-on || '[]').labels, 'self-hosted')) || startsWith(inputs.runs-on, '"blacksmith-')) && inputs.runs-on) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
     timeout-minutes: 15
     permissions:
       contents: read

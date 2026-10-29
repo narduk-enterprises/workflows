@@ -906,14 +906,23 @@ def test_fast_parallel() -> None:
     assert lanes["permissions"] == JOBS["fast"]["permissions"] and lanes["timeout-minutes"] == JOBS["fast"]["timeout-minutes"]
     # Lanes take `fast`'s ordinary route; the aggregate takes `fast-escalated`'s
     # lightweight one when `fast-parallel` is on (and the ordinary one off).
-    light = JOBS["fast-escalated"]["runs-on"][len("${{ fromJSON("):-len(") }}")]
+    # Unknown visibility is blocked by the shared outer guard; compare the
+    # normal branches here (the runner matrix evaluates that guard itself).
+    sentinel = "${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '\"missing-repository-visibility-do-not-run\"' || ("
+    routes = {}
+    for name, job in JOBS.items():
+        route = job.get("runs-on", "")
+        if isinstance(route, str) and route.startswith(sentinel):
+            route = "${{ fromJSON(" + route[len(sentinel):-len(")) }}")] + ") }}"
+        routes[name] = route
+    light = routes["fast-escalated"][len("${{ fromJSON("):-len(") }}")]
     prefix = "${{ fromJSON(inputs.fast-parallel && (" + light + ") || ("
     for job in ("fast", "fast-escalable"):
-        assert JOBS[job]["runs-on"].startswith(prefix) and JOBS[job]["runs-on"].endswith(")) }}"), job
-    ordinary = "${{ fromJSON(" + JOBS["fast"]["runs-on"][len(prefix):-len(")) }}")] + ") }}"
-    assert lanes["runs-on"] == ordinary
-    assert JOBS["fast-escalable"]["runs-on"] == JOBS["fast"]["runs-on"]
-    assert JOBS["fast-lanes-plan"]["runs-on"] == JOBS["fast-escalated"]["runs-on"]
+        assert routes[job].startswith(prefix) and routes[job].endswith(")) }}"), job
+    ordinary = "${{ fromJSON(" + routes["fast"][len(prefix):-len(")) }}")] + ") }}"
+    assert routes["fast-lanes"] == ordinary
+    assert routes["fast-escalable"] == routes["fast"]
+    assert routes["fast-lanes-plan"] == routes["fast-escalated"]
     assert lanes["defaults"] == JOBS["fast"]["defaults"]
     for job in ("fast", "fast-escalable"):
         assert {"fast-lanes-plan", "fast-lanes"} <= set(needs_of(JOBS[job])), job

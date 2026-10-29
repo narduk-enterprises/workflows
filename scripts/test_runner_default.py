@@ -43,7 +43,7 @@ CALLABLES = {
 # Minimal GitHub Actions expression interpreter (the subset these files use).
 # --------------------------------------------------------------------------
 TOKEN = re.compile(
-    r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<op>\|\||&&|==|!=|!|\(|\)|,)"
+    r"\s*(?:(?P<attr>\.[A-Za-z_][\w-]*)|(?P<str>'(?:[^']|'')*')|(?P<op>\|\||&&|==|!=|!|\(|\)|,)"
     r"|(?P<num>-?\d+(?:\.\d+)?)|(?P<id>[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)*))"
 )
 
@@ -159,7 +159,12 @@ class Evaluator:
                     if self.peek()[1] == ",":
                         self.i += 1
                 self.eat(")")
-                return self.call(val, args)
+                result = self.call(val, args)
+                while self.peek()[0] == "attr":
+                    key = self.peek()[1][1:]
+                    self.i += 1
+                    result = result.get(key) if isinstance(result, dict) else None
+                return result
             cur = self.ctx
             for part in val.split("."):
                 cur = cur.get(part) if isinstance(cur, dict) else None
@@ -180,6 +185,10 @@ class Evaluator:
         if name == "startsWith":
             return str(args[0]).lower().startswith(str(args[1]).lower())
         if name == "contains":
+            if isinstance(args[0], list):
+                return any(loose_eq(value, args[1]) for value in args[0])
+            if isinstance(args[0], dict) or args[0] is None:
+                return False
             return str(args[1]).lower() in str(args[0]).lower()
         raise ValueError(f"unsupported function {name}")
 
@@ -213,6 +222,9 @@ def check_callable(fname, _name=None):
                  "BLACKSMITH_RUNNERS_ENABLED": "", "BLACKSMITH_LINUX_LABEL": ""}
     hosted = ['"ubuntu-latest"', '"ubuntu-24.04"', '"ubuntu-slim"',
               '"windows-latest"', '"macos-latest"', '["ubuntu-latest"]',
+              '{"group":"self-hosted","labels":["ubuntu-latest"]}',
+              '{"self-hosted":true,"labels":["windows-latest"]}',
+              '{"labels":"ubuntu-self-hosted"}',
               '{"labels":"ubuntu-latest"}', '{"group":"large","labels":["ubuntu-latest"]}']
     checks = 0
     for jid, job in doc["jobs"].items():
@@ -235,7 +247,10 @@ def check_callable(fname, _name=None):
                                        "BLACKSMITH_LINUX_LABEL": "ubuntu-latest"})]
                         for trial_inputs, trial_vars in variants:
                             got = evaluate(expression, runner_context(visibility, trial_inputs, trial_vars))
-                            assert is_private_route(got), (fname, jid, visibility, value, got)
+                            if visibility is None:
+                                assert got == "missing-repository-visibility-do-not-run", (fname, jid, value, got)
+                            else:
+                                assert is_private_route(got), (fname, jid, visibility, value, got)
                             checks += 1
             # Valid explicit fleet routes retain precedence when this job reads them.
             for key in runner_names:
@@ -261,6 +276,29 @@ def check_callable(fname, _name=None):
     return checks
 
 
+def check_precedence():
+    fleet_a = '{"group":"linux-ci","labels":["self-hosted","seat-a"]}'
+    fleet_b = '{"group":"linux-ci","labels":["self-hosted","seat-b"]}'
+    cases = [
+        ("red-main-listener.yml", "reconcile", {"runner": fleet_a}, {"CI_LIGHTWEIGHT_RUNNER": fleet_b}, fleet_b),
+        ("red-main-listener.yml", "reconcile", {"runner": fleet_a}, {"CI_LIGHTWEIGHT_RUNNER": '\"ubuntu-latest\"'}, fleet_a),
+        ("node-library.yml", "required", {"runner": fleet_a, "required-runner": fleet_b}, {"CI_LIGHTWEIGHT_RUNNER": fleet_a}, fleet_b),
+        ("node-library.yml", "required", {"runner": fleet_a}, {"CI_LIGHTWEIGHT_RUNNER": fleet_b}, fleet_b),
+        ("nuxt-cloudflare.yml", "build", {"runner": fleet_a}, {"CI_LINUX_RUNNER": fleet_b}, fleet_b),
+        ("taskgraph.yml", "tasks", {"runner": fleet_a}, {"CI_LINUX_RUNNER": fleet_b}, fleet_b),
+        ("docs-governance.yml", "required", {"runner": fleet_a}, {}, fleet_a),
+        ("docs-governance.yml", "required", {"runner": fleet_a}, {"BLACKSMITH_RUNNERS_ENABLED": "true"}, '\"blacksmith-2vcpu-ubuntu-2404\"'),
+        ("docs-governance.yml", "required", {"runner": fleet_a}, {"BLACKSMITH_RUNNERS_ENABLED": "true", "BLACKSMITH_LINUX_LABEL": "blacksmith-4vcpu-ubuntu-2404"}, '\"blacksmith-4vcpu-ubuntu-2404\"'),
+        ("apple.yml", "xcode", {"apple-runner": '{"group":"apple-vm","labels":["self-hosted","macOS","X64","apple-vm"]}'}, {}, '{"group":"apple-vm","labels":["self-hosted","macOS","X64","apple-vm"]}'),
+        ("reusable-browser-tests.yml", "chromium", {"browser-runner": '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}'}, {}, '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}'),
+    ]
+    for filename, job, inputs, variables, wanted in cases:
+        expression = yaml.safe_load((WORKFLOWS / filename).read_text())["jobs"][job]["runs-on"]
+        assert evaluate(expression, runner_context(True, inputs, variables)) == json.loads(wanted), (filename, job, "precedence")
+        assert evaluate(expression, runner_context(None, inputs, variables)) == "missing-repository-visibility-do-not-run", (filename, job, "unknown")
+    print(f"ok  {len(cases)} exact fleet/Blacksmith precedence and unknown-visibility cases")
+
+
 def check_single_literal() -> None:
     literals = set()
     for f in WORKFLOWS.glob("*.yml"):
@@ -281,6 +319,7 @@ def self_test() -> None:
 def main() -> int:
     self_test()
     total = sum(check_callable(f, n) for f, n in CALLABLES.items())
+    check_precedence()
     check_single_literal()
     print(f"test_runner_default: all passed ({total} evaluations)")
     return 0

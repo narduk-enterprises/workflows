@@ -250,15 +250,20 @@ The value must be **valid JSON** — a bare string still needs its own quotes,
 which is why the explicit hosted value is the four-character JSON string
 `"ubuntu-latest"`, not the bare word.
 
-### Visibility and override contract
+### Default route (empty `runner`)
 
 Only an explicitly public caller may select GitHub-hosted capacity. Private
-callers and events with unknown visibility ignore hosted runner inputs and
+callers ignore hosted runner inputs and
 variables, including `CI_LIGHTWEIGHT_RUNNER`, `CI_LINUX_RUNNER`,
 `required-runner`, `lightweight-runner`, and platform-specific runner inputs.
 This prevents stale `"ubuntu-latest"` overrides from spending Actions minutes.
 
-Accepted private overrides are JSON containing the `"self-hosted"` label, or a
+Unknown visibility selects the unschedulable
+`missing-repository-visibility-do-not-run` sentinel; it never gets fleet access
+or paid hosted capacity.
+
+Accepted private overrides require an actual `self-hosted` label in the parsed
+JSON string, array, or object labels, or a
 JSON string beginning `"blacksmith-`. Existing precedence is preserved among
 accepted overrides. A rejected value falls through to the next accepted route,
 then to the `linux-ci` group. Xcode and browser shard inputs instead fall back
@@ -268,6 +273,11 @@ callers retain their explicit runner input and free hosted default.
 The existing Blacksmith switch remains opt-in and private-only. Its label
 variable must begin `blacksmith-`; a hosted value cannot redirect that branch.
 No provider, paid plan, or allowance is added by this routing contract.
+
+A public caller must never pass a self-hosted route: public fork code must not
+reach the private fleet. Resolve private routes from the fleet manifest and
+copy the returned group and labels verbatim; a missing fleet grant queues
+until onboarding, it does not justify a hosted override.
 
 `scripts/test_runner_default.py` evaluates every shipped callable's routing
 expressions against hosted inputs, variable overrides, public/private/unknown
