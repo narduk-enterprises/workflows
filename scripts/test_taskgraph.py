@@ -220,6 +220,18 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.equal(r.a.status, 'passed');
   });
 
+  await test('run: a ci:shared task runs in the checkout itself; one reading outputs is refused', async () => {
+    const g = graph({ a: {} });
+    g.tasks[0].shared = true;
+    const cwds = {};
+    const r = await run(g, ['a'], { onEvent: e => { if (e.type === 'start') cwds[e.task] = e.cwd; } });
+    assert.equal(r.a.status, 'passed');
+    assert.equal(cwds.a, repo);
+    fs.rmSync(path.join(repo, 'out-a'), { recursive: true });
+    assert.throws(() => planOf({ turbo: JSON.stringify({ tasks: { build: { outputs: ['.output/**'] }, test: { tags: ['ci', 'ci:shared'], dependsOn: ['build'] } } }) }), /ci:shared but depends on build/);
+    assert.equal(planOf({ turbo: JSON.stringify({ tasks: { lint: { tags: ['ci', 'ci:shared'] } } }) }).tasks[0].shared, true);
+  });
+
   await test('run: without isolation tasks share the checkout', async () => {
     const g = graph({ a: {} });
     const r = await run(g, ['a'], { isolate: false });

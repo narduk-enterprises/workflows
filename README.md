@@ -2304,7 +2304,13 @@ output gets a fresh build.
   `concurrency` CPUs at once. A `ci:cpus:N` tag sets a task's weight.
 - **Failures.** A failed task blocks only its dependents, so one push shows
   every independent failure.
-- **Isolation.** Each task runs in a detached worktree. The install's
+- **Shared checkout.** A task tagged `ci:shared` skips its worktree and
+  runs in the checkout itself. Use it for checks that only read the tree,
+  such as operator-portal's 34 one-second guards. A worktree costs one checkout of the tracked
+  files (about 1-4 s for 3,900 files). A `ci:shared` task may not depend
+  on a task with `outputs`, because those outputs exist only in that task's
+  worktree.
+- **Isolation.** Each other task runs in a detached worktree. The install's
   `node_modules` directories are linked in, any other files the install left
   are copied in, and each dependency's `outputs` directories are copied from
   that dependency's worktree.

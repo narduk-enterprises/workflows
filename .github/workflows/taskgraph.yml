@@ -818,6 +818,13 @@ jobs:
                 inputsDigest: fp.digest,
                 dependencies: deps.map(d => [d, keys.get(d)]),
               };
+              // `ci:shared`: a check that only reads the tree runs in the checkout
+              // itself, skipping a worktree. It cannot read another task's outputs,
+              // which live in that task's worktree.
+              if ((def.tags || []).includes('ci:shared')) {
+                const producer = deps.find(d => (tasks.get(d).outputs || []).length > 0);
+                if (producer) throw new Error(`task ${name} is ci:shared but depends on ${producer}, whose outputs only reach isolated tasks`);
+              }
               const key = sha256(JSON.stringify(material));
               keys.set(name, key);
               out.push({
@@ -831,6 +838,7 @@ jobs:
                 tagged: tagged.includes(name),
                 inputFiles: fp.files,
                 cpus: cpusOf(def.tags || []),
+                shared: (def.tags || []).includes('ci:shared'),
               });
             }
             return { engine: ENGINE, tasks: out };
@@ -1181,7 +1189,7 @@ jobs:
                   let taskCwd = cwd;
                   let setupError = null;
                   try {
-                    if (isolate) {
+                    if (isolate && !byName.get(name).shared) {
                       taskCwd = isolatedWorkspace(cwd, isolate, name);
                       // What turbo restores from cache before a dependent runs: the
                       // declared `outputs` of every dependency that ran here.
