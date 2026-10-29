@@ -119,6 +119,20 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.throws(() => planOf({ turbo: JSON.stringify({ tasks: { lint: { tags: ['ci'], outputs: ['**/*.d.ts'] } } }) }), /names no directory/);
   });
 
+  await test('selection: inputs that select no file, unknown turbo tokens and diff-scoped tools are refused', () => {
+    const only = inputs => planOf({ turbo: JSON.stringify({ tasks: { lint: { tags: ['ci'], inputs } } }) });
+    assert.throws(() => only(['scr/**']), /select no tracked file/);
+    assert.throws(() => only(['!README.md']), /select no tracked file/);
+    assert.throws(() => only(['$TURBO_ROOT$/tsconfig.json']), /only \$TURBO_DEFAULT\$/);
+    assert.ok(only(['src/**', '!src/**/*.md']));
+    const scoped = script => planOf({ scripts: { ...scripts, test: script } });
+    for (const script of ['jest --changedSince=origin/main', 'jest --onlyChanged', 'eslint $(git diff --name-only origin/main)',
+      'node x.mjs $(git merge-base HEAD origin/main)', 'nx affected -t test', 'vitest --changed', 'pnpm run test:changed', 'echo $GITHUB_BASE_REF']) {
+      assert.throws(() => scoped(script), /diff-scoped/, script);
+    }
+    assert.ok(scoped('node tools:changed-files-report.mjs && vitest run'), 'a name merely containing :changed is fine');
+  });
+
   await test('keys: stable for the same content', () => {
     assert.deepEqual(planOf(), planOf());
     assert.match(keyOf(planOf(), 'lint'), /^[0-9a-f]{64}$/);
@@ -154,6 +168,9 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.deepEqual(tg.executionSet(p.tasks, new Set(['lint'])), ['prepare', 'lint']);
     const noOut = tg.plan({ entries: entries(base), turboText: JSON.stringify({ tasks: { a: {}, b: { tags: ['ci'], dependsOn: ['a'] } } }), packageText: pkg({ a: 'x', b: 'y' }), nodeVersionText: '24', context: {} });
     assert.deepEqual(tg.executionSet(noOut.tasks, new Set(['b'])), ['b']);
+    // x misses, y passed and has no outputs, z behind it has outputs: z is rebuilt, y is not re-run.
+    const chain = tg.plan({ entries: entries(base), turboText: JSON.stringify({ tasks: { z: { outputs: ['dist/**'] }, y: { dependsOn: ['z'] }, x: { tags: ['ci'], dependsOn: ['y'] } } }), packageText: pkg({ x: 'a', y: 'b', z: 'c' }), nodeVersionText: '24', context: {} });
+    assert.deepEqual(tg.executionSet(chain.tasks, new Set(['x'])), ['z', 'x']);
   });
 
   await test('concurrency: cgroup limits win over host cores and memory', () => {
@@ -231,6 +248,8 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.equal(cwds.a, repo);
     fs.rmSync(path.join(repo, 'out-a'), { recursive: true });
     assert.throws(() => planOf({ turbo: JSON.stringify({ tasks: { build: { outputs: ['.output/**'] }, test: { tags: ['ci', 'ci:shared'], dependsOn: ['build'] } } }) }), /ci:shared but depends on build/);
+    // A producer behind a no-output task is still a producer.
+    assert.throws(() => planOf({ turbo: JSON.stringify({ tasks: { build: { outputs: ['.output/**'] }, prepare: { dependsOn: ['build'] }, test: { tags: ['ci', 'ci:shared'], dependsOn: ['prepare'] } } }) }), /ci:shared but depends on build/);
     assert.equal(planOf({ turbo: JSON.stringify({ tasks: { lint: { tags: ['ci', 'ci:shared'] } } }) }).tasks[0].shared, true);
   });
 
@@ -254,6 +273,17 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.match(outputs.hang, /was stopped/);
     assert.equal(r.after.status, 'passed', outputs.after);
     assert.ok(Date.now() - t0 < 20000, `took ${Date.now() - t0} ms`);
+  });
+
+  await test('run: task names that sanitise alike still get their own worktrees', async () => {
+    const root = path.join(tmp, 'collide');
+    const one = tg.isolatedWorkspace(repo, root, 'a:b');
+    fs.writeFileSync(path.join(one, 'MARK'), 'x');
+    const two = tg.isolatedWorkspace(repo, root, 'a_b');
+    assert.notEqual(one, two);
+    assert.ok(fs.existsSync(path.join(one, 'MARK')));
+    fs.rmSync(root, { recursive: true, force: true });
+    git('worktree', 'prune');
   });
 
   await test('run: without isolation tasks share the checkout', async () => {
@@ -401,6 +431,7 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
   await test('plan step: a missing node-version-file and a parent working-directory are refused', async () => {
     await assert.rejects(tg.planStep({ github: api(), context, core: core(), store: fakeStore, env: env({ NODE_VERSION_FILE: '.nvmrc' }) }), /does not exist/);
     assert.throws(() => tg.normalizeDir('../x'), /leaves the repository/);
+    await assert.rejects(tg.planStep({ github: api(), context, core: core(), store: fakeStore, env: env({ PACKAGE_MANAGER: 'yarn' }) }), /pnpm or npm/);
     assert.equal(tg.normalizeDir('./apps/web/'), 'apps/web');
     assert.equal(tg.normalizeDir('.'), '');
   });

@@ -638,7 +638,9 @@ jobs:
           const KEY = /^[0-9a-f]{64}$/;
           const LOCKFILES = ['pnpm-lock.yaml', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'bun.lock', 'bun.lockb'];
           const NODE_VERSION_FILES = ['.node-version', '.nvmrc', '.tool-versions'];
-          const DIFF_SCOPED = /FAST_BASE_REF|--changed\b|--only-changed\b|--since\b|:changed\b/;
+          // Flags and refs that make a script choose its checks from a diff, and a
+          // script token (a name, `pnpm run x:changed`) ending in `:changed`.
+          const DIFF_SCOPED = /FAST_BASE_REF|BASE_REF\b|--changed\b|--changedSince\b|--only-?[cC]hanged\b|--since\b|--affected\b|\baffected\b|merge-base|git diff\b|(?:^|\s)[\w:./@-]*:changed(?=\s|$)/;
           // Bounded so a broken store or API costs seconds, never the job budget.
           const LOOKUP_TIMEOUT_MS = 10000;
           // How long a task's pipes may stay open after its process exits.
@@ -716,6 +718,9 @@ jobs:
             const negative = [];
             for (const raw of inputs) {
               if (typeof raw !== 'string' || raw === '') throw new Error(`input ${JSON.stringify(raw)} is not a glob`);
+              // Only `$TURBO_DEFAULT$` is understood. Any other turbo token would
+              // select nothing, silently, and freeze the key.
+              if (/\$TURBO_(?!DEFAULT\$$)[A-Z_]*\$/.test(raw)) throw new Error(`input ${JSON.stringify(raw)}: only $TURBO_DEFAULT$ is supported; write the path relative to the package`);
               if (raw === '$TURBO_DEFAULT$') positive.push(/^/);
               else if (raw.startsWith('!')) negative.push(globToRegExp(raw.slice(1).replace(/^\.\//, '')));
               else positive.push(globToRegExp(raw.replace(/^\.\//, '')));
@@ -811,6 +816,10 @@ jobs:
               outputDirs(def.outputs);
               const inputs = Array.isArray(def.inputs) && def.inputs.length ? def.inputs : ['$TURBO_DEFAULT$'];
               const fp = fingerprint(entries, inputs);
+              // An `inputs` list that selects no file gives a key no change can
+              // move, so one old pass would be reused for ever (a typo such as
+              // `scr/**`, or only negations).
+              if (fp.files === 0) throw new Error(`turbo.json task ${name}: inputs ${JSON.stringify(inputs)} select no tracked file, so no change could ever re-run it`);
               const material = {
                 engine: ENGINE,
                 context,
@@ -827,7 +836,10 @@ jobs:
               // itself, skipping a worktree. It cannot read another task's outputs,
               // which live in that task's worktree.
               if ((def.tags || []).includes('ci:shared')) {
-                const producer = deps.find(d => (tasks.get(d).outputs || []).length > 0);
+                const ancestors = [];
+                const climb = n => { for (const d of localDeps(n, tasks.get(n))) if (!ancestors.includes(d)) { ancestors.push(d); climb(d); } };
+                climb(name);
+                const producer = ancestors.find(d => (tasks.get(d).outputs || []).length > 0);
                 if (producer) throw new Error(`task ${name} is ci:shared but depends on ${producer}, whose outputs only reach isolated tasks`);
               }
               const key = sha256(JSON.stringify(material));
@@ -855,12 +867,18 @@ jobs:
           function executionSet(planTasks, misses) {
             const byName = new Map(planTasks.map(t => [t.task, t]));
             const run = new Set();
+            // A passed dependency with no outputs is not re-run, but the outputs of
+            // the tasks behind it are still needed, so look through it.
+            const through = (name, seen) => {
+              for (const dep of byName.get(name).dependsOn) {
+                if (misses.has(dep) || byName.get(dep).outputs.length > 0) visit(dep);
+                else if (!seen.has(dep)) { seen.add(dep); through(dep, seen); }
+              }
+            };
             const visit = name => {
               if (run.has(name)) return;
               run.add(name);
-              for (const dep of byName.get(name).dependsOn) {
-                if (misses.has(dep) || byName.get(dep).outputs.length > 0) visit(dep);
-              }
+              through(name, new Set());
             };
             for (const name of misses) {
               if (!byName.has(name)) throw new Error(`unknown task ${name}`);
@@ -905,14 +923,14 @@ jobs:
             if (!attempts.has(id)) {
               attempts.set(id, (async () => {
                 const { data: run } = await github.rest.actions.getWorkflowRunAttempt({
-                  ...context.repo, run_id: pointer.run_id, attempt_number: pointer.run_attempt, request: { timeout: LOOKUP_TIMEOUT_MS },
+                  ...context.repo, run_id: pointer.run_id, attempt_number: pointer.run_attempt, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) },
                 });
                 if (run.id !== pointer.run_id || run.run_attempt !== pointer.run_attempt || run.path !== workflowPath
                     || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) {
                   return { ok: false, reason: `run ${pointer.run_id} is not this repository's own run of ${workflowPath}` };
                 }
                 const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
-                  ...context.repo, run_id: run.id, attempt_number: pointer.run_attempt, per_page: 100, request: { timeout: LOOKUP_TIMEOUT_MS },
+                  ...context.repo, run_id: run.id, attempt_number: pointer.run_attempt, per_page: 100, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) },
                 });
                 const stepName = `${PUBLISH_STEP} ${digest}`;
                 const attested = jobs.some(job => /(^| \/ )Required$/.test(String(job.name))
@@ -961,18 +979,21 @@ jobs:
           // key's proof up, and hand the misses to `Run tasks`. Any lookup problem is a
           // miss with a warning; only a broken turbo.json or package.json fails here.
           async function planStep({ github, context, core, store, env = process.env }) {
-            const request = { timeout: LOOKUP_TIMEOUT_MS };
+            // The fetch-based Octokit honours an AbortSignal, not a `timeout` option;
+            // one fresh signal per call.
+            const request = () => ({ signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) });
+            if (!['pnpm', 'npm'].includes(env.PACKAGE_MANAGER || 'pnpm')) throw new Error(`package-manager ${JSON.stringify(env.PACKAGE_MANAGER)}: taskgraph runs tasks with pnpm or npm`);
             const repo = context.repo;
             const repository = `${repo.owner}/${repo.repo}`;
             const wd = normalizeDir(env.WORKING_DIRECTORY);
             const workflowPath = String(env.CALLER_WORKFLOW_REF || '').split('@')[0].slice(`${repository}/`.length);
-            const { data: commit } = await github.rest.repos.getCommit({ ...repo, ref: context.sha, request });
+            const { data: commit } = await github.rest.repos.getCommit({ ...repo, ref: context.sha, request: request() });
             const treeSha = commit.commit.tree.sha;
-            const { data: tree } = await github.rest.git.getTree({ ...repo, tree_sha: treeSha, recursive: 'true', request });
+            const { data: tree } = await github.rest.git.getTree({ ...repo, tree_sha: treeSha, recursive: 'true', request: request() });
             if (tree.truncated) throw new Error(`the trees API truncated tree ${treeSha} (over 100,000 entries or 7 MB); taskgraph cannot key this repository`);
             const read = async file => {
               try {
-                const { data } = await github.rest.repos.getContent({ ...repo, path: file, ref: context.sha, mediaType: { format: 'raw' }, request });
+                const { data } = await github.rest.repos.getContent({ ...repo, path: file, ref: context.sha, mediaType: { format: 'raw' }, request: request() });
                 return typeof data === 'string' ? data : Buffer.from(data).toString('utf8');
               } catch (error) {
                 if (error.status === 404) return null;
@@ -1080,7 +1101,8 @@ jobs:
             const git = args => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
             const top = git(['rev-parse', '--show-toplevel']).trim();
             const prefix = git(['rev-parse', '--show-prefix']).trim();
-            const dir = path.join(root, name.replace(/[^A-Za-z0-9._-]/g, '_'));
+            // The hash keeps `a:b` and `a_b` apart.
+            const dir = path.join(root, `${name.replace(/[^A-Za-z0-9._-]/g, '_')}-${sha256(name).slice(0, 8)}`);
             fs.rmSync(dir, { recursive: true, force: true });
             // A persistent runner can hold a registration from an earlier job whose
             // directory is gone; prune it so `add` never refuses the path.

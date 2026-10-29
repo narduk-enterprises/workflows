@@ -2279,9 +2279,11 @@ every task, for a scheduled full check, and still records the passes.
 with `"cache": false`, `foundation:check`, and the performance budget after
 `build:ci`. Three things do not move:
 
-- **Diff-scoped scripts.** A task whose script reads `FAST_BASE_REF` or uses
-  `--changed`, `--only-changed` or `--since` (or a name ending `:changed`) is
-  refused, because its pass depends on the base branch and is not a fact
+- **Diff-scoped scripts.** A task is refused when its script picks its checks
+  from a diff. That covers reading `FAST_BASE_REF` or a `*BASE_REF`, using
+  `--changed`, `--changedSince`, `--onlyChanged`, `--only-changed`, `--since`,
+  `affected`, `git diff` or `merge-base`, and running any script whose name
+  ends `:changed`. Its pass depends on the base branch, so it is not a fact
   about the tree. Tag the full script instead (`test`, not `test:changed`).
   The keys do the selecting.
 - **Browser E2E, preview checks and deploy dry runs.** Keep them where they
@@ -2300,7 +2302,9 @@ read without running it:
 - its `turbo.json` definition;
 - the path, mode and blob hash of every tracked file its `inputs` select.
   The default is `$TURBO_DEFAULT$`, every tracked file. Negations (`!docs/**`)
-  and `globalDependencies` work as in turbo;
+  and `globalDependencies` work as in turbo. A list that selects no file is
+  refused (a typo such as `scr/**` would otherwise freeze the key), and so is
+  any turbo token other than `$TURBO_DEFAULT$`;
 - the lockfile blob, `packageManager`, `engines` and the Node version (input
   or file);
 - the caller workflow file's blob, which carries this callable's pinned SHA;
@@ -2361,8 +2365,16 @@ output gets a fresh build.
   `node_modules` directories are linked in, any other files the install left
   are copied in, and each dependency's `outputs` directories are copied from
   that dependency's worktree.
+- **Ending.** A task is over when its process exits. If a server or watcher
+  it left behind still holds its output open, the engine waits 3 s and then
+  ends the task's process group. No task may run longer than 20 minutes
+  ("if we have a CI job that lasts 20 minutes there better be a damn good
+  reason", Logan, 2026-09-17): one that does is stopped and fails, and the
+  others still report.
 - **Logs.** Each task's log is printed in its own group when the task
-  finishes. Failures are repeated at the end, ungrouped. The job summary
+  finishes. A line every minute names what is still running. One notice
+  annotation per run lists the slowest tasks, so the timings reach the
+  checks API even when the log cannot be read. Failures are repeated at the end, ungrouped. The job summary
   shows the plan (reused or run, with a link to the run that proved each
   reused task) and the wall time against summed task time.
 
