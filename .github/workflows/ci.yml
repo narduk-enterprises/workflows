@@ -238,6 +238,13 @@ jobs:
       - name: CI artifact store client tests
         run: python3 scripts/test_ci_artifact_store.py
 
+      # taskgraph.yml's engine (keys, the task graph, isolated side-by-side
+      # runs, task proofs and the plan/publish steps), extracted from the
+      # callable and executed; plus the steps it copies from
+      # nuxt-cloudflare.yml held byte-equal.
+      - name: taskgraph engine tests
+        run: python3 scripts/test_taskgraph.py
+
       # R12's fail-capable proof. A callable job that requests a permission
       # its caller did not grant kills the caller's ENTIRE run at startup --
       # zero jobs, no logs, no annotation -- on every adopter at once, the

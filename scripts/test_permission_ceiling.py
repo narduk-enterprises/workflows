@@ -151,9 +151,11 @@ def check_id_token_sits_on_exactly_the_caller_code_jobs() -> None:
 
 
 def check_other_callables_do_not_gain_id_token() -> None:
-    """Only design-publish.yml (its own publish credential) holds id-token elsewhere."""
+    """Only design-publish.yml (its own publish credential) and taskgraph.yml
+    (one job that runs caller scripts, as nuxt-cloudflare.yml's caller-code
+    jobs do) hold id-token elsewhere."""
     for path in sorted(WORKFLOWS.glob("*.yml")):
-        if path.name in ("nuxt-cloudflare.yml", "design-publish.yml"):
+        if path.name in ("nuxt-cloudflare.yml", "design-publish.yml", "taskgraph.yml"):
             continue
         doc = yaml.safe_load(path.read_text())
         for job_id, job in (doc.get("jobs") or {}).items():

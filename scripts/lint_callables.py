@@ -159,6 +159,11 @@ CALLER_GRANTS: dict[str, set[str]] = {
     "design-ledger.yml": {"contents", "issues"},
     # The run's OIDC token is the publish credential to the designs Worker.
     "design-publish.yml": {"contents", "id-token"},
+    # The one `Required` job reads the tree and turbo.json (contents), asks
+    # GitHub to confirm the run a task proof names (actions), installs the
+    # private bundle (packages) and runs caller scripts that resolve the
+    # portal-served app config (id-token, as nuxt-cloudflare.yml's).
+    "taskgraph.yml": {"contents", "actions", "packages", "id-token"},
 }
 
 # Local composite/local-path uses are exempt from SHA pinning: `./...` and
