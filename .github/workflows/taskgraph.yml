@@ -13,15 +13,17 @@ name: taskgraph
 #      (measured 2026-10-28, 169 merges), so main's run is mostly lookups.
 #   2. CONFIG IS THE TASK GRAPH. The caller's turbo.json tags what CI runs
 #      ("tags": ["ci"]), the same file Vercel CI reads; this callable has
-#      eight inputs, not a flag per gate.
-#   3. INSTALL ONCE, THEN RUN SIDE BY SIDE. One checkout and one install, then
-#      every task that must run starts as soon as its dependencies pass, each
-#      in its own worktree (Vercel gives each task its own machine started
-#      from the post-install copy; a worktree is that copy on one machine).
+#      nine inputs, not a flag per gate.
+#   3. INSTALL ONCE PER MACHINE, THEN RUN SIDE BY SIDE. Every task that must
+#      run starts as soon as its dependencies pass, each in its own worktree
+#      (Vercel gives each task its own machine started from the post-install
+#      copy; a worktree is that copy on one machine). A task tagged
+#      `ci:machine` gets a machine of its own, as on Vercel.
 #
-# ONE JOB, ONE SEAT. `Required` plans from the GitHub API before it checks
-# anything out, so a run whose tasks all passed before takes one short job
-# and no install. There is no plan job and no aggregator to queue for.
+# THREE JOBS. `Plan` (light) keys every task from the GitHub API, no
+# checkout. `Tasks (<leg>)` runs the misses, one leg per machine. `Required`
+# (light) is the verdict and Caller lint. A run whose tasks all passed before
+# has no legs: Plan, then Required.
 #
 # What it does not do (yet): browser E2E on the isolated pool, preview checks,
 # deploy dry runs. Callers keep those where they are today (an `e2e.yml`, the
@@ -36,6 +38,14 @@ on:
           gets the fleet manifest's linux-ci group route, a public or
           visibility-unknown caller gets GitHub-hosted ubuntu-latest, exactly
           as nuxt-cloudflare.yml's default route (README "Runner routing").
+        type: string
+        required: false
+        default: ""
+      lightweight-runner:
+        description: >-
+          JSON runs-on value for the Plan and Required jobs (API reads and
+          Caller lint). Empty: org CI_LIGHTWEIGHT_RUNNER, then the runner
+          route, as nuxt-cloudflare.yml's planners.
         type: string
         required: false
         default: ""
@@ -98,30 +108,25 @@ permissions:
   contents: read
 
 jobs:
-  required:
-    name: Required
-    # Blacksmith overflow and CI_LINUX_RUNNER exactly as nuxt-cloudflare.yml's
-    # ordinary route (README "Runner routing", D-CI-CAP-1 (c)/D-BLACKSMITH-2).
-    runs-on: ${{ fromJSON(github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+  plan:
+    name: Plan
+    # A few API reads: the lightweight route, as nuxt-cloudflare.yml's planners.
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
-    timeout-minutes: 30
+    timeout-minutes: 20
     permissions:
-      # checkout and the trees/contents API the plan reads
+      # the trees and contents API the plan reads
       contents: read
       # confirm the run a task proof names (getWorkflowRunAttempt, its jobs)
       actions: read
-      # private GitHub Packages bundle (install)
-      packages: read
-      # portal-served app config for caller scripts (D-PORTAL-APP-CONFIG-1),
-      # as nuxt-cloudflare.yml's caller-code jobs
-      id-token: write
-    defaults:
-      run:
-        working-directory: ${{ inputs.working-directory }}
+    outputs:
+      plan: ${{ steps.plan.outputs.plan }}
+      run: ${{ steps.plan.outputs.run }}
+      legs: ${{ steps.plan.outputs.legs }}
     steps:
       - name: Install CI artifact store client
         working-directory: ${{ github.workspace }}
-        run: |
+        run: &install_ci_artifact_store |
           set -euo pipefail
           cat > "$RUNNER_TEMP/ci-artifact-store.cjs" <<'CI_ARTIFACT_STORE'
           'use strict';
@@ -597,7 +602,7 @@ jobs:
 
       - name: Install taskgraph engine
         working-directory: ${{ github.workspace }}
-        run: |
+        run: &install_taskgraph_engine |
           set -euo pipefail
           cat > "$RUNNER_TEMP/taskgraph.cjs" <<'TASKGRAPH_ENGINE'
           'use strict';
@@ -842,6 +847,15 @@ jobs:
                 const producer = ancestors.find(d => (tasks.get(d).outputs || []).length > 0);
                 if (producer) throw new Error(`task ${name} is ci:shared but depends on ${producer}, whose outputs only reach isolated tasks`);
               }
+              // `ci:machine`: a leg (a seat) of its own. Two machine tasks in one
+              // chain would each need the other's machine.
+              if ((def.tags || []).includes('ci:machine')) {
+                const behind = [];
+                const climb = n => { for (const d of localDeps(n, tasks.get(n))) if (!behind.includes(d)) { behind.push(d); climb(d); } };
+                climb(name);
+                const other = behind.find(d => (tasks.get(d).tags || []).includes('ci:machine'));
+                if (other) throw new Error(`ci:machine task ${name} depends on ci:machine task ${other}; one chain runs on one machine, so tag only one of them`);
+              }
               const key = sha256(JSON.stringify(material));
               keys.set(name, key);
               out.push({
@@ -856,6 +870,7 @@ jobs:
                 inputFiles: fp.files,
                 cpus: cpusOf(def.tags || []),
                 shared: (def.tags || []).includes('ci:shared'),
+                machine: (def.tags || []).includes('ci:machine'),
               });
             }
             return { engine: ENGINE, tasks: out };
@@ -885,6 +900,49 @@ jobs:
               visit(name);
             }
             return planTasks.map(t => t.task).filter(n => run.has(n));
+          }
+
+          // The legs, one machine each: every task tagged `ci:machine` that must run,
+          // with the tasks behind it in the run (a dependent reads its outputs or
+          // waits for it) and whatever those need from the shared run set; and one
+          // shared leg for the rest. A task behind two machine tasks is refused: it
+          // could run on only one of them.
+          function legsOf(planTasks, executes) {
+            const byName = new Map(planTasks.map(t => [t.task, t]));
+            const running = new Set(executes);
+            const memo = new Map();
+            const behind = name => {
+              if (!memo.has(name)) {
+                const all = new Set();
+                for (const d of byName.get(name).dependsOn) { all.add(d); for (const x of behind(d)) all.add(x); }
+                memo.set(name, all);
+              }
+              return memo.get(name);
+            };
+            const machines = executes.filter(n => byName.get(n).machine);
+            const owner = new Map();
+            for (const n of executes) {
+              if (byName.get(n).machine) { owner.set(n, n); continue; }
+              const on = machines.filter(m => behind(n).has(m));
+              if (on.length > 1) throw new Error(`task ${n} needs ci:machine tasks ${on.join(' and ')}; it can run on only one machine`);
+              if (on.length === 1) owner.set(n, on[0]);
+            }
+            const legs = [];
+            const onMachines = new Set();
+            const leg = (id, members) => {
+              // A member's running dependencies run on its machine too (a shared
+              // `nuxt:prepare` runs once per machine that needs it).
+              const set = new Set(members);
+              for (const n of members) for (const d of behind(n)) if (running.has(d) && (owner.get(d) ?? null) === null) set.add(d);
+              legs.push({ id, names: executes.filter(n => set.has(n)).join(',') });
+              return set;
+            };
+            for (const m of machines) for (const n of leg(m, executes.filter(n => owner.get(n) === m))) onMachines.add(n);
+            // The shared leg: the rest, less what only machine legs needed.
+            const unowned = executes.filter(n => !owner.has(n));
+            const wanted = unowned.filter(n => !onMachines.has(n) || unowned.some(u => !onMachines.has(u) && behind(u).has(n)));
+            if (wanted.length) leg(machines.length ? 'shared' : 'all', wanted);
+            return legs;
           }
 
           function manifestDigest(keys) {
@@ -933,9 +991,9 @@ jobs:
                   ...context.repo, run_id: run.id, attempt_number: pointer.run_attempt, per_page: 100, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) },
                 });
                 const stepName = `${PUBLISH_STEP} ${digest}`;
-                const attested = jobs.some(job => /(^| \/ )Required$/.test(String(job.name))
+                const attested = jobs.some(job => /(^| \/ )Tasks \([A-Za-z0-9:_.\/@-]+\)$/.test(String(job.name))
                   && (job.steps || []).some(step => step.name === stepName && step.conclusion === 'success'));
-                return attested ? { ok: true, run } : { ok: false, reason: `${run.html_url} shows no successful "${stepName}" step in a Required job` };
+                return attested ? { ok: true, run } : { ok: false, reason: `${run.html_url} shows no successful "${stepName}" step in a Tasks leg` };
               })());
             }
             const verdict = await attempts.get(id);
@@ -1049,6 +1107,9 @@ jobs:
             core.setOutput('plan', JSON.stringify(result));
             core.setOutput('misses', misses.join(','));
             core.setOutput('run', executes.length ? 'true' : 'false');
+            const legs = executes.length ? legsOf(result.tasks, executes) : [];
+            core.setOutput('legs', JSON.stringify(legs));
+            if (legs.length) core.info(`legs: ${legs.map(l => `${l.id} (${l.names.split(',').length})`).join(', ')}`);
             const rows = result.tasks.map((t, i) => {
               const v = verdicts[i];
               const state = v.hit ? `passed before ([run ${v.run.id}](${v.run.html_url}))` : executes.includes(t.task) ? `runs (${misses.includes(t.task) ? v.reason : 'its outputs are needed'})` : 'runs';
@@ -1141,10 +1202,14 @@ jobs:
               const [quota, period] = read('/sys/fs/cgroup/cpu.max').trim().split(/\s+/);
               if (quota !== 'max' && Number(period) > 0) limits.cpus = Math.max(1, Math.floor(Number(quota) / Number(period)));
             } catch { /* no cgroup v2 CPU limit */ }
-            try {
-              const memory = read('/sys/fs/cgroup/memory.max').trim();
-              if (memory !== 'max' && Number(memory) > 0) limits.memory = Number(memory);
-            } catch { /* no cgroup v2 memory limit */ }
+            // memory.high throttles instead of killing: past it a task crawls
+            // (four heavy tasks ran 20 minutes on one seat), so it counts as a limit.
+            for (const file of ['memory.max', 'memory.high']) {
+              try {
+                const memory = read(`/sys/fs/cgroup/${file}`).trim();
+                if (memory !== 'max' && Number(memory) > 0) limits.memory = Math.min(limits.memory, Number(memory));
+              } catch { /* no cgroup v2 limit of that kind */ }
+            }
             return limits;
           }
 
@@ -1171,9 +1236,10 @@ jobs:
 
           function defaultConcurrency(limits = cgroupLimits()) {
             const cpus = Math.min(os.availableParallelism ? os.availableParallelism() : os.cpus().length, limits.cpus);
-            // About 2 GiB per concurrent Node tool (a Nuxt build, vue-tsc, ESLint)
-            // keeps a 4-CPU / 8 GiB guest out of the OOM killer.
-            const byMemory = Math.floor(Math.min(os.totalmem(), limits.memory) / (2 * 1024 ** 3));
+            // About 3 GiB per concurrent Node tool (a Nuxt build, vue-tsc, ESLint),
+            // so a seat stays under its memory limit; a heavier task takes a
+            // machine of its own (`ci:machine`).
+            const byMemory = Math.floor(Math.min(os.totalmem(), limits.memory) / (3 * 1024 ** 3));
             return Math.max(1, Math.min(cpus, byMemory));
           }
 
@@ -1301,8 +1367,12 @@ jobs:
           // names) and `results` to $GITHUB_OUTPUT.
           async function main(env = process.env) {
             const planTasks = JSON.parse(env.TASKGRAPH_PLAN).tasks;
-            const misses = new Set(String(env.TASKGRAPH_MISSES || '').split(',').filter(Boolean));
-            const names = executionSet(planTasks, misses);
+            // A leg names exactly what it runs; without one, the misses and what they need.
+            const known = new Set(planTasks.map(t => t.task));
+            for (const n of String(env.TASKGRAPH_RUN || '').split(',').filter(Boolean)) if (!known.has(n)) throw new Error(`leg names unknown task ${n}`);
+            const names = env.TASKGRAPH_RUN
+              ? planTasks.map(t => t.task).filter(n => String(env.TASKGRAPH_RUN).split(',').includes(n))
+              : executionSet(planTasks, new Set(String(env.TASKGRAPH_MISSES || '').split(',').filter(Boolean)));
             const pm = env.TASKGRAPH_PM === 'npm' ? 'npm' : 'pnpm';
             const requested = Number(env.TASKGRAPH_CONCURRENCY || 0);
             const concurrency = Number.isSafeInteger(requested) && requested > 0 ? requested : defaultConcurrency();
@@ -1364,7 +1434,10 @@ jobs:
             // log cannot be read.
             const slowest = names.map(n => [n, results[n]]).sort((a, b) => b[1].durationMs - a[1].durationMs).slice(0, 12)
               .map(([n, r]) => `${n} ${seconds(r.durationMs)}${r.status === 'passed' ? '' : ` ${r.status}${r.signal === 'timeout' ? ' (timeout)' : ''}`}`);
-            console.log(`::notice title=taskgraph ${ok ? 'passed' : 'failed'} in ${seconds(wall)}::${names.length} task(s) on ${concurrency} slot(s); slowest: ${slowest.join(', ')}`);
+            const lim = cgroupLimits();
+            const gib = b => (Number.isFinite(b) ? `${(b / 1024 ** 3).toFixed(1)} GiB` : 'none');
+            const machine = `${os.availableParallelism ? os.availableParallelism() : os.cpus().length} cpus, ${gib(os.totalmem())} RAM, cgroup cpus ${Number.isFinite(lim.cpus) ? lim.cpus : 'none'}, cgroup memory ${gib(lim.memory)}`;
+            console.log(`::notice title=taskgraph ${ok ? 'passed' : 'failed'} in ${seconds(wall)}::${names.length} task(s) on ${concurrency} slot(s) (${machine}); slowest: ${slowest.join(', ')}`);
             if (env.GITHUB_STEP_SUMMARY) {
               const mark = { passed: '✓ passed', failed: '✗ failed', blocked: '⊘ not run (a dependency failed)' };
               const rows = names.map(n => `| \`${n}\` | ${mark[results[n].status]} | ${seconds(results[n].durationMs)} |`);
@@ -1377,7 +1450,7 @@ jobs:
           module.exports = {
             ENGINE, POINTER_SCHEMA, PUBLISH_STEP, LOCKFILES, NODE_VERSION_FILES,
             sha256, parseJsonc, globToRegExp, entriesFromApi, entriesFromLsTree, fingerprint,
-            selectTasks, plan, executionSet, manifestDigest, proofKey, findTaskProof, publishTaskProofs,
+            selectTasks, plan, executionSet, legsOf, manifestDigest, proofKey, findTaskProof, publishTaskProofs,
             normalizeDir, planStep, publishStep,
             isolatedWorkspace, outputDirs, cgroupLimits, defaultConcurrency, runTasks, main,
           };
@@ -1392,8 +1465,8 @@ jobs:
 
       # PLAN, from the GitHub API alone: the tested commit's tree (every
       # blob hash), turbo.json, package.json and the Node version file. No
-      # checkout, so a run whose tasks all passed before finishes here plus
-      # Caller lint. Then one store lookup per task; GitHub must confirm each.
+      # checkout. Then one store lookup per task; GitHub must confirm each.
+      # The misses are split into legs, one machine each (see `tasks`).
       - name: Plan tasks
         id: plan
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -1414,33 +1487,59 @@ jobs:
             const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
             await tg.planStep({ github, context, core, store });
 
+
+  # One machine per leg (Vercel CI gives every task its own). Untagged misses
+  # share one leg; a task tagged `ci:machine` gets a leg of its own, with the
+  # tasks that read its outputs, because one seat cannot hold several heavy
+  # Node tools at once (operator-portal's build, typecheck, lint and unit
+  # suite each ran past 20 minutes side by side on one linux-ci seat,
+  # 2026-10-29, and took 163-258 s each on a larger machine).
+  tasks:
+    name: Tasks (${{ matrix.leg.id }})
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.plan.outputs.legs) }}
+    # Blacksmith overflow and CI_LINUX_RUNNER exactly as nuxt-cloudflare.yml's
+    # ordinary route (README "Runner routing", D-CI-CAP-1 (c)/D-BLACKSMITH-2).
+    runs-on: ${{ fromJSON(github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+    # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
+    timeout-minutes: 30
+    permissions:
+      # checkout
+      contents: read
+      # private GitHub Packages bundle (install)
+      packages: read
+      # portal-served app config for caller scripts (D-PORTAL-APP-CONFIG-1),
+      # as nuxt-cloudflare.yml's caller-code jobs
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.plan.outputs.run == 'true'
         with:
           persist-credentials: false
           # Depth 1: keys replace diff-based selection, so nothing reads HEAD^1.
           fetch-depth: 1
 
-      # Caller lint reads only `.github` (and local action metadata). A run
-      # with nothing to execute fetches only those paths.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: steps.plan.outputs.run != 'true'
-        with:
-          persist-credentials: false
-          sparse-checkout: |
-            .github
-            action.yml
-            action.yaml
-          sparse-checkout-cone-mode: false
+      - name: Install CI artifact store client
+        working-directory: ${{ github.workspace }}
+        run: *install_ci_artifact_store
+
+      - name: Install taskgraph engine
+        working-directory: ${{ github.workspace }}
+        run: *install_taskgraph_engine
 
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        if: steps.plan.outputs.run == 'true' && inputs.package-manager == 'pnpm'
+        if: inputs.package-manager == 'pnpm'
         # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
         # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic).
         env:
           PNPM_CONFIG_LOGLEVEL: error
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        if: steps.plan.outputs.run == 'true'
         with:
           # Mutually exclusive on setup-node: node-version-file wins when set.
           node-version-file: ${{ inputs.node-version-file }}
@@ -1452,7 +1551,7 @@ jobs:
       # A self-hosted guest's store is persistent and shared (R8).
       - name: Resolve dependency cache directory
         id: dep-cache-dir
-        if: steps.plan.outputs.run == 'true' && (runner.environment == 'github-hosted')
+        if: (runner.environment == 'github-hosted')
         run: |
           set -euo pipefail
           # Beside the checkout, not in it, and absolute with no `..`
@@ -1468,7 +1567,7 @@ jobs:
 
       - name: Restore dependency cache
         id: dep-cache
-        if: steps.plan.outputs.run == 'true' && (runner.environment == 'github-hosted')
+        if: (runner.environment == 'github-hosted')
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.dep-cache-dir.outputs.path }}
@@ -1477,7 +1576,7 @@ jobs:
             node-deps-${{ runner.os }}-${{ runner.arch }}-${{ inputs.package-manager }}-
 
       - name: Configure package registry auth
-        if: steps.plan.outputs.run == 'true' && inputs.install-script == ''
+        if: inputs.install-script == ''
         env:
           GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
           NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
@@ -1536,7 +1635,7 @@ jobs:
       # copies every file instead of hard-linking it (R9; nuxt-cloudflare.yml
       # "SELF-HOSTED: THE PNPM STORE MUST SIT ON THE WORKSPACE'S OWN FILESYSTEM").
       - name: Point pnpm at a workspace-local store (self-hosted)
-        if: steps.plan.outputs.run == 'true' && (runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm')
+        if: (runner.environment == 'self-hosted' && inputs.package-manager == 'pnpm')
         run: |
           set -euo pipefail
           mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
@@ -1552,7 +1651,7 @@ jobs:
           echo "npm_config_store_dir=$store" >> "$GITHUB_ENV"
           echo "pnpm store -> $store (same filesystem as $GITHUB_WORKSPACE)"
       - name: Install dependencies (pnpm)
-        if: steps.plan.outputs.run == 'true' && inputs.install-script == '' && inputs.package-manager == 'pnpm'
+        if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
           GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
@@ -1560,7 +1659,7 @@ jobs:
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       - name: Install dependencies (npm)
-        if: steps.plan.outputs.run == 'true' && inputs.install-script == '' && inputs.package-manager == 'npm'
+        if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
           GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
@@ -1575,7 +1674,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"
       - name: Install dependencies (caller script)
-        if: steps.plan.outputs.run == 'true' && inputs.install-script != ''
+        if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
           NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
@@ -1599,15 +1698,15 @@ jobs:
           fi
           "$PM" run "$INSTALL_SCRIPT"
 
-      # RUN: the misses, plus any dependency whose outputs they need, side by
-      # side in dependency order, each in its own worktree. Every task's log
-      # is its own group; failures are repeated, ungrouped, at the end.
+      # RUN: this leg's tasks (its misses plus any dependency whose outputs
+      # they need), side by side in dependency order, each in its own
+      # worktree. Every task's log is its own group; failures are repeated,
+      # ungrouped, at the end.
       - name: Run tasks
         id: run
-        if: steps.plan.outputs.run == 'true'
         env:
-          TASKGRAPH_PLAN: ${{ steps.plan.outputs.plan }}
-          TASKGRAPH_MISSES: ${{ steps.plan.outputs.misses }}
+          TASKGRAPH_PLAN: ${{ needs.plan.outputs.plan }}
+          TASKGRAPH_RUN: ${{ matrix.leg.names }}
           TASKGRAPH_PM: ${{ inputs.package-manager }}
           TASKGRAPH_CONCURRENCY: ${{ inputs.concurrency }}
         run: node "$RUNNER_TEMP/taskgraph.cjs"
@@ -1620,7 +1719,7 @@ jobs:
         if: always() && steps.run.outputs.digest != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
-          TASKGRAPH_PLAN: ${{ steps.plan.outputs.plan }}
+          TASKGRAPH_PLAN: ${{ needs.plan.outputs.plan }}
           TASKGRAPH_RESULTS: ${{ steps.run.outputs.results }}
           CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
           CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
@@ -1631,11 +1730,57 @@ jobs:
             const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
             await tg.publishStep({ context, core, store });
 
+
+  required:
+    name: Required
+    needs: [plan, tasks]
+    if: "!cancelled()"
+    # A verdict and Caller lint: the lightweight route.
+    runs-on: ${{ fromJSON(github.event.repository.private == false && '"ubuntu-latest"' || inputs.lightweight-runner || vars.CI_LIGHTWEIGHT_RUNNER || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (inputs.runner || github.event.repository.private == true && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      # Green only when the plan succeeded and, if it found work, every leg
+      # passed; a run whose tasks all passed before has no legs at all.
+      - name: Require the plan and every leg to pass
+        working-directory: ${{ github.workspace }}
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          RUN: ${{ needs.plan.outputs.run }}
+          TASKS_RESULT: ${{ needs.tasks.result }}
+        run: |
+          set -euo pipefail
+          echo "plan: $PLAN_RESULT (work to run: ${RUN:-unknown}); legs: $TASKS_RESULT"
+          if [ "$PLAN_RESULT" != success ]; then
+            echo "::error::Plan did not succeed ($PLAN_RESULT)"
+            exit 1
+          fi
+          if [ "$RUN" = true ] && [ "$TASKS_RESULT" != success ]; then
+            echo "::error::A task leg did not pass ($TASKS_RESULT)"
+            exit 1
+          fi
+          if [ "$RUN" != true ] && [ "$TASKS_RESULT" != skipped ]; then
+            echo "::error::Plan found nothing to run, but the legs report $TASKS_RESULT"
+            exit 1
+          fi
+
+      # Caller lint reads only `.github` (and local action metadata).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: "!cancelled()"
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            .github
+            action.yml
+            action.yaml
+          sparse-checkout-cone-mode: false
+
       # CALLER LINT, as nuxt-cloudflare.yml's `Required` runs it (byte-equal
       # step text; scripts/test_taskgraph.py holds the copies together):
       # actionlint plus the hygiene audit over the CALLER's own
-      # .github/workflows. `!cancelled()`, so a task failure and a lint
-      # finding are both reported in one run.
+      # .github/workflows. `!cancelled()`, so a failed leg and a lint finding
+      # are both reported in one run.
       - name: Ensure PyYAML is available
         if: "!cancelled()"
         working-directory: ${{ github.workspace }}

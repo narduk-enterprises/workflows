@@ -50,7 +50,7 @@ def step(doc: dict, job: str, name: str) -> dict:
 
 
 def install(doc: dict, name: str, runner_temp: Path) -> None:
-    subprocess.run(["bash", "-c", step(doc, "required", name)["run"]], check=True,
+    subprocess.run(["bash", "-c", step(doc, "plan", name)["run"]], check=True,
                    env={**os.environ, "RUNNER_TEMP": str(runner_temp)}, cwd=runner_temp)
 
 
@@ -173,10 +173,41 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.deepEqual(tg.executionSet(chain.tasks, new Set(['x'])), ['z', 'x']);
   });
 
+  await test('legs: untagged misses share one leg; a ci:machine task takes its readers to its own', () => {
+    const t = JSON.stringify({ tasks: {
+      prepare: { outputs: ['.nuxt/**'] },
+      build: { tags: ['ci', 'ci:machine'], outputs: ['.output/**'], dependsOn: ['prepare'] },
+      wrangler: { tags: ['ci'], dependsOn: ['build'] },
+      lint: { tags: ['ci', 'ci:machine'], dependsOn: ['prepare'] },
+      format: { tags: ['ci'] },
+      guard: { tags: ['ci'] },
+    } });
+    const p = tg.plan({ entries: entries(base), turboText: t, packageText: pkg({ prepare: 'p', build: 'b', wrangler: 'w', lint: 'l', format: 'f', guard: 'g' }), nodeVersionText: '24', context: {} });
+    const all = tg.executionSet(p.tasks, new Set(p.tasks.map(x => x.task)));
+    assert.deepEqual(tg.legsOf(p.tasks, all), [
+      { id: 'build', names: 'prepare,build,wrangler' },
+      { id: 'lint', names: 'prepare,lint' },
+      { id: 'shared', names: 'format,guard' },
+    ]);
+    // No machine tags: one leg for everything, as one seat.
+    const flat = planOf();
+    assert.deepEqual(tg.legsOf(flat.tasks, tg.executionSet(flat.tasks, new Set(['lint', 'format']))), [{ id: 'all', names: 'prepare,lint,format' }]);
+    // Only the misses: a passed build's leg does not exist.
+    assert.deepEqual(tg.legsOf(p.tasks, tg.executionSet(p.tasks, new Set(['guard']))), [{ id: 'all', names: 'guard' }]);
+  });
+
+  await test('legs: a task behind two machine tasks, or a machine task behind another, is refused', () => {
+    const two = JSON.stringify({ tasks: { a: { tags: ['ci', 'ci:machine'] }, b: { tags: ['ci', 'ci:machine'] }, c: { tags: ['ci'], dependsOn: ['a', 'b'] } } });
+    const p = tg.plan({ entries: entries(base), turboText: two, packageText: pkg({ a: 'a', b: 'b', c: 'c' }), nodeVersionText: '24', context: {} });
+    assert.throws(() => tg.legsOf(p.tasks, ['a', 'b', 'c']), /only one machine/);
+    const chain = JSON.stringify({ tasks: { a: { tags: ['ci', 'ci:machine'] }, b: { tags: ['ci', 'ci:machine'], dependsOn: ['a'] } } });
+    assert.throws(() => tg.plan({ entries: entries(base), turboText: chain, packageText: pkg({ a: 'a', b: 'b' }), nodeVersionText: '24', context: {} }), /depends on ci:machine task a/);
+  });
+
   await test('concurrency: cgroup limits win over host cores and memory', () => {
-    const limits = tg.cgroupLimits(f => (f.endsWith('cpu.max') ? '400000 100000\n' : `${8 * 1024 ** 3}\n`));
-    assert.deepEqual(limits, { cpus: 4, memory: 8 * 1024 ** 3 });
-    assert.equal(tg.defaultConcurrency({ cpus: 4, memory: 8 * 1024 ** 3 }) <= 4, true);
+    const limits = tg.cgroupLimits(f => (f.endsWith('cpu.max') ? '400000 100000\n' : f.endsWith('memory.high') ? `${6 * 1024 ** 3}\n` : `${8 * 1024 ** 3}\n`));
+    assert.deepEqual(limits, { cpus: 4, memory: 6 * 1024 ** 3 }, 'memory.high, where it throttles, is the limit');
+    assert.equal(tg.defaultConcurrency({ cpus: 4, memory: 6 * 1024 ** 3 }), 2, '3 GiB a slot');
     assert.equal(tg.defaultConcurrency({ cpus: 64, memory: 2 * 1024 ** 3 }), 1);
     assert.deepEqual(tg.cgroupLimits(() => 'max\n'), { cpus: Infinity, memory: Infinity });
   });
@@ -315,6 +346,15 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.equal(res.b.status, 'passed');
     assert.match(fs.readFileSync(summary, 'utf8'), /taskgraph run/);
     assert.ok(!git('worktree', 'list').includes(path.join(tmp, 'rt')), 'main removes and prunes its worktrees');
+    // A leg runs exactly the names it was given.
+    fs.writeFileSync(out, '');
+    process.chdir(repo);
+    console.log = () => {};
+    process.stdout.write = () => true;
+    try { code = await tg.main({ ...env, TASKGRAPH_MISSES: '', TASKGRAPH_RUN: 'a' }); } finally { console.log = log; process.stdout.write = write; process.chdir(cwd); }
+    assert.equal(code, 0);
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(out, 'utf8').match(/^results=(.*)$/m)[1])), ['a']);
+    await assert.rejects(tg.main({ ...env, TASKGRAPH_RUN: 'nope' }), /unknown task nope/);
   });
 
   // ---- proofs against a fake store and a fake GitHub ----
@@ -331,7 +371,7 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     paginate: async (fn, args) => (await fn(args)).data,
     rest: { actions: {
       getWorkflowRunAttempt: async ({ run_id, attempt_number }) => ({ data: { id: run_id, run_attempt: attempt_number, path: over.path || '.github/workflows/ci.yml', html_url: `https://x/${run_id}`, repository: { id: repoId }, head_repository: { id: over.headRepo || repoId } } }),
-      listJobsForWorkflowRunAttempt: async () => ({ data: [{ name: over.job || 'ci / Required', steps: [{ name: over.step || `Publish task proofs ${digest}`, conclusion: over.conclusion || 'success' }] }] }),
+      listJobsForWorkflowRunAttempt: async () => ({ data: [{ name: over.job || 'ci / Tasks (all)', steps: [{ name: over.step || `Publish task proofs ${digest}`, conclusion: over.conclusion || 'success' }] }] }),
     } },
   });
   const pointer = (over = {}) => JSON.stringify({ schema: tg.POINTER_SCHEMA, key, repository_id: repoId, run_id: 7, run_attempt: 1, manifest: [key, other], ...over });
@@ -350,7 +390,8 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     for (const [why, gh] of [
       ['step failed', fakeGithub({ conclusion: 'failure' })],
       ['digest of another manifest', fakeGithub({ step: `Publish task proofs ${tg.manifestDigest([key])}` })],
-      ['not the Required job', fakeGithub({ job: 'ci / Something' })],
+      ['not a Tasks leg', fakeGithub({ job: 'ci / Required' })],
+      ['a leg of another shape', fakeGithub({ job: 'ci / Tasks (a) (b)' })],
       ['another workflow', fakeGithub({ path: '.github/workflows/e2e.yml' })],
       ['a fork run', fakeGithub({ headRepo: 1 })],
     ]) assert.equal((await lookup(gh)).found, false, why);
@@ -403,6 +444,7 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.equal(c.outputs.run, 'true');
     assert.equal(c.outputs.misses, 'lint,test');
     assert.deepEqual(JSON.parse(c.outputs.plan), result);
+    assert.deepEqual(JSON.parse(c.outputs.legs), [{ id: 'all', names: 'lint,test' }]);
   });
 
   await test('plan step: every task passed before -> no run, nothing to install', async () => {
@@ -414,6 +456,7 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     await tg.planStep({ github: api({ step: `Publish task proofs ${tg.manifestDigest(keys)}` }), context, core: c, store: fakeStore, env: env() });
     assert.equal(c.outputs.run, 'false');
     assert.equal(c.outputs.misses, '');
+    assert.equal(c.outputs.legs, '[]');
     const r = core();
     await tg.planStep({ github: api({ step: `Publish task proofs ${tg.manifestDigest(keys)}` }), context, core: r, store: fakeStore, env: env({ REUSE: 'false' }) });
     assert.equal(r.outputs.misses, 'lint,test', 'reuse: false runs everything');
@@ -469,56 +512,83 @@ def check_copies() -> None:
     tg = yaml.safe_load(WORKFLOW.read_text())
     nc = yaml.safe_load(NUXT.read_text())
     pairs = [
-        (STORE_STEP, "reuse-plan"),
-        ("Configure package registry auth", "build"),
-        ("Point pnpm at a workspace-local store (self-hosted)", "build"),
-        ("Install dependencies (pnpm)", "build"),
-        ("Install dependencies (npm)", "build"),
-        ("Ensure PyYAML is available", "build"),
-        ("Install actionlint", "build"),
-        ("actionlint (caller's own workflows)", "build"),
-        ("Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)", "build"),
+        (STORE_STEP, "plan", "reuse-plan"),
+        (STORE_STEP, "tasks", "reuse-plan"),
+        ("Configure package registry auth", "tasks", "build"),
+        ("Point pnpm at a workspace-local store (self-hosted)", "tasks", "build"),
+        ("Install dependencies (pnpm)", "tasks", "build"),
+        ("Install dependencies (npm)", "tasks", "build"),
+        ("Ensure PyYAML is available", "required", "build"),
+        ("Install actionlint", "required", "build"),
+        ("actionlint (caller's own workflows)", "required", "build"),
+        ("Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)", "required", "build"),
     ]
-    for name, job in pairs:
-        assert run_text(tg, "required", name) == run_text(nc, job, name), f"{name}: drifted from nuxt-cloudflare.yml {job}"
+    for name, ours, job in pairs:
+        assert run_text(tg, ours, name) == run_text(nc, job, name), f"{name} ({ours}): drifted from nuxt-cloudflare.yml {job}"
+    assert run_text(tg, "plan", ENGINE_STEP) == run_text(tg, "tasks", ENGINE_STEP), "one engine for both jobs"
     assert step(tg, "required", "Install actionlint")["env"] == step(nc, "build", "Install actionlint")["env"]
     for name in ("Install dependencies (pnpm)", "Install dependencies (npm)"):
-        assert step(tg, "required", name)["env"] == step(nc, "build", name)["env"], f"{name}: env drifted"
+        assert step(tg, "tasks", name)["env"] == step(nc, "build", name)["env"], f"{name}: env drifted"
     print(f"ok  {len(pairs)} copied steps match nuxt-cloudflare.yml byte for byte")
 
 
 def check_shape() -> None:
     doc = yaml.safe_load(WORKFLOW.read_text())
     jobs = doc["jobs"]
-    assert list(jobs) == ["required"] and jobs["required"]["name"] == "Required", "one job, named Required"
-    assert "if" not in jobs["required"], "a self-contained Required carries no if:"
-    names = [s.get("name") or s.get("uses") for s in steps(doc, "required")]
-    assert names.index(STORE_STEP) < names.index(ENGINE_STEP) < names.index("Plan tasks") < names.index("Run tasks")
-    publish = next(s for s in steps(doc, "required") if str(s.get("name", "")).startswith("Publish task proofs"))
-    # The engine's verifier looks for exactly this name.
+    assert list(jobs) == ["plan", "tasks", "required"], list(jobs)
+    assert jobs["required"]["name"] == "Required" and jobs["required"]["if"] == "!cancelled()"
+    assert jobs["required"]["needs"] == ["plan", "tasks"], "Required needs every job"
+    # Plan holds no install and runs no caller code.
+    plan = [s.get("name") or s.get("uses") for s in steps(doc, "plan")]
+    assert plan == [STORE_STEP, ENGINE_STEP, "Plan tasks"], plan
+    assert jobs["plan"]["permissions"] == {"contents": "read", "actions": "read"}
+    # One leg per machine, only when there is work; an empty matrix is an error.
+    tasks = jobs["tasks"]
+    assert tasks["name"] == "Tasks (${{ matrix.leg.id }})"
+    assert tasks["if"] == "needs.plan.outputs.run == 'true'"
+    assert tasks["strategy"] == {"fail-fast": False, "matrix": {"leg": "${{ fromJSON(needs.plan.outputs.legs) }}"}}
+    run = step(doc, "tasks", "Run tasks")
+    assert run["env"]["TASKGRAPH_RUN"] == "${{ matrix.leg.names }}"
+    assert "steps.plan" not in yaml.safe_dump(tasks), "a leg reads the plan through needs, not a step"
+    publish = next(s for s in steps(doc, "tasks") if str(s.get("name", "")).startswith("Publish task proofs"))
+    # The engine's verifier looks for exactly this name, in a `Tasks (<leg>)` job.
     assert publish["name"] == "Publish task proofs ${{ steps.run.outputs.digest }}"
     assert publish["if"].startswith("always() && steps.run.outputs.digest != ''")
     assert "head.repo.full_name == github.repository" in publish["if"], "a fork pull request records nothing"
-    checkouts = [s for s in steps(doc, "required") if str(s.get("uses", "")).startswith("actions/checkout@")]
-    assert [c["if"] for c in checkouts] == ["steps.plan.outputs.run == 'true'", "steps.plan.outputs.run != 'true'"]
-    for s in steps(doc, "required"):
-        name = s.get("name") or s.get("uses")
-        if name in ("Install dependencies (pnpm)", "Install dependencies (npm)", "Install dependencies (caller script)", "Run tasks",
-                    "Configure package registry auth", "Resolve dependency cache directory", "Restore dependency cache") or \
-                str(name).startswith(("pnpm/action-setup", "actions/setup-node")):
-            assert "steps.plan.outputs.run == 'true'" in s["if"], f"{name} must not run when nothing executes"
-    lint_steps = [s for s in steps(doc, "required") if s.get("name") in (
+    assert "Tasks \\(" in run_text(doc, "plan", ENGINE_STEP), "the verifier matches the leg job name"
+    # Required: the verdict, then a sparse checkout and Caller lint, all after a failed leg too.
+    req = steps(doc, "required")
+    assert req[0]["name"] == "Require the plan and every leg to pass"
+    lint_steps = [s for s in req if s.get("name") in (
         "Ensure PyYAML is available", "Install actionlint", "actionlint (caller's own workflows)",
         "Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)")]
     assert len(lint_steps) == 4 and all(s["if"] == "!cancelled()" for s in lint_steps), "Caller lint runs after a task failure too"
     on = doc[True]["workflow_call"]
-    assert len(on["inputs"]) == 8, f"eight inputs, not a flag per gate (got {len(on['inputs'])})"
+    assert len(on["inputs"]) == 9, f"nine inputs, not a flag per gate (got {len(on['inputs'])})"
     assert all(not v.get("required") for v in on["secrets"].values())
-    print("ok  one Required job: plan before checkout, publish names the digest, Caller lint after failures")
+    print("ok  Plan, one Tasks leg per machine, Required: publish names the digest, Caller lint after failures")
+
+
+def check_verdict() -> None:
+    """Required: green only for a green plan and, when it found work, green legs."""
+    doc = yaml.safe_load(WORKFLOW.read_text())
+    script = step(doc, "required", "Require the plan and every leg to pass")["run"]
+
+    def verdict(plan, run, tasks):
+        env = {**os.environ, "PLAN_RESULT": plan, "RUN": run, "TASKS_RESULT": tasks}
+        return subprocess.run(["bash", "-c", script], env=env, capture_output=True).returncode
+
+    assert verdict("success", "false", "skipped") == 0, "nothing to run"
+    assert verdict("success", "true", "success") == 0
+    for plan, run, tasks in (("failure", "", "skipped"), ("success", "true", "failure"), ("success", "true", "cancelled"),
+                             ("success", "true", "skipped"), ("success", "false", "success"), ("cancelled", "", "skipped")):
+        assert verdict(plan, run, tasks) != 0, (plan, run, tasks)
+    print("ok  Required fails unless the plan passed and every leg it asked for passed")
 
 
 def main() -> int:
     check_shape()
+    check_verdict()
     check_copies()
     check_engine()
     print("test_taskgraph: all passed")

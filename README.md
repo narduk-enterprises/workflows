@@ -78,7 +78,7 @@ in their app-class workflow.
 | `design-ledger.yml` | **New 2026-09-27** (agent-infrastructure#1804). **Advisory, never required.** Runs the design ledger checker (`scripts/dc_ledger.py`, a byte copy of agent-infrastructure's canonical file) against a product's `design/<canvas>/ledger.json`. `mode: check` goes red while a canvas screen and its code have drifted and writes the table to the job summary; `mode: flag` keeps one `Design drift: <canvas>` issue. See [Design ledger](#design-ledgeryml) |
 | `design-publish.yml` | **New 2026-10-13** (operator-portal#727, design-portal-sync phase 2). Uploads a caller's `design/<slug>/` git mirror to the Operator Portal's designs Worker with the run's own OIDC token, no stored credential. Not a gate. See [Design publish](#design-publishyml) |
 | `flake-digest.yml` | **New 2026-09-24** (narduk-reboot P3-C2). Weekly, advisory: scans a caller's completed runs of one workflow, counts failures in jobs matching `quarantine-job-pattern` (nuxt-cloudflare.yml's `e2e-quarantine` by default), and files or refreshes one digest issue per ISO week. Never gates `main`, never opens `red-main` |
-| `taskgraph.yml` | **New 2026-10-29.** Vercel CI's model (beta 2026-10-28) for any `package.json`-script repo: the caller's `turbo.json` tags the CI tasks, each task gets a content key from Git's blob hashes, a task whose key already passed is never run again (a pointer in the R2 CI artifact store that GitHub's API must confirm), and the rest run side by side in one job after one install, each in its own worktree. One `Required` job, eight inputs. See [taskgraph.yml](#taskgraphyml) |
+| `taskgraph.yml` | **New 2026-10-29.** Vercel CI's model (beta 2026-10-28) for any `package.json`-script repo: the caller's `turbo.json` tags the CI tasks, each task gets a content key from Git's blob hashes, a task whose key already passed is never run again (a pointer in the R2 CI artifact store that GitHub's API must confirm), and the rest run side by side after one install per machine, each in its own worktree; a `ci:machine` task gets its own seat. Plan, Tasks legs, Required; nine inputs. See [taskgraph.yml](#taskgraphyml) |
 
 All eleven shipped callables are `on: workflow_call` only — none of them declare their own
 triggers, and none declare workflow-level `concurrency:` (see "How to consume"
@@ -2199,11 +2199,26 @@ that make it fast:
 2. **The task graph is the config.** The caller's `turbo.json` tags what CI
    runs (`"tags": ["ci"]`), the same file and the same tag Vercel CI reads. A
    caller passes no flag per gate.
-3. **Install once, then run tasks side by side.** One checkout and one
-   install. Every task that has to run then starts as soon as its
-   dependencies pass. Vercel gives each task its own machine started from
-   a post-install copy of the repository. Here each task gets its own Git
-   worktree started from that copy, on one machine.
+3. **Install once per machine, then run tasks side by side.** Every task
+   that has to run starts as soon as its dependencies pass. Vercel gives each
+   task its own machine started from a post-install copy of the repository.
+   Here each task gets its own Git worktree started from that copy, and a
+   task tagged `ci:machine` gets a machine (a seat) of its own.
+
+**Three jobs.** `Plan` (lightweight) keys every task from the GitHub API with
+no checkout and splits the misses into legs. `Tasks (<leg>)` is a matrix, one
+seat per leg: checkout, install, run that leg's tasks, record their passes.
+`Required` (lightweight) is the verdict and Caller lint. Untagged misses share
+one leg (`all`, or `shared` beside machine legs). A `ci:machine` task's leg
+holds it, the tasks that depend on it, and the dependencies they need, so a
+shared `nuxt:prepare` runs once per machine that needs it. A task that depends
+on two machine tasks is refused, and so is a machine task that depends on
+another. A run whose tasks all passed before has no legs: Plan, then Required.
+
+Why machines: operator-portal's `build`, `typecheck`, full `lint` and unit
+suite each ran past 20 minutes side by side on one linux-ci seat
+(2026-10-29), against 163-258 s each on a larger machine. One seat cannot
+hold four heavy Node tools at once.
 
 **Why this, measured.** The estate's CI over 2026-10-21..28 (17 busiest
 repositories, read-only from the Actions API):
@@ -2218,10 +2233,10 @@ repositories, read-only from the Actions API):
 - Repeated per-job setup (checkout, toolchain, install) is 20-25% of seat
   time. Nuxt push runs paid for `pnpm install` 3.1 times per run.
 
-With taskgraph, a merge whose tree passed on its PR is one short job:
-`Plan tasks` (GitHub API only, no checkout) finds every task already passed,
-and Caller lint runs on a sparse `.github` checkout. A pull request runs its
-whole task set side by side, so main has nothing left to do.
+With taskgraph, a merge whose tree passed on its PR is two short
+lightweight jobs: `Plan` (GitHub API only) finds every task already passed,
+and `Required` runs Caller lint on a sparse `.github` checkout. A pull request
+runs its whole task set side by side, so main has nothing left to do.
 
 #### Adopting it
 
@@ -2266,12 +2281,19 @@ jobs:
       CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
 ```
 
-The inputs are `runner`, `node-version`, `node-version-file`,
-`package-manager`, `install-script`, `working-directory`, `concurrency` and
-`reuse`. They mean what they mean in `nuxt-cloudflare.yml`, except the last
-two. `concurrency` is the CPU budget, set by default from the runner's
-cores and its cgroup and capped at one slot per 2 GiB. `reuse: false` runs
-every task, for a scheduled full check, and still records the passes.
+The inputs are `runner`, `lightweight-runner`, `node-version`,
+`node-version-file`, `package-manager`, `install-script`,
+`working-directory`, `concurrency` and `reuse`. They mean what they mean in
+`nuxt-cloudflare.yml`, except the last two. `concurrency` is a leg's CPU
+budget. By default it comes from the runner's cores and cgroup
+(`cpu.max`, `memory.max` and `memory.high`, which throttles rather than
+kills), capped at one slot per 3 GiB. The run's timing annotation reports
+what was detected. `reuse: false` runs every task, for a scheduled full
+check, and still records the passes.
+
+Tag a heavy task (a Nuxt build, `vue-tsc`, a full ESLint, a large unit
+suite) `ci:machine` so it gets a seat of its own. Leave light checks untagged
+(or `ci:shared`); they share one leg.
 
 **Moving from `nuxt-cloudflare.yml`.** Tag the scripts you passed as
 `fast-scripts`, `build-script`, `extra-scripts`, `extra-gate-scripts` and
@@ -2329,7 +2351,7 @@ only when GitHub's API confirms all of the following:
 
 - the attempt belongs to this repository's own run (head repository included,
   so no fork run counts) of the same caller workflow;
-- its `Required` job has a successful step named exactly
+- one of its `Tasks (<leg>)` jobs has a successful step named exactly
   `Publish task proofs <SHA-256 of the manifest>`;
 - the manifest holds the key.
 
@@ -2380,9 +2402,9 @@ output gets a fresh build.
 
 **Measured on gonogo** (a 14-core Mac, the same five tasks plus
 `nuxt:prepare`, isolated): see the PR that added this file for the
-1-, 2- and 4-slot timings. A default `linux-ci` seat is 4 CPU / 8 GiB
-(fleet `runnerSizes`), so `concurrency` defaults to 4 there.
-`linux-ci-large` (16 / 32) suits a repository with a long task list.
+1-, 2- and 4-slot timings. A default `linux-ci` seat is declared as 4 CPU /
+8 GiB (fleet `runnerSizes`). Do not count on running more than two heavy
+tasks on one: tag them `ci:machine` instead.
 
 `scripts/test_taskgraph.py` runs the shipped engine against a real Git
 repository and fake GitHub and store doubles. It also holds the steps copied

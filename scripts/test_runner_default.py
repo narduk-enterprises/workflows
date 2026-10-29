@@ -61,7 +61,7 @@ DEFAULT_TAIL = f"github.event.repository.private == true && '{LINUX_CI}' || '\"u
 # proves by evaluating both.
 LINUX_VAR_SITES = {
     "nuxt-cloudflare.yml": {"build", "checks", "extra-gate", "deploy-dry-run", "fast", "fast-escalable", "fast-lanes"},
-    "taskgraph.yml": {"required"},
+    "taskgraph.yml": {"tasks"},
 }
 
 # callable -> the input that carries the caller's route
