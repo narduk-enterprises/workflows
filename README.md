@@ -2368,11 +2368,35 @@ Without store credentials (a fork, Dependabot, or a caller missing from the
 every task runs, and nothing is recorded. A lookup that fails or times out
 (10 s) is a miss with a warning. The store can cost a run, never coverage.
 
+#### Output cache
+
+A pass also stores the producer's files, as Turborepo's remote cache does.
+When a task with `outputs` passes, `Run tasks` packs those directories from
+its worktree into one tarball. Tarballs over 1 GiB are not stored.
+
+`Publish task proofs` uploads it to
+`prebuilt/<owner>/<repo>/<run>-<attempt>-taskout-<key>.tar.gz`, where the
+store keeps it for 7 days. The proof records the tarball's SHA-256 under
+`outputs`. The step name's digest covers every `key sha256` pair, so GitHub's
+record of that step attests the tarball as well as the key.
+
+On a later run, Plan marks such a producer restorable whenever a dependent
+misses. Its leg's `Restore task outputs` step runs before any caller code. It
+downloads the tarball and checks it against the attested hash. `Run tasks`
+checks the hash again and extracts the tarball into the producer's own
+directory, and the dependent gets those files exactly as from a producer that
+ran there.
+
+A tarball that is missing, expired or does not match is never used: that
+producer runs in the leg instead. Proofs written before this cache carry no
+`outputs`, so their producers run as before.
+
 #### Execution
 
-`Run tasks` runs the misses. It also runs any dependency that declares
-`outputs`, since a proof restores no files: a `test` that reads the build's
-output gets a fresh build.
+`Run tasks` runs the misses. A dependency that declares `outputs` and
+passed before is restored from its stored outputs rather than run again (see
+Output cache below). With no stored outputs, it runs again, so a `test` that
+reads the build's output always gets a build.
 
 - **Order and budget.** Tasks start in dependency order, at most
   `concurrency` CPUs at once. A `ci:cpus:N` tag sets a task's weight.

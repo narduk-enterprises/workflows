@@ -432,6 +432,80 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     objects.clear();
   });
 
+  // ---- output cache: a passed producer's outputs, stored and restored ----
+  await test('outputs: a stored producer is restored, not re-run, and the digest attests its tarball', () => {
+    const g = graph({ build: { outputs: ['.output/**'] }, test: { dependsOn: ['build'] }, mid: { dependsOn: ['build'] }, e2e: { dependsOn: ['mid'] } });
+    assert.deepEqual(tg.executionSet(g.tasks, new Set(['test'])), ['build', 'test'], 'without a stored tarball the build runs');
+    assert.deepEqual(tg.executionSet(g.tasks, new Set(['test']), new Set(['build'])), ['test']);
+    assert.deepEqual(tg.restoresFor(g.tasks, ['test'], new Set(['build'])), ['build']);
+    // Looked up through a passed task with no outputs.
+    assert.deepEqual(tg.executionSet(g.tasks, new Set(['e2e']), new Set(['build'])), ['e2e']);
+    assert.deepEqual(tg.restoresFor(g.tasks, ['e2e'], new Set(['build'])), ['build']);
+    assert.deepEqual(tg.restoresFor(g.tasks, ['build', 'test'], new Set(['build'])), [], 'a producer that runs is not restored');
+    const h = 'd'.repeat(64);
+    assert.equal(tg.manifestDigest([key, other]), tg.manifestDigest([key, other], {}), 'no outputs: the digest is unchanged');
+    assert.notEqual(tg.manifestDigest([key, other], { [key]: h }), tg.manifestDigest([key, other]));
+    assert.equal(tg.outputObjectKey(store, 'narduk-enterprises/app', 7, 1, key), `prebuilt/narduk-enterprises/app/7-1-taskout-${key}.tar.gz`);
+  });
+
+  await test('outputs: the proof carries the tarball hash only when the attested digest covers it', async () => {
+    const h = 'd'.repeat(64);
+    const withOut = tg.manifestDigest([key, other], { [key]: h });
+    objects.set(objectKey, pointer({ outputs: { [key]: h } }));
+    const ok = await lookup(fakeGithub({ step: `Publish task proofs ${withOut}` }));
+    assert.equal(ok.found, true);
+    assert.deepEqual(ok.output, { sha256: h, run_id: 7, run_attempt: 1 });
+    assert.equal((await lookup(fakeGithub())).found, false, 'a hash the step name does not attest');
+    for (const [why, outs] of [['not a hash', { [key]: 'x' }], ['a key outside the manifest', { ['e'.repeat(64)]: h }], ['an array', [h]]]) {
+      objects.set(objectKey, pointer({ outputs: outs }));
+      assert.equal((await lookup(fakeGithub({ step: `Publish task proofs ${withOut}` }))).found, false, why);
+    }
+    objects.set(objectKey, pointer());
+    assert.equal((await lookup(fakeGithub())).output, null, 'an old proof restores nothing');
+    objects.delete(objectKey);
+  });
+
+  await test('outputs: archived after a pass, stored, fetched, checked and restored into a dependent', async () => {
+    const bins = new Map();
+    const binStore = { ...store, storeConfig: () => cfg, getObject: async (c, k) => bins.get(k) || null, putObject: async (c, k, body) => { bins.set(k, Buffer.from(body)); } };
+    const g = graph({ prepare: { outputs: ['.nuxt/**'] }, uses: { dependsOn: ['prepare'] } });
+    const rt = path.join(tmp, 'rt-out');
+    fs.rmSync(rt, { recursive: true, force: true });
+    const cwds = new Map();
+    const r1 = await run(g, ['prepare'], { onEvent: e => { if (e.type === 'start') cwds.set(e.task, e.cwd); } });
+    assert.equal(r1.prepare.status, 'passed');
+    const outs = tg.archiveOutputs({ planTasks: g.tasks, results: r1, cwds, dir: path.join(rt, 'taskgraph-outputs') });
+    const pk = tg.sha256('prepare');
+    assert.match(outs[pk], /^[0-9a-f]{64}$/);
+    const warnings = [];
+    await tg.publishTaskProofs({ store: binStore, cfg, context, planTasks: g.tasks, results: r1, outputs: outs, outputDir: path.join(rt, 'taskgraph-outputs'), env: { GITHUB_RUN_ID: '9', GITHUB_RUN_ATTEMPT: '2' }, warn: m => warnings.push(m) });
+    assert.deepEqual(warnings, []);
+    const tarKey = tg.outputObjectKey(store, 'narduk-enterprises/app', 9, 2, pk);
+    assert.ok(bins.has(tarKey));
+    const proof = JSON.parse(bins.get(tg.proofKey(store, 'narduk-enterprises/app', pk)).toString());
+    assert.deepEqual(proof.outputs, { [pk]: outs[pk] });
+    // A later leg: `uses` misses, `prepare` passed with its tarball stored.
+    const restores = { prepare: { key: pk, sha256: outs[pk], run_id: 9, run_attempt: 2 } };
+    const core = { warning: m => warnings.push(m), info: () => {} };
+    const env = { RUNNER_TEMP: rt, TASKGRAPH_PLAN: JSON.stringify(g), TASKGRAPH_RUN: 'uses', TASKGRAPH_RESTORES: JSON.stringify(restores), CI_ARTIFACTS_R2_ACCOUNT_ID: 'a', CI_ARTIFACTS_R2_ACCESS_KEY_ID: 'b', CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: 'c' };
+    assert.deepEqual(await tg.restoreStep({ context, core, store: binStore, env }), ['prepare']);
+    const out = path.join(tmp, 'gh-output-restore');
+    fs.writeFileSync(out, '');
+    const quiet = async fn => { const log = console.log; const w = process.stdout.write; const c = process.cwd(); console.log = () => {}; process.stdout.write = () => true; process.chdir(repo); try { return await fn(); } finally { console.log = log; process.stdout.write = w; process.chdir(c); } };
+    fs.rmSync(path.join(repo, '.nuxt'), { recursive: true, force: true });
+    assert.equal(await quiet(() => tg.main({ ...process.env, ...env, TASKGRAPH_PM: 'npm', GITHUB_OUTPUT: out })), 0, 'uses reads the restored .nuxt');
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(out, 'utf8').match(/^results=(.*)$/m)[1])), ['uses'], 'prepare did not run');
+    // A tarball that does not match its proof is refused, and the producer runs instead.
+    bins.set(tarKey, Buffer.from('tampered'));
+    fs.rmSync(path.join(rt, 'taskgraph-restore'), { recursive: true, force: true });
+    assert.deepEqual(await tg.restoreStep({ context, core, store: binStore, env }), []);
+    assert.match(warnings.join('\n'), /does not match its proof/);
+    fs.writeFileSync(out, '');
+    assert.equal(await quiet(() => tg.main({ ...process.env, ...env, TASKGRAPH_PM: 'npm', GITHUB_OUTPUT: out })), 0);
+    assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(out, 'utf8').match(/^results=(.*)$/m)[1])), ['prepare', 'uses'], 'no checked tarball: prepare runs here');
+    fs.rmSync(rt, { recursive: true, force: true });
+  });
+
   // ---- the github-script steps ----
   const notes = [];
   const core = () => {
