@@ -659,12 +659,14 @@ FIND = '''
     rest: { actions: {
       async getWorkflowRun({ run_id }) { return { data: { id: run_id, run_attempt: 1, event: 'pull_request',
         status: 'completed', conclusion: 'success', path: '.github/workflows/ci.yml', repository: { id: 42 },
-        head_repository: { id: 42 }, html_url: `https://example.test/run/${run_id}` } }; },
+        head_repository: { id: 42 }, html_url: `https://example.test/run/${run_id}`,
+        referenced_workflows: [{ path: 'narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@refs/heads/main', sha: '9'.repeat(40) }] } }; },
       async listJobsForWorkflowRunAttempt() { return { data: { jobs: vars.jobs } }; },
+      async downloadJobLogsForWorkflowRun() { return { data: vars.log ?? `2026-10-30T21:14:00.9Z Uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@${'9'.repeat(40)}\n2026-10-30T21:14:01.0Z Complete job name: ci / Required\n` }; },
     } },
     async paginate(method, args) { return (await method(args)).data.jobs; },
   };
-  return await store.findProof({ github, context, kind: vars.kind, key: vars.key,
+  return await store.findProof({ github, context: { ...context, runId: 900 }, kind: vars.kind, key: vars.key,
     workflowPath: '.github/workflows/ci.yml', env: vars.env });
 '''
 
@@ -685,18 +687,22 @@ def test_proofs(client: Client) -> None:
         "repository": "example/app", "repository_id": 42, "run_id": 555, "run_attempt": 1, "sha": "a" * 40,
     }, pointer
 
-    attested = [{"name": "ci / Required", "conclusion": "success", "steps": [
+    attested = [{"id": 7, "name": "ci / Required", "conclusion": "success", "steps": [
         {"name": f"Publish Required proof {REQUIRED_KEY}", "conclusion": "success"}]}]
     found = client.run(FIND, kind="required", key=REQUIRED_KEY, env=CREDS, jobs=attested, event="push")
     assert found["threw"] is None and found["result"]["found"] is True, found
     assert found["result"]["run"]["html_url"] == "https://example.test/run/555"
-    unattested = [{"name": "ci / Required", "conclusion": "success", "steps": [
+    forged = client.run(FIND, kind="required", key=REQUIRED_KEY, env=CREDS, jobs=attested, event="push",
+                        log="2026-10-30T21:14:01.0Z Complete job name: ci / Required\n")
+    assert forged["result"]["found"] is False and "no Required job that" in forged["result"]["reason"], forged
+    unattested = [{"id": 7, "name": "ci / Required", "conclusion": "success", "steps": [
         {"name": "Publish Required proof ${{ steps.required-key.outputs.key }}", "conclusion": "success"}]}]
     refused = client.run(FIND, kind="required", key=REQUIRED_KEY, env=CREDS, jobs=unattested, event="push")
     assert refused["result"]["found"] is False and "shows no successful" in refused["result"]["reason"], refused
     absent = client.run(FIND, kind="e2e", key=E2E_KEY, env=CREDS, jobs=attested, event="push")
     assert absent["result"] == {"found": False, "reason": f"no pointer at proof/example/app/{E2E_KEY}.json"}, absent
-    print("PASS  a published pointer reads back byte for byte and is honoured only with the attesting step")
+    print("PASS  a published pointer reads back byte for byte and is honoured only with the attesting step, "
+          "in a Required job the callable's runner header names")
 
     double.log.clear()
     for name, kind, overrides, level, fragment in (

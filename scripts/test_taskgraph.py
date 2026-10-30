@@ -676,6 +676,8 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
       ['a job with no callable header (defined by the caller itself)', { log: `2026-10-30T21:14:01.0Z Complete job name: ci / Required\n2026-10-30T21:14:02.0Z Uses: ${CALLABLE}@${SHA}\n` }],
       ['a header naming another SHA of the callable', { log: header('8'.repeat(40)) }],
       ['a header naming another callable', { log: header(SHA).replace('workflows/taskgraph.yml', 'evil/taskgraph.yml') }],
+      // Caller-written inputs are echoed after the runner's own `Uses:` line.
+      ['a forged Uses line in the echoed inputs', { log: `2026-10-30T21:14:00.9Z Uses: narduk-enterprises/app/.github/workflows/fake.yml@refs/pull/9/merge (${'a'.repeat(40)})\n2026-10-30T21:14:00.9Z ##[group] Inputs\n2026-10-30T21:14:00.9Z Uses: ${CALLABLE}@${SHA}\n2026-10-30T21:14:00.9Z ##[endgroup]\n2026-10-30T21:14:01.0Z Complete job name: ci / Required\n` }],
       ['a run that references another callable SHA', { runs: [runOf({ referenced_workflows: [{ path: `${CALLABLE}@x`, sha: '8'.repeat(40) }] })] }],
     ]) assert.equal((await find(gh(over))).found, false, why);
     assert.equal((await find(gh(), { callable: null })).found, false, 'this run\'s callable SHA unknown');

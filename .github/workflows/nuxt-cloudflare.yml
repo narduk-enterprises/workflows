@@ -1712,6 +1712,60 @@ jobs:
             }
           }
 
+          // THE CALLABLE THAT WROTE A JOB (taskgraph.yml's engine does the same).
+          // A job or step name proves nothing: any workflow can name a job
+          // `x / Required` and a step after a key, and a pull_request run executes
+          // the workflow in its merge ref, which a writer controls through the
+          // pull request's base branch. What no step can write is the runner's
+          // setup header, logged before the first step: a job that a reusable
+          // workflow defines logs `Uses: <owner>/<repo>/<path>@<sha>` there,
+          // before `Complete job name:`. A proof counts only from a Required job
+          // whose header names this callable at the SHA this run itself uses (its
+          // own `referenced_workflows`).
+          const PROOF_CALLABLE = 'narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml';
+          const HEADER_BYTES = 64 * 1024;
+          function callableSha(run, callable = PROOF_CALLABLE) {
+            const shas = new Set((run?.referenced_workflows || [])
+              .filter(w => String(w.path || '').startsWith(`${callable}@`)).map(w => String(w.sha || '')).filter(sha => /^[0-9a-f]{40}$/.test(sha)));
+            return shas.size === 1 ? [...shas][0] : null;
+          }
+
+          function headerNamesCallable(log, sha, callable = PROOF_CALLABLE) {
+            const lines = String(log).split('\n').map(line => line.replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /, '').trim());
+            const end = lines.findIndex(line => line.startsWith('Complete job name: '));
+            // The runner's own line is the FIRST `Uses:`. The `Inputs` group it
+            // echoes next holds caller-written values, which can carry a line of
+            // their own, so a later `Uses:` proves nothing.
+            const uses = lines.slice(0, Math.max(end, 0)).find(line => line.startsWith('Uses: '));
+            return end > 0 && uses === `Uses: ${callable}@${sha}`;
+          }
+
+          async function writtenByCallable({ github, context, job_id, sha, callable = PROOF_CALLABLE }) {
+            if (!/^[0-9a-f]{40}$/.test(String(sha || ''))) return false;
+            // The header is the first few KB; a server that ignores the range sends it all.
+            const { data } = await github.rest.actions.downloadJobLogsForWorkflowRun({
+              ...context.repo, job_id, headers: { range: `bytes=0-${HEADER_BYTES - 1}` }, request: { signal: AbortSignal.timeout(10000) },
+            });
+            return headerNamesCallable(typeof data === 'string' ? data : Buffer.from(data).toString('utf8'), sha, callable);
+          }
+
+          // The jobs API can answer for a finished attempt before it lists the
+          // steps that finished it: a present, green proof step read as missing
+          // on about half of main pushes (fleet#1180). Re-read up to twice while
+          // a green Required job lists no proof step yet.
+          const SETTLE_DELAYS_MS = [2000, 5000];
+          async function settledJobs({ github, context, run_id, attempt_number, done }) {
+            let jobs = [];
+            for (let i = 0; i <= SETTLE_DELAYS_MS.length; i += 1) {
+              if (i) await new Promise(resolve => setTimeout(resolve, SETTLE_DELAYS_MS[i - 1]));
+              jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+                ...context.repo, run_id, attempt_number, per_page: 100, request: { timeout: 10000 },
+              });
+              if (done(jobs)) break;
+            }
+            return jobs;
+          }
+
           // Returns { found: true, run } only when GitHub itself confirms the pointer.
           async function findProof({ github, context, kind, key, workflowPath, env = process.env }) {
             const cfg = storeConfig(env);
@@ -1741,14 +1795,23 @@ jobs:
             if (run.run_attempt !== pointer.run_attempt) {
               return { found: false, reason: `run ${run.id} is on attempt ${run.run_attempt}, but attempt ${pointer.run_attempt} published the pointer` };
             }
-            const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
-              ...context.repo, run_id: run.id, attempt_number: pointer.run_attempt, per_page: 100, request: { timeout: 10000 },
+            // Always `<caller job> / Required`: this callable runs only as a called job.
+            const required = job => / \/ Required$/.test(String(job.name));
+            const jobs = await settledJobs({
+              github, context, run_id: run.id, attempt_number: pointer.run_attempt,
+              done: js => js.filter(j => required(j) && j.conclusion === 'success').every(j => (j.steps || []).some(step => step.name.startsWith(PROOF_STEP[kind]) && step.conclusion)),
             });
             const stepName = `${PROOF_STEP[kind]} ${key}`;
-            const attested = jobs.some(job => /(^| \/ )Required$/.test(String(job.name)) && job.conclusion === 'success'
+            const attesting = jobs.filter(job => required(job) && job.conclusion === 'success'
               && (job.steps || []).some(step => step.name === stepName && step.conclusion === 'success'));
-            if (!attested) return { found: false, reason: `run ${run.html_url} shows no successful "${stepName}" step in a Required job` };
-            return { found: true, run };
+            if (!attesting.length) return { found: false, reason: `run ${run.html_url} shows no successful "${stepName}" step in a Required job` };
+            const { data: self } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId, request: { timeout: 10000 } });
+            const sha = callableSha(self);
+            if (!sha) return { found: false, reason: `this run's own ${PROOF_CALLABLE} SHA is unknown, so run ${run.html_url} cannot be confirmed` };
+            for (const job of attesting) {
+              if (await writtenByCallable({ github, context, job_id: job.id, sha })) return { found: true, run };
+            }
+            return { found: false, reason: `run ${run.html_url}: no Required job that ${PROOF_CALLABLE}@${sha.slice(0, 12)} wrote shows "${stepName}"` };
           }
 
           module.exports = {
@@ -1757,7 +1820,7 @@ jobs:
             storeConfig, endpoint, repositoryOf, assertKey, prebuiltKey, proofObjectKey,
             putObject, getObject, deleteObject,
             publishPrebuilt, parsePrebuilt, fetchPrebuilt, publishPrebuiltStep, fetchPrebuiltStep, buildDir,
-            publishProof, publishProofStep, findProof,
+            publishProof, publishProofStep, findProof, callableSha, headerNamesCallable, writtenByCallable, settledJobs,
           };
           CI_ARTIFACT_STORE
       - name: Find equivalent successful PR Required proof

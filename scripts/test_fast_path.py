@@ -1229,7 +1229,8 @@ def test_required_reuse_lookup() -> None:
     key = pushed["outputs"]["key"]
     assert key.startswith("required-proof-v1-") and len(key) == len("required-proof-v1-") + 64
     assert pushed["calls"] == [
-        {"r2": f"GET proof/example/app/{key}.json"}, {"getWorkflowRun": 123}, {"listJobs": [123, 1]}]
+        {"r2": f"GET proof/example/app/{key}.json"}, {"getWorkflowRun": 123}, {"listJobs": [123, 1]},
+        {"getWorkflowRun": 900}, {"jobLog": 7}]
     # The pull request only computes the key: it never reads the store, so it
     # needs no client (Required's copy of this text runs with none).
     pr = run_script(script, {"event": "pull_request"}, inputs, "PROOF_INPUTS",
@@ -1244,6 +1245,8 @@ def test_required_reuse_lookup() -> None:
         "E2E proof step, not the Required one": {"stepName": "Publish full E2E proof {KEY}"},
         "Required proof step skipped": {"stepConclusion": "skipped"},
         "pointer of the other proof kind": {"pointer": {"kind": "e2e"}},
+        "a top-level job named Required": {"jobName": "Required"},
+        "a Required job no callable wrote": {"log": "2026-10-30T21:14:01.0Z Complete job name: ci / Required\n"},
     }.items():
         assert run_script(script, scenario, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "false", name
     changed = run_script(script, {"storedKey": key}, {**inputs, "e2e-args": "--project=other"}, "PROOF_INPUTS")

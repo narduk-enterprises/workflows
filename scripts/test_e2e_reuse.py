@@ -30,8 +30,10 @@ OTHER_KEY = {'e2e': 'e2e-proof-v1-' + '0' * 64, 'required': 'required-proof-v1-'
 #   missing, storedKey, r2Status, r2Throw, pointerRaw, pointer, proofKey
 #                                         the bucket stand-in
 #   run, runError                         actions.getWorkflowRun
-#   jobs, jobsError, jobName, jobConclusion, stepName, stepConclusion
+#   jobs, jobsError, jobName, jobConclusion, stepName, stepConclusion, lagOnce
 #                                         actions.listJobsForWorkflowRunAttempt
+#   refs                                  this run's own referenced_workflows
+#   log                                   the attesting job's log (runner header)
 HARNESS = r'''
 const fs = require('node:fs');
 const scenario = JSON.parse(fs.readFileSync(process.argv[1], 'utf8'));
@@ -51,8 +53,13 @@ if (!scenario.noCreds) {
 Object.assign(process.env, scenario.env || {});
 const context = {
   repo: {owner: 'example', repo: 'app'}, sha: 'a'.repeat(40),
-  eventName: scenario.event || 'push', payload: {repository: {id: 42}},
+  eventName: scenario.event || 'push', payload: {repository: {id: 42}}, runId: 900,
 };
+// The runner's setup header: which callable, at which SHA, wrote a job.
+const CALLABLE = 'narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml';
+const SHA = '9'.repeat(40);
+const header = (sha = SHA) => `\uFEFF2026-10-30T21:14:00.5773853Z Current runner version: '2.337.0'\n2026-10-30T21:14:00.9939313Z Uses: ${CALLABLE}@${sha}\n2026-10-30T21:14:01.0004920Z Complete job name: ci / Required\n2026-10-30T21:14:02.0000000Z ##[group]Run step\n`;
+let jobReads = 0;
 const core = {
   setOutput(k, v) { outputs[k] = v; },
   info(m) { log.push(['info', m]); }, notice(m) { log.push(['notice', m]); },
@@ -96,6 +103,9 @@ const github = {
     actions: {
       async getWorkflowRun(args) {
         calls.push({getWorkflowRun: args.run_id});
+        if (args.run_id === context.runId) {
+          return {data: {id: args.run_id, referenced_workflows: scenario.refs ?? [{path: `${CALLABLE}@refs/heads/main`, sha: SHA}]}};
+        }
         if (scenario.runError) throw Error('unavailable');
         return {data: {
           id: args.run_id, run_attempt: 1, event: 'pull_request', status: 'completed', conclusion: 'success',
@@ -106,16 +116,24 @@ const github = {
       async listJobsForWorkflowRunAttempt(args) {
         calls.push({listJobs: [args.run_id, args.attempt_number]});
         if (scenario.jobsError) throw Error('unavailable');
+        jobReads += 1;
+        if (scenario.lagOnce && jobReads === 1) {
+          return {data: {total_count: 1, jobs: [{id: 7, name: 'ci / Required', conclusion: 'success', steps: [{name: 'Set up job', conclusion: 'success'}]}]}};
+        }
         const prefix = served.kind === 'required' ? 'Publish Required proof' : 'Publish full E2E proof';
         const stepName = (scenario.stepName || '{PREFIX} {KEY}').replace('{PREFIX}', prefix).replace('{KEY}', served.key);
         const jobs = scenario.jobs || [
-          {name: 'ci / Build', conclusion: 'success', steps: [{name: 'Build', conclusion: 'success'}]},
-          {name: scenario.jobName || 'ci / Required', conclusion: scenario.jobConclusion || 'success', steps: [
+          {id: 6, name: 'ci / Build', conclusion: 'success', steps: [{name: 'Build', conclusion: 'success'}]},
+          {id: 7, name: scenario.jobName || 'ci / Required', conclusion: scenario.jobConclusion || 'success', steps: [
             {name: 'Set up job', conclusion: 'success'},
             {name: stepName, conclusion: scenario.stepConclusion || 'success'},
           ]},
         ];
         return {data: {total_count: jobs.length, jobs}};
+      },
+      async downloadJobLogsForWorkflowRun(args) {
+        calls.push({jobLog: args.job_id});
+        return {data: scenario.log ?? header()};
       },
     },
   },
@@ -217,7 +235,11 @@ def main() -> None:
     key = baseline['outputs']['key']
     assert baseline['calls'] == [
         {'r2': f'GET proof/example/app/{key}.json'}, {'getWorkflowRun': 123}, {'listJobs': [123, 1]},
+        {'getWorkflowRun': 900}, {'jobLog': 7},
     ], baseline['calls']
+    lagged = run_lookup(script, {'lagOnce': True})
+    assert lagged['outputs']['reused'] == 'true', lagged
+    assert lagged['calls'].count({'listJobs': [123, 1]}) == 2, 'a jobs record that lags is read again (fleet#1180)'
     pr = run_lookup(script, {'event': 'pull_request'}, workflow='example/app/.github/workflows/ci.yml@refs/pull/1/merge',
                     install=False)
     assert pr['outputs'] == {'reused': 'false', 'key': key}
@@ -226,6 +248,7 @@ def main() -> None:
     # Each case names the reason it must give: a case that stopped reusing
     # for some other reason (a harness crash, say) proves nothing.
     NOT_ATTESTED = 'shows no successful "Publish full E2E proof'
+    NOT_THE_CALLABLE = 'no Required job that narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@'
     NOT_A_PR_RUN = 'is not a successful same-repository pull-request run'
     FOREIGN = 'does not describe this key and repository'
     cases = {
@@ -267,6 +290,24 @@ def main() -> None:
         'publish step for another key': ({'stepName': '{PREFIX} ' + OTHER_KEY['e2e']}, NOT_ATTESTED),
         'Required proof step, not the E2E one': ({'stepName': 'Publish Required proof {KEY}'}, NOT_ATTESTED),
         'merged tree changed': ({'tree': 'c' * 40, 'storedKey': key}, 'no pointer at'),
+        # A name any workflow can write, in a run whose workflow a writer chose
+        # through the pull request's base branch: only the runner header counts.
+        'a top-level job named Required': ({'jobName': 'Required'}, NOT_ATTESTED),
+        'a Required job with no callable header': ({'log': '2026-10-30T21:14:01.0Z Complete job name: ci / Required\n'
+                                                     '2026-10-30T21:14:02.0Z Uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@' + '9' * 40 + '\n'}, NOT_THE_CALLABLE),
+        'a header naming another SHA': ({'log': '2026-10-30T21:14:00.9Z Uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@' + '8' * 40
+                                                + '\n2026-10-30T21:14:01.0Z Complete job name: ci / Required\n'}, NOT_THE_CALLABLE),
+        'a header naming another callable': ({'log': '2026-10-30T21:14:00.9Z Uses: evil/workflows/.github/workflows/nuxt-cloudflare.yml@' + '9' * 40
+                                                     + '\n2026-10-30T21:14:01.0Z Complete job name: ci / Required\n'}, NOT_THE_CALLABLE),
+        'this run names no callable SHA': ({'refs': []}, 'SHA is unknown'),
+        # The runner echoes caller-written inputs after its own `Uses:` line;
+        # only the first `Uses:` is the runner's.
+        'a forged Uses line in the echoed inputs': ({'log': '2026-10-30T21:14:00.9Z Uses: example/app/.github/workflows/fake.yml@refs/pull/9/merge (' + 'a' * 40 + ')\n'
+                                                     '2026-10-30T21:14:00.9Z ##[group] Inputs\n'
+                                                     '2026-10-30T21:14:00.9Z   note: x\n'
+                                                     '2026-10-30T21:14:00.9Z Uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@' + '9' * 40 + '\n'
+                                                     '2026-10-30T21:14:00.9Z ##[endgroup]\n'
+                                                     '2026-10-30T21:14:01.0Z Complete job name: ci / Required\n'}, NOT_THE_CALLABLE),
     }
     for name, (scenario, reason) in cases.items():
         install_client = scenario.pop('__install', True)
