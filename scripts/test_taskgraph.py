@@ -11,6 +11,12 @@ module it wrote with Node:
   - execution: dependency order, the CPU budget, a failure blocking only its
     dependents, one worktree per task with node_modules linked, install leftovers
     copied and dependency outputs carried in;
+  - targeted tasks: a script reading FAST_BASE_REF is keyed on its base tree,
+    sees the ref only itself, and must be a leaf; other diff-scoped scripts
+    are still refused;
+  - whole-run proofs: with no store, an earlier run whose Required verdict
+    step names this run's digest is reused, for this repository and caller
+    blob only, re-reading the jobs API while it lags;
   - proofs: a pointer is honoured only when GitHub confirms the named attempt
     ran `Publish task proofs <digest>` successfully in its Required job, for
     this repository, this caller workflow, and a manifest holding the key;
@@ -38,7 +44,11 @@ import yaml
 WORKFLOW = Path(".github/workflows/taskgraph.yml")
 NUXT = Path(".github/workflows/nuxt-cloudflare.yml")
 ENGINE_STEP = "Install taskgraph engine"
+ENGINE_STEP_2 = "Install taskgraph engine (execution)"
+# actionlint's shellcheck pass stalls for good on one `run:` script of 64 KiB.
+RUN_SCRIPT_CAP = 60 * 1024
 STORE_STEP = "Install CI artifact store client"
+VERDICT = "Require the plan and every leg to pass ${{ needs.plan.outputs.attest }}"
 
 
 def steps(doc: dict, job: str) -> list[dict]:
@@ -113,7 +123,24 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
 
   await test('selection: a task with no script, a diff-scoped script, an output with no directory are refused', () => {
     assert.throws(() => planOf({ scripts: { ...scripts, typecheck: undefined } }), /no package.json script/);
-    assert.throws(() => planOf({ scripts: { ...scripts, test: 'vitest run --changed=$FAST_BASE_REF' } }), /diff-scoped/);
+    assert.ok(planOf({ scripts: { ...scripts, test: 'vitest run ${FAST_BASE_REF:+--changed=$FAST_BASE_REF}' } }), 'FAST_BASE_REF makes it targeted');
+    for (const script of ['vitest --changed=${FAST_BASE_REF:-origin/main}', 'FAST_BASE_REF=HEAD^1 node t.mjs', 'eslint $(git diff --name-only ${FAST_BASE_REF:=HEAD^1})']) {
+      assert.throws(() => planOf({ scripts: { ...scripts, test: script } }), /a value of its own/, script);
+    }
+    // verify B2: each selects nothing on a push (FAST_BASE_REF empty) and would pass.
+    for (const script of ['vitest run --changed ${FAST_BASE_REF:+$FAST_BASE_REF} --passWithNoTests',
+      'test -n "$FAST_BASE_REF" || true; vitest run --changed --passWithNoTests',
+      'B=$FAST_BASE_REF; vitest run --changed=${B:-origin/main} --passWithNoTests',
+      'vitest run --changed=${FAST_BASE_REF:-}origin/main --passWithNoTests',
+      'vitest run --changed="$FAST_BASE_REF" --passWithNoTests',
+      'eslint $(git diff --name-only "$FAST_BASE_REF")']) {
+      assert.throws(() => planOf({ scripts: { ...scripts, test: script } }), /FAST_BASE_REF/, script);
+    }
+    assert.ok(planOf({ scripts: { ...scripts, test: 'vitest run ${FAST_BASE_REF:+--changed=$FAST_BASE_REF}' } }), 'the whole flag inside the expansion');
+    assert.ok(planOf({ scripts: { ...scripts, test: 'eslint ${FAST_BASE_REF:+$(git diff --name-only $FAST_BASE_REF)} .' } }), 'a diff inside the expansion');
+    // gonogo's test:changed: an empty default for `set -u` is not a value of its own.
+    assert.ok(planOf({ scripts: { ...scripts, test: 'if [ -n "${FAST_BASE_REF:-}" ]; then vitest run --changed="$FAST_BASE_REF"; else vitest run; fi' } }));
+    assert.ok(planOf({ scripts: { ...scripts, test: 'FAST_BASE_REF= vitest run' } }));
     assert.throws(() => planOf({ turbo: JSON.stringify({ tasks: { 'test:changed': { tags: ['ci'] } } }), scripts: { 'test:changed': 'vitest' } }), /diff-scoped/);
     assert.ok(planOf({ turbo: JSON.stringify({ tasks: { 'test:changed': { tags: ['ci'], cache: false } } }), scripts: { 'test:changed': 'vitest' } }));
     assert.throws(() => planOf({ turbo: JSON.stringify({ tasks: { lint: { tags: ['ci'], outputs: ['**/*.d.ts'] } } }) }), /names no directory/);
@@ -128,7 +155,7 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     const scoped = script => planOf({ scripts: { ...scripts, test: script } });
     for (const script of ['jest --changedSince=origin/main', 'jest --onlyChanged', 'eslint $(git diff --name-only origin/main)',
       'node x.mjs $(git merge-base HEAD origin/main)', 'nx affected -t test', 'vitest --changed', 'pnpm run test:changed', 'echo $GITHUB_BASE_REF']) {
-      assert.throws(() => scoped(script), /diff-scoped/, script);
+      assert.throws(() => scoped(script), /diff-scoped.*does not read FAST_BASE_REF/, script);
     }
     assert.ok(scoped('node tools:changed-files-report.mjs && vitest run'), 'a name merely containing :changed is fine');
   });
@@ -378,18 +405,25 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
   const key = 'a'.repeat(64);
   const other = 'b'.repeat(64);
   const digest = tg.manifestDigest([key, other]);
+  // The runner's setup header names the callable a job came from (writtenByCallable).
+  const CALLABLE = 'narduk-enterprises/workflows/.github/workflows/taskgraph.yml';
+  const SHA = '9'.repeat(40);
+  const header = (sha = SHA, name = 'ci / Required') => `\uFEFF2026-10-30T21:14:00.5773853Z Current runner version: '2.337.0'\n2026-10-30T21:14:00.9939313Z Uses: ${CALLABLE}@${sha}\n2026-10-30T21:14:01.0004920Z Complete job name: ${name}\n2026-10-30T21:14:02.0000000Z ##[group]Run step\n`;
   const fakeGithub = (over = {}) => ({
     calls: 0,
     paginate: async (fn, args) => (await fn(args)).data,
     rest: { actions: {
       getWorkflowRunAttempt: async ({ run_id, attempt_number }) => ({ data: { id: run_id, run_attempt: attempt_number, path: over.path || '.github/workflows/ci.yml', html_url: `https://x/${run_id}`, repository: { id: repoId }, head_repository: { id: over.headRepo || repoId } } }),
-      listJobsForWorkflowRunAttempt: async () => ({ data: [{ name: over.job || 'ci / Tasks (all)', steps: [{ name: over.step || `Publish task proofs ${digest}`, conclusion: over.conclusion || 'success' }] }] }),
+      listWorkflowRuns: async () => ({ data: { workflow_runs: [] } }),
+      listJobsForWorkflowRunAttempt: async () => ({ data: [{ id: 5, name: over.job || 'ci / Tasks (all)', steps: [{ name: over.step || `Publish task proofs ${digest}`, conclusion: over.conclusion || 'success' }] }] }),
+      downloadJobLogsForWorkflowRun: async () => ({ data: over.log ?? header(SHA, 'ci / Tasks (all)') }),
+      getWorkflowRun: async () => ({ data: { referenced_workflows: over.refs ?? [{ path: `${CALLABLE}@refs/heads/x`, sha: SHA }] } }),
     }, repos: {
       getContent: async () => ({ data: { sha: over.blob || 'f'.repeat(40) } }),
     } },
   });
   const pointer = (over = {}) => JSON.stringify({ schema: tg.POINTER_SCHEMA, key, repository_id: repoId, run_id: 7, run_attempt: 1, manifest: [key, other], ...over });
-  const lookup = async (gh, k = key) => tg.findTaskProof({ github: gh, context, store: fakeStore, cfg, key: k, workflowPath: '.github/workflows/ci.yml', attempts: new Map() });
+  const lookup = async (gh, k = key) => tg.findTaskProof({ github: gh, context, store: fakeStore, cfg, key: k, workflowPath: '.github/workflows/ci.yml', callable: SHA, attempts: new Map() });
   const objectKey = tg.proofKey(store, 'narduk-enterprises/app', key);
 
   await test('proof: the object key is repository-scoped and shape-checked', () => {
@@ -408,9 +442,11 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
       ['a leg of another shape', fakeGithub({ job: 'ci / Tasks (a) (b)' })],
       ['another workflow', fakeGithub({ path: '.github/workflows/e2e.yml' })],
       ['a fork run', fakeGithub({ headRepo: 1 })],
+      ['a leg no callable wrote', fakeGithub({ log: '2026-10-30T21:14:01.0Z Complete job name: ci / Tasks (all)\n' })],
+      ['a leg of another callable SHA', fakeGithub({ log: header('8'.repeat(40), 'ci / Tasks (all)') })],
     ]) assert.equal((await lookup(gh)).found, false, why);
     // The attested run must have run this caller workflow's text, not only its path.
-    const withBlob = (gh, blob) => tg.findTaskProof({ github: gh, context, store: fakeStore, cfg, key, workflowPath: '.github/workflows/ci.yml', callerBlob: blob, attempts: new Map() });
+    const withBlob = (gh, blob) => tg.findTaskProof({ github: gh, context, store: fakeStore, cfg, key, workflowPath: '.github/workflows/ci.yml', callerBlob: blob, callable: SHA, attempts: new Map() });
     assert.equal((await withBlob(fakeGithub(), 'f'.repeat(40))).found, true);
     assert.equal((await withBlob(fakeGithub({ blob: 'e'.repeat(40) }), 'f'.repeat(40))).found, false, 'another version of the workflow');
     for (const [why, p] of [
@@ -535,6 +571,143 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+
+  // ---- targeted tasks ----
+  const tturbo = JSON.stringify({ tasks: { lint: { tags: ['ci'] }, 'test:changed': { tags: ['ci'] }, helper: { tags: ['ci', 'ci:diff'] } } });
+  const tscripts = { lint: 'eslint .', 'test:changed': 'vitest run ${FAST_BASE_REF:+--changed=$FAST_BASE_REF}', helper: 'node scripts/changed.mjs' };
+  const tplan = ({ base: b = null } = {}) => tg.plan({ entries: entries(base), turboText: tturbo, packageText: pkg(tscripts), nodeVersionText: '24', context: { callerWorkflow: '.github/workflows/ci.yml:f1' }, base: b });
+  const T = (p, n) => p.tasks.find(t => t.task === n);
+
+  await test('targeted: FAST_BASE_REF or ci:diff marks a task; untargeted keys ignore the base', () => {
+    const none = tplan({});
+    const pr = tplan({ base: { event: 'pull_request', tree: 'p'.repeat(40) } });
+    const push = tplan({ base: { event: 'push', tree: 'p'.repeat(40) } });
+    assert.equal(T(pr, 'lint').targeted, false);
+    assert.equal(T(pr, 'test:changed').targeted, true);
+    assert.equal(T(pr, 'helper').targeted, true, 'ci:diff');
+    assert.equal(T(pr, 'lint').key, T(none, 'lint').key, 'an untargeted key is unchanged by the base');
+    assert.equal(T(push, 'lint').key, T(none, 'lint').key);
+    assert.equal(T(pr, 'lint').alt, null);
+    assert.equal(pr.fastBaseRef, 'HEAD^1');
+    assert.equal(push.fastBaseRef, '', 'a push runs the full selection');
+    assert.equal(none.fastBaseRef, '');
+  });
+
+  await test('targeted: a pull request runs narrowed; a push runs full and accepts the narrowed pass from the same base', () => {
+    const pb = { event: 'pull_request', tree: 'p'.repeat(40) };
+    const pr = tplan({ base: pb });
+    const push = tplan({ base: { event: 'push', tree: 'p'.repeat(40) } });
+    const moved = tplan({ base: { event: 'push', tree: 'q'.repeat(40) } });
+    const t = 'test:changed';
+    assert.equal(push.tasks.find(x => x.task === t).alt, T(pr, t).key, 'the push looks up the PR\'s narrowed key');
+    assert.equal(T(pr, t).alt, T(push, t).key, 'a PR accepts a full pass of the same content');
+    assert.notEqual(T(moved, t).alt, T(pr, t).key, 'a base that moved is another key');
+    assert.equal(T(moved, t).key, T(push, t).key, 'the full key does not depend on the base');
+    assert.notEqual(T(pr, t).key, T(push, t).key, 'a narrowed pass never stands for a full one');
+    const prOther = tplan({ base: { event: 'pull_request', tree: 'q'.repeat(40) } });
+    assert.notEqual(T(prOther, t).key, T(pr, t).key, 'the key changes when the base changes');
+    assert.equal(tg.runDigest(push.tasks, true), tg.runDigest(pr.tasks), 'the push alt digest is the PR run digest');
+    assert.notEqual(tg.runDigest(moved.tasks, true), tg.runDigest(pr.tasks));
+    assert.notEqual(tg.runDigest(push.tasks), tg.runDigest(pr.tasks));
+    assert.deepEqual(tg.runDigests(planOf().tasks), [tg.runDigest(planOf().tasks)], 'no targeted task, one digest');
+    assert.notEqual(tg.runDigest(planOf().tasks), tg.manifestDigest(planOf().tasks.filter(x => x.cache).map(x => x.key)), 'domain-separated from a leg manifest');
+  });
+
+  await test('targeted: nothing may depend on a targeted task', () => {
+    const turboDep = JSON.stringify({ tasks: { 'test:changed': {}, report: { tags: ['ci'], dependsOn: ['test:changed'] } } });
+    assert.throws(() => tg.plan({ entries: entries(base), turboText: turboDep, packageText: pkg({ ...tscripts, report: 'node r.mjs' }), nodeVersionText: '24', context: {} }), /must be a leaf/);
+  });
+
+  await test('targeted: only a targeted task sees FAST_BASE_REF; every other task sees it empty', async () => {
+    const dir = fs.mkdtempSync(path.join(tmp, 'fbr-'));
+    const pt = [{ task: 'a', key: 'a'.repeat(64), dependsOn: [], outputs: [], cpus: 1, targeted: true }, { task: 'b', key: 'b'.repeat(64), dependsOn: [], outputs: [], cpus: 1, targeted: false }];
+    const seen = {};
+    await tg.runTasks({ planTasks: pt, names: ['a', 'b'], cwd: dir, concurrency: 2, isolate: null, env: { ...process.env, FAST_BASE_REF: 'leaked' }, fastBaseRef: 'HEAD^1',
+      command: n => ['node', '-e', `process.stdout.write('[' + (process.env.FAST_BASE_REF ?? 'unset') + ']')`],
+      onEvent: e => { if (e.type === 'end') seen[e.task] = e.output; } });
+    assert.equal(seen.a, '[HEAD^1]');
+    assert.equal(seen.b, '[]', 'a runner-level FAST_BASE_REF never reaches an untargeted task');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  // ---- whole-run proofs (no store) ----
+  await test('whole run: a merged pull request\'s green verdict for this digest is reused, with no store', async () => {
+    const want = 'd'.repeat(64);
+    const pushCtx = { repo: { owner: 'narduk-enterprises', repo: 'app' }, payload: { repository: { id: repoId }, head_commit: { message: 'Speed it up (#12)\n\nbody', tree_id: 't'.repeat(40) } }, ref: 'refs/heads/main', runId: 99, eventName: 'push', sha: 'c'.repeat(40) };
+    // A merged PR's runs list no pull_requests: GitHub empties the field on merge.
+    const runOf = (over = {}) => ({ id: 50, run_attempt: 1, path: '.github/workflows/ci.yml', head_sha: 'h'.repeat(40), html_url: 'https://x/50', repository: { id: repoId }, head_repository: { id: repoId }, pull_requests: [], display_title: 'Speed it up', head_commit: { tree_id: 'u'.repeat(40) }, ...over });
+    const gh = (over = {}) => {
+      const calls = { jobs: 0, list: [] };
+      return { calls, paginate: async (fn, args) => (await fn(args)).data, rest: {
+        actions: {
+          listWorkflowRuns: async params => { calls.list.push(params); return { data: { workflow_runs: params.event === 'pull_request' ? (over.runs || [runOf()]) : [] } }; },
+          listJobsForWorkflowRunAttempt: async () => {
+            calls.jobs += 1;
+            if (over.lagOnce && calls.jobs === 1) return { data: [{ name: 'ci / Required', conclusion: 'success', steps: [] }] };
+            return { data: [{ id: 7, name: over.job || 'ci / Required', conclusion: over.jobConclusion || 'success', steps: [{ name: `${tg.VERDICT_STEP} ${over.digest || want}`, conclusion: over.conclusion || 'success' }] }] };
+          },
+          downloadJobLogsForWorkflowRun: async () => ({ data: over.log ?? header() }),
+        },
+        repos: { getContent: async () => ({ data: { sha: over.blob || 'f'.repeat(40) } }) },
+      } };
+    };
+    const find = (g, extra = {}) => tg.findRunAttestation({ github: g, context: pushCtx, digests: [want], workflowPath: '.github/workflows/ci.yml', callerBlob: 'f'.repeat(40), callable: SHA, sleep: async () => {}, ...extra });
+    const g = gh();
+    const hit = await find(g);
+    assert.equal(hit.found, true, JSON.stringify(hit));
+    assert.equal(hit.run.id, 50);
+    assert.ok(g.calls.list.some(p => p.event === 'pull_request' && p.status === 'completed' && p.workflow_id === 'ci.yml'));
+    assert.ok(g.calls.list.some(p => p.event === 'push' && p.branch === 'main'));
+    const lag = gh({ lagOnce: true });
+    assert.equal((await find(lag)).found, true, 'a jobs record that lags is read again');
+    assert.equal(lag.calls.jobs, 2);
+    for (const [why, over] of [
+      ['another digest', { digest: 'e'.repeat(64) }],
+      ['the verdict step failed', { conclusion: 'failure' }],
+      ['Required failed', { jobConclusion: 'failure' }],
+      ['not the Required job', { job: 'ci / Tasks (all)' }],
+      ['another caller blob', { blob: 'e'.repeat(40) }],
+      ['a fork run', { runs: [runOf({ head_repository: { id: 1 } })] }],
+      ['another workflow', { runs: [runOf({ path: '.github/workflows/e2e.yml' })] }],
+      ['another pull request (title and tree differ)', { runs: [runOf({ display_title: 'Other' })] }],
+      ['this run itself', { runs: [runOf({ id: 99 })] }],
+      // verify B1: a job any workflow could name, in a run whose workflow a writer chose.
+      ['a top-level job named Required', { job: 'Required' }],
+      ['a job with no callable header (defined by the caller itself)', { log: `2026-10-30T21:14:01.0Z Complete job name: ci / Required\n2026-10-30T21:14:02.0Z Uses: ${CALLABLE}@${SHA}\n` }],
+      ['a header naming another SHA of the callable', { log: header('8'.repeat(40)) }],
+      ['a header naming another callable', { log: header(SHA).replace('workflows/taskgraph.yml', 'evil/taskgraph.yml') }],
+      ['a run that references another callable SHA', { runs: [runOf({ referenced_workflows: [{ path: `${CALLABLE}@x`, sha: '8'.repeat(40) }] })] }],
+    ]) assert.equal((await find(gh(over))).found, false, why);
+    assert.equal((await find(gh(), { callable: null })).found, false, 'this run\'s callable SHA unknown');
+    assert.equal((await find(gh(), { digests: [] })).found, false, 'nothing cacheable');
+    assert.equal((await find(gh(), { workflowPath: '' })).found, false, 'no caller path');
+    const prCtx = { ...pushCtx, eventName: 'pull_request', payload: { repository: { id: repoId }, pull_request: { number: 12, head: { ref: 'feat' } } } };
+    const gp = gh();
+    assert.equal((await tg.findRunAttestation({ github: gp, context: prCtx, digests: [want], workflowPath: '.github/workflows/ci.yml', callerBlob: 'f'.repeat(40), callable: SHA, sleep: async () => {} })).found, true, 'a re-push of the same content');
+    assert.deepEqual(gp.calls.list.map(p => [p.event, p.branch]), [['pull_request', 'feat']]);
+    const byTree = gh({ runs: [runOf({ display_title: 'Renamed later', head_commit: { tree_id: 't'.repeat(40) } })] });
+    assert.equal((await find(byTree)).found, true, 'a PR head that already held this tree (a branch kept up to date)');
+    const mergeCtx = { ...pushCtx, payload: { ...pushCtx.payload, head_commit: { message: 'Merge pull request #7 from narduk-enterprises/feat/x\n\nTitle' } } };
+    const gm = gh({ runs: [runOf({ display_title: 'Other' })] });
+    assert.equal((await tg.findRunAttestation({ github: gm, context: mergeCtx, digests: [want], workflowPath: '.github/workflows/ci.yml', callerBlob: 'f'.repeat(40), callable: SHA, sleep: async () => {} })).found, true, 'a merge commit names the branch');
+    assert.ok(gm.calls.list.some(p => p.event === 'pull_request' && p.branch === 'feat/x'));
+    assert.deepEqual(tg.mergedPull('Merge pull request #7 from a/b/c\n\nx'), { number: 7, branch: 'b/c' });
+    assert.deepEqual(tg.mergedPull('Fix it (#8)'), { number: 8, title: 'Fix it' });
+    assert.equal(tg.mergedPull('Fix it'), null);
+  });
+
+  await test('proof: a publish step the jobs API has not listed yet is read again', async () => {
+    let n = 0;
+    const g = fakeGithub();
+    const inner = g.rest.actions.listJobsForWorkflowRunAttempt;
+    g.rest.actions.listJobsForWorkflowRunAttempt = async args => { n += 1; return n === 1 ? { data: [{ name: 'ci / Tasks (all)', steps: [{ name: 'Run tasks', conclusion: 'success' }] }] } : inner(args); };
+    objects.set(objectKey, pointer());
+    const r = await tg.findTaskProof({ github: g, context, store: fakeStore, cfg, key, workflowPath: '.github/workflows/ci.yml', callable: SHA, attempts: new Map(), sleep: async () => {} });
+    assert.equal(r.found, true, JSON.stringify(r));
+    assert.equal(n, 2);
+    objects.clear();
+  });
+
   // ---- the github-script steps ----
   const notes = [];
   const core = () => {
@@ -586,6 +759,30 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.ok(notes.some(n => /No CI artifact store credentials/.test(n)));
   });
 
+  await test('plan step: no store credentials, but a run that passed this content -> nothing runs', async () => {
+    const c0 = core();
+    const { result } = await tg.planStep({ github: api(), context, core: c0, store: fakeStore, env: env({ CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: '' }) });
+    assert.equal(c0.outputs.attest, tg.runDigest(result.tasks));
+    const gh = api();
+    gh.rest.actions.listWorkflowRuns = async p => ({ data: { workflow_runs: p.event === 'push' ? [{ id: 61, run_attempt: 1, path: '.github/workflows/ci.yml', head_sha: 'h'.repeat(40), html_url: 'https://x/61', repository: { id: repoId }, head_repository: { id: repoId } }] : [] } });
+    gh.rest.actions.listJobsForWorkflowRunAttempt = async () => ({ data: [{ id: 7, name: 'ci / Required', conclusion: 'success', steps: [{ name: `${tg.VERDICT_STEP} ${c0.outputs.attest}`, conclusion: 'success' }] }] });
+    gh.rest.actions.downloadJobLogsForWorkflowRun = async () => ({ data: header() });
+    const c = core();
+    notes.length = 0;
+    await tg.planStep({ github: gh, context: { ...context, ref: 'refs/heads/main', runId: 62 }, core: c, store: fakeStore, env: env({ CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: '' }) });
+    assert.equal(c.outputs.run, 'false', JSON.stringify(notes));
+    assert.equal(c.outputs.misses, '');
+    assert.ok(!notes.some(n => /No CI artifact store credentials/.test(n)), 'no notice when the whole run is reused');
+  });
+
+  await test('plan step: a run without a secret never vouches for one with it', async () => {
+    const a = core();
+    const b = core();
+    await tg.planStep({ github: api(), context, core: a, store: fakeStore, env: env({ HAS_NVAULT_TOKEN: 'true', HAS_PACKAGES_READ: 'true' }) });
+    await tg.planStep({ github: api(), context, core: b, store: fakeStore, env: env({ HAS_NVAULT_TOKEN: 'false', HAS_PACKAGES_READ: 'true' }) });
+    assert.notEqual(a.outputs.attest, b.outputs.attest);
+  });
+
   await test('plan step: a missing node-version-file and a parent working-directory are refused', async () => {
     await assert.rejects(tg.planStep({ github: api(), context, core: core(), store: fakeStore, env: env({ NODE_VERSION_FILE: '.nvmrc' }) }), /does not exist/);
     assert.throws(() => tg.normalizeDir('../x'), /leaves the repository/);
@@ -604,6 +801,7 @@ def check_engine() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp).resolve()
         install(doc, ENGINE_STEP, root)
+        install(doc, ENGINE_STEP_2, root)
         install(doc, STORE_STEP, root)
         harness = root / "harness.cjs"
         harness.write_text(HARNESS)
@@ -640,7 +838,8 @@ def check_copies() -> None:
     ]
     for name, ours, job in pairs:
         assert run_text(tg, ours, name) == run_text(nc, job, name), f"{name} ({ours}): drifted from nuxt-cloudflare.yml {job}"
-    assert run_text(tg, "plan", ENGINE_STEP) == run_text(tg, "tasks", ENGINE_STEP), "one engine for both jobs"
+    for name in (ENGINE_STEP, ENGINE_STEP_2):
+        assert run_text(tg, "plan", name) == run_text(tg, "tasks", name), "one engine for both jobs"
     assert step(tg, "required", "Install actionlint")["env"] == step(nc, "build", "Install actionlint")["env"]
     for name in ("Install dependencies (pnpm)", "Install dependencies (npm)"):
         assert step(tg, "tasks", name)["env"] == step(nc, "build", name)["env"], f"{name}: env drifted"
@@ -655,7 +854,11 @@ def check_shape() -> None:
     assert jobs["required"]["needs"] == ["plan", "tasks"], "Required needs every job"
     # Plan holds no install and runs no caller code.
     plan = [s.get("name") or s.get("uses") for s in steps(doc, "plan")]
-    assert plan == [STORE_STEP, ENGINE_STEP, "Plan tasks"], plan
+    assert plan == [STORE_STEP, ENGINE_STEP, ENGINE_STEP_2, "Plan tasks"], plan
+    for job in jobs.values():
+        for s in job.get("steps", []):
+            size = len(s.get("run", "").encode())
+            assert size < RUN_SCRIPT_CAP, f"{s.get('name')}: a {size}-byte run script; actionlint's shellcheck stalls at 64 KiB, so split it"
     assert jobs["plan"]["permissions"] == {"contents": "read", "actions": "read"}
     # One leg per machine, only when there is work; an empty matrix is an error.
     tasks = jobs["tasks"]
@@ -673,7 +876,12 @@ def check_shape() -> None:
     assert "Tasks \\(" in run_text(doc, "plan", ENGINE_STEP), "the verifier matches the leg job name"
     # Required: the verdict, then a sparse checkout and Caller lint, all after a failed leg too.
     req = steps(doc, "required")
-    assert req[0]["name"] == "Require the plan and every leg to pass"
+    # The verdict names the run digest: the store-free whole-run proof.
+    assert req[0]["name"] == VERDICT
+    assert jobs["plan"]["outputs"]["attest"] == "${{ steps.plan.outputs.attest }}"
+    assert "VERDICT_STEP = 'Require the plan and every leg to pass'" in run_text(doc, "plan", ENGINE_STEP)
+    checkout = next(s for s in steps(doc, "tasks") if str(s.get("uses", "")).startswith("actions/checkout@"))
+    assert checkout["with"]["fetch-depth"] == "${{ github.event_name == 'pull_request' && 2 || 1 }}", "HEAD^1 exists for a targeted task"
     lint_steps = [s for s in req if s.get("name") in (
         "Ensure PyYAML is available", "Install actionlint", "actionlint (caller's own workflows)",
         "Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)")]
@@ -687,7 +895,7 @@ def check_shape() -> None:
 def check_verdict() -> None:
     """Required: green only for a green plan and, when it found work, green legs."""
     doc = yaml.safe_load(WORKFLOW.read_text())
-    script = step(doc, "required", "Require the plan and every leg to pass")["run"]
+    script = step(doc, "required", VERDICT)["run"]
 
     def verdict(plan, run, tasks):
         env = {**os.environ, "PLAN_RESULT": plan, "RUN": run, "TASKS_RESULT": tasks}

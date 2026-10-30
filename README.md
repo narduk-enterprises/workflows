@@ -79,7 +79,7 @@ in their app-class workflow.
 | `design-ledger.yml` | **New 2026-09-27** (agent-infrastructure#1804). **Advisory, never required.** Runs the design ledger checker (`scripts/dc_ledger.py`, a byte copy of agent-infrastructure's canonical file) against a product's `design/<canvas>/ledger.json`. `mode: check` goes red while a canvas screen and its code have drifted and writes the table to the job summary; `mode: flag` keeps one `Design drift: <canvas>` issue. See [Design ledger](#design-ledgeryml) |
 | `design-publish.yml` | **New 2026-10-13** (operator-portal#727, design-portal-sync phase 2). Uploads a caller's `design/<slug>/` git mirror to the Operator Portal's designs Worker with the run's own OIDC token, no stored credential. Not a gate. See [Design publish](#design-publishyml) |
 | `flake-digest.yml` | **New 2026-09-24** (narduk-reboot P3-C2). Weekly, advisory: scans a caller's completed runs of one workflow, counts failures in jobs matching `quarantine-job-pattern` (nuxt-cloudflare.yml's `e2e-quarantine` by default), and files or refreshes one digest issue per ISO week. Never gates `main`, never opens `red-main` |
-| `taskgraph.yml` | **New 2026-10-29.** Vercel CI's model (beta 2026-10-28) for any `package.json`-script repo: the caller's `turbo.json` tags the CI tasks, each task gets a content key from Git's blob hashes, a task whose key already passed is never run again (a pointer in the R2 CI artifact store that GitHub's API must confirm), and the rest run side by side after one install per machine, each in its own worktree; a `ci:machine` task gets its own seat. Plan, Tasks legs, Required; nine inputs. See [taskgraph.yml](#taskgraphyml) |
+| `taskgraph.yml` | **New 2026-10-29.** Vercel CI's model (beta 2026-10-28) for any `package.json`-script repo: the caller's `turbo.json` tags the CI tasks, each task gets a content key from Git's blob hashes, a task whose key already passed is never run again (GitHub's own record of a green run of the same content, with no secret; per task, a pointer in the R2 CI artifact store that GitHub's API must confirm), `FAST_BASE_REF` scripts run narrowed on PRs keyed on their base, and the rest run side by side after one install per machine, each in its own worktree; a `ci:machine` task gets its own seat. Plan, Tasks legs, Required; nine inputs. See [taskgraph.yml](#taskgraphyml) |
 
 All eleven shipped callables are `on: workflow_call` only — none of them declare their own
 triggers, and none declare workflow-level `concurrency:` (see "How to consume"
@@ -2281,23 +2281,64 @@ suite) `ci:machine` so it gets a seat of its own. Leave light checks untagged
 
 **Moving from `nuxt-cloudflare.yml`.** Tag the scripts you passed as
 `fast-scripts`, `build-script`, `extra-scripts`, `extra-gate-scripts` and
-`test-script`. The `quality-level` gates become tasks too: dependency audit
-with `"cache": false`, `foundation:check`, and the performance budget after
-`build:ci`. Three things do not move:
+`test-script`. Your `fast-scripts` that read `FAST_BASE_REF` keep working
+unchanged (see Targeted tasks below). The `quality-level` gates become tasks
+too: dependency audit with `"cache": false`, `foundation:check`, and the
+performance budget after `build:ci`. Two things do not move:
 
-- **Diff-scoped scripts.** A task is refused when its script picks its checks
-  from a diff. That covers reading `FAST_BASE_REF` or a `*BASE_REF`, using
-  `--changed`, `--changedSince`, `--onlyChanged`, `--only-changed`, `--since`,
-  `affected`, `git diff` or `merge-base`, and running any script whose name
-  ends `:changed`. Its pass depends on the base branch, so it is not a fact
-  about the tree. Tag the full script instead (`test`, not `test:changed`).
-  The keys do the selecting.
 - **Browser E2E, preview checks and deploy dry runs.** Keep them where they
-  are: an `e2e.yml` and the Workers Builds preview.
+  are: an `e2e.yml` (or `reusable-browser-tests.yml`) and the Workers Builds
+  preview, as separate jobs beside the `taskgraph` job in the same caller.
+  taskgraph's `Required` covers only its own tasks; the caller's other jobs
+  report their own checks.
 - **Hidden ordering.** Each task runs in its own worktree, so a task that
   only passed because an earlier serial script left files behind fails.
   gonogo's `test` needed the `.nuxt` that `lint` had written. Declare that
   prerequisite as a task with `outputs`.
+
+#### Targeted tasks
+
+A script that reads `FAST_BASE_REF` follows `nuxt-cloudflare.yml`'s
+contract. On a pull request it is `HEAD^1`, the base branch head the merge
+commit sits on, and the script selects from the diff (`vitest
+${FAST_BASE_REF:+--changed=$FAST_BASE_REF}`, ESLint over `git diff
+--name-only "$FAST_BASE_REF"`). On every other event it is empty, and the
+script runs its full selection. A task whose helper file reads the variable
+(`node scripts/test-changed.mjs`) is tagged `ci:diff`.
+
+- **Keys.** A narrowed pass is a fact about the tree and its base. On a pull
+  request the task's key also covers the base commit's tree. On any other event
+  it runs in full under the plain key.
+- **Reuse.** A full pass of the same content satisfies a pull request.
+  A push accepts a pull request's narrowed pass only when the push's parent
+  tree is the base that pass was taken from. That is the rule
+  agent-infrastructure#4723 uses for a main push.
+- **Isolation.** Only a targeted task sees the ref. Every other task gets
+  `FAST_BASE_REF` empty, even if the runner sets it.
+- **Leaves only.** A dependent would inherit a key that differs between the
+  pull request and its push, so nothing may depend on a targeted task.
+- **Guarded selections only.** In a targeted script, every diff selection
+  must disappear when the variable is empty. Two forms qualify:
+  - inside `${FAST_BASE_REF:+…}`, for example
+    `vitest run ${FAST_BASE_REF:+--changed=$FAST_BASE_REF}`;
+  - in the `then` branch of
+    `if [ -n "${FAST_BASE_REF:-}" ]; then …; else <full run>; fi`, which is
+    gonogo's `test:changed`.
+
+  Anything else is refused. That includes a bare `--changed`,
+  `--changed="$FAST_BASE_REF"` with no guard, a copy into another variable,
+  and a default (`${FAST_BASE_REF:-origin/main}`). On a push each of those
+  selects nothing and passes under the full key.
+- **Refusals.** A script that picks its checks from a diff but never reads
+  `FAST_BASE_REF` is refused too: bare `vitest --changed`, `--changedSince`,
+  `--onlyChanged`, `--since`, `affected`, `git diff`, `merge-base`. Use one of
+  the guarded forms, tag the full script, or set `"cache": false`. A helper
+  file tagged `ci:diff` cannot be read, so its author owns that contract.
+
+When a push reuses a pull request's narrowed pass, it names its own full
+digest, so later runs of that tree reuse it as a full pass. That is sound only
+while the pushed branch's parent commit was itself green, the same assumption
+agent-infrastructure#4723 makes. A scheduled `reuse: false` run re-checks everything in full.
 
 #### Keys
 
@@ -2347,9 +2388,64 @@ the tasks that passed, because a passing `lint` stays a fact about its
 content when `test` fails beside it. It is the per-task cache Vercel CI keeps.
 The engine (`findTaskProof`) is where to review this rule.
 
-Without store credentials (a fork, Dependabot, or a caller missing from the
-`CI_ARTIFACTS_R2_*` secrets' repository lists), the plan says so in a notice,
-every task runs, and nothing is recorded. A lookup that fails or times out
+#### Whole-run reuse, with no store
+
+`Required`'s verdict step is named `Require the plan and every leg to pass
+<run digest>`. The run digest covers every cacheable key, each of which
+passed in this run or was reused. No caller code runs in that job before the
+step. Before it looks up any task in the store, `Plan` asks GitHub for an
+earlier completed run of the same caller workflow whose `Required` job ran
+that step successfully with this run's digest:
+
+- on a pull request, that PR's own earlier runs (a re-push or rebase that left
+  the content unchanged);
+- on a push, the runs of the pull request it merges, then the last three
+  pushes to the branch. The pull request is found from the push's subject. A
+  merge commit names its branch. A squash commit is the PR title, which is
+  the run's `display_title`. A PR head that already held the pushed tree also
+  counts. A run's `pull_requests` field can't identify the PR, because GitHub
+  empties it once the PR merges.
+  - This needs no `pull-requests: read`, which every caller would otherwise
+    have to grant.
+
+The run must be this repository's own (head repository included) and must
+have run the same caller workflow blob.
+
+**Which job vouches.** A name proves nothing on its own. Any workflow can name
+a job `ci / Required` and a step after a digest. A `pull_request` run also
+executes the workflow from its merge ref, which a writer controls through the
+PR's base branch. So the verdict counts only from a job the runner says this
+callable wrote. The runner logs `Uses:
+narduk-enterprises/workflows/.github/workflows/taskgraph.yml@<sha>` before
+`Complete job name:`, ahead of any step. `Plan` reads that header from the
+job's log and requires the SHA this run itself uses, taken from its own
+`referenced_workflows`. A store proof's `Tasks` leg is checked the same way.
+
+A workflow that calls the real callable still can't vouch for another one.
+Its digest covers its own caller workflow blob, so it differs.
+
+The digest also covers whether the package-read and `NVAULT_TOKEN` secrets
+were present, so a Dependabot run without them never vouches for a run with
+them. On a hit, every cacheable task is
+reused and nothing installs. For a push, the digest also covers a targeted
+task's narrowed key, so a merge whose tree and parent match the PR's is two
+lightweight jobs.
+
+This needs only the `contents: read` and `actions: read` that callers already
+grant, and **no secret**. It works in any org, `narduk-enterprises-clients`
+included (this repository is public). It covers the
+85% of merges whose main tree equals the tested PR head. The store adds
+per-task reuse (a PR that touched only docs reuses `test`) and the output
+cache.
+
+A finished attempt's jobs record can lag its steps, so a lookup that finds the
+verdict or publish step not yet listed reads the jobs again after 2 s and 5 s
+(fleet#1180's missed reuse).
+
+Without store credentials (a fork, Dependabot, another org, or a caller
+missing from the `CI_ARTIFACTS_R2_*` secrets' repository lists), only
+whole-run reuse applies. The plan says so in a notice when it finds none, the
+tasks run, and no per-task pass is recorded. A lookup that fails or times out
 (10 s) is a miss with a warning. The store can cost a run, never coverage.
 
 #### Output cache

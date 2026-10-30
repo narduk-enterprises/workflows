@@ -25,6 +25,14 @@ name: taskgraph
 # (light) is the verdict and Caller lint. A run whose tasks all passed before
 # has no legs: Plan, then Required.
 #
+# TARGETED TASKS. A script that reads FAST_BASE_REF (nuxt-cloudflare.yml's
+# contract: HEAD^1 on a pull request, empty elsewhere) runs narrowed on a pull
+# request, keyed on its base tree too, and full everywhere else.
+#
+# NO STORE NEEDED. Required's verdict step names the run digest, so a run
+# whose content already passed (a merged PR's main push, a re-push) is reused
+# from GitHub's own record. The store adds per-task reuse and output restores.
+#
 # What it does not do (yet): browser E2E on the isolated pool, preview checks,
 # deploy dry runs. Callers keep those where they are today (an `e2e.yml`, the
 # Workers Builds preview). See README "taskgraph.yml" for the adoption steps.
@@ -126,6 +134,7 @@ jobs:
       run: ${{ steps.plan.outputs.run }}
       legs: ${{ steps.plan.outputs.legs }}
       restores: ${{ steps.plan.outputs.restores }}
+      attest: ${{ steps.plan.outputs.attest }}
     steps:
       - name: Install CI artifact store client
         working-directory: ${{ github.workspace }}
@@ -646,12 +655,32 @@ jobs:
           const OUTPUT_TIMEOUT_MS = 180000;
           const POINTER_SCHEMA = 'narduk-taskgraph-proof-v1';
           const PUBLISH_STEP = 'Publish task proofs';
+          // Required's verdict step. Its name carries the run digest (every key
+          // this run passed or reused), so GitHub's record of it is a proof that
+          // needs no store: see findRunAttestation.
+          const VERDICT_STEP = 'Require the plan and every leg to pass';
           const TASK_NAME = /^[A-Za-z0-9:_./@-]+$/;
           const KEY = /^[0-9a-f]{64}$/;
           const LOCKFILES = ['pnpm-lock.yaml', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'bun.lock', 'bun.lockb'];
           const NODE_VERSION_FILES = ['.node-version', '.nvmrc', '.tool-versions'];
           // Flags and refs that make a script choose its checks from a diff, and a
           // script token (a name, `pnpm run x:changed`) ending in `:changed`.
+          // A script that reads FAST_BASE_REF (or a task tagged `ci:diff`, whose
+          // helper file reads it) is TARGETED: nuxt-cloudflare.yml's contract,
+          // HEAD^1 on a pull request and empty (run the full selection) on every
+          // other event. Any other diff-scoped script is refused: in CI it would
+          // select nothing, pass, and record a pass for the whole tree.
+          const TARGETED_REF = /\bFAST_BASE_REF\b/;
+          // `${FAST_BASE_REF:-origin/main}` or an assignment narrows a push too,
+          // whose pass is recorded as full. An empty default (`${FAST_BASE_REF:-}`,
+          // for `set -u`) is fine.
+          const DEFAULTED_REF = /\$\{FAST_BASE_REF:?[-=][^}]|\bFAST_BASE_REF=(?!""|''|\s|$)/;
+          // In a targeted script a diff selection must vanish when FAST_BASE_REF is
+          // empty: inside `${FAST_BASE_REF:+...}`, or in the `then` branch of
+          // `if [ -n "$FAST_BASE_REF" ]; then ... else ... fi`. Anything else that
+          // selects from a diff (a bare `--changed`, `--changed="$FAST_BASE_REF"`
+          // with no guard, a copy into another variable) is refused.
+          const GUARDED_DIFF = /\$\{FAST_BASE_REF:\+(?:[^{}]|\$\{FAST_BASE_REF\})*\}|\bif \[\[? -n "?\$\{?FAST_BASE_REF(?::-)?\}?"? \]\]?; then\b[\s\S]*?\belse\b/g;
           const DIFF_SCOPED = /FAST_BASE_REF|BASE_REF\b|--changed\b|--changedSince\b|--only-?[cC]hanged\b|--since\b|--affected\b|\baffected\b|merge-base|git diff\b|(?:^|\s)[\w:./@-]*:changed(?=\s|$)/;
           // Bounded so a broken store or API costs seconds, never the job budget.
           const LOOKUP_TIMEOUT_MS = 10000;
@@ -793,7 +822,16 @@ jobs:
           }
 
           // The whole plan: every selected task, dependencies first, with its key.
-          function plan({ entries, turboText, packageText, nodeVersionText, rootLockfile, context }) {
+          //
+          // `base` is the tree of the tested commit's first parent and the event:
+          // a targeted task's pass is a fact about the tree AND that base. On a
+          // pull request it runs narrowed (FAST_BASE_REF=HEAD^1) under the base
+          // key, and a full pass of the same content (`alt`) also satisfies it. On
+          // any other event it runs the full selection under the full key, and a
+          // pull request's narrowed pass satisfies it only when the parent tree is
+          // the base that pass was taken from: the rule agent-infrastructure#4723
+          // ships for a main push.
+          function plan({ entries, turboText, packageText, nodeVersionText, rootLockfile, context, base = null }) {
             if (turboText == null) throw new Error('no turbo.json: tag the tasks CI should run, e.g. {"tasks": {"lint": {"tags": ["ci"]}}}');
             if (packageText == null) throw new Error('no package.json beside turbo.json');
             const turbo = parseJsonc(turboText);
@@ -811,18 +849,36 @@ jobs:
               globalEnv: [...(turbo.globalEnv || [])].sort(),
             };
             const keys = new Map();
+            const targetedTasks = new Set();
             const out = [];
+            const pullRequest = base?.event === 'pull_request' && Boolean(base?.tree);
             for (const name of selected) {
               const def = tasks.get(name);
               if (typeof scripts[name] !== 'string' || scripts[name] === '') {
                 throw new Error(`turbo.json task ${name} has no package.json script of that name; a task with no script would pass having run nothing`);
               }
               // A key says "this content passed". A script that decides what to check
-              // from the diff (vitest --changed, a FAST_BASE_REF subset) can pass on a
-              // tree whose full check fails, so its pass is not a fact about the tree.
-              const text = [name, scripts[name], scripts[`pre${name}`] || '', scripts[`post${name}`] || ''].join('\n');
-              if (def.cache !== false && DIFF_SCOPED.test(text)) {
-                throw new Error(`turbo.json task ${name} looks diff-scoped (${text.match(DIFF_SCOPED)[0]}); its result depends on the base branch, not the tree. Tag the full script (e.g. "test", not "test:changed") or set "cache": false`);
+              // from the diff can pass on a tree whose full check fails. One that
+              // reads FAST_BASE_REF is keyed on its base too (see above); any other
+              // is refused.
+              const scriptText = [scripts[name], scripts[`pre${name}`] || '', scripts[`post${name}`] || ''].join('\n');
+              const text = `${name}\n${scriptText}`;
+              const targeted = (def.tags || []).includes('ci:diff') || TARGETED_REF.test(scriptText);
+              const guardHint = 'Put the whole selection inside ${FAST_BASE_REF:+...} (e.g. vitest run ${FAST_BASE_REF:+--changed=$FAST_BASE_REF}) or in the then-branch of if [ -n "$FAST_BASE_REF" ]; then ...; else <full run>; fi';
+              if (!targeted && def.cache !== false && DIFF_SCOPED.test(text)) {
+                throw new Error(`turbo.json task ${name} looks diff-scoped (${text.match(DIFF_SCOPED)[0]}) but does not read FAST_BASE_REF, so in CI it would select nothing and pass. ${guardHint}; tag it "ci:diff" if a helper file reads it, tag the full script instead, or set "cache": false`);
+              }
+              if (targeted && def.cache !== false) {
+                if (DEFAULTED_REF.test(scriptText)) {
+                  throw new Error(`turbo.json task ${name} gives FAST_BASE_REF a value of its own (${scriptText.match(DEFAULTED_REF)[0]}); an empty FAST_BASE_REF must run the full selection. ${guardHint}`);
+                }
+                // What is left once every guarded selection is gone must not pick
+                // from a diff: with FAST_BASE_REF empty (every push) it would select
+                // nothing and pass under the full key.
+                const loose = scriptText.replace(GUARDED_DIFF, ' ').replace(/\$\{FAST_BASE_REF(?::-)?\}|\$FAST_BASE_REF\b|\bFAST_BASE_REF\b/g, '"$REF"').match(DIFF_SCOPED);
+                if (loose) {
+                  throw new Error(`turbo.json task ${name} reads FAST_BASE_REF but selects from a diff (${loose[0]}) where an empty FAST_BASE_REF (every push) would select nothing and pass. ${guardHint}`);
+                }
               }
               const deps = localDeps(name, def);
               outputDirs(def.outputs);
@@ -864,7 +920,19 @@ jobs:
               } else if (machinesBehind.length > 1) {
                 throw new Error(`task ${name} needs ci:machine tasks ${machinesBehind.join(' and ')}; it can run on only one machine`);
               }
-              const key = sha256(JSON.stringify(material));
+              // A dependent would inherit a key that differs between a pull request
+              // and the push that lands it, so a targeted task must be a leaf.
+              const targetedBehind = ancestors.find(d => targetedTasks.has(d));
+              if (targetedBehind) throw new Error(`task ${name} depends on ${targetedBehind}, which reads FAST_BASE_REF; a targeted task must be a leaf (nothing may depend on it)`);
+              // An untargeted key is unchanged by the base, so its passes carry over.
+              const keyFor = selection => sha256(JSON.stringify(targeted ? { ...material, selection } : material));
+              let key = keyFor('full');
+              let alt = null;
+              if (targeted) {
+                targetedTasks.add(name);
+                const narrowed = base?.tree ? keyFor(`base:${base.tree}`) : null;
+                if (pullRequest) { alt = key; key = narrowed; } else alt = narrowed;
+              }
               keys.set(name, key);
               out.push({
                 task: name,
@@ -879,9 +947,26 @@ jobs:
                 cpus: cpusOf(def.tags || []),
                 shared: (def.tags || []).includes('ci:shared'),
                 machine: (def.tags || []).includes('ci:machine'),
+                // Sees FAST_BASE_REF; `alt` is the other key that satisfies it.
+                targeted,
+                alt,
               });
             }
-            return { engine: ENGINE, tasks: out };
+            return { engine: ENGINE, fastBaseRef: pullRequest ? 'HEAD^1' : '', tasks: out };
+          }
+
+          // The run digest Required's verdict step names: every cacheable key, so a
+          // green verdict says each passed here or was reused. With `alt`, a
+          // targeted task's other key: the digest an earlier run of the same
+          // content would have named (a pull request's, seen from its push).
+          function runDigest(planTasks, alt = false) {
+            const keys = planTasks.filter(t => t.cache).map(t => (alt && t.targeted ? t.alt : t.key));
+            if (!keys.length || keys.some(k => !KEY.test(String(k)))) return null;
+            return sha256(`${ENGINE} run\n${[...keys].sort().join('\n')}`);
+          }
+
+          function runDigests(planTasks) {
+            return [...new Set([runDigest(planTasks), runDigest(planTasks, true)].filter(Boolean))];
           }
 
           // What must execute: every miss, plus every dependency of a miss that
@@ -996,7 +1081,145 @@ jobs:
 
           // Honour a proof only when GitHub confirms the attempt it names (see the
           // header). `attempts` caches one confirmation per run attempt.
-          async function findTaskProof({ github, context, store, cfg, key, workflowPath, callerBlob = null, attempts }) {
+          // The jobs API can answer for a finished attempt before it lists the steps
+          // that finished it (a present, green proof step read as missing on about
+          // half of main pushes, fleet#1180). Re-read up to twice while `done`
+          // says the record is incomplete.
+          const SETTLE_DELAYS_MS = [2000, 5000];
+          const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+          async function settledJobs({ github, context, run_id, attempt_number, done, sleep = pause }) {
+            let jobs = [];
+            for (let i = 0; i <= SETTLE_DELAYS_MS.length; i += 1) {
+              if (i) await sleep(SETTLE_DELAYS_MS[i - 1]);
+              jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
+                ...context.repo, run_id, attempt_number, per_page: 100, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) },
+              });
+              if (done(jobs)) break;
+            }
+            return jobs;
+          }
+
+          // THE CALLABLE THAT WROTE A JOB. A job or step name proves nothing: any
+          // workflow can name a job `x / Required` and a step after a digest, and a
+          // pull_request run executes the workflow in its merge ref, which a writer
+          // controls through the pull request's base branch. What no step can write
+          // is the runner's setup header, logged before the first step: a job that
+          // a reusable workflow defines logs `Uses: <owner>/<repo>/<path>@<sha>`
+          // there, before `Complete job name:`. A job vouches only when that header
+          // names this callable at the SHA this run itself uses (its own
+          // `referenced_workflows`), so the job ran this engine's own steps.
+          const CALLABLE = 'narduk-enterprises/workflows/.github/workflows/taskgraph.yml';
+          const HEADER_BYTES = 64 * 1024;
+          function callableSha(run) {
+            const shas = new Set((run?.referenced_workflows || [])
+              .filter(w => String(w.path || '').startsWith(`${CALLABLE}@`)).map(w => String(w.sha || '')).filter(sha => /^[0-9a-f]{40}$/.test(sha)));
+            return shas.size === 1 ? [...shas][0] : null;
+          }
+
+          function headerNamesCallable(log, sha) {
+            const lines = String(log).split('\n').map(line => line.replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /, '').trim());
+            const end = lines.findIndex(line => line.startsWith('Complete job name: '));
+            return end > 0 && lines.slice(0, end).includes(`Uses: ${CALLABLE}@${sha}`);
+          }
+
+          async function writtenByCallable({ github, context, job_id, sha }) {
+            if (!/^[0-9a-f]{40}$/.test(String(sha || ''))) return false;
+            // The header is the first few KB; a server that ignores the range sends it all.
+            const { data } = await github.rest.actions.downloadJobLogsForWorkflowRun({
+              ...context.repo, job_id, headers: { range: `bytes=0-${HEADER_BYTES - 1}` }, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) },
+            });
+            return headerNamesCallable(typeof data === 'string' ? data : Buffer.from(data).toString('utf8'), sha);
+          }
+
+          // The pull request a push merged, from its subject alone (no
+          // pull-requests permission, so no caller has to grant one). A merge
+          // commit names the head branch. A squash commit is the PR title and
+          // `(#N)`, and a pull_request run's display_title is that title. A run's
+          // `pull_requests` cannot say: GitHub empties it once the PR merges.
+          function mergedPull(message) {
+            const subject = String(message || '').split('\n')[0];
+            const merge = subject.match(/^Merge pull request #(\d+) from [^/\s]+\/(\S+)$/);
+            if (merge) return { number: Number(merge[1]), branch: merge[2] };
+            const squash = subject.match(/^(.*\S) \(#(\d+)\)$/);
+            return squash ? { number: Number(squash[2]), title: squash[1] } : null;
+          }
+
+          // A WHOLE-RUN PROOF, with no store: an earlier completed run of this
+          // repository's own caller workflow, at the same blob, whose Required job
+          // ran `Require the plan and every leg to pass <digest>` successfully for
+          // one of `digests`. That step runs no caller code and its digest covers
+          // every cacheable key, so every task is reused. Candidates, newest
+          // first: on a pull request its own earlier runs (a re-push of the same
+          // content, a base that did not move); on a push, the runs of the pull
+          // request it merges (by branch, title, or a head that already held this
+          // tree), then earlier pushes to the same branch. It needs
+          // only `actions: read` and `contents: read`, so a repository without
+          // the CI_ARTIFACTS_R2_* secrets (another org, a fork) still reuses a
+          // pull request's pass on main.
+          async function findRunAttestation({ github, context, digests, workflowPath, callerBlob, callable, sleep = pause, limit = 10 }) {
+            const repositoryId = context.payload.repository.id;
+            const workflowId = workflowPath.split('/').pop();
+            if (!digests.length) return { found: false, reason: 'no cacheable task' };
+            if (!callable) return { found: false, reason: `this run's own ${CALLABLE} SHA is unknown` };
+            if (!callerBlob || !/^\.github\/workflows\/[^/]+\.ya?ml$/.test(workflowPath)) return { found: false, reason: `caller workflow ${workflowPath || '(unknown)'} is not a file in .github/workflows` };
+            const list = async params => {
+              const { data } = await github.rest.actions.listWorkflowRuns({ ...context.repo, workflow_id: workflowId, status: 'completed', ...params, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) } });
+              return data.workflow_runs || [];
+            };
+            const pr = context.payload.pull_request;
+            let candidates;
+            if (pr) {
+              candidates = await list({ event: 'pull_request', branch: pr.head.ref, per_page: limit });
+            } else {
+              const merged = mergedPull(context.payload.head_commit?.message);
+              const tree = context.payload.head_commit?.tree_id;
+              const prRuns = merged?.branch
+                ? await list({ event: 'pull_request', branch: merged.branch, per_page: limit })
+                : (await list({ event: 'pull_request', per_page: 50 }))
+                  .filter(r => (merged?.title && r.display_title === merged.title) || (tree && r.head_commit?.tree_id === tree));
+              const branch = String(context.ref || '').replace(/^refs\/heads\//, '');
+              const pushes = branch ? await list({ event: 'push', branch, per_page: 3 }) : [];
+              candidates = [...prRuns.slice(0, limit), ...pushes];
+            }
+            candidates = candidates.filter(r => r.id !== context.runId && r.path === workflowPath
+              && r.repository?.id === repositoryId && r.head_repository?.id === repositoryId
+              && (!Array.isArray(r.referenced_workflows) || callableSha(r) === callable));
+            const blobs = new Map();
+            const blobAt = sha => {
+              if (!blobs.has(sha)) {
+                blobs.set(sha, github.rest.repos.getContent({ ...context.repo, path: workflowPath, ref: sha, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) } })
+                  .then(({ data }) => data?.sha || null, () => null));
+              }
+              return blobs.get(sha);
+            };
+            const names = new Set(digests.map(d => `${VERDICT_STEP} ${d}`));
+            // Always `<caller job> / Required`: this callable runs only as a called job.
+            const required = job => / \/ Required$/.test(String(job.name));
+            // Side by side, so a lagging record costs its re-reads once, not per
+            // candidate; the newest hit wins.
+            const verdicts = await Promise.all(candidates.map(async run => {
+              try {
+                const jobs = await settledJobs({
+                  github, context, run_id: run.id, attempt_number: run.run_attempt || 1, sleep,
+                  // Re-read only a green Required job whose verdict step is unlisted.
+                  done: js => js.filter(j => required(j) && j.conclusion === 'success').every(j => (j.steps || []).some(s => s.name.startsWith(VERDICT_STEP) && s.conclusion)),
+                });
+                const hits = jobs.filter(job => required(job) && job.conclusion === 'success'
+                  && (job.steps || []).some(s => names.has(s.name) && s.conclusion === 'success'));
+                if (!hits.length || (await blobAt(run.head_sha)) !== callerBlob) return false;
+                // The verdict came from this callable's own Required job.
+                for (const job of hits) if (await writtenByCallable({ github, context, job_id: job.id, sha: callable })) return true;
+                return false;
+              } catch {
+                return false;
+              }
+            }));
+            const at = verdicts.indexOf(true);
+            if (at >= 0) return { found: true, run: candidates[at] };
+            return { found: false, reason: candidates.length ? `none of ${candidates.length} earlier run(s) passed this content` : 'no earlier run to compare' };
+          }
+
+          async function findTaskProof({ github, context, store, cfg, key, workflowPath, callerBlob = null, callable = null, attempts, sleep = pause }) {
             const repository = `${context.repo.owner}/${context.repo.repo}`;
             const repositoryId = context.payload.repository.id;
             const objectKey = proofKey(store, repository, key);
@@ -1033,13 +1256,18 @@ jobs:
                   const { data: file } = await github.rest.repos.getContent({ ...context.repo, path: workflowPath, ref: run.head_sha, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) } });
                   if (!file || file.sha !== callerBlob) return { ok: false, reason: `run ${pointer.run_id} ran another version of ${workflowPath}` };
                 }
-                const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRunAttempt, {
-                  ...context.repo, run_id: run.id, attempt_number: pointer.run_attempt, per_page: 100, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) },
-                });
                 const stepName = `${PUBLISH_STEP} ${digest}`;
-                const attested = jobs.some(job => /(^| \/ )Tasks \([A-Za-z0-9:_.\/@-]+\)$/.test(String(job.name))
-                  && (job.steps || []).some(step => step.name === stepName && step.conclusion === 'success'));
-                return attested ? { ok: true, run } : { ok: false, reason: `${run.html_url} shows no successful "${stepName}" step in a Tasks leg` };
+                const leg = job => /(^| \/ )Tasks \([A-Za-z0-9:_.\/@-]+\)$/.test(String(job.name));
+                const attested = await settledJobs({
+                  github, context, run_id: run.id, attempt_number: pointer.run_attempt, sleep,
+                  done: jobs => jobs.filter(leg).every(job => (job.steps || []).some(s => s.name.startsWith(PUBLISH_STEP) && s.conclusion)),
+                }).then(async jobs => {
+                  for (const job of jobs.filter(j => leg(j) && (j.steps || []).some(step => step.name === stepName && step.conclusion === 'success'))) {
+                    if (await writtenByCallable({ github, context, job_id: job.id, sha: callable })) return true;
+                  }
+                  return false;
+                });
+                return attested ? { ok: true, run } : { ok: false, reason: `${run.html_url} shows no successful "${stepName}" step in a Tasks leg of ${CALLABLE}@${callable || '(unknown)'}` };
               })());
             }
             const verdict = await attempts.get(id);
@@ -1129,7 +1357,19 @@ jobs:
             ]);
             if (nodeFile && nodeText == null) throw new Error(`node-version-file ${nodeFile} does not exist at ${context.sha}`);
             const caller = tree.tree.find(e => e.path === workflowPath);
+            // The first parent's tree: the base a targeted task's pass is taken from
+            // (a pull request's merge commit sits on its base branch head).
+            let baseTree = null;
+            const parent = commit.parents?.[0]?.sha;
+            if (parent) {
+              try {
+                baseTree = (await github.rest.git.getCommit({ ...repo, commit_sha: parent, request: request() })).data.tree.sha;
+              } catch (error) {
+                core.warning(`could not read the parent commit's tree, so targeted tasks run their full selection: ${error.message}`);
+              }
+            }
             const result = plan({
+              base: { event: context.eventName, tree: baseTree },
               entries: entriesFromApi(tree.tree, wd),
               turboText,
               packageText,
@@ -1141,6 +1381,9 @@ jobs:
                 callerWorkflow: caller ? `${caller.path}:${caller.sha}` : workflowPath,
                 packageManager: env.PACKAGE_MANAGER || 'pnpm',
                 installScript: env.INSTALL_SCRIPT || '',
+                // A task can behave differently without a secret (skip a check that
+                // needs it), so a run without one never vouches for a run with it.
+                secrets: { packages: env.HAS_PACKAGES_READ === 'true', nvault: env.HAS_NVAULT_TOKEN === 'true' },
                 workingDirectory: wd,
               },
             });
@@ -1152,14 +1395,44 @@ jobs:
               core.warning(`${error.message}; every task runs and no pass is reused`);
             }
             const reuse = env.REUSE !== 'false';
-            if (!cfg) core.notice('No CI artifact store credentials in this run (fork, Dependabot, or a caller missing from the CI_ARTIFACTS_R2_* secrets\' repository lists): every task runs and no pass is recorded.');
+            core.setOutput('attest', runDigest(result.tasks) || '');
+            // The callable SHA this run uses: a proof counts only from a job that
+            // the same callable wrote (writtenByCallable).
+            let callable = null;
+            if (reuse) {
+              try {
+                callable = callableSha((await github.rest.actions.getWorkflowRun({ ...repo, run_id: context.runId, request: request() })).data);
+              } catch (error) {
+                core.warning(`could not read this run's referenced workflows: ${error.message}`);
+              }
+              if (!callable) core.warning(`this run's ${CALLABLE} SHA is unknown, so no earlier pass can be confirmed and every task runs`);
+            }
+            // First the whole-run proof (no store needed): an earlier run that
+            // passed exactly this content. Then, per task, the store's pointers.
+            let whole = null;
+            if (reuse) {
+              try {
+                const found = await findRunAttestation({ github, context, digests: runDigests(result.tasks), workflowPath, callerBlob: caller?.sha || null, callable });
+                if (found.found) whole = found.run;
+                else core.info(`whole-run reuse: ${found.reason}`);
+              } catch (error) {
+                core.warning(`whole-run reuse lookup failed, so tasks are looked up one by one: ${error.message}`);
+              }
+            }
+            if (!cfg && !whole) core.notice('No CI artifact store credentials in this run (fork, Dependabot, another org, or a caller missing from the CI_ARTIFACTS_R2_* secrets\' repository lists): only a run that already passed this exact content is reused, and no per-task pass is recorded.');
             const attempts = new Map();
             const verdicts = await Promise.all(result.tasks.map(async t => {
               if (!t.cache) return { hit: false, reason: 'cache: false' };
               if (!reuse) return { hit: false, reason: 'reuse: false' };
+              if (whole) return { hit: true, run: whole, output: null };
               if (!cfg) return { hit: false, reason: 'no store credentials' };
               try {
-                const proof = await findTaskProof({ github, context, store, cfg, key: t.key, workflowPath, callerBlob: caller?.sha || null, attempts });
+                let proof = { found: false, reason: 'no proof' };
+                for (const k of [t.key, t.alt].filter(Boolean)) {
+                  proof = await findTaskProof({ github, context, store, cfg, key: k, workflowPath, callerBlob: caller?.sha || null, callable, attempts });
+                  // Outputs are stored under the key that produced them.
+                  if (proof.found) { if (k !== t.key) proof.output = null; break; }
+                }
                 return proof.found ? { hit: true, run: proof.run, output: proof.output } : { hit: false, reason: proof.reason };
               } catch (error) {
                 core.warning(`${t.task}: proof lookup failed, so it runs: ${error.message}`);
@@ -1265,7 +1538,17 @@ jobs:
             core.info(`Restored the outputs of ${got.length} of ${wanted.length} task(s): ${got.join(', ') || 'none'}`);
             return got;
           }
+          TASKGRAPH_ENGINE
 
+      # The engine's second half. One `run:` script of 64 KiB or more stalls
+      # actionlint's shellcheck pass for good (Validate workflows hung on the
+      # whole engine), so it is written in two steps; scripts/test_taskgraph.py
+      # holds every script under the cap.
+      - name: Install taskgraph engine (execution)
+        working-directory: ${{ github.workspace }}
+        run: &install_taskgraph_engine_execution |
+          set -euo pipefail
+          cat >> "$RUNNER_TEMP/taskgraph.cjs" <<'TASKGRAPH_ENGINE'
           // ---- Execution ----------------------------------------------------------------
 
           // Vercel CI starts each task on its own machine from a copy of the
@@ -1375,7 +1658,10 @@ jobs:
           // Run `names` in dependency order, at most `concurrency` CPUs at once (a
           // task's `ci:cpus:N` tag is its weight). A failed task blocks its dependents
           // and nothing else, so one push shows every independent failure.
-          function runTasks({ planTasks, names, command, cwd, concurrency, isolate, restored = new Map(), env = process.env, onEvent = () => {}, timeoutMs = TASK_TIMEOUT_MS }) {
+          // FAST_BASE_REF reaches only a targeted task; every other task sees it
+          // empty, so a script that reads it through a helper file runs its full
+          // selection and its pass stays a fact about the tree.
+          function runTasks({ planTasks, names, command, cwd, concurrency, isolate, restored = new Map(), env = process.env, fastBaseRef = '', onEvent = () => {}, timeoutMs = TASK_TIMEOUT_MS }) {
             const byName = new Map(planTasks.map(t => [t.task, t]));
             // A restored producer passed in an earlier run; its outputs sit in its own
             // directory and reach its dependents like a producer's that ran here.
@@ -1465,7 +1751,7 @@ jobs:
                   }
                   const [bin, ...args] = command(name);
                   // Its own process group, so a task's leftovers can be ended with it.
-                  const child = spawn(bin, args, { cwd: taskCwd, env: { ...env, TASKGRAPH_TASK: name }, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+                  const child = spawn(bin, args, { cwd: taskCwd, env: { ...env, TASKGRAPH_TASK: name, FAST_BASE_REF: byName.get(name).targeted ? fastBaseRef : '' }, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
                   child.stdout.on('data', d => chunks.push(d));
                   child.stderr.on('data', d => chunks.push(d));
                   let done = false;
@@ -1531,7 +1817,8 @@ jobs:
           }
 
           async function main(env = process.env) {
-            const planTasks = JSON.parse(env.TASKGRAPH_PLAN).tasks;
+            const planDoc = JSON.parse(env.TASKGRAPH_PLAN);
+            const planTasks = planDoc.tasks;
             // A leg names exactly what it runs; without one, the misses and what they need.
             const known = new Set(planTasks.map(t => t.task));
             for (const n of String(env.TASKGRAPH_RUN || '').split(',').filter(Boolean)) if (!known.has(n)) throw new Error(`leg names unknown task ${n}`);
@@ -1585,7 +1872,7 @@ jobs:
             let results;
             try {
               results = await runTasks({
-                planTasks, names, cwd: process.cwd(), concurrency, isolate, restored, env,
+                planTasks, names, cwd: process.cwd(), concurrency, isolate, restored, env, fastBaseRef: planDoc.fastBaseRef || '',
                 timeoutMs: requestedTimeout > 0 ? requestedTimeout : TASK_TIMEOUT_MS,
                 command: name => [pm, 'run', name],
                 onEvent: e => {
@@ -1645,9 +1932,10 @@ jobs:
           }
 
           module.exports = {
-            ENGINE, POINTER_SCHEMA, PUBLISH_STEP, LOCKFILES, NODE_VERSION_FILES,
+            ENGINE, POINTER_SCHEMA, PUBLISH_STEP, VERDICT_STEP, LOCKFILES, NODE_VERSION_FILES,
             sha256, parseJsonc, globToRegExp, entriesFromApi, entriesFromLsTree, fingerprint,
-            selectTasks, plan, executionSet, restoresFor, legsOf, manifestDigest, proofKey, outputObjectKey, findTaskProof, publishTaskProofs,
+            selectTasks, plan, runDigest, runDigests, executionSet, restoresFor, legsOf, manifestDigest, proofKey, outputObjectKey,
+            findTaskProof, findRunAttestation, settledJobs, mergedPull, callableSha, headerNamesCallable, writtenByCallable, publishTaskProofs,
             normalizeDir, planStep, publishStep, restoreStep, archiveOutputs, carriedOutputDirs,
             isolatedWorkspace, outputDirs, cgroupLimits, defaultConcurrency, runTasks, main,
           };
@@ -1675,6 +1963,8 @@ jobs:
           PACKAGE_MANAGER: ${{ inputs.package-manager }}
           INSTALL_SCRIPT: ${{ inputs.install-script }}
           REUSE: ${{ inputs.reuse }}
+          HAS_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ != '' }}
+          HAS_NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN != '' }}
           CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
           CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
           CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
@@ -1719,8 +2009,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # Depth 1: keys replace diff-based selection, so nothing reads HEAD^1.
-          fetch-depth: 1
+          # Depth 2 on a pull request: a targeted task's FAST_BASE_REF is HEAD^1.
+          # Elsewhere nothing reads a parent.
+          fetch-depth: ${{ github.event_name == 'pull_request' && 2 || 1 }}
 
       - name: Install CI artifact store client
         working-directory: ${{ github.workspace }}
@@ -1729,6 +2020,10 @@ jobs:
       - name: Install taskgraph engine
         working-directory: ${{ github.workspace }}
         run: *install_taskgraph_engine
+
+      - name: Install taskgraph engine (execution)
+        working-directory: ${{ github.workspace }}
+        run: *install_taskgraph_engine_execution
 
       # RESTORE: the stored outputs of passed producers this leg's tasks read
       # (a build whose content did not change), each checked against the
@@ -1961,8 +2256,11 @@ jobs:
       contents: read
     steps:
       # Green only when the plan succeeded and, if it found work, every leg
-      # passed; a run whose tasks all passed before has no legs at all.
-      - name: Require the plan and every leg to pass
+      # passed; a run whose tasks all passed before has no legs at all. The
+      # name carries the run digest, so a later run of the same content can
+      # reuse this one with no store (findRunAttestation). No caller code runs
+      # in this job before it.
+      - name: Require the plan and every leg to pass ${{ needs.plan.outputs.attest }}
         working-directory: ${{ github.workspace }}
         env:
           PLAN_RESULT: ${{ needs.plan.result }}
