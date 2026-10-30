@@ -110,6 +110,15 @@ Each rule below exists because breaking it has a specific, known blast radius:
   true`, `Required` does not list it, and no other job `needs:` it. Every
   other R11 rule still applies to it.
 
+  RESULT_ALIAS_JOBS is the other sanctioned exception to R5, and only for a
+  migration alias that reports an established required context (`ci / Fast`)
+  from the real `Required` result. It needs exactly the Required job, runs
+  under `if: always()` (a skipped check satisfies a ruleset), and its one
+  step exits 1 unless that result is success. It is not continue-on-error,
+  and nothing needs it, Required included: that would cycle. The behavioral
+  proof that a failing Required fails the alias, and a passing one passes it,
+  lives in scripts/test_taskgraph.py, which executes the shipped step.
+
   The FOLDED GATE is the one sanctioned way for a job other than a literal
   `Required` to report the `Required` check (ci-reset W10, W8 item 3): when
   a single condition X says Build is the only lane, Build is named
@@ -285,6 +294,87 @@ NON_GATING_JOBS: dict[str, frozenset[str]] = {
     "nuxt-cloudflare.yml": frozenset({"e2e-quarantine"}),
 }
 
+# workflow file name -> job ids that report an old required context from the
+# real Required result. Adding an entry is a gate-shape change; see the
+# module docstring. The job id `fast` is named exactly `Fast`.
+RESULT_ALIAS_JOBS: dict[str, frozenset[str]] = {
+    "taskgraph.yml": frozenset({"fast"}),
+}
+
+
+def _needs_list(job: dict) -> list:
+    needs = job.get("needs") or []
+    if isinstance(needs, str):
+        return [needs]
+    return list(needs)
+
+
+def result_alias_jobs(path: Path, doc: dict, f: Findings) -> frozenset[str]:
+    """Declared migration aliases, after checking each one reports Required's
+    real result instead of a skip or an unconditional pass."""
+    jobs = doc.get("jobs") or {}
+    declared = RESULT_ALIAS_JOBS.get(path.name, frozenset())
+    for jid in sorted(declared - set(jobs)):
+        f.add(path, f"R5 result alias '{jid}' is declared but missing from the workflow")
+    required_ids = [
+        jid for jid, job in jobs.items()
+        if isinstance(job, dict) and (job.get("name") or jid) == "Required"
+    ]
+    present = declared & set(jobs)
+    for jid in sorted(present):
+        job = jobs[jid]
+        if not isinstance(job, dict):
+            f.add(path, f"R5 result alias '{jid}' is not a job mapping")
+            continue
+        if job.get("name") != "Fast":
+            f.add(
+                path,
+                f"R5 result alias '{jid}' must be named exactly 'Fast' "
+                f"(the established context), got {job.get('name')!r}",
+            )
+        if str(job.get("if", "")).strip() != "always()":
+            f.add(
+                path,
+                f"R5 result alias '{jid}' must run under `if: always()` — a skipped "
+                f"check satisfies a ruleset, got {job.get('if')!r}",
+            )
+        if "continue-on-error" in job:
+            f.add(
+                path,
+                f"R5 result alias '{jid}' must not set continue-on-error — "
+                "that would report success when Required failed",
+            )
+        needs = _needs_list(job)
+        if needs != required_ids:
+            f.add(
+                path,
+                f"R5 result alias '{jid}' must need exactly the Required job {required_ids}, got {needs}",
+            )
+        for other_id, other in jobs.items():
+            if isinstance(other, dict) and jid in _needs_list(other):
+                f.add(
+                    path,
+                    f"R5 result alias '{jid}' is needed by '{other_id}' — it only reports "
+                    "Required's result and must not feed the gate",
+                )
+        steps = [s for s in (job.get("steps") or []) if isinstance(s, dict)]
+        bound = [
+            s for s in steps
+            if isinstance(s.get("env"), dict)
+            and s["env"].get("REQUIRED_RESULT") == "${{ needs.required.result }}"
+            and isinstance(s.get("run"), str)
+            and "REQUIRED_RESULT" in s["run"]
+            and "success" in s["run"]
+            and "exit 1" in s["run"]
+        ]
+        if len(bound) != 1:
+            f.add(
+                path,
+                f"R5 result alias '{jid}' needs exactly one step that reads "
+                "needs.required.result into REQUIRED_RESULT and exits 1 unless it is success",
+            )
+    return present
+
 
 def non_gating_jobs(path: Path, doc: dict, f: Findings) -> frozenset[str]:
     """The declared non-gating jobs present in this file, after checking that each
@@ -442,6 +532,7 @@ def check_required_job(path: Path, doc: dict, f: Findings) -> None:
     aggregators, _, _ = folded_gate(jobs)
     required = {jid: j for jid, j in jobs.items() if (j.get("name") or jid) == "Required"}
     required.update({jid: jobs[jid] for jid in aggregators})
+    aliases = result_alias_jobs(path, doc, f)
     if not required:
         return
     for jid, job in required.items():
@@ -475,7 +566,7 @@ def check_required_job(path: Path, doc: dict, f: Findings) -> None:
                 f"R5 job '{jid}' is named Required but its `if:` is {cond!r} — "
                 "it must be `always()` or exactly `!cancelled()`",
             )
-        missing = sorted(set(jobs) - set(needs) - {jid} - non_gating_jobs(path, doc, f))
+        missing = sorted(set(jobs) - set(needs) - {jid} - non_gating_jobs(path, doc, f) - aliases)
         if missing:
             f.add(
                 path,
