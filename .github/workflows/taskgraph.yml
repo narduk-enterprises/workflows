@@ -547,11 +547,11 @@ jobs:
             try {
               cfg = storeConfig(env);
             } catch (error) {
-              core.warning(`${error.message}; no ${kind} proof published, so the default-branch push runs it in full`);
+              core.warning(`${error.message}; no ${kind} pointer published; the default-branch push looks the run up on GitHub instead`);
               return;
             }
             if (!cfg) {
-              core.notice(`No CI artifact store credentials in this run; no ${kind} proof published, so the default-branch push runs it in full.`);
+              core.notice(`No CI artifact store credentials in this run; no ${kind} pointer published; the default-branch push looks the run up on GitHub instead.`);
               return;
             }
             try {
@@ -559,7 +559,7 @@ jobs:
               core.info(`R2 put ${objectKey}: pointer to run ${pointer.run_id} attempt ${pointer.run_attempt}`);
               core.info(`R2 get ${objectKey}: read-back matches`);
             } catch (error) {
-              core.warning(`Could not publish the ${kind} proof to the CI artifact store; the default-branch push runs it in full: ${describe(error)}`);
+              core.warning(`Could not publish the ${kind} proof to the CI artifact store; the default-branch push looks the run up on GitHub instead: ${describe(error)}`);
             }
           }
 
@@ -706,8 +706,12 @@ jobs:
             const runs = merged?.branch
               ? await list({ branch: merged.branch, per_page: limit })
               : (await list({ per_page: 50 })).filter(r => (merged?.title && r.display_title === merged.title) || (tree && r.head_commit?.tree_id === tree));
+            // A Dependabot run gets no secrets (NVAULT_TOKEN, the store), so a
+            // caller's install or a check can behave differently there; with a
+            // store it could never publish a pointer, and it never vouches here.
+            const dependabot = r => [r.actor?.login, r.triggering_actor?.login].includes('dependabot[bot]');
             const candidates = runs.filter(r => r.event === 'pull_request' && r.status === 'completed' && r.conclusion === 'success'
-              && r.path === workflowPath && r.repository?.id === repositoryId && r.head_repository?.id === repositoryId).slice(0, limit);
+              && r.path === workflowPath && r.repository?.id === repositoryId && r.head_repository?.id === repositoryId && !dependabot(r)).slice(0, limit);
             if (!candidates.length) return { found: false, reason: `no successful run of the pull request this push merged (${merged ? `#${merged.number}` : 'subject names none'})` };
             const ownSha = callableSha((await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId, request: { timeout: 10000 } })).data);
             if (!ownSha) return { found: false, reason: `this run's own ${PROOF_CALLABLE} SHA is unknown` };

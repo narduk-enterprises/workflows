@@ -674,10 +674,12 @@ on:
           On a default-branch push, reuse a successful same-repository PR run
           of the full E2E suite only when its tested Git tree, caller workflow
           and all callable inputs match. Missing, expired or unreadable proof
-          runs E2E. The proof is a pointer in the CI artifact store (see THE
-          CI ARTIFACT STORE at `reuse-plan`), so it needs the
-          CI_ARTIFACTS_R2_* secrets on both the pull request and the push;
-          without them no proof is published or honoured and E2E runs.
+          runs E2E. The proof is the pull request run's own Required job
+          passing `Publish full E2E proof <key>`. With the CI_ARTIFACTS_R2_*
+          secrets, a pointer in the CI artifact store names that run (see THE
+          CI ARTIFACT STORE at `reuse-plan`). Without them, `E2E plan` finds
+          the merged pull request's run on GitHub, so a caller without the
+          secrets also reuses E2E on its push (never from a Dependabot run).
           Requires actions: read on the caller's ci job. Disable for
           suites whose behavior intentionally differs between PR and push.
         required: false
@@ -1172,7 +1174,9 @@ on:
       # the S3 secret access key. All optional. Without them (a fork,
       # Dependabot, a public caller, or a caller that does not pass them)
       # nothing is stored or read: each E2E job builds its own application,
-      # and no reuse proof is published or honoured, so the gate runs in full.
+      # and no pointer is published. A push then finds the merged pull
+      # request's own run on GitHub instead (findProofOnGitHub), except a
+      # Dependabot run, which never vouches.
       # E2E jobs receive only the two IDs, never the secret access key.
       CI_ARTIFACTS_R2_ACCOUNT_ID:
         required: false
@@ -1697,11 +1701,11 @@ jobs:
             try {
               cfg = storeConfig(env);
             } catch (error) {
-              core.warning(`${error.message}; no ${kind} proof published, so the default-branch push runs it in full`);
+              core.warning(`${error.message}; no ${kind} pointer published; the default-branch push looks the run up on GitHub instead`);
               return;
             }
             if (!cfg) {
-              core.notice(`No CI artifact store credentials in this run; no ${kind} proof published, so the default-branch push runs it in full.`);
+              core.notice(`No CI artifact store credentials in this run; no ${kind} pointer published; the default-branch push looks the run up on GitHub instead.`);
               return;
             }
             try {
@@ -1709,7 +1713,7 @@ jobs:
               core.info(`R2 put ${objectKey}: pointer to run ${pointer.run_id} attempt ${pointer.run_attempt}`);
               core.info(`R2 get ${objectKey}: read-back matches`);
             } catch (error) {
-              core.warning(`Could not publish the ${kind} proof to the CI artifact store; the default-branch push runs it in full: ${describe(error)}`);
+              core.warning(`Could not publish the ${kind} proof to the CI artifact store; the default-branch push looks the run up on GitHub instead: ${describe(error)}`);
             }
           }
 
@@ -1856,8 +1860,12 @@ jobs:
             const runs = merged?.branch
               ? await list({ branch: merged.branch, per_page: limit })
               : (await list({ per_page: 50 })).filter(r => (merged?.title && r.display_title === merged.title) || (tree && r.head_commit?.tree_id === tree));
+            // A Dependabot run gets no secrets (NVAULT_TOKEN, the store), so a
+            // caller's install or a check can behave differently there; with a
+            // store it could never publish a pointer, and it never vouches here.
+            const dependabot = r => [r.actor?.login, r.triggering_actor?.login].includes('dependabot[bot]');
             const candidates = runs.filter(r => r.event === 'pull_request' && r.status === 'completed' && r.conclusion === 'success'
-              && r.path === workflowPath && r.repository?.id === repositoryId && r.head_repository?.id === repositoryId).slice(0, limit);
+              && r.path === workflowPath && r.repository?.id === repositoryId && r.head_repository?.id === repositoryId && !dependabot(r)).slice(0, limit);
             if (!candidates.length) return { found: false, reason: `no successful run of the pull request this push merged (${merged ? `#${merged.number}` : 'subject names none'})` };
             const ownSha = callableSha((await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId, request: { timeout: 10000 } })).data);
             if (!ownSha) return { found: false, reason: `this run's own ${PROOF_CALLABLE} SHA is unknown` };
@@ -1918,7 +1926,8 @@ jobs:
               // Bounded; an absent proof costs a run, never coverage.
               const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
               let proof = await store.findProof({ github, context, kind: 'required', key, workflowPath });
-              // No pointer (no store credentials, another org, a store outage):
+              // No pointer (no store credentials, another org, no pointer stored;
+              // a store error throws and runs the full gate):
               // GitHub's own record of the merged pull request's run.
               if (!proof.found) {
                 const stored = proof.reason;
@@ -4031,7 +4040,8 @@ jobs:
               // coverage.
               const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
               let proof = await store.findProof({ github, context, kind: 'e2e', key, workflowPath });
-              // No pointer (no store credentials, another org, a store outage):
+              // No pointer (no store credentials, another org, no pointer stored;
+              // a store error throws and runs the full gate):
               // GitHub's own record of the merged pull request's run.
               if (!proof.found) {
                 const stored = proof.reason;

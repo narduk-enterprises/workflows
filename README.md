@@ -926,7 +926,7 @@ jobs:
       NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
       # The CI artifact store (see "The CI artifact store (2026-09-26)").
       # Optional: without them each E2E job builds its own application and no
-      # reuse proof is published or honoured.
+      # pointer is published; a push finds the merged PR's run on GitHub.
       CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
       CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
       CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}

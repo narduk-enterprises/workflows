@@ -338,6 +338,8 @@ def main() -> None:
                                 'headCommit': {'message': 'Merge pull request #12 from example/feat/x\n\nShip it'}})
     assert merge['outputs']['reused'] == 'true', merge
     assert {'listRuns': ['pull_request', 'success', 'feat/x']} in merge['calls'], merge['calls']
+    second = run_lookup(script, {'noCreds': True, 'prRuns': [{**pr_run, 'run_attempt': 2}]})
+    assert second['outputs']['reused'] == 'true' and {'listJobs': [321, 2]} in second['calls'], 'the latest attempt is read'
     by_tree = run_lookup(script, {'noCreds': True, 'prRuns': [{**pr_run, 'display_title': 'Renamed', 'head_commit': {'tree_id': 't' * 40}}]})
     assert by_tree['outputs']['reused'] == 'true', 'a PR head that already held the pushed tree'
     for name, scenario in {
@@ -349,6 +351,9 @@ def main() -> None:
                                         + '\n2026-10-30T21:14:01.0Z Complete job name: ci / Required\n'},
         'no attesting step': {'prRuns': [pr_run], 'stepName': '{PREFIX} ' + OTHER_KEY['e2e']},
         'a subject that names no pull request': {'prRuns': [pr_run], 'headCommit': {'message': 'direct push', 'tree_id': 'z' * 40}},
+        'a Dependabot run (no secrets, so it never vouches)': {'prRuns': [{**pr_run, 'actor': {'login': 'dependabot[bot]'}}]},
+        'a run re-triggered by Dependabot': {'prRuns': [{**pr_run, 'triggering_actor': {'login': 'dependabot[bot]'}}]},
+        'a merged tree the run did not test (its step names another key)': {'prRuns': [pr_run], 'stepName': '{PREFIX} ' + OTHER_KEY['e2e']},
     }.items():
         result = run_lookup(script, {'noCreds': True, **scenario})
         assert result['outputs']['reused'] == 'false', (name, result)
