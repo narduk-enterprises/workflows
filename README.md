@@ -3148,9 +3148,23 @@ all of the following hold:
   of the same caller workflow;
 - the run's repository and head repository are both this repository;
 - the run attempt is the one that wrote the pointer;
-- that attempt's `Required` job succeeded;
+- that attempt's `<caller job> / Required` job succeeded;
 - that job has a successful step named `Publish Required proof <key>` or
-  `Publish full E2E proof <key>`, with this exact key.
+  `Publish full E2E proof <key>`, with this exact key;
+- the runner itself wrote that job from this callable. The job log's setup
+  header, before `Complete job name:`, must say
+  `Uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@<sha>`,
+  with the SHA this run itself uses (its own `referenced_workflows`).
+
+The last rule exists because a name proves nothing. Any workflow can name a
+job `ci / Required` and a step after a key. A `pull_request` run also executes
+the workflow in its merge ref, which a writer controls through the PR's base
+branch. No step can write the runner's header, so a proof forged that way
+never counts. `taskgraph.yml` applies the same rule (workflows#226).
+
+A finished attempt's jobs record can lag its steps, so a lookup that finds a
+green `Required` job with no proof step listed yet reads the jobs again after
+2 s and 5 s. That lag is fleet#1180's main-push reuse miss.
 
 The key is unchanged from the artifact era: the digest of the tested Git tree,
 the caller workflow and every callable input.
