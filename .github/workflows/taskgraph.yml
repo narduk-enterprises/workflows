@@ -1538,7 +1538,17 @@ jobs:
             core.info(`Restored the outputs of ${got.length} of ${wanted.length} task(s): ${got.join(', ') || 'none'}`);
             return got;
           }
+          TASKGRAPH_ENGINE
 
+      # The engine's second half. One `run:` script of 64 KiB or more stalls
+      # actionlint's shellcheck pass for good (Validate workflows hung on the
+      # whole engine), so it is written in two steps; scripts/test_taskgraph.py
+      # holds every script under the cap.
+      - name: Install taskgraph engine (execution)
+        working-directory: ${{ github.workspace }}
+        run: &install_taskgraph_engine_execution |
+          set -euo pipefail
+          cat >> "$RUNNER_TEMP/taskgraph.cjs" <<'TASKGRAPH_ENGINE'
           // ---- Execution ----------------------------------------------------------------
 
           // Vercel CI starts each task on its own machine from a copy of the
@@ -2010,6 +2020,10 @@ jobs:
       - name: Install taskgraph engine
         working-directory: ${{ github.workspace }}
         run: *install_taskgraph_engine
+
+      - name: Install taskgraph engine (execution)
+        working-directory: ${{ github.workspace }}
+        run: *install_taskgraph_engine_execution
 
       # RESTORE: the stored outputs of passed producers this leg's tasks read
       # (a build whose content did not change), each checked against the

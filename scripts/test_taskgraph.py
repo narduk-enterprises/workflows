@@ -44,6 +44,9 @@ import yaml
 WORKFLOW = Path(".github/workflows/taskgraph.yml")
 NUXT = Path(".github/workflows/nuxt-cloudflare.yml")
 ENGINE_STEP = "Install taskgraph engine"
+ENGINE_STEP_2 = "Install taskgraph engine (execution)"
+# actionlint's shellcheck pass stalls for good on one `run:` script of 64 KiB.
+RUN_SCRIPT_CAP = 60 * 1024
 STORE_STEP = "Install CI artifact store client"
 VERDICT = "Require the plan and every leg to pass ${{ needs.plan.outputs.attest }}"
 
@@ -798,6 +801,7 @@ def check_engine() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp).resolve()
         install(doc, ENGINE_STEP, root)
+        install(doc, ENGINE_STEP_2, root)
         install(doc, STORE_STEP, root)
         harness = root / "harness.cjs"
         harness.write_text(HARNESS)
@@ -834,7 +838,8 @@ def check_copies() -> None:
     ]
     for name, ours, job in pairs:
         assert run_text(tg, ours, name) == run_text(nc, job, name), f"{name} ({ours}): drifted from nuxt-cloudflare.yml {job}"
-    assert run_text(tg, "plan", ENGINE_STEP) == run_text(tg, "tasks", ENGINE_STEP), "one engine for both jobs"
+    for name in (ENGINE_STEP, ENGINE_STEP_2):
+        assert run_text(tg, "plan", name) == run_text(tg, "tasks", name), "one engine for both jobs"
     assert step(tg, "required", "Install actionlint")["env"] == step(nc, "build", "Install actionlint")["env"]
     for name in ("Install dependencies (pnpm)", "Install dependencies (npm)"):
         assert step(tg, "tasks", name)["env"] == step(nc, "build", name)["env"], f"{name}: env drifted"
@@ -849,7 +854,11 @@ def check_shape() -> None:
     assert jobs["required"]["needs"] == ["plan", "tasks"], "Required needs every job"
     # Plan holds no install and runs no caller code.
     plan = [s.get("name") or s.get("uses") for s in steps(doc, "plan")]
-    assert plan == [STORE_STEP, ENGINE_STEP, "Plan tasks"], plan
+    assert plan == [STORE_STEP, ENGINE_STEP, ENGINE_STEP_2, "Plan tasks"], plan
+    for job in jobs.values():
+        for s in job.get("steps", []):
+            size = len(s.get("run", "").encode())
+            assert size < RUN_SCRIPT_CAP, f"{s.get('name')}: a {size}-byte run script; actionlint's shellcheck stalls at 64 KiB, so split it"
     assert jobs["plan"]["permissions"] == {"contents": "read", "actions": "read"}
     # One leg per machine, only when there is work; an empty matrix is an error.
     tasks = jobs["tasks"]
