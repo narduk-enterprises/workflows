@@ -214,7 +214,8 @@ on:
           Opt-in exact production build handoff to cloudflare-version-upload.yml.
           Relative Nitro output directory containing server/wrangler.json. Main
           pushes and main dispatch only; docs/test-only pushes publish nothing.
-          Requires a build-script and required-reuse-pr-results=false. No deploy
+          Requires a build-script. Required reuse never applies with it (a main
+          push must build the artifact it hands off). No deploy
           credentials enter Build. Artifact retention is one day; verify storage
           allowance and a hard zero-dollar Actions budget before adoption. A
           storage refusal leaves Build green with a warning and fails the
@@ -1077,10 +1078,13 @@ on:
           pointer in the CI artifact store names that run. Without them (another
           org, a repository off their lists) `Reuse plan` finds the merged pull
           request's run on GitHub from the push's subject. Requires
-          `actions: read` on the caller's `ci` job.
+          `actions: read` on the caller's `ci` job. On by default since
+          2026-10-30: a push repeats a check only when its tree, caller
+          workflow or inputs differ from a green pull request's. Set false for
+          a gate whose behaviour intentionally differs between PR and push.
         required: false
         type: boolean
-        default: false
+        default: true
       e2e-pr-only-changed:
         description: >-
           On `pull_request` events that take the pull-request tier (no
@@ -1241,7 +1245,7 @@ jobs:
       group: workflows-nuxt-cloudflare-reuse-plan-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Reuse plan
-    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))"
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.production-output-directory == '' && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))"
     runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (toJSON(github.event.repository.private) == 'false' && '"ubuntu-latest"' || ((toJSON(github.event.repository.private) == 'false' || inputs.lightweight-runner == '"self-hosted"' || startsWith(inputs.lightweight-runner, '[') && contains(fromJSON(inputs.lightweight-runner || '[]'), 'self-hosted') || startsWith(inputs.lightweight-runner, '{') && (fromJSON(inputs.lightweight-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.lightweight-runner || '[]').labels), '[') && contains(fromJSON(inputs.lightweight-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.lightweight-runner, '"blacksmith-')) && inputs.lightweight-runner) || ((toJSON(github.event.repository.private) == 'false' || vars.CI_LIGHTWEIGHT_RUNNER == '"self-hosted"' || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]'), 'self-hosted') || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '{') && (fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels), '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels, 'self-hosted')) || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '"blacksmith-')) && vars.CI_LIGHTWEIGHT_RUNNER) || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', startsWith(vars.BLACKSMITH_LINUX_LABEL, 'blacksmith-') && vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
     timeout-minutes: 20
@@ -4019,6 +4023,10 @@ jobs:
               // what was tested). The workflow path IS, so a ci.yml proof and an
               // E2E-workflow proof never cross.
               delete inputs.mode;
+              // Whether the push may reuse Required says nothing about what E2E
+              // tested (and its default flipped on 2026-10-30), so it is never
+              // part of the E2E key.
+              delete inputs['required-reuse-pr-results'];
               // Fast-path inputs (P3-C1) and the quality-level inputs stay out of
               // the key at their defaults, so proof minted before they existed
               // still matches.
@@ -7166,7 +7174,7 @@ jobs:
       - name: Require fast-path and journey-smoke lanes
         if: "needs.ci-admission.outputs.skip != 'true'"
         env:
-          REUSE_APPLIES: ${{ inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          REUSE_APPLIES: ${{ inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.production-output-directory == '' && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
           REUSE_PLAN_RESULT: ${{ needs.reuse-plan.result }}
           FAST_RESULT: ${{ needs.fast.result }}
           FAST_ESCALABLE_RESULT: ${{ needs.fast-escalable.result }}
