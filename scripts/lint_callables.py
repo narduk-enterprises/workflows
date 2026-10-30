@@ -81,6 +81,28 @@ Each rule below exists because breaking it has a specific, known blast radius:
                                         interface change: every caller must
                                         grant the new permission BEFORE the
                                         tag carrying it moves
+  R13 every `actions/upload-artifact`   GitHub's org artifact storage quota is
+      step is small, short and          shared by every private repo, and when
+      non-fatal                         it is hit every upload fails until
+                                        usage is recalculated (6-12 h). It
+                                        turned estate CI red on 2026-09-26 and
+                                        again on 2026-10-30 (stonx run
+                                        41102439037, `ci / Build`). So each
+                                        upload sets a literal `retention-days`
+                                        of 1 to 3, is `continue-on-error:
+                                        true` (a storage refusal is not a test
+                                        result), and is either a registered
+                                        ARTIFACT_HANDOFFS step (retention 1,
+                                        an `id`, and a later step of the job
+                                        reads its `outcome` so the refusal is
+                                        surfaced, never swallowed) or a report
+                                        whose `if:` uploads only on
+                                        `failure()`. R11's step-level
+                                        continue-on-error rule exempts only
+                                        upload-artifact steps that pass R13,
+                                        never a download, a test or a job
+                                        (NON_GATING_JOBS below is the
+                                        job-level exemption)
 
   NON_GATING_JOBS is the one sanctioned exception to R5 and to R11's
   continue-on-error rule: a named, reviewed job that must NOT reach the gate
@@ -242,6 +264,17 @@ def check_uses_pins(path: Path, f: Findings) -> None:
                 f"R4 line {lineno}: `uses: {ref}` is SHA-pinned but carries no `# vX.Y.Z` comment, "
                 "so nobody can tell what version it is without a network call",
             )
+
+
+# R13: workflow file name -> (job id, step id) of each upload-artifact step
+# that hands build output to a later job (the consumer fails closed when the
+# artifact is missing). Every other upload is a report and runs on failure only.
+ARTIFACT_HANDOFFS: dict[str, frozenset[tuple[str, str]]] = {
+    # Exact production output for cloudflare-version-upload.yml.
+    "nuxt-cloudflare.yml": frozenset({("build", "publish-production")}),
+}
+MAX_REPORT_RETENTION_DAYS = 3
+UPLOAD_ARTIFACT = "actions/upload-artifact@"
 
 
 # workflow file name -> job ids that deliberately never reach `Required`.
@@ -596,6 +629,9 @@ def check_fail_closed_playwright(path: Path, doc: dict, f: Findings) -> None:
             f.add(path, f"R11 job '{job_id}' declares continue-on-error — a required gate may not soften failure")
         for step in job.get("steps") or []:
             if isinstance(step, dict) and "continue-on-error" in step:
+                # R13 owns upload-artifact steps; only its exact shape passes.
+                if str(step.get("uses", "")).startswith(UPLOAD_ARTIFACT) and step["continue-on-error"] is True:
+                    continue
                 f.add(
                     path,
                     f"R11 job '{job_id}' step '{step.get('name') or step.get('uses') or '(unnamed)'}' "
@@ -720,6 +756,42 @@ def check_fail_closed_playwright(path: Path, doc: dict, f: Findings) -> None:
         f.add(path, "R11 Required still accepts a skipped enabled E2E job")
 
 
+def check_artifact_budget(path: Path, doc: dict, f: Findings) -> None:
+    """R13: uploads are short-lived, non-fatal, and either a handoff or a failure report."""
+    handoffs = ARTIFACT_HANDOFFS.get(path.name, frozenset())
+    seen: set[tuple[str, str]] = set()
+    for job_id, job in (doc.get("jobs") or {}).items():
+        if not isinstance(job, dict):
+            continue
+        steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
+        for index, step in enumerate(steps):
+            if not str(step.get("uses", "")).startswith(UPLOAD_ARTIFACT):
+                continue
+            label = f"R13 job '{job_id}' step '{step.get('name') or step.get('id') or '(unnamed)'}'"
+            retention = (step.get("with") or {}).get("retention-days")
+            if type(retention) is not int or not 1 <= retention <= MAX_REPORT_RETENTION_DAYS:
+                f.add(path, f"{label} must set a literal `retention-days` of 1 to {MAX_REPORT_RETENTION_DAYS}, "
+                            f"not {retention!r} (the repo default is up to 90 days of shared org quota)")
+            if step.get("continue-on-error") is not True:
+                f.add(path, f"{label} must be `continue-on-error: true`: an artifact storage refusal "
+                            "(org quota) is not a build or test result and may not fail the job")
+            step_id = step.get("id")
+            if (job_id, step_id) in handoffs:
+                seen.add((job_id, step_id))
+                if retention != 1:
+                    f.add(path, f"{label} hands build output between jobs and must keep `retention-days: 1`")
+                reader = f"steps.{step_id}.outcome"
+                if not any(reader in str(later.get("if", "")) for later in steps[index + 1:]):
+                    f.add(path, f"{label} is a handoff, so a later step must read `{reader}` and "
+                                "surface a storage refusal instead of swallowing it")
+            elif "failure()" not in (cond := str(step.get("if", ""))) or any(
+                    widen in cond for widen in ("always()", "success()", "cancelled()")):
+                f.add(path, f"{label} is not a registered ARTIFACT_HANDOFFS step, so it is a report and "
+                            "must upload only on `failure()`")
+    for job_id, step_id in sorted(handoffs - seen):
+        f.add(path, f"R13 ARTIFACT_HANDOFFS names job '{job_id}' step id '{step_id}', which uploads nothing")
+
+
 def check_permission_ceiling(path: Path, doc: dict, f: Findings) -> None:
     """R12 — no job may request a permission outside the callable's caller grant."""
     grant = CALLER_GRANTS.get(path.name)
@@ -793,6 +865,7 @@ def check_file(path: Path, f: Findings) -> None:
     check_store_placement(path, doc, f)
     check_tee_pipefail(path, doc, f)
     check_fail_closed_playwright(path, doc, f)
+    check_artifact_budget(path, doc, f)
 
 
 def main(argv: list[str]) -> int:

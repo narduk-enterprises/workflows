@@ -285,6 +285,8 @@ def test_no_github_artifacts() -> None:
     assert upload['if'] == "steps.production-output.outputs.artifact != ''"
     assert upload['with']['retention-days'] == 1
     assert upload['with']['if-no-files-found'] == 'error'
+    # A storage refusal is surfaced and fails the consumer, not Build (R13).
+    assert upload['id'] == 'publish-production' and upload['continue-on-error'] is True
     assert document[True]['workflow_call']['inputs']['production-output-directory']['default'] == ''
     for forbidden in ("download-artifact", "listArtifactsForRepo", "listWorkflowRunArtifacts", "downloadArtifact", "getArtifact"):
         assert forbidden not in text, f"nuxt-cloudflare.yml still names {forbidden}"
