@@ -1963,6 +1963,10 @@ jobs:
     if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && !cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')) && needs.ci-admission.outputs.skip != 'true')"
     outputs:
       production-artifact: ${{ steps.production-output.outputs.artifact }}
+      # `true` when a pull request's dependency audit only warned about what
+      # blocks the default branch: such a run vouches for no push (Required
+      # proof), or the push would skip the audit that blocks it.
+      audit-would-block: ${{ steps.dependency-audit.outputs.would-block }}
       e2e-build-path: ${{ steps.e2e-build-path.outputs.path }}
       # JSON naming the CI artifact store object with its SHA-256, size and
       # presigned-GET signature (never a secret: GitHub drops an output that
@@ -2509,6 +2513,7 @@ jobs:
       # audit itself takes. `Required` covers it through `build`, which it
       # already demands success from.
       - name: Dependency audit
+        id: dependency-audit
         if: inputs.dependency-audit && inputs.mode != 'e2e'
         env:
           PM: ${{ inputs.package-manager }}
@@ -2546,6 +2551,9 @@ jobs:
             sed -n '1,20p' "$errlog" >&2 || true
             if [ "$warn_only" = true ]; then
               echo "::warning::dependency audit did not run on this pull request; it blocks on the default branch, schedule and manual runs"
+              # Would have blocked on the default branch: this run mints no
+              # Required proof, so its push runs the audit itself.
+              echo "would-block=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             exit 1
@@ -2750,6 +2758,9 @@ jobs:
           PYEOF_AUDIT
           if [ "$audit_rc" -ne 0 ] && [ "$warn_only" = true ]; then
             echo "::warning::dependency audit found blocking findings (listed above as warnings). They do not fail this pull request; they will fail the default branch, the nightly run and a manual run until fixed or given an audit-ignore reason."
+            # Would have blocked on the default branch: this run mints no
+            # Required proof, so its push runs the audit itself.
+            echo "would-block=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           exit "$audit_rc"
@@ -3306,7 +3317,6 @@ jobs:
         env:
           OUTPUT_DIR: ${{ inputs.production-output-directory }}
           BUILD_SCRIPT: ${{ inputs.build-script }}
-          REUSE: ${{ inputs.required-reuse-pr-results }}
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -3315,8 +3325,10 @@ jobs:
           const cp = require('node:child_process');
           const crypto = require('node:crypto');
           const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
-          if (!process.env.BUILD_SCRIPT || process.env.REUSE === 'true') {
-            throw new Error('Production handoff requires build-script and required-reuse-pr-results=false');
+          // Required reuse never applies beside the handoff (reuse-plan and
+          // REUSE_APPLIES both exclude it), so this Build always ran.
+          if (!process.env.BUILD_SCRIPT) {
+            throw new Error('Production handoff requires build-script');
           }
           const ignored = p => p.startsWith('docs/') || p.startsWith('tests/') || p.startsWith('e2e/') ||
             p.startsWith('.github/ISSUE_TEMPLATE/') || /\.md$/i.test(p) || /\.(test|spec)\.[^/]+$/.test(p);
@@ -7332,7 +7344,7 @@ jobs:
         # E2E because `CI_E2E_IN_CI` was false must mint no proof, or the
         # variable's later removal (rollback) or a repo override would let the
         # push reuse it and turn main green without E2E ever having run.
-        if: "needs.ci-admission.outputs.skip != 'true' && (success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.build.result == 'success' && (needs.checks.result == 'success' || (inputs.checks-in-build && needs.checks.result == 'skipped')) && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards)))"
+        if: "needs.ci-admission.outputs.skip != 'true' && (success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.build.result == 'success' && needs.build.outputs.audit-would-block != 'true' && (needs.checks.result == 'success' || (inputs.checks-in-build && needs.checks.result == 'skipped')) && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards)))"
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}

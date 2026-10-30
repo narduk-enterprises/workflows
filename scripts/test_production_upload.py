@@ -36,7 +36,7 @@ class ProductionUpload(unittest.TestCase):
         (self.output / 'server/index.mjs').write_text('export default {}')
         self.config = self.output / 'server/wrangler.json'
         self.config.write_text(json.dumps({'main': 'index.mjs', 'assets': {'directory': '../public'}}))
-        self.env = {**os.environ, 'OUTPUT_DIR': '.output', 'BUILD_SCRIPT': 'cf:build', 'REUSE': 'false',
+        self.env = {**os.environ, 'OUTPUT_DIR': '.output', 'BUILD_SCRIPT': 'cf:build',
                     'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_SHA': 'a' * 40,
                     'GITHUB_REPOSITORY': 'narduk-enterprises/example', 'GITHUB_RUN_ID': '42',
                     'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_OUTPUT': str(self.root / 'outputs'),
@@ -80,9 +80,8 @@ class ProductionUpload(unittest.TestCase):
         (self.output / 'external').symlink_to(self.root / 'event.json')
         self.assertNotEqual(self.execute(PREPARE).returncode, 0)
 
-    def test_handoff_requires_real_build_and_disallows_gate_reuse(self):
+    def test_handoff_requires_real_build(self):
         self.assertNotEqual(self.execute(PREPARE, BUILD_SCRIPT='').returncode, 0)
-        self.assertNotEqual(self.execute(PREPARE, REUSE='true').returncode, 0)
         self.assertNotEqual(self.execute(PREPARE, OUTPUT_DIR='..').returncode, 0)
 
     def test_path_skip_covers_whole_push_and_defaults_unknown_paths_to_upload(self):

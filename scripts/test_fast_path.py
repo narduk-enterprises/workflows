@@ -1294,6 +1294,11 @@ def test_required_reuse_lookup() -> None:
     # a main push must build the artifact it hands to cloudflare-version-upload.yml.
     on_push = context("push", inputs={})
     assert INPUTS["required-reuse-pr-results"]["default"] is True and ev(JOBS["reuse-plan"]["if"], on_push) is True
+    # A PR whose dependency audit only warned about what blocks main mints no
+    # Required proof, so the push runs the audit (and everything) itself.
+    key_if = step("required", "Compute Required proof key")["if"]
+    assert "needs.build.outputs.audit-would-block != 'true'" in key_if
+    assert JOBS["build"]["outputs"]["audit-would-block"] == "${{ steps.dependency-audit.outputs.would-block }}"
     handoff = context("push", inputs={"production-output-directory": ".output"})
     assert ev(JOBS["reuse-plan"]["if"], handoff) is False, "reuse beside the production handoff"
     print("PASS  Required reuse: same key on PR and push; only a completed successful same-repo PR run is reused")
