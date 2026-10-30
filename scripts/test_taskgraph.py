@@ -124,6 +124,9 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     for (const script of ['vitest --changed=${FAST_BASE_REF:-origin/main}', 'FAST_BASE_REF=HEAD^1 node t.mjs', 'eslint $(git diff --name-only ${FAST_BASE_REF:=HEAD^1})']) {
       assert.throws(() => planOf({ scripts: { ...scripts, test: script } }), /a value of its own/, script);
     }
+    // gonogo's test:changed: an empty default for `set -u` is not a value of its own.
+    assert.ok(planOf({ scripts: { ...scripts, test: 'if [ -n "${FAST_BASE_REF:-}" ]; then vitest run --changed="$FAST_BASE_REF"; else vitest run; fi' } }));
+    assert.ok(planOf({ scripts: { ...scripts, test: 'FAST_BASE_REF= vitest run' } }));
     assert.throws(() => planOf({ turbo: JSON.stringify({ tasks: { 'test:changed': { tags: ['ci'] } } }), scripts: { 'test:changed': 'vitest' } }), /diff-scoped/);
     assert.ok(planOf({ turbo: JSON.stringify({ tasks: { 'test:changed': { tags: ['ci'], cache: false } } }), scripts: { 'test:changed': 'vitest' } }));
     assert.throws(() => planOf({ turbo: JSON.stringify({ tasks: { lint: { tags: ['ci'], outputs: ['**/*.d.ts'] } } }) }), /names no directory/);

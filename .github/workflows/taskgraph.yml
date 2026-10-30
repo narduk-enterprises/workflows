@@ -672,8 +672,9 @@ jobs:
           // select nothing, pass, and record a pass for the whole tree.
           const TARGETED_REF = /\bFAST_BASE_REF\b/;
           // `${FAST_BASE_REF:-origin/main}` or an assignment narrows a push too,
-          // whose pass is recorded as full.
-          const DEFAULTED_REF = /\$\{FAST_BASE_REF:?[-=]|\bFAST_BASE_REF=/;
+          // whose pass is recorded as full. An empty default (`${FAST_BASE_REF:-}`,
+          // for `set -u`) is fine.
+          const DEFAULTED_REF = /\$\{FAST_BASE_REF:?[-=][^}]|\bFAST_BASE_REF=(?!""|''|\s|$)/;
           const DIFF_SCOPED = /FAST_BASE_REF|BASE_REF\b|--changed\b|--changedSince\b|--only-?[cC]hanged\b|--since\b|--affected\b|\baffected\b|merge-base|git diff\b|(?:^|\s)[\w:./@-]*:changed(?=\s|$)/;
           // Bounded so a broken store or API costs seconds, never the job budget.
           const LOOKUP_TIMEOUT_MS = 10000;
