@@ -20,10 +20,13 @@ name: taskgraph
 #      copy; a worktree is that copy on one machine). A task tagged
 #      `ci:machine` gets a machine of its own, as on Vercel.
 #
-# THREE JOBS. `Plan` (light) keys every task from the GitHub API, no
-# checkout. `Tasks (<leg>)` runs the misses, one leg per machine. `Required`
-# (light) is the verdict and Caller lint. A run whose tasks all passed before
-# has no legs: Plan, then Required.
+# JOBS. `Plan` (light) keys every task from the GitHub API, no checkout.
+# `Tasks (<leg>)` runs the misses, one leg per machine. `Required` (light)
+# is the verdict and Caller lint. `Fast` is a migration alias: it needs
+# Required, runs under always(), and fails unless Required succeeded, so a
+# caller whose ruleset still requires `ci / Fast` sees that context with
+# the real result. Required does not need Fast. A run whose tasks all
+# passed before has no legs: Plan, then Required, then Fast.
 #
 # TARGETED TASKS. A script that reads FAST_BASE_REF (nuxt-cloudflare.yml's
 # contract: HEAD^1 on a pull request, empty elsewhere) runs narrowed on a pull
@@ -53,9 +56,9 @@ on:
         default: ""
       lightweight-runner:
         description: >-
-          JSON runs-on value for the Plan and Required jobs (API reads and
-          Caller lint). Empty: org CI_LIGHTWEIGHT_RUNNER, then the runner
-          route, as nuxt-cloudflare.yml's planners.
+          JSON runs-on value for the Plan, Required and Fast jobs (API reads,
+          Caller lint, and the Fast alias). Empty: org CI_LIGHTWEIGHT_RUNNER,
+          then the runner route, as nuxt-cloudflare.yml's planners.
         type: string
         required: false
         default: ""
@@ -121,7 +124,8 @@ jobs:
   plan:
     name: Plan
     # A few API reads: the lightweight route, as nuxt-cloudflare.yml's planners.
-    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (toJSON(github.event.repository.private) == 'false' && '"ubuntu-latest"' || ((toJSON(github.event.repository.private) == 'false' || inputs.lightweight-runner == '"self-hosted"' || startsWith(inputs.lightweight-runner, '[') && contains(fromJSON(inputs.lightweight-runner || '[]'), 'self-hosted') || startsWith(inputs.lightweight-runner, '{') && (fromJSON(inputs.lightweight-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.lightweight-runner || '[]').labels), '[') && contains(fromJSON(inputs.lightweight-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.lightweight-runner, '"blacksmith-')) && inputs.lightweight-runner) || ((toJSON(github.event.repository.private) == 'false' || vars.CI_LIGHTWEIGHT_RUNNER == '"self-hosted"' || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]'), 'self-hosted') || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '{') && (fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels), '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels, 'self-hosted')) || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '"blacksmith-')) && vars.CI_LIGHTWEIGHT_RUNNER) || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', startsWith(vars.BLACKSMITH_LINUX_LABEL, 'blacksmith-') && vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')))) }}
+    # Required and Fast use this same anchor, so the alias cannot take another route.
+    runs-on: &lightweight_runner ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (toJSON(github.event.repository.private) == 'false' && '"ubuntu-latest"' || ((toJSON(github.event.repository.private) == 'false' || inputs.lightweight-runner == '"self-hosted"' || startsWith(inputs.lightweight-runner, '[') && contains(fromJSON(inputs.lightweight-runner || '[]'), 'self-hosted') || startsWith(inputs.lightweight-runner, '{') && (fromJSON(inputs.lightweight-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.lightweight-runner || '[]').labels), '[') && contains(fromJSON(inputs.lightweight-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.lightweight-runner, '"blacksmith-')) && inputs.lightweight-runner) || ((toJSON(github.event.repository.private) == 'false' || vars.CI_LIGHTWEIGHT_RUNNER == '"self-hosted"' || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]'), 'self-hosted') || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '{') && (fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels), '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels, 'self-hosted')) || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '"blacksmith-')) && vars.CI_LIGHTWEIGHT_RUNNER) || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', startsWith(vars.BLACKSMITH_LINUX_LABEL, 'blacksmith-') && vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
     timeout-minutes: 20
     permissions:
@@ -2377,7 +2381,7 @@ jobs:
     needs: [plan, tasks]
     if: "!cancelled()"
     # A verdict and Caller lint: the lightweight route.
-    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (toJSON(github.event.repository.private) == 'false' && '"ubuntu-latest"' || ((toJSON(github.event.repository.private) == 'false' || inputs.lightweight-runner == '"self-hosted"' || startsWith(inputs.lightweight-runner, '[') && contains(fromJSON(inputs.lightweight-runner || '[]'), 'self-hosted') || startsWith(inputs.lightweight-runner, '{') && (fromJSON(inputs.lightweight-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.lightweight-runner || '[]').labels), '[') && contains(fromJSON(inputs.lightweight-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.lightweight-runner, '"blacksmith-')) && inputs.lightweight-runner) || ((toJSON(github.event.repository.private) == 'false' || vars.CI_LIGHTWEIGHT_RUNNER == '"self-hosted"' || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]'), 'self-hosted') || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '{') && (fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels), '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels, 'self-hosted')) || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '"blacksmith-')) && vars.CI_LIGHTWEIGHT_RUNNER) || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', startsWith(vars.BLACKSMITH_LINUX_LABEL, 'blacksmith-') && vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')))) }}
+    runs-on: *lightweight_runner
     timeout-minutes: 20
     permissions:
       contents: read
@@ -2584,3 +2588,31 @@ jobs:
           print(f"\ncaller-lint: {len(files)} file(s) checked, {len(findings)} finding(s)")
           sys.exit(1 if findings else 0)
           PYEOF_AUDIT
+
+  # MIGRATION ALIAS. A ruleset that still requires `ci / Fast` does not wait
+  # on `ci / Required`. This job does no work. It needs Required, runs under
+  # always(), and fails unless Required succeeded, so the check carries the
+  # real result. A skipped job would satisfy the ruleset, and so would
+  # continue-on-error, so neither is used. Required does not need this job:
+  # that would cycle.
+  fast:
+    name: Fast
+    needs: [required]
+    if: always()
+    runs-on: *lightweight_runner
+    # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Report the Required result
+        env:
+          REQUIRED_RESULT: ${{ needs.required.result }}
+        run: |
+          set -euo pipefail
+          echo "required: ${REQUIRED_RESULT:-unset}"
+          if [ "${REQUIRED_RESULT:-}" != success ]; then
+            echo "::error::Required did not succeed (${REQUIRED_RESULT:-unset}); ci / Fast carries that result"
+            exit 1
+          fi
+          echo "Required succeeded; ci / Fast passes"

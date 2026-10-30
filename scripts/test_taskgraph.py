@@ -33,13 +33,20 @@ Run: python3 scripts/test_taskgraph.py
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 
 import yaml
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import lint_callables as lint  # noqa: E402
 
 WORKFLOW = Path(".github/workflows/taskgraph.yml")
 NUXT = Path(".github/workflows/nuxt-cloudflare.yml")
@@ -851,9 +858,9 @@ def check_copies() -> None:
 def check_shape() -> None:
     doc = yaml.safe_load(WORKFLOW.read_text())
     jobs = doc["jobs"]
-    assert list(jobs) == ["plan", "tasks", "required"], list(jobs)
+    assert list(jobs) == ["plan", "tasks", "required", "fast"], list(jobs)
     assert jobs["required"]["name"] == "Required" and jobs["required"]["if"] == "!cancelled()"
-    assert jobs["required"]["needs"] == ["plan", "tasks"], "Required needs every job"
+    assert jobs["required"]["needs"] == ["plan", "tasks"], "Required needs plan and tasks; Fast only reports it"
     # Plan holds no install and runs no caller code.
     plan = [s.get("name") or s.get("uses") for s in steps(doc, "plan")]
     assert plan == [STORE_STEP, ENGINE_STEP, ENGINE_STEP_2, "Plan tasks"], plan
@@ -894,6 +901,64 @@ def check_shape() -> None:
     print("ok  Plan, one Tasks leg per machine, Required: publish names the digest, Caller lint after failures")
 
 
+FAST_STEP = "Report the Required result"
+
+
+def fast_exit(script: str, result: str) -> int:
+    """Run a Fast step the way Actions would, with Required's result in the env."""
+    env = {**os.environ, "REQUIRED_RESULT": result}
+    return subprocess.run(["bash", "-c", script], env=env, capture_output=True).returncode
+
+
+def check_fast_alias() -> None:
+    """Fast carries Required's real result: success passes, anything else fails.
+
+    An unconditional `exit 0`, and a job that skips when Required fails, would
+    both satisfy a ruleset. The shipped step is executed both ways, and the
+    linter rejects each structural way to hide the failure.
+    """
+    doc = yaml.safe_load(WORKFLOW.read_text())
+    job = doc["jobs"]["fast"]
+    assert job["name"] == "Fast" and job["needs"] == ["required"] and job["if"] == "always()"
+    assert "continue-on-error" not in job
+    assert job["runs-on"] == doc["jobs"]["required"]["runs-on"] == doc["jobs"]["plan"]["runs-on"]
+    assert "fast" not in doc["jobs"]["required"]["needs"]
+    step_doc = step(doc, "fast", FAST_STEP)
+    assert step_doc["env"]["REQUIRED_RESULT"] == "${{ needs.required.result }}"
+    script = step_doc["run"]
+    assert fast_exit(script, "success") == 0
+    for result in ("failure", "cancelled", "skipped", "", "SUCCESS"):
+        assert fast_exit(script, result) != 0, result
+    # The helper is not vacuous: a script that ignores the result stays green.
+    assert fast_exit("exit 0\n", "failure") == 0
+
+    def findings(document: dict) -> list[str]:
+        found = lint.Findings()
+        lint.check_required_job(WORKFLOW, document, found)
+        return [item for item in found.items if " R5 " in item]
+
+    assert findings(doc) == [], findings(doc)
+
+    def mutated(fn) -> dict:
+        document = copy.deepcopy(doc)
+        fn(document["jobs"])
+        return document
+
+    cases = {
+        "if success() skips a failed Required into a passing check": lambda j: j["fast"].__setitem__("if", "success()"),
+        "continue-on-error hides the failure": lambda j: j["fast"].__setitem__("continue-on-error", True),
+        "renamed off the established context": lambda j: j["fast"].__setitem__("name", "Fast (alias)"),
+        "does not need Required": lambda j: j["fast"].__setitem__("needs", []),
+        "Required needs the alias": lambda j: j["required"]["needs"].append("fast"),
+        "result env unbound": lambda j: j["fast"]["steps"][0]["env"].pop("REQUIRED_RESULT"),
+        "unconditional pass": lambda j: j["fast"]["steps"][0].__setitem__("run", "exit 0\n"),
+    }
+    for label, fn in cases.items():
+        items = findings(mutated(fn))
+        assert items, f"linter accepted: {label}"
+    print("ok  Fast fails unless Required succeeded, and the linter rejects an unconditional pass")
+
+
 def check_verdict() -> None:
     """Required: green only for a green plan and, when it found work, green legs."""
     doc = yaml.safe_load(WORKFLOW.read_text())
@@ -913,6 +978,7 @@ def check_verdict() -> None:
 
 def main() -> int:
     check_shape()
+    check_fast_alias()
     check_verdict()
     check_copies()
     check_engine()

@@ -79,7 +79,7 @@ in their app-class workflow.
 | `design-ledger.yml` | **New 2026-09-27** (agent-infrastructure#1804). **Advisory, never required.** Runs the design ledger checker (`scripts/dc_ledger.py`, a byte copy of agent-infrastructure's canonical file) against a product's `design/<canvas>/ledger.json`. `mode: check` goes red while a canvas screen and its code have drifted and writes the table to the job summary; `mode: flag` keeps one `Design drift: <canvas>` issue. See [Design ledger](#design-ledgeryml) |
 | `design-publish.yml` | **New 2026-10-13** (operator-portal#727, design-portal-sync phase 2). Uploads a caller's `design/<slug>/` git mirror to the Operator Portal's designs Worker with the run's own OIDC token, no stored credential. Not a gate. See [Design publish](#design-publishyml) |
 | `flake-digest.yml` | **New 2026-09-24** (narduk-reboot P3-C2). Weekly, advisory: scans a caller's completed runs of one workflow, counts failures in jobs matching `quarantine-job-pattern` (nuxt-cloudflare.yml's `e2e-quarantine` by default), and files or refreshes one digest issue per ISO week. Never gates `main`, never opens `red-main` |
-| `taskgraph.yml` | **New 2026-10-29.** Vercel CI's model (beta 2026-10-28) for any `package.json`-script repo: the caller's `turbo.json` tags the CI tasks, each task gets a content key from Git's blob hashes, a task whose key already passed is never run again (GitHub's own record of a green run of the same content, with no secret; per task, a pointer in the R2 CI artifact store that GitHub's API must confirm), `FAST_BASE_REF` scripts run narrowed on PRs keyed on their base, and the rest run side by side after one install per machine, each in its own worktree; a `ci:machine` task gets its own seat. Plan, Tasks legs, Required; nine inputs. See [taskgraph.yml](#taskgraphyml) |
+| `taskgraph.yml` | **New 2026-10-29.** Vercel CI's model (beta 2026-10-28) for any `package.json`-script repo: the caller's `turbo.json` tags the CI tasks, each task gets a content key from Git's blob hashes, a task whose key already passed is never run again (GitHub's own record of a green run of the same content, with no secret; per task, a pointer in the R2 CI artifact store that GitHub's API must confirm), `FAST_BASE_REF` scripts run narrowed on PRs keyed on their base, and the rest run side by side after one install per machine, each in its own worktree; a `ci:machine` task gets its own seat. Plan, Tasks legs, Required, and a `Fast` alias of Required's real result for rulesets that still require `ci / Fast`; nine inputs. See [taskgraph.yml](#taskgraphyml) |
 
 All eleven shipped callables are `on: workflow_call` only — none of them declare their own
 triggers, and none declare workflow-level `concurrency:` (see "How to consume"
@@ -2188,16 +2188,21 @@ that make it fast:
    Here each task gets its own Git worktree started from that copy, and a
    task tagged `ci:machine` gets a machine (a seat) of its own.
 
-**Three jobs.** `Plan` (lightweight) keys every task from the GitHub API with
+**Jobs.** `Plan` (lightweight) keys every task from the GitHub API with
 no checkout and splits the misses into legs. `Tasks (<leg>)` is a matrix, one
 seat per leg: checkout, install, run that leg's tasks, record their passes.
-`Required` (lightweight) is the verdict and Caller lint. Untagged misses share
+`Required` (lightweight) is the verdict and Caller lint. `Fast` needs
+`Required`, runs under `always()`, and fails unless `Required` succeeded:
+a caller whose ruleset still requires `ci / Fast` keeps that context, with
+the real result, while the gate is `ci / Required`. A skipped job would
+satisfy the ruleset, so this one runs and fails closed. `Required` does not
+need it. Untagged misses share
 one leg (`all`, or `shared` beside machine legs). A `ci:machine` task's leg
 holds it, the tasks that depend on it, and the dependencies they need, so a
 shared `nuxt:prepare` runs once per machine that needs it. Plan refuses a task
 that depends on two machine tasks, a machine task that depends on another, and
 a machine task named `shared` or `all`, whether or not those tasks would run.
-A run whose tasks all passed before has no legs: Plan, then Required.
+A run whose tasks all passed before has no legs: Plan, then Required, then the Fast alias.
 
 Why machines: operator-portal's `build`, `typecheck`, full `lint` and unit
 suite each ran past 20 minutes side by side on one linux-ci seat
@@ -2217,10 +2222,11 @@ repositories, read-only from the Actions API):
 - Repeated per-job setup (checkout, toolchain, install) is 20-25% of seat
   time. Nuxt push runs paid for `pnpm install` 3.1 times per run.
 
-With taskgraph, a merge whose tree passed on its PR is two short
+With taskgraph, a merge whose tree passed on its PR is three short
 lightweight jobs: `Plan` (GitHub API only) finds every task already passed,
-and `Required` runs Caller lint on a sparse `.github` checkout. A pull request
-runs its whole task set side by side, so main has nothing left to do.
+`Required` runs Caller lint on a sparse `.github` checkout, and `Fast`
+repeats that result. A pull request runs its whole task set side by side,
+so main has nothing left to do.
 
 #### Adopting it
 
@@ -2429,8 +2435,8 @@ The digest also covers whether the package-read and `NVAULT_TOKEN` secrets
 were present, so a Dependabot run without them never vouches for a run with
 them. On a hit, every cacheable task is
 reused and nothing installs. For a push, the digest also covers a targeted
-task's narrowed key, so a merge whose tree and parent match the PR's is two
-lightweight jobs.
+task's narrowed key, so a merge whose tree and parent match the PR's is
+Plan, Required, and the Fast alias.
 
 This needs only the `contents: read` and `actions: read` that callers already
 grant, and **no secret**. It works in any org, `narduk-enterprises-clients`
