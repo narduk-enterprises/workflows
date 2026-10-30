@@ -551,11 +551,11 @@ jobs:
             try {
               cfg = storeConfig(env);
             } catch (error) {
-              core.warning(`${error.message}; no ${kind} proof published, so the default-branch push runs it in full`);
+              core.warning(`${error.message}; no ${kind} pointer published; the default-branch push looks the run up on GitHub instead`);
               return;
             }
             if (!cfg) {
-              core.notice(`No CI artifact store credentials in this run; no ${kind} proof published, so the default-branch push runs it in full.`);
+              core.notice(`No CI artifact store credentials in this run; no ${kind} pointer published; the default-branch push looks the run up on GitHub instead.`);
               return;
             }
             try {
@@ -563,7 +563,7 @@ jobs:
               core.info(`R2 put ${objectKey}: pointer to run ${pointer.run_id} attempt ${pointer.run_attempt}`);
               core.info(`R2 get ${objectKey}: read-back matches`);
             } catch (error) {
-              core.warning(`Could not publish the ${kind} proof to the CI artifact store; the default-branch push runs it in full: ${describe(error)}`);
+              core.warning(`Could not publish the ${kind} proof to the CI artifact store; the default-branch push looks the run up on GitHub instead: ${describe(error)}`);
             }
           }
 
@@ -650,23 +650,82 @@ jobs:
             if (run.run_attempt !== pointer.run_attempt) {
               return { found: false, reason: `run ${run.id} is on attempt ${run.run_attempt}, but attempt ${pointer.run_attempt} published the pointer` };
             }
+            return attestedRun({ github, context, run, attempt: pointer.run_attempt, kind, key });
+          }
+
+          // `run` (attempt `attempt`) vouches for `key` when a `<caller job> /
+          // Required` job that this callable wrote (writtenByCallable) passed with
+          // a successful `Publish ... proof <key>` step. That step runs in a pull
+          // request run with or without store credentials, so its name is the
+          // proof; a pointer only says where to look.
+          async function attestedRun({ github, context, run, attempt, kind, key, ownSha = null }) {
             // Always `<caller job> / Required`: this callable runs only as a called job.
             const required = job => / \/ Required$/.test(String(job.name));
             const jobs = await settledJobs({
-              github, context, run_id: run.id, attempt_number: pointer.run_attempt,
+              github, context, run_id: run.id, attempt_number: attempt,
               done: js => js.filter(j => required(j) && j.conclusion === 'success').every(j => (j.steps || []).some(step => step.name.startsWith(PROOF_STEP[kind]) && step.conclusion)),
             });
             const stepName = `${PROOF_STEP[kind]} ${key}`;
             const attesting = jobs.filter(job => required(job) && job.conclusion === 'success'
               && (job.steps || []).some(step => step.name === stepName && step.conclusion === 'success'));
             if (!attesting.length) return { found: false, reason: `run ${run.html_url} shows no successful "${stepName}" step in a Required job` };
-            const { data: self } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId, request: { timeout: 10000 } });
-            const sha = callableSha(self);
+            const sha = ownSha ?? callableSha((await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId, request: { timeout: 10000 } })).data);
             if (!sha) return { found: false, reason: `this run's own ${PROOF_CALLABLE} SHA is unknown, so run ${run.html_url} cannot be confirmed` };
             for (const job of attesting) {
               if (await writtenByCallable({ github, context, job_id: job.id, sha })) return { found: true, run };
             }
             return { found: false, reason: `run ${run.html_url}: no Required job that ${PROOF_CALLABLE}@${sha.slice(0, 12)} wrote shows "${stepName}"` };
+          }
+
+          // The pull request a push merged, from its subject alone (no
+          // pull-requests permission, so no caller has to grant one). A merge
+          // commit names the head branch. A squash commit is the PR title and
+          // `(#N)`, and a pull_request run's display_title is that title. A run's
+          // `pull_requests` cannot say: GitHub empties it once the PR merges.
+          function mergedPull(message) {
+            const subject = String(message || '').split('\n')[0];
+            const merge = subject.match(/^Merge pull request #(\d+) from [^/\s]+\/(\S+)$/);
+            if (merge) return { number: Number(merge[1]), branch: merge[2] };
+            const squash = subject.match(/^(.*\S) \(#(\d+)\)$/);
+            return squash ? { number: Number(squash[2]), title: squash[1] } : null;
+          }
+
+          // A PROOF WITH NO STORE, for a caller without the CI_ARTIFACTS_R2_*
+          // secrets (another org, a repository off their lists) or a store that
+          // holds no pointer. On a push, the runs of the pull request it merged,
+          // found from the push's subject or a head that already held this tree,
+          // newest first, under the same rules as a pointer's run (attestedRun).
+          // Needs only actions: read. The key covers the tested tree, so the
+          // candidate search only decides speed, never what counts.
+          async function findProofOnGitHub({ github, context, kind, key, workflowPath, limit = 10 }) {
+            if (!new RegExp(`^${kind}-proof-v1-[0-9a-f]{64}$`).test(String(key))) return { found: false, reason: `not a ${kind} proof key` };
+            if (!/^\.github\/workflows\/[^/]+\.ya?ml$/.test(String(workflowPath))) return { found: false, reason: `caller workflow ${workflowPath} is not a file in .github/workflows` };
+            if (context.eventName !== 'push') return { found: false, reason: 'only a push reuses a pull request\'s proof' };
+            const repositoryId = context.payload.repository.id;
+            const list = async params => (await github.rest.actions.listWorkflowRuns({
+              ...context.repo, workflow_id: workflowPath.split('/').pop(), event: 'pull_request', status: 'success', ...params, request: { timeout: 10000 },
+            })).data.workflow_runs || [];
+            const merged = mergedPull(context.payload.head_commit?.message);
+            const tree = context.payload.head_commit?.tree_id;
+            const runs = merged?.branch
+              ? await list({ branch: merged.branch, per_page: limit })
+              : (await list({ per_page: 50 })).filter(r => (merged?.title && r.display_title === merged.title) || (tree && r.head_commit?.tree_id === tree));
+            // A Dependabot run gets no secrets (NVAULT_TOKEN, the store), so a
+            // caller's install or a check can behave differently there; with a
+            // store it could never publish a pointer, and it never vouches here.
+            const dependabot = r => [r.actor?.login, r.triggering_actor?.login].includes('dependabot[bot]');
+            const candidates = runs.filter(r => r.event === 'pull_request' && r.status === 'completed' && r.conclusion === 'success'
+              && r.path === workflowPath && r.repository?.id === repositoryId && r.head_repository?.id === repositoryId && !dependabot(r)).slice(0, limit);
+            if (!candidates.length) return { found: false, reason: `no successful run of the pull request this push merged (${merged ? `#${merged.number}` : 'subject names none'})` };
+            const ownSha = callableSha((await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: context.runId, request: { timeout: 10000 } })).data);
+            if (!ownSha) return { found: false, reason: `this run's own ${PROOF_CALLABLE} SHA is unknown` };
+            const reasons = [];
+            for (const run of candidates) {
+              const verdict = await attestedRun({ github, context, run, attempt: run.run_attempt || 1, kind, key, ownSha });
+              if (verdict.found) return verdict;
+              reasons.push(verdict.reason);
+            }
+            return { found: false, reason: `none of ${candidates.length} pull-request run(s) attests ${key}: ${reasons[0]}` };
           }
 
           module.exports = {
@@ -675,7 +734,8 @@ jobs:
             storeConfig, endpoint, repositoryOf, assertKey, prebuiltKey, proofObjectKey,
             putObject, getObject, deleteObject,
             publishPrebuilt, parsePrebuilt, fetchPrebuilt, publishPrebuiltStep, fetchPrebuiltStep, buildDir,
-            publishProof, publishProofStep, findProof, callableSha, headerNamesCallable, writtenByCallable, settledJobs,
+            publishProof, publishProofStep, findProof, findProofOnGitHub, attestedRun, mergedPull,
+            callableSha, headerNamesCallable, writtenByCallable, settledJobs,
           };
           CI_ARTIFACT_STORE
 

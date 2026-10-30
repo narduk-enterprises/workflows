@@ -1249,6 +1249,16 @@ def test_required_reuse_lookup() -> None:
         "a Required job no callable wrote": {"log": "2026-10-30T21:14:01.0Z Complete job name: ci / Required\n"},
     }.items():
         assert run_script(script, scenario, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "false", name
+    # No store credentials (another org, a repository off the secrets' lists):
+    # the merged pull request's own run vouches, from GitHub's record alone.
+    pr_run = {"id": 321, "run_attempt": 1, "event": "pull_request", "status": "completed", "conclusion": "success",
+              "path": ".github/workflows/ci.yml", "repository": {"id": 42}, "head_repository": {"id": 42},
+              "html_url": "https://example.test/run/321", "display_title": "Ship it", "head_commit": {"tree_id": "u" * 40}}
+    free = run_script(script, {"noCreds": True, "prRuns": [pr_run]}, inputs, "PROOF_INPUTS")
+    assert free["outputs"]["reused"] == "true", free
+    assert {"jobLog": 7} in free["calls"]
+    unrelated = run_script(script, {"noCreds": True, "prRuns": [{**pr_run, "display_title": "Other"}]}, inputs, "PROOF_INPUTS")
+    assert unrelated["outputs"]["reused"] == "false"
     changed = run_script(script, {"storedKey": key}, {**inputs, "e2e-args": "--project=other"}, "PROOF_INPUTS")
     assert changed["outputs"]["reused"] == "false"
     # The publish step carries the key in its NAME (the attestation the push
