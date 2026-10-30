@@ -2317,24 +2317,28 @@ script runs its full selection. A task whose helper file reads the variable
   `FAST_BASE_REF` empty, even if the runner sets it.
 - **Leaves only.** A dependent would inherit a key that differs between the
   pull request and its push, so nothing may depend on a targeted task.
-- **Refusals.** A script that picks its checks from a diff but never reads
-  `FAST_BASE_REF` is still refused: bare `vitest --changed`, `--changedSince`,
-  `--onlyChanged`, `--since`, `affected`, `git diff`, `merge-base`, or a name
-  ending `:changed`. In CI each selects nothing, passes, and would record a
-  pass for the whole tree. Read `FAST_BASE_REF`, tag the full script, or set
-  `"cache": false`.
+- **Guarded selections only.** In a targeted script, every diff selection
+  must disappear when the variable is empty. Two forms qualify:
+  - inside `${FAST_BASE_REF:+…}`, for example
+    `vitest run ${FAST_BASE_REF:+--changed=$FAST_BASE_REF}`;
+  - in the `then` branch of
+    `if [ -n "${FAST_BASE_REF:-}" ]; then …; else <full run>; fi`, which is
+    gonogo's `test:changed`.
 
-A script must treat an empty `FAST_BASE_REF` as "run everything". A script
-that runs nothing when it is empty passes a push vacuously. That is the
-same contract `nuxt-cloudflare.yml`'s fast check has always relied on. The
-plan refuses a targeted script that gives the variable a value of its own
-(`${FAST_BASE_REF:-origin/main}`, `${FAST_BASE_REF:=…}`, `FAST_BASE_REF=…`).
-Use `${FAST_BASE_REF:+…}`.
+  Anything else is refused. That includes a bare `--changed`,
+  `--changed="$FAST_BASE_REF"` with no guard, a copy into another variable,
+  and a default (`${FAST_BASE_REF:-origin/main}`). On a push each of those
+  selects nothing and passes under the full key.
+- **Refusals.** A script that picks its checks from a diff but never reads
+  `FAST_BASE_REF` is refused too: bare `vitest --changed`, `--changedSince`,
+  `--onlyChanged`, `--since`, `affected`, `git diff`, `merge-base`. Use one of
+  the guarded forms, tag the full script, or set `"cache": false`. A helper
+  file tagged `ci:diff` cannot be read, so its author owns that contract.
 
 When a push reuses a pull request's narrowed pass, it names its own full
 digest, so later runs of that tree reuse it as a full pass. That is sound only
-while main itself was green, the same assumption agent-infrastructure#4723
-makes. A scheduled `reuse: false` run re-checks everything in full.
+while the pushed branch's parent commit was itself green, the same assumption
+agent-infrastructure#4723 makes. A scheduled `reuse: false` run re-checks everything in full.
 
 #### Keys
 
@@ -2405,7 +2409,24 @@ that step successfully with this run's digest:
     have to grant.
 
 The run must be this repository's own (head repository included) and must
-have run the same caller workflow blob. On a hit, every cacheable task is
+have run the same caller workflow blob.
+
+**Which job vouches.** A name proves nothing on its own. Any workflow can name
+a job `ci / Required` and a step after a digest. A `pull_request` run also
+executes the workflow from its merge ref, which a writer controls through the
+PR's base branch. So the verdict counts only from a job the runner says this
+callable wrote. The runner logs `Uses:
+narduk-enterprises/workflows/.github/workflows/taskgraph.yml@<sha>` before
+`Complete job name:`, ahead of any step. `Plan` reads that header from the
+job's log and requires the SHA this run itself uses, taken from its own
+`referenced_workflows`. A store proof's `Tasks` leg is checked the same way.
+
+A workflow that calls the real callable still can't vouch for another one.
+Its digest covers its own caller workflow blob, so it differs.
+
+The digest also covers whether the package-read and `NVAULT_TOKEN` secrets
+were present, so a Dependabot run without them never vouches for a run with
+them. On a hit, every cacheable task is
 reused and nothing installs. For a push, the digest also covers a targeted
 task's narrowed key, so a merge whose tree and parent match the PR's is two
 lightweight jobs.

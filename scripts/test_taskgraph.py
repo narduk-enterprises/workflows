@@ -124,6 +124,17 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     for (const script of ['vitest --changed=${FAST_BASE_REF:-origin/main}', 'FAST_BASE_REF=HEAD^1 node t.mjs', 'eslint $(git diff --name-only ${FAST_BASE_REF:=HEAD^1})']) {
       assert.throws(() => planOf({ scripts: { ...scripts, test: script } }), /a value of its own/, script);
     }
+    // verify B2: each selects nothing on a push (FAST_BASE_REF empty) and would pass.
+    for (const script of ['vitest run --changed ${FAST_BASE_REF:+$FAST_BASE_REF} --passWithNoTests',
+      'test -n "$FAST_BASE_REF" || true; vitest run --changed --passWithNoTests',
+      'B=$FAST_BASE_REF; vitest run --changed=${B:-origin/main} --passWithNoTests',
+      'vitest run --changed=${FAST_BASE_REF:-}origin/main --passWithNoTests',
+      'vitest run --changed="$FAST_BASE_REF" --passWithNoTests',
+      'eslint $(git diff --name-only "$FAST_BASE_REF")']) {
+      assert.throws(() => planOf({ scripts: { ...scripts, test: script } }), /FAST_BASE_REF/, script);
+    }
+    assert.ok(planOf({ scripts: { ...scripts, test: 'vitest run ${FAST_BASE_REF:+--changed=$FAST_BASE_REF}' } }), 'the whole flag inside the expansion');
+    assert.ok(planOf({ scripts: { ...scripts, test: 'eslint ${FAST_BASE_REF:+$(git diff --name-only $FAST_BASE_REF)} .' } }), 'a diff inside the expansion');
     // gonogo's test:changed: an empty default for `set -u` is not a value of its own.
     assert.ok(planOf({ scripts: { ...scripts, test: 'if [ -n "${FAST_BASE_REF:-}" ]; then vitest run --changed="$FAST_BASE_REF"; else vitest run; fi' } }));
     assert.ok(planOf({ scripts: { ...scripts, test: 'FAST_BASE_REF= vitest run' } }));
@@ -391,19 +402,25 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
   const key = 'a'.repeat(64);
   const other = 'b'.repeat(64);
   const digest = tg.manifestDigest([key, other]);
+  // The runner's setup header names the callable a job came from (writtenByCallable).
+  const CALLABLE = 'narduk-enterprises/workflows/.github/workflows/taskgraph.yml';
+  const SHA = '9'.repeat(40);
+  const header = (sha = SHA, name = 'ci / Required') => `\uFEFF2026-10-30T21:14:00.5773853Z Current runner version: '2.337.0'\n2026-10-30T21:14:00.9939313Z Uses: ${CALLABLE}@${sha}\n2026-10-30T21:14:01.0004920Z Complete job name: ${name}\n2026-10-30T21:14:02.0000000Z ##[group]Run step\n`;
   const fakeGithub = (over = {}) => ({
     calls: 0,
     paginate: async (fn, args) => (await fn(args)).data,
     rest: { actions: {
       getWorkflowRunAttempt: async ({ run_id, attempt_number }) => ({ data: { id: run_id, run_attempt: attempt_number, path: over.path || '.github/workflows/ci.yml', html_url: `https://x/${run_id}`, repository: { id: repoId }, head_repository: { id: over.headRepo || repoId } } }),
       listWorkflowRuns: async () => ({ data: { workflow_runs: [] } }),
-      listJobsForWorkflowRunAttempt: async () => ({ data: [{ name: over.job || 'ci / Tasks (all)', steps: [{ name: over.step || `Publish task proofs ${digest}`, conclusion: over.conclusion || 'success' }] }] }),
+      listJobsForWorkflowRunAttempt: async () => ({ data: [{ id: 5, name: over.job || 'ci / Tasks (all)', steps: [{ name: over.step || `Publish task proofs ${digest}`, conclusion: over.conclusion || 'success' }] }] }),
+      downloadJobLogsForWorkflowRun: async () => ({ data: over.log ?? header(SHA, 'ci / Tasks (all)') }),
+      getWorkflowRun: async () => ({ data: { referenced_workflows: over.refs ?? [{ path: `${CALLABLE}@refs/heads/x`, sha: SHA }] } }),
     }, repos: {
       getContent: async () => ({ data: { sha: over.blob || 'f'.repeat(40) } }),
     } },
   });
   const pointer = (over = {}) => JSON.stringify({ schema: tg.POINTER_SCHEMA, key, repository_id: repoId, run_id: 7, run_attempt: 1, manifest: [key, other], ...over });
-  const lookup = async (gh, k = key) => tg.findTaskProof({ github: gh, context, store: fakeStore, cfg, key: k, workflowPath: '.github/workflows/ci.yml', attempts: new Map() });
+  const lookup = async (gh, k = key) => tg.findTaskProof({ github: gh, context, store: fakeStore, cfg, key: k, workflowPath: '.github/workflows/ci.yml', callable: SHA, attempts: new Map() });
   const objectKey = tg.proofKey(store, 'narduk-enterprises/app', key);
 
   await test('proof: the object key is repository-scoped and shape-checked', () => {
@@ -422,9 +439,11 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
       ['a leg of another shape', fakeGithub({ job: 'ci / Tasks (a) (b)' })],
       ['another workflow', fakeGithub({ path: '.github/workflows/e2e.yml' })],
       ['a fork run', fakeGithub({ headRepo: 1 })],
+      ['a leg no callable wrote', fakeGithub({ log: '2026-10-30T21:14:01.0Z Complete job name: ci / Tasks (all)\n' })],
+      ['a leg of another callable SHA', fakeGithub({ log: header('8'.repeat(40), 'ci / Tasks (all)') })],
     ]) assert.equal((await lookup(gh)).found, false, why);
     // The attested run must have run this caller workflow's text, not only its path.
-    const withBlob = (gh, blob) => tg.findTaskProof({ github: gh, context, store: fakeStore, cfg, key, workflowPath: '.github/workflows/ci.yml', callerBlob: blob, attempts: new Map() });
+    const withBlob = (gh, blob) => tg.findTaskProof({ github: gh, context, store: fakeStore, cfg, key, workflowPath: '.github/workflows/ci.yml', callerBlob: blob, callable: SHA, attempts: new Map() });
     assert.equal((await withBlob(fakeGithub(), 'f'.repeat(40))).found, true);
     assert.equal((await withBlob(fakeGithub({ blob: 'e'.repeat(40) }), 'f'.repeat(40))).found, false, 'another version of the workflow');
     for (const [why, p] of [
@@ -622,13 +641,14 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
           listJobsForWorkflowRunAttempt: async () => {
             calls.jobs += 1;
             if (over.lagOnce && calls.jobs === 1) return { data: [{ name: 'ci / Required', conclusion: 'success', steps: [] }] };
-            return { data: [{ name: over.job || 'ci / Required', conclusion: over.jobConclusion || 'success', steps: [{ name: `${tg.VERDICT_STEP} ${over.digest || want}`, conclusion: over.conclusion || 'success' }] }] };
+            return { data: [{ id: 7, name: over.job || 'ci / Required', conclusion: over.jobConclusion || 'success', steps: [{ name: `${tg.VERDICT_STEP} ${over.digest || want}`, conclusion: over.conclusion || 'success' }] }] };
           },
+          downloadJobLogsForWorkflowRun: async () => ({ data: over.log ?? header() }),
         },
         repos: { getContent: async () => ({ data: { sha: over.blob || 'f'.repeat(40) } }) },
       } };
     };
-    const find = (g, extra = {}) => tg.findRunAttestation({ github: g, context: pushCtx, digests: [want], workflowPath: '.github/workflows/ci.yml', callerBlob: 'f'.repeat(40), sleep: async () => {}, ...extra });
+    const find = (g, extra = {}) => tg.findRunAttestation({ github: g, context: pushCtx, digests: [want], workflowPath: '.github/workflows/ci.yml', callerBlob: 'f'.repeat(40), callable: SHA, sleep: async () => {}, ...extra });
     const g = gh();
     const hit = await find(g);
     assert.equal(hit.found, true, JSON.stringify(hit));
@@ -648,18 +668,25 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
       ['another workflow', { runs: [runOf({ path: '.github/workflows/e2e.yml' })] }],
       ['another pull request (title and tree differ)', { runs: [runOf({ display_title: 'Other' })] }],
       ['this run itself', { runs: [runOf({ id: 99 })] }],
+      // verify B1: a job any workflow could name, in a run whose workflow a writer chose.
+      ['a top-level job named Required', { job: 'Required' }],
+      ['a job with no callable header (defined by the caller itself)', { log: `2026-10-30T21:14:01.0Z Complete job name: ci / Required\n2026-10-30T21:14:02.0Z Uses: ${CALLABLE}@${SHA}\n` }],
+      ['a header naming another SHA of the callable', { log: header('8'.repeat(40)) }],
+      ['a header naming another callable', { log: header(SHA).replace('workflows/taskgraph.yml', 'evil/taskgraph.yml') }],
+      ['a run that references another callable SHA', { runs: [runOf({ referenced_workflows: [{ path: `${CALLABLE}@x`, sha: '8'.repeat(40) }] })] }],
     ]) assert.equal((await find(gh(over))).found, false, why);
+    assert.equal((await find(gh(), { callable: null })).found, false, 'this run\'s callable SHA unknown');
     assert.equal((await find(gh(), { digests: [] })).found, false, 'nothing cacheable');
     assert.equal((await find(gh(), { workflowPath: '' })).found, false, 'no caller path');
     const prCtx = { ...pushCtx, eventName: 'pull_request', payload: { repository: { id: repoId }, pull_request: { number: 12, head: { ref: 'feat' } } } };
     const gp = gh();
-    assert.equal((await tg.findRunAttestation({ github: gp, context: prCtx, digests: [want], workflowPath: '.github/workflows/ci.yml', callerBlob: 'f'.repeat(40), sleep: async () => {} })).found, true, 'a re-push of the same content');
+    assert.equal((await tg.findRunAttestation({ github: gp, context: prCtx, digests: [want], workflowPath: '.github/workflows/ci.yml', callerBlob: 'f'.repeat(40), callable: SHA, sleep: async () => {} })).found, true, 'a re-push of the same content');
     assert.deepEqual(gp.calls.list.map(p => [p.event, p.branch]), [['pull_request', 'feat']]);
     const byTree = gh({ runs: [runOf({ display_title: 'Renamed later', head_commit: { tree_id: 't'.repeat(40) } })] });
     assert.equal((await find(byTree)).found, true, 'a PR head that already held this tree (a branch kept up to date)');
     const mergeCtx = { ...pushCtx, payload: { ...pushCtx.payload, head_commit: { message: 'Merge pull request #7 from narduk-enterprises/feat/x\n\nTitle' } } };
     const gm = gh({ runs: [runOf({ display_title: 'Other' })] });
-    assert.equal((await tg.findRunAttestation({ github: gm, context: mergeCtx, digests: [want], workflowPath: '.github/workflows/ci.yml', callerBlob: 'f'.repeat(40), sleep: async () => {} })).found, true, 'a merge commit names the branch');
+    assert.equal((await tg.findRunAttestation({ github: gm, context: mergeCtx, digests: [want], workflowPath: '.github/workflows/ci.yml', callerBlob: 'f'.repeat(40), callable: SHA, sleep: async () => {} })).found, true, 'a merge commit names the branch');
     assert.ok(gm.calls.list.some(p => p.event === 'pull_request' && p.branch === 'feat/x'));
     assert.deepEqual(tg.mergedPull('Merge pull request #7 from a/b/c\n\nx'), { number: 7, branch: 'b/c' });
     assert.deepEqual(tg.mergedPull('Fix it (#8)'), { number: 8, title: 'Fix it' });
@@ -672,7 +699,7 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     const inner = g.rest.actions.listJobsForWorkflowRunAttempt;
     g.rest.actions.listJobsForWorkflowRunAttempt = async args => { n += 1; return n === 1 ? { data: [{ name: 'ci / Tasks (all)', steps: [{ name: 'Run tasks', conclusion: 'success' }] }] } : inner(args); };
     objects.set(objectKey, pointer());
-    const r = await tg.findTaskProof({ github: g, context, store: fakeStore, cfg, key, workflowPath: '.github/workflows/ci.yml', attempts: new Map(), sleep: async () => {} });
+    const r = await tg.findTaskProof({ github: g, context, store: fakeStore, cfg, key, workflowPath: '.github/workflows/ci.yml', callable: SHA, attempts: new Map(), sleep: async () => {} });
     assert.equal(r.found, true, JSON.stringify(r));
     assert.equal(n, 2);
     objects.clear();
@@ -735,13 +762,22 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.equal(c0.outputs.attest, tg.runDigest(result.tasks));
     const gh = api();
     gh.rest.actions.listWorkflowRuns = async p => ({ data: { workflow_runs: p.event === 'push' ? [{ id: 61, run_attempt: 1, path: '.github/workflows/ci.yml', head_sha: 'h'.repeat(40), html_url: 'https://x/61', repository: { id: repoId }, head_repository: { id: repoId } }] : [] } });
-    gh.rest.actions.listJobsForWorkflowRunAttempt = async () => ({ data: [{ name: 'ci / Required', conclusion: 'success', steps: [{ name: `${tg.VERDICT_STEP} ${c0.outputs.attest}`, conclusion: 'success' }] }] });
+    gh.rest.actions.listJobsForWorkflowRunAttempt = async () => ({ data: [{ id: 7, name: 'ci / Required', conclusion: 'success', steps: [{ name: `${tg.VERDICT_STEP} ${c0.outputs.attest}`, conclusion: 'success' }] }] });
+    gh.rest.actions.downloadJobLogsForWorkflowRun = async () => ({ data: header() });
     const c = core();
     notes.length = 0;
     await tg.planStep({ github: gh, context: { ...context, ref: 'refs/heads/main', runId: 62 }, core: c, store: fakeStore, env: env({ CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: '' }) });
     assert.equal(c.outputs.run, 'false', JSON.stringify(notes));
     assert.equal(c.outputs.misses, '');
     assert.ok(!notes.some(n => /No CI artifact store credentials/.test(n)), 'no notice when the whole run is reused');
+  });
+
+  await test('plan step: a run without a secret never vouches for one with it', async () => {
+    const a = core();
+    const b = core();
+    await tg.planStep({ github: api(), context, core: a, store: fakeStore, env: env({ HAS_NVAULT_TOKEN: 'true', HAS_PACKAGES_READ: 'true' }) });
+    await tg.planStep({ github: api(), context, core: b, store: fakeStore, env: env({ HAS_NVAULT_TOKEN: 'false', HAS_PACKAGES_READ: 'true' }) });
+    assert.notEqual(a.outputs.attest, b.outputs.attest);
   });
 
   await test('plan step: a missing node-version-file and a parent working-directory are refused', async () => {

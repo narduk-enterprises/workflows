@@ -675,6 +675,12 @@ jobs:
           // whose pass is recorded as full. An empty default (`${FAST_BASE_REF:-}`,
           // for `set -u`) is fine.
           const DEFAULTED_REF = /\$\{FAST_BASE_REF:?[-=][^}]|\bFAST_BASE_REF=(?!""|''|\s|$)/;
+          // In a targeted script a diff selection must vanish when FAST_BASE_REF is
+          // empty: inside `${FAST_BASE_REF:+...}`, or in the `then` branch of
+          // `if [ -n "$FAST_BASE_REF" ]; then ... else ... fi`. Anything else that
+          // selects from a diff (a bare `--changed`, `--changed="$FAST_BASE_REF"`
+          // with no guard, a copy into another variable) is refused.
+          const GUARDED_DIFF = /\$\{FAST_BASE_REF:\+(?:[^{}]|\$\{FAST_BASE_REF\})*\}|\bif \[\[? -n "?\$\{?FAST_BASE_REF(?::-)?\}?"? \]\]?; then\b[\s\S]*?\belse\b/g;
           const DIFF_SCOPED = /FAST_BASE_REF|BASE_REF\b|--changed\b|--changedSince\b|--only-?[cC]hanged\b|--since\b|--affected\b|\baffected\b|merge-base|git diff\b|(?:^|\s)[\w:./@-]*:changed(?=\s|$)/;
           // Bounded so a broken store or API costs seconds, never the job budget.
           const LOOKUP_TIMEOUT_MS = 10000;
@@ -855,13 +861,24 @@ jobs:
               // from the diff can pass on a tree whose full check fails. One that
               // reads FAST_BASE_REF is keyed on its base too (see above); any other
               // is refused.
-              const text = [name, scripts[name], scripts[`pre${name}`] || '', scripts[`post${name}`] || ''].join('\n');
-              const targeted = (def.tags || []).includes('ci:diff') || TARGETED_REF.test(text);
+              const scriptText = [scripts[name], scripts[`pre${name}`] || '', scripts[`post${name}`] || ''].join('\n');
+              const text = `${name}\n${scriptText}`;
+              const targeted = (def.tags || []).includes('ci:diff') || TARGETED_REF.test(scriptText);
+              const guardHint = 'Put the whole selection inside ${FAST_BASE_REF:+...} (e.g. vitest run ${FAST_BASE_REF:+--changed=$FAST_BASE_REF}) or in the then-branch of if [ -n "$FAST_BASE_REF" ]; then ...; else <full run>; fi';
               if (!targeted && def.cache !== false && DIFF_SCOPED.test(text)) {
-                throw new Error(`turbo.json task ${name} looks diff-scoped (${text.match(DIFF_SCOPED)[0]}) but does not read FAST_BASE_REF, so in CI it would select nothing and pass. Select from FAST_BASE_REF (HEAD^1 on a pull request; empty means run everything), tag it "ci:diff" if a helper file reads it, tag the full script instead, or set "cache": false`);
+                throw new Error(`turbo.json task ${name} looks diff-scoped (${text.match(DIFF_SCOPED)[0]}) but does not read FAST_BASE_REF, so in CI it would select nothing and pass. ${guardHint}; tag it "ci:diff" if a helper file reads it, tag the full script instead, or set "cache": false`);
               }
-              if (targeted && DEFAULTED_REF.test(text)) {
-                throw new Error(`turbo.json task ${name} gives FAST_BASE_REF a value of its own (${text.match(DEFAULTED_REF)[0]}); an empty FAST_BASE_REF must run the full selection, so use \${FAST_BASE_REF:+...}`);
+              if (targeted && def.cache !== false) {
+                if (DEFAULTED_REF.test(scriptText)) {
+                  throw new Error(`turbo.json task ${name} gives FAST_BASE_REF a value of its own (${scriptText.match(DEFAULTED_REF)[0]}); an empty FAST_BASE_REF must run the full selection. ${guardHint}`);
+                }
+                // What is left once every guarded selection is gone must not pick
+                // from a diff: with FAST_BASE_REF empty (every push) it would select
+                // nothing and pass under the full key.
+                const loose = scriptText.replace(GUARDED_DIFF, ' ').replace(/\$\{FAST_BASE_REF(?::-)?\}|\$FAST_BASE_REF\b|\bFAST_BASE_REF\b/g, '"$REF"').match(DIFF_SCOPED);
+                if (loose) {
+                  throw new Error(`turbo.json task ${name} reads FAST_BASE_REF but selects from a diff (${loose[0]}) where an empty FAST_BASE_REF (every push) would select nothing and pass. ${guardHint}`);
+                }
               }
               const deps = localDeps(name, def);
               outputDirs(def.outputs);
@@ -1082,6 +1099,38 @@ jobs:
             return jobs;
           }
 
+          // THE CALLABLE THAT WROTE A JOB. A job or step name proves nothing: any
+          // workflow can name a job `x / Required` and a step after a digest, and a
+          // pull_request run executes the workflow in its merge ref, which a writer
+          // controls through the pull request's base branch. What no step can write
+          // is the runner's setup header, logged before the first step: a job that
+          // a reusable workflow defines logs `Uses: <owner>/<repo>/<path>@<sha>`
+          // there, before `Complete job name:`. A job vouches only when that header
+          // names this callable at the SHA this run itself uses (its own
+          // `referenced_workflows`), so the job ran this engine's own steps.
+          const CALLABLE = 'narduk-enterprises/workflows/.github/workflows/taskgraph.yml';
+          const HEADER_BYTES = 64 * 1024;
+          function callableSha(run) {
+            const shas = new Set((run?.referenced_workflows || [])
+              .filter(w => String(w.path || '').startsWith(`${CALLABLE}@`)).map(w => String(w.sha || '')).filter(sha => /^[0-9a-f]{40}$/.test(sha)));
+            return shas.size === 1 ? [...shas][0] : null;
+          }
+
+          function headerNamesCallable(log, sha) {
+            const lines = String(log).split('\n').map(line => line.replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /, '').trim());
+            const end = lines.findIndex(line => line.startsWith('Complete job name: '));
+            return end > 0 && lines.slice(0, end).includes(`Uses: ${CALLABLE}@${sha}`);
+          }
+
+          async function writtenByCallable({ github, context, job_id, sha }) {
+            if (!/^[0-9a-f]{40}$/.test(String(sha || ''))) return false;
+            // The header is the first few KB; a server that ignores the range sends it all.
+            const { data } = await github.rest.actions.downloadJobLogsForWorkflowRun({
+              ...context.repo, job_id, headers: { range: `bytes=0-${HEADER_BYTES - 1}` }, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) },
+            });
+            return headerNamesCallable(typeof data === 'string' ? data : Buffer.from(data).toString('utf8'), sha);
+          }
+
           // The pull request a push merged, from its subject alone (no
           // pull-requests permission, so no caller has to grant one). A merge
           // commit names the head branch. A squash commit is the PR title and
@@ -1107,10 +1156,11 @@ jobs:
           // only `actions: read` and `contents: read`, so a repository without
           // the CI_ARTIFACTS_R2_* secrets (another org, a fork) still reuses a
           // pull request's pass on main.
-          async function findRunAttestation({ github, context, digests, workflowPath, callerBlob, sleep = pause, limit = 10 }) {
+          async function findRunAttestation({ github, context, digests, workflowPath, callerBlob, callable, sleep = pause, limit = 10 }) {
             const repositoryId = context.payload.repository.id;
             const workflowId = workflowPath.split('/').pop();
             if (!digests.length) return { found: false, reason: 'no cacheable task' };
+            if (!callable) return { found: false, reason: `this run's own ${CALLABLE} SHA is unknown` };
             if (!callerBlob || !/^\.github\/workflows\/[^/]+\.ya?ml$/.test(workflowPath)) return { found: false, reason: `caller workflow ${workflowPath || '(unknown)'} is not a file in .github/workflows` };
             const list = async params => {
               const { data } = await github.rest.actions.listWorkflowRuns({ ...context.repo, workflow_id: workflowId, status: 'completed', ...params, request: { signal: AbortSignal.timeout(LOOKUP_TIMEOUT_MS) } });
@@ -1132,7 +1182,8 @@ jobs:
               candidates = [...prRuns.slice(0, limit), ...pushes];
             }
             candidates = candidates.filter(r => r.id !== context.runId && r.path === workflowPath
-              && r.repository?.id === repositoryId && r.head_repository?.id === repositoryId);
+              && r.repository?.id === repositoryId && r.head_repository?.id === repositoryId
+              && (!Array.isArray(r.referenced_workflows) || callableSha(r) === callable));
             const blobs = new Map();
             const blobAt = sha => {
               if (!blobs.has(sha)) {
@@ -1142,7 +1193,8 @@ jobs:
               return blobs.get(sha);
             };
             const names = new Set(digests.map(d => `${VERDICT_STEP} ${d}`));
-            const required = job => /(^| \/ )Required$/.test(String(job.name));
+            // Always `<caller job> / Required`: this callable runs only as a called job.
+            const required = job => / \/ Required$/.test(String(job.name));
             // Side by side, so a lagging record costs its re-reads once, not per
             // candidate; the newest hit wins.
             const verdicts = await Promise.all(candidates.map(async run => {
@@ -1152,11 +1204,12 @@ jobs:
                   // Re-read only a green Required job whose verdict step is unlisted.
                   done: js => js.filter(j => required(j) && j.conclusion === 'success').every(j => (j.steps || []).some(s => s.name.startsWith(VERDICT_STEP) && s.conclusion)),
                 });
-                const hit = jobs.some(job => required(job) && job.conclusion === 'success'
+                const hits = jobs.filter(job => required(job) && job.conclusion === 'success'
                   && (job.steps || []).some(s => names.has(s.name) && s.conclusion === 'success'));
-                // The same caller workflow text: a branch that edits the workflow to
-                // name a fake verdict cannot vouch for this one's keys.
-                return hit && (await blobAt(run.head_sha)) === callerBlob;
+                if (!hits.length || (await blobAt(run.head_sha)) !== callerBlob) return false;
+                // The verdict came from this callable's own Required job.
+                for (const job of hits) if (await writtenByCallable({ github, context, job_id: job.id, sha: callable })) return true;
+                return false;
               } catch {
                 return false;
               }
@@ -1166,7 +1219,7 @@ jobs:
             return { found: false, reason: candidates.length ? `none of ${candidates.length} earlier run(s) passed this content` : 'no earlier run to compare' };
           }
 
-          async function findTaskProof({ github, context, store, cfg, key, workflowPath, callerBlob = null, attempts, sleep = pause }) {
+          async function findTaskProof({ github, context, store, cfg, key, workflowPath, callerBlob = null, callable = null, attempts, sleep = pause }) {
             const repository = `${context.repo.owner}/${context.repo.repo}`;
             const repositoryId = context.payload.repository.id;
             const objectKey = proofKey(store, repository, key);
@@ -1208,8 +1261,13 @@ jobs:
                 const attested = await settledJobs({
                   github, context, run_id: run.id, attempt_number: pointer.run_attempt, sleep,
                   done: jobs => jobs.filter(leg).every(job => (job.steps || []).some(s => s.name.startsWith(PUBLISH_STEP) && s.conclusion)),
-                }).then(jobs => jobs.some(job => leg(job) && (job.steps || []).some(step => step.name === stepName && step.conclusion === 'success')));
-                return attested ? { ok: true, run } : { ok: false, reason: `${run.html_url} shows no successful "${stepName}" step in a Tasks leg` };
+                }).then(async jobs => {
+                  for (const job of jobs.filter(j => leg(j) && (j.steps || []).some(step => step.name === stepName && step.conclusion === 'success'))) {
+                    if (await writtenByCallable({ github, context, job_id: job.id, sha: callable })) return true;
+                  }
+                  return false;
+                });
+                return attested ? { ok: true, run } : { ok: false, reason: `${run.html_url} shows no successful "${stepName}" step in a Tasks leg of ${CALLABLE}@${callable || '(unknown)'}` };
               })());
             }
             const verdict = await attempts.get(id);
@@ -1323,6 +1381,9 @@ jobs:
                 callerWorkflow: caller ? `${caller.path}:${caller.sha}` : workflowPath,
                 packageManager: env.PACKAGE_MANAGER || 'pnpm',
                 installScript: env.INSTALL_SCRIPT || '',
+                // A task can behave differently without a secret (skip a check that
+                // needs it), so a run without one never vouches for a run with it.
+                secrets: { packages: env.HAS_PACKAGES_READ === 'true', nvault: env.HAS_NVAULT_TOKEN === 'true' },
                 workingDirectory: wd,
               },
             });
@@ -1335,12 +1396,23 @@ jobs:
             }
             const reuse = env.REUSE !== 'false';
             core.setOutput('attest', runDigest(result.tasks) || '');
+            // The callable SHA this run uses: a proof counts only from a job that
+            // the same callable wrote (writtenByCallable).
+            let callable = null;
+            if (reuse) {
+              try {
+                callable = callableSha((await github.rest.actions.getWorkflowRun({ ...repo, run_id: context.runId, request: request() })).data);
+              } catch (error) {
+                core.warning(`could not read this run's referenced workflows: ${error.message}`);
+              }
+              if (!callable) core.warning(`this run's ${CALLABLE} SHA is unknown, so no earlier pass can be confirmed and every task runs`);
+            }
             // First the whole-run proof (no store needed): an earlier run that
             // passed exactly this content. Then, per task, the store's pointers.
             let whole = null;
             if (reuse) {
               try {
-                const found = await findRunAttestation({ github, context, digests: runDigests(result.tasks), workflowPath, callerBlob: caller?.sha || null });
+                const found = await findRunAttestation({ github, context, digests: runDigests(result.tasks), workflowPath, callerBlob: caller?.sha || null, callable });
                 if (found.found) whole = found.run;
                 else core.info(`whole-run reuse: ${found.reason}`);
               } catch (error) {
@@ -1357,7 +1429,7 @@ jobs:
               try {
                 let proof = { found: false, reason: 'no proof' };
                 for (const k of [t.key, t.alt].filter(Boolean)) {
-                  proof = await findTaskProof({ github, context, store, cfg, key: k, workflowPath, callerBlob: caller?.sha || null, attempts });
+                  proof = await findTaskProof({ github, context, store, cfg, key: k, workflowPath, callerBlob: caller?.sha || null, callable, attempts });
                   // Outputs are stored under the key that produced them.
                   if (proof.found) { if (k !== t.key) proof.output = null; break; }
                 }
@@ -1853,7 +1925,7 @@ jobs:
             ENGINE, POINTER_SCHEMA, PUBLISH_STEP, VERDICT_STEP, LOCKFILES, NODE_VERSION_FILES,
             sha256, parseJsonc, globToRegExp, entriesFromApi, entriesFromLsTree, fingerprint,
             selectTasks, plan, runDigest, runDigests, executionSet, restoresFor, legsOf, manifestDigest, proofKey, outputObjectKey,
-            findTaskProof, findRunAttestation, settledJobs, mergedPull, publishTaskProofs,
+            findTaskProof, findRunAttestation, settledJobs, mergedPull, callableSha, headerNamesCallable, writtenByCallable, publishTaskProofs,
             normalizeDir, planStep, publishStep, restoreStep, archiveOutputs, carriedOutputDirs,
             isolatedWorkspace, outputDirs, cgroupLimits, defaultConcurrency, runTasks, main,
           };
@@ -1881,6 +1953,8 @@ jobs:
           PACKAGE_MANAGER: ${{ inputs.package-manager }}
           INSTALL_SCRIPT: ${{ inputs.install-script }}
           REUSE: ${{ inputs.reuse }}
+          HAS_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ != '' }}
+          HAS_NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN != '' }}
           CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
           CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
           CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
