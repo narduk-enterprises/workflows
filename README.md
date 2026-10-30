@@ -3112,8 +3112,9 @@ A storage failure (the org artifact quota, stonx run 41102439037, 2026-10-30) is
 a build or test result: the upload step is `continue-on-error: true`, Build warns
 (`Production output not stored`, also in the job summary) and `ci / Required` keeps
 the build and test verdict. `production-artifact` stays set, so the caller's
-`upload` job still runs, finds no artifact and fails red; the run is not a success,
-so a promotion gated on it never fires. It must never trigger a rebuild on a deploy
+`upload` job still runs; when armed it finds no artifact and fails red, the run is
+not a success, and a promotion gated on it never fires (unarmed, it uploads nothing,
+as before). It must never trigger a rebuild on a deploy
 runner. `lint_callables.py` R13 holds every upload in this repo to that shape.
 
 In the SAME caller workflow, add an `upload` job with `needs: ci`, guarded to main

@@ -10,7 +10,7 @@ build or test result, turned the required check red. This test pins down:
 - the linter rejects each way of making an upload long-lived, fatal, silent
   or unconditional, and R11 still refuses `continue-on-error` everywhere else;
 - the shipped `Report unstored production output` step warns, writes the job
-  summary and exits 0, while `production-artifact` stays set so the caller's
+  summary and exits 0, while `production-artifact` stays set so an armed caller
   upload job fails closed and nothing is promoted.
 
 Run: python3 scripts/test_artifact_budget.py
@@ -131,6 +131,9 @@ def check_linter() -> None:
         "report uploads unconditionally": lambda j: add_report(j, **{"if": None}),
         "report widened with always()": lambda j: add_report(j, **{"if": "always() || failure()"}),
         "report widened with !cancelled()": lambda j: add_report(j, **{"if": "failure() || !cancelled()"}),
+        "report widened with an event check": lambda j: add_report(j, **{"if": "failure() || github.event_name == 'push'"}),
+        "report on !failure()": lambda j: add_report(j, **{"if": "!failure()"}),
+        "report on failure() || true": lambda j: add_report(j, **{"if": "${{ failure() || true }}"}),
         "report keeps 7 days": lambda j: add_report(j, retention=7),
         "report keeps 0 days (repo default)": lambda j: add_report(j, retention=0),
         "report has no retention": lambda j: j["steps"].append(
@@ -152,6 +155,15 @@ def check_linter() -> None:
     download["continue-on-error"] = True
     assert findings(UPLOAD, upload), "linter accepted: continue-on-error on a download"
     print("PASS  linter rejects: continue-on-error on a download")
+
+    # R13 must run from the linter's entry point, not only when called here.
+    with tempfile.TemporaryDirectory() as tmp:
+        target = pathlib.Path(tmp) / NUXT.name
+        target.write_text(yaml.safe_dump(mutated(lambda j: publish(j)["with"].__setitem__("retention-days", 7))))
+        f = lint.Findings()
+        lint.check_file(target, f)
+        assert any(item.split(": ", 1)[1].startswith("R13 ") for item in f.items), f.items
+    print("PASS  check_file runs R13")
 
 
 def check_report_step() -> None:

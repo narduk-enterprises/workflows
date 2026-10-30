@@ -756,6 +756,14 @@ def check_fail_closed_playwright(path: Path, doc: dict, f: Findings) -> None:
         f.add(path, "R11 Required still accepts a skipped enabled E2E job")
 
 
+def is_failure_only(condition: object) -> bool:
+    """True only for `failure()` alone or `failure() && <narrowing>`, with no `||`."""
+    text = " ".join(str(condition or "").split())
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2].strip()
+    return "||" not in text and (text == "failure()" or text.startswith("failure() &&"))
+
+
 def check_artifact_budget(path: Path, doc: dict, f: Findings) -> None:
     """R13: uploads are short-lived, non-fatal, and either a handoff or a failure report."""
     handoffs = ARTIFACT_HANDOFFS.get(path.name, frozenset())
@@ -784,8 +792,7 @@ def check_artifact_budget(path: Path, doc: dict, f: Findings) -> None:
                 if not any(reader in str(later.get("if", "")) for later in steps[index + 1:]):
                     f.add(path, f"{label} is a handoff, so a later step must read `{reader}` and "
                                 "surface a storage refusal instead of swallowing it")
-            elif "failure()" not in (cond := str(step.get("if", ""))) or any(
-                    widen in cond for widen in ("always()", "success()", "cancelled()")):
+            elif not is_failure_only(step.get("if")):
                 f.add(path, f"{label} is not a registered ARTIFACT_HANDOFFS step, so it is a report and "
                             "must upload only on `failure()`")
     for job_id, step_id in sorted(handoffs - seen):
