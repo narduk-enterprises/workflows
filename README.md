@@ -68,6 +68,7 @@ in their app-class workflow.
 | `reusable-browser-tests.yml` | Private-repo browser CI: validates the exact manifest browser-group object before any shard is scheduled, consumes a same-run production build, asserts the immutable Playwright package/browser image and real launch, runs three Chromium shards plus opt-in WebKit, each reporting in its own job log (no report upload or merge) |
 | `docs-governance.yml` | Thin generic gate for docs/handbook-shaped repos: checkout, optionally provision Python/Node, run one repo-provided check command. Generalizes company-hq's `handbook-spine-check.yml` / `untangle-project-sync.yml` shape |
 | `node-library.yml` | CI gate for `library` / `cli` project-lifecycle surfaces: script-probed lint/typecheck/test/build, with an optional per-package matrix generalizing narduk-libs' `package-gates` + `verify` pattern |
+| `cloudflare-version-upload.yml` | Upload the successful CI run’s exact production artifact as a SHA-tagged Worker version; no app checkout, install, build, migration or promotion. Private: group-pinned linux-deploy. Public: ubuntu-latest. |
 | `nuxt-cloudflare.yml` | CI gate for `nuxt-web` / `cloudflare-worker` surfaces: typecheck (worker + Nuxt split, matching hydrogen), optional unit tests, build, optional `extra-scripts`, optional web-foundation conformance check, optional Playwright e2e — optionally **sharded onto a separately-routed browser pool**, the prebuilt application reaching each shard through the R2 CI artifact store — optional `wrangler deploy --dry-run` validation. CI only — no deploy job (see below) |
 | `reusable-node-ci.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8): zero live callers estate-wide, re-verified via `gh search code` / `gh api search/code` across narduk-enterprises, narduk-incubator and narduk-enterprises-clients. `node-library.yml` was always the richer, preferred surface — see workflows#14/#16 |
 | `code-review.yml` | **Retired 2026-09-24** (narduk-reboot P3-C2 / O-D8, extending the 2026-09-19 advisory retirement below): zero live pool adopters, file deleted. Current review is the CT650 PR review bot (runners#212) |
@@ -3097,3 +3098,48 @@ installs it. It checks:
 
 `test_e2e_build_artifact.py`, `test_e2e_reuse.py` and `test_fast_path.py`
 cover the wiring and the proof lookups job by job.
+
+## Production build handoff (Workers Builds replacement)
+
+Opt in to `nuxt-cloudflare.yml` with `production-output-directory: .output` and a real
+production `build-script`. It publishes that existing build, including hidden files,
+as a one-day artifact keyed by commit, run and attempt. Generated
+`server/wrangler.json` must name an entrypoint inside the artifact and contain no
+custom build command or environment overrides. CI receives no deploy credentials.
+The existing E2E handoff continues using R2. Before enabling GitHub production
+artifacts, verify storage allowance and the organization's hard $0 Actions budget;
+a storage failure fails CI and must never trigger a rebuild on a deploy runner.
+
+In the SAME caller workflow, add an `upload` job with `needs: ci`, guarded to main
+pushes/main dispatch and `needs.ci.outputs.production-artifact != ''`. Call
+`cloudflare-version-upload.yml` at the same reviewed SHA as CI, granting only
+`contents: read`, with `artifact: ${{ needs.ci.outputs.production-artifact }}` and
+explicit `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` secrets. These are the
+existing per-app persona, never a root provisioner. Missing either produces a
+warning and `uploaded=false`; a missing/mismatched artifact or upload error fails.
+Private apps must already have portal-approved linux-deploy membership. Public
+callers always use ubuntu-latest. Cancel superseded CI/upload runs per repo+main;
+keep the separate promotion workflow's concurrency cancellation disabled.
+
+Promotion remains a `workflow_run` listener on the SAME CI workflow, so it runs
+only after the upload job finishes successfully. Preserve the same-repo main-push
+and green-CI guards, migration guard, live proof, smoke and rollback. Missing
+versions remain errors. For docs/test-only pushes, CI deliberately publishes no
+production artifact and executes the step `Record production upload path skip`.
+The promoter may no-op only after finding this successful step in a successful
+job at the matching SHA in that source run's EXACT run attempt (paginate the
+jobs API). An absent receipt is unknown, not permission to skip a missing version.
+Do not path-filter a required CI workflow: PR/main checks must keep reporting.
+The handoff filters the whole push's `before..SHA`, including deleted and renamed
+paths. Only docs, Markdown, tests/e2e, test/spec files and issue templates skip;
+unknown paths upload, and an unreadable diff fails closed. Main dispatch always
+publishes. A standalone non-required main upload caller may instead carry these
+same exclusions in `push.paths-ignore`.
+
+Roll out alongside Workers Builds first. Record its root, branch, build/deploy
+commands and variable NAMES before disconnect. For each repo, prove the
+runner-uploaded SHA was promoted and the live health/header reports that SHA;
+only then disconnect its Git integration and preview builds through its scoped
+registered Builds-control route. If that route is unavailable, stop with a
+ready-to-disconnect list. Reconnect the recorded integration to recover uploading
+on the next main push; production rollback remains a version-pointer move.

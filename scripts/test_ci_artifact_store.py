@@ -15,7 +15,7 @@ drives the module it wrote with Node against:
     unsigned, mis-signed, expired and payload-mismatched requests.
 
 It also holds the workflow to the decision itself: no GitHub artifact action
-and no artifact API anywhere in nuxt-cloudflare.yml, and no artifact upload in
+except the explicit one-day production handoff, no artifact API in CI, and no artifact upload in
 reusable-browser-tests.yml.
 
 Run: python3 scripts/test_ci_artifact_store.py
@@ -274,14 +274,23 @@ def messages(outcome: dict, kind: str) -> list[str]:
 # ---- Workflow text --------------------------------------------------------
 
 def test_no_github_artifacts() -> None:
-    """F6: nothing in the callable touches GitHub artifact storage."""
+    """E2E stays on R2; the opt-in production handoff is bounded and fail-closed."""
     text = WORKFLOW.read_text()
-    for forbidden in ("upload-artifact", "download-artifact", "listArtifactsForRepo",
-                      "listWorkflowRunArtifacts", "downloadArtifact", "getArtifact"):
+    document = yaml.safe_load(text)
+    production = [step for job in document['jobs'].values() for step in job.get('steps', [])
+                  if step.get('uses', '').startswith('actions/upload-artifact@')]
+    assert len(production) == 1
+    upload = production[0]
+    assert upload['name'] == 'Publish exact production output'
+    assert upload['if'] == "steps.production-output.outputs.artifact != ''"
+    assert upload['with']['retention-days'] == 1
+    assert upload['with']['if-no-files-found'] == 'error'
+    assert document[True]['workflow_call']['inputs']['production-output-directory']['default'] == ''
+    for forbidden in ("download-artifact", "listArtifactsForRepo", "listWorkflowRunArtifacts", "downloadArtifact", "getArtifact"):
         assert forbidden not in text, f"nuxt-cloudflare.yml still names {forbidden}"
     browser = BROWSER_WORKFLOW.read_text()
     assert "upload-artifact" not in browser, "reusable-browser-tests.yml still uploads an artifact"
-    print("PASS  no upload-artifact, download-artifact or artifact API in nuxt-cloudflare.yml; no browser uploads")
+    print("PASS  E2E uses R2; only the explicit, one-day production artifact uses GitHub storage")
 
 
 def test_workflow_wiring() -> None:

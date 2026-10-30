@@ -204,7 +204,23 @@ permissions:
 
 on:
   workflow_call:
+    outputs:
+      production-artifact:
+        description: Exact production output for this main SHA; empty for excluded paths.
+        value: ${{ jobs.build.outputs.production-artifact }}
     inputs:
+      production-output-directory:
+        description: >-
+          Opt-in exact production build handoff to cloudflare-version-upload.yml.
+          Relative Nitro output directory containing server/wrangler.json. Main
+          pushes and main dispatch only; docs/test-only pushes publish nothing.
+          Requires a build-script and required-reuse-pr-results=false. No deploy
+          credentials enter Build. Artifact retention is one day; verify storage
+          allowance and a hard zero-dollar Actions budget before adoption.
+        required: false
+        type: string
+        default: ""
+
       ci-concurrency-key:
         description: "Stable unique key per invocation when this callable is used more than once in the same caller workflow."
         required: false
@@ -1231,7 +1247,8 @@ jobs:
       # THE CI ARTIFACT STORE (org artifact storage quota, 2026-09-26: GitHub
       # refused every artifact upload estate-wide and CI went red; the owner
       # chose to move CI handoffs to an R2 bucket the estate owns). This
-      # workflow neither uploads nor downloads a GitHub artifact. What used to
+      # E2E handoff neither uploads nor downloads a GitHub artifact. The explicit
+      # production-output-directory opt-in below uses a one-day production artifact. What used to
       # be artifacts are objects in the R2 bucket `narduk-ci-artifacts`:
       #   - `prebuilt/<owner>/<repo>/<run>-<attempt>-<scope>.tar.gz`, the
       #     application Build hands to every E2E job (lifecycle: 7 days);
@@ -1803,6 +1820,7 @@ jobs:
     needs: ["reuse-plan", "fast-plan", "ci-admission"]
     if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && !cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')) && needs.ci-admission.outputs.skip != 'true')"
     outputs:
+      production-artifact: ${{ steps.production-output.outputs.artifact }}
       e2e-build-path: ${{ steps.e2e-build-path.outputs.path }}
       # JSON naming the CI artifact store object with its SHA-256, size and
       # presigned-GET signature (never a secret: GitHub drops an output that
@@ -1850,6 +1868,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: ${{ inputs.production-output-directory != '' && '0' || '1' }}
           persist-credentials: false
           ref: ${{ inputs.expected-candidate-sha }}
 
@@ -3134,6 +3153,81 @@ jobs:
             console.log(`performance budget passed over ${counts}`);
             note(`- :white_check_mark: **performance-budget** passed over ${counts}`);
           '
+
+      # Publish the output this CI job already built, never a second build.
+      - name: Prepare production artifact
+        id: production-output
+        if: >-
+          inputs.production-output-directory != '' && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          (github.event_name != 'push' || github.event.repository.full_name == github.repository)
+        env:
+          OUTPUT_DIR: ${{ inputs.production-output-directory }}
+          BUILD_SCRIPT: ${{ inputs.build-script }}
+          REUSE: ${{ inputs.required-reuse-pr-results }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const cp = require('node:child_process');
+          const crypto = require('node:crypto');
+          const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          if (!process.env.BUILD_SCRIPT || process.env.REUSE === 'true') {
+            throw new Error('Production handoff requires build-script and required-reuse-pr-results=false');
+          }
+          const ignored = p => p.startsWith('docs/') || p.startsWith('tests/') || p.startsWith('e2e/') ||
+            p.startsWith('.github/ISSUE_TEMPLATE/') || /\.md$/i.test(p) || /\.(test|spec)\.[^/]+$/.test(p);
+          if (process.env.GITHUB_EVENT_NAME === 'push' && /^[0-9a-f]{40}$/.test(event.before || '') && !/^0+$/.test(event.before)) {
+            // A failed diff is an error, never permission to skip deployment.
+            const files = cp.execFileSync('git', ['diff', '--name-only', '--no-renames', '-z', event.before, process.env.GITHUB_SHA], {encoding: 'utf8'}).split('\0').filter(Boolean);
+            if (files.length && files.every(ignored)) {
+              console.log('::notice::Production upload path-skipped: only docs/tests changed.');
+              process.exit(0);
+            }
+          }
+          const dir = process.env.OUTPUT_DIR;
+          if (!dir || path.isAbsolute(dir) || dir.split(/[\\/]/).includes('..') || /[\r\n]/.test(dir) || dir === '.') throw new Error('Invalid production output directory');
+          const base = fs.realpathSync('.');
+          const output = fs.realpathSync(dir);
+          if (!output.startsWith(base + path.sep) || !fs.statSync(output).isDirectory()) throw new Error('Production output must be inside working-directory');
+          const check = target => {
+            if (!fs.realpathSync(target).startsWith(output + path.sep)) throw new Error('Production artifact references an external path');
+          };
+          const walk = d => { for (const item of fs.readdirSync(d, {withFileTypes:true})) {
+            const target = path.join(d, item.name);
+            if (item.isSymbolicLink()) check(target);
+            else if (item.isDirectory()) walk(target);
+          }};
+          walk(output);
+          const configPath = path.join(output, 'server/wrangler.json');
+          check(configPath);
+          const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+          if (config.build || config.env || config.configPath || !config.main) throw new Error('Generated config must have main and no custom build/env/configPath');
+          check(path.resolve(path.dirname(configPath), config.main));
+          if (config.assets?.directory) check(path.resolve(path.dirname(configPath), config.assets.directory));
+          fs.writeFileSync(path.join(output, '.narduk-build.json'), JSON.stringify({repository: process.env.GITHUB_REPOSITORY, sha: process.env.GITHUB_SHA, run: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT}));
+          const artifact = `production-${process.env.GITHUB_SHA}-${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT}-${crypto.randomBytes(6).toString('hex')}`;
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `artifact=${artifact}\n`);
+          NODE
+
+      - name: Record production upload path skip
+        if: >-
+          success() && inputs.production-output-directory != '' &&
+          github.ref == 'refs/heads/main' && github.event_name == 'push' &&
+          github.event.repository.full_name == github.repository &&
+          steps.production-output.outputs.artifact == ''
+        run: echo 'Production upload path-skipped; this successful step is the promotion no-op receipt.'
+
+      - name: Publish exact production output
+        if: steps.production-output.outputs.artifact != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.production-output.outputs.artifact }}
+          path: ${{ inputs.working-directory }}/${{ inputs.production-output-directory }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
 
       # Resolve only known Nuxt outputs. An ambiguous or absent build is an
       # error here, never a reason to drop the handoff. E2E compiles its own
