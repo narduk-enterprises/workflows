@@ -2419,7 +2419,8 @@ callable wrote. The runner logs `Uses:
 narduk-enterprises/workflows/.github/workflows/taskgraph.yml@<sha>` before
 `Complete job name:`, ahead of any step. `Plan` reads that header from the
 job's log and requires the SHA this run itself uses, taken from its own
-`referenced_workflows`. A store proof's `Tasks` leg is checked the same way.
+`referenced_workflows`. Only the first `Uses:` line counts, because the
+runner then echoes the caller-written `Inputs`. A store proof's `Tasks` leg is checked the same way.
 
 A workflow that calls the real callable still can't vouch for another one.
 Its digest covers its own caller workflow blob, so it differs.
@@ -3159,8 +3160,10 @@ all of the following hold:
 The last rule exists because a name proves nothing. Any workflow can name a
 job `ci / Required` and a step after a key. A `pull_request` run also executes
 the workflow in its merge ref, which a writer controls through the PR's base
-branch. No step can write the runner's header, so a proof forged that way
-never counts. `taskgraph.yml` applies the same rule (workflows#226).
+branch. Only the first `Uses:` line counts, because that line is the runner's own.
+The `Inputs` group it echoes next holds values the caller wrote, so a later
+`Uses:` line proves nothing. With that rule, a proof forged this way never
+counts. `taskgraph.yml` applies the same rule (workflows#226).
 
 A finished attempt's jobs record can lag its steps, so a lookup that finds a
 green `Required` job with no proof step listed yet reads the jobs again after

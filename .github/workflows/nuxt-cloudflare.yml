@@ -1733,7 +1733,11 @@ jobs:
           function headerNamesCallable(log, sha, callable = PROOF_CALLABLE) {
             const lines = String(log).split('\n').map(line => line.replace(/^\uFEFF?\d{4}-\d\d-\d\dT[\d:.]+Z /, '').trim());
             const end = lines.findIndex(line => line.startsWith('Complete job name: '));
-            return end > 0 && lines.slice(0, end).includes(`Uses: ${callable}@${sha}`);
+            // The runner's own line is the FIRST `Uses:`. The `Inputs` group it
+            // echoes next holds caller-written values, which can carry a line of
+            // their own, so a later `Uses:` proves nothing.
+            const uses = lines.slice(0, Math.max(end, 0)).find(line => line.startsWith('Uses: '));
+            return end > 0 && uses === `Uses: ${callable}@${sha}`;
           }
 
           async function writtenByCallable({ github, context, job_id, sha, callable = PROOF_CALLABLE }) {

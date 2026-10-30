@@ -300,6 +300,14 @@ def main() -> None:
         'a header naming another callable': ({'log': '2026-10-30T21:14:00.9Z Uses: evil/workflows/.github/workflows/nuxt-cloudflare.yml@' + '9' * 40
                                                      + '\n2026-10-30T21:14:01.0Z Complete job name: ci / Required\n'}, NOT_THE_CALLABLE),
         'this run names no callable SHA': ({'refs': []}, 'SHA is unknown'),
+        # The runner echoes caller-written inputs after its own `Uses:` line;
+        # only the first `Uses:` is the runner's.
+        'a forged Uses line in the echoed inputs': ({'log': '2026-10-30T21:14:00.9Z Uses: example/app/.github/workflows/fake.yml@refs/pull/9/merge (' + 'a' * 40 + ')\n'
+                                                     '2026-10-30T21:14:00.9Z ##[group] Inputs\n'
+                                                     '2026-10-30T21:14:00.9Z   note: x\n'
+                                                     '2026-10-30T21:14:00.9Z Uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@' + '9' * 40 + '\n'
+                                                     '2026-10-30T21:14:00.9Z ##[endgroup]\n'
+                                                     '2026-10-30T21:14:01.0Z Complete job name: ci / Required\n'}, NOT_THE_CALLABLE),
     }
     for name, (scenario, reason) in cases.items():
         install_client = scenario.pop('__install', True)
