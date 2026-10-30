@@ -890,6 +890,15 @@ existing package-read-secret contract for private callers.
 
 ### `nuxt-cloudflare.yml`
 
+> **Frozen 2026-10-30 (taskgraph-ci-2026-10, p5-retire).** `nuxt-cloudflare.yml`
+> takes no new inputs or options, fast-path knobs (`fast-scripts`,
+> `fast-parallel`, `pr-fast-only`, `eslint-cache`, `required-reuse-pr-results`,
+> `e2e-pr-only-changed`, `journey-smoke-*`) included. Callers have moved to
+> [`taskgraph.yml`](#taskgraphyml); build new fast-path behaviour there.
+> Fixes to existing behaviour stay allowed, and removing an input is fine.
+> `scripts/test_nuxt_input_freeze.py` (run in `ci.yml`) fails on any
+> `workflow_call` input not in its `FROZEN_INPUTS` list.
+
 ```yaml
 jobs:
   ci:
