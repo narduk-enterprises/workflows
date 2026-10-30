@@ -9,6 +9,8 @@ import unittest
 
 import yaml
 
+from test_runner_default import evaluate, runner_context, LINUX_CI
+
 CI = yaml.safe_load(Path('.github/workflows/nuxt-cloudflare.yml').read_text())
 UPLOAD = yaml.safe_load(Path('.github/workflows/cloudflare-version-upload.yml').read_text())
 
@@ -49,6 +51,16 @@ class ProductionUpload(unittest.TestCase):
         result = self.execute(PREPARE)
         self.assertEqual(result.returncode, 0, result.stderr)
         return (self.root / 'outputs').read_text().strip().split('=', 1)[1]
+
+    def test_production_build_uses_only_fleet_ci_or_public_hosted(self):
+        expression = CI['jobs']['build']['runs-on']
+        definitions = CI[True]['workflow_call']['inputs']
+        inputs = {key: value.get('default', '') for key, value in definitions.items()}
+        inputs.update({'production-output-directory': '.output', 'runner': '\"ubuntu-latest\"'})
+        overrides = {'BLACKSMITH_RUNNERS_ENABLED': 'true', 'CI_LINUX_RUNNER': '\"blacksmith-x\"'}
+        for visibility, expected in ((True, json.loads(LINUX_CI)), (False, 'ubuntu-latest'),
+                                     (None, 'missing-repository-visibility-do-not-run')):
+            self.assertEqual(evaluate(expression, runner_context(visibility, inputs, overrides)), expected)
 
     def test_exact_identity_and_generated_config_survive_handoff(self):
         artifact = self.prepare()
