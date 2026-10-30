@@ -1,5 +1,9 @@
 name: Reusable Nuxt + Cloudflare CI
 
+# FROZEN (taskgraph-ci-2026-10 p5-retire): add no new inputs or options here,
+# fast-path knobs included; new CI behaviour goes in taskgraph.yml.
+# scripts/test_nuxt_input_freeze.py enforces it.
+#
 # CI gate for the `nuxt-web` / `cloudflare-worker` project-lifecycle surfaces.
 # pnpm/npm install -> typecheck (worker + Nuxt split, matching hydrogen's
 # .github/workflows/ci-deploy.yml `ci` job) -> build -> optional Playwright
