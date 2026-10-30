@@ -279,6 +279,11 @@ jobs:
       - name: Fast-path contract tests
         run: python3 scripts/test_fast_path.py
 
+      # nuxt-cloudflare.yml's input surface is frozen (p5-retire); new
+      # fast-path work goes in taskgraph.yml.
+      - name: nuxt-cloudflare input freeze
+        run: python3 scripts/test_nuxt_input_freeze.py
+
       # E2E off the pull request: the `CI_E2E_IN_CI` switch and `mode: e2e`
       # (the post-merge / nightly run), over the real job graph.
       - name: E2E mode contract tests
