@@ -43,7 +43,7 @@ JOBS = DOC["jobs"]
 INPUTS = DOC[True]["workflow_call"]["inputs"]
 NEW_INPUTS = {
     "fast-scripts": "",
-    "required-reuse-pr-results": False,
+    "required-reuse-pr-results": True,
     "e2e-pr-only-changed": False,
     "journey-smoke-url": "",
     "journey-smoke-args": "--grep=@smoke --retries=1",
@@ -315,8 +315,10 @@ def test_default_graph_matches_origin_main() -> None:
     for (event, ref), run_e2e, dry_run, preview, extra, quarantine, skipped, shards in itertools.product(
             EVENTS, [True, False], [True, False], ["og", "none"], ["", "lint"], ["", "--grep=@quarantine"],
             ["false", "true"], ["1", "2"]):
+        # Required reuse opted out (on by default since 2026-10-30): the graph
+        # is origin/main's.
         inputs = {"run-e2e": run_e2e, "wrangler-dry-run": dry_run, "preview-checks": preview,
-                  "extra-gate-scripts": extra, "e2e-quarantine-args": quarantine}
+                  "extra-gate-scripts": extra, "e2e-quarantine-args": quarantine, "required-reuse-pr-results": False}
         outs = plan_outputs(skipped, shards)
         for failing, cancelled in faults:
             results = {failing: "failure"} if failing else {}
@@ -498,7 +500,9 @@ def test_new_inputs_default_off() -> None:
         assert spec.get("required") is False, name
         assert spec.get("default") == default, (name, spec.get("default"))
     assert DOC[True]["workflow_call"]["secrets"]["JOURNEY_SMOKE_ROLLBACK_TOKEN"] == {"required": False}
-    print("PASS  every fast-path input is optional and defaults off")
+    # The one fast-path input that defaults on: Required reuse (2026-10-30).
+    assert INPUTS["required-reuse-pr-results"]["default"] is True
+    print("PASS  every fast-path input is optional; all but Required reuse default off")
 
 
 def test_defaults_leave_every_lane_as_before() -> None:
@@ -507,8 +511,10 @@ def test_defaults_leave_every_lane_as_before() -> None:
                       "extra-gate": "inputs.extra-gate-scripts != ''", "e2e-plan": "inputs.run-e2e"}
     for (event, ref), extra_gate, run_e2e, status in itertools.product(
             EVENTS, ["", "lint"], [True, False], ["success", "cancelled"]):
-        ctx = context(event, ref, {"extra-gate-scripts": extra_gate, "run-e2e": run_e2e},
-                      SKIPPED_REUSE, status)
+        # Opted out of Required reuse (on by default since 2026-10-30), every
+        # lane runs exactly as before it existed.
+        ctx = context(event, ref, {"extra-gate-scripts": extra_gate, "run-e2e": run_e2e,
+                                   "required-reuse-pr-results": False}, SKIPPED_REUSE, status)
         assert ev(JOBS["reuse-plan"]["if"], ctx) is False
         for job, old in old_conditions.items():
             # A job with no needs runs unless the run was cancelled.
@@ -1284,6 +1290,17 @@ def test_required_reuse_lookup() -> None:
         assert ev(JOBS[job]["if"], ctx) is False, job
         ctx["needs"]["reuse-plan"]["outputs"]["reused"] = "false"
         assert ev(JOBS[job]["if"], ctx) is True, job
+    # On by default (2026-10-30), but never beside the production build handoff:
+    # a main push must build the artifact it hands to cloudflare-version-upload.yml.
+    on_push = context("push", inputs={})
+    assert INPUTS["required-reuse-pr-results"]["default"] is True and ev(JOBS["reuse-plan"]["if"], on_push) is True
+    # A PR whose dependency audit only warned about what blocks main mints no
+    # Required proof, so the push runs the audit (and everything) itself.
+    key_if = step("required", "Compute Required proof key")["if"]
+    assert "needs.build.outputs.audit-would-block != 'true'" in key_if
+    assert JOBS["build"]["outputs"]["audit-would-block"] == "${{ steps.dependency-audit.outputs.would-block }}"
+    handoff = context("push", inputs={"production-output-directory": ".output"})
+    assert ev(JOBS["reuse-plan"]["if"], handoff) is False, "reuse beside the production handoff"
     print("PASS  Required reuse: same key on PR and push; only a completed successful same-repo PR run is reused")
 
 
@@ -1293,9 +1310,13 @@ def test_e2e_proof_key_ignores_default_fast_path_inputs() -> None:
     base = run_script(script, {}, legacy, "E2E_INPUTS")["outputs"]["key"]
     with_defaults = run_script(script, {}, {**legacy, **NEW_INPUTS}, "E2E_INPUTS")["outputs"]["key"]
     assert with_defaults == base, "default fast-path inputs changed the E2E proof key"
-    for name, value in [("fast-scripts", "lint"), ("e2e-pr-only-changed", True), ("required-reuse-pr-results", True)]:
+    for name, value in [("fast-scripts", "lint"), ("e2e-pr-only-changed", True)]:
         other = run_script(script, {}, {**legacy, **NEW_INPUTS, name: value}, "E2E_INPUTS")["outputs"]["key"]
         assert other != base, name
+    # Whether Required may be reused is not something E2E tested.
+    for value in (True, False):
+        same = run_script(script, {}, {**legacy, **NEW_INPUTS, "required-reuse-pr-results": value}, "E2E_INPUTS")["outputs"]["key"]
+        assert same == base, value
     print("PASS  E2E proof keys minted before these inputs existed still match; non-defaults change the key")
 
 

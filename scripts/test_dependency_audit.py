@@ -192,7 +192,10 @@ def run_case(script: str, *, pm: str, stdout: str, exit_code: int, audit_ignore:
 
         summary = pathlib.Path(tmp, "summary.md")
         summary.write_text("")
+        outputs = pathlib.Path(tmp, "outputs")
+        outputs.write_text("")
         env = {
+            "GITHUB_OUTPUT": str(outputs),
             "PATH": f"{bindir}:/usr/bin:/bin",
             "PM": pm,
             "AUDIT_IGNORE": audit_ignore,
@@ -205,7 +208,8 @@ def run_case(script: str, *, pm: str, stdout: str, exit_code: int, audit_ignore:
         proc = subprocess.run(
             ["bash", "-c", script], cwd=tmp, env=env, capture_output=True, text=True
         )
-        return proc.returncode, proc.stdout + proc.stderr, summary.read_text()
+        # The step's outputs ride along, so a case can assert `would-block`.
+        return proc.returncode, proc.stdout + proc.stderr + f"\nOUTPUTS<{outputs.read_text()}>", summary.read_text()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -530,6 +534,27 @@ def main() -> None:
         for failure in failures:
             print(f"::error::{failure}")
         raise SystemExit(1)
+
+    # A pull request whose audit only warned about what blocks the default
+    # branch records `would-block=true`: Build exports it and that run mints no
+    # Required proof, so its push audits for itself (required reuse would
+    # otherwise skip the one run that blocks).
+    for event in PR_EVENTS:
+        for label, stdout, code, want in (("fixable high", FIXABLE_HIGH, 1, True), ("no report", "", 0, True),
+                                          ("clean", CLEAN_PNPM, 0, False), ("unfixable only", UNFIXABLE_HIGH, 1, False)):
+            rc, out, _ = run_case(script, pm="pnpm", stdout=stdout, exit_code=code, event_name=event)
+            marked = "would-block=true" in out
+            if rc != 0 or marked != want:
+                failures.append(f"{event} {label}: rc {rc}, would-block {marked}, wanted {want}")
+    for event in BLOCKING_EVENTS:
+        rc, out, _ = run_case(script, pm="pnpm", stdout=FIXABLE_HIGH, exit_code=1, event_name=event)
+        if rc == 0 or "would-block=true" in out:
+            failures.append(f"{event}: a block must fail the step itself, not mark it (rc {rc})")
+    if failures:
+        for failure in failures:
+            print(f"::error::{failure}")
+        raise SystemExit(1)
+    print("PASS  a pull request's suppressed block marks would-block; a blocking event fails instead")
 
     print(f"test_dependency_audit: {len(CASES)} case(s) passed")
 

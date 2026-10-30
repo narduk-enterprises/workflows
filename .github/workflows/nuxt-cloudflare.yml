@@ -218,7 +218,8 @@ on:
           Opt-in exact production build handoff to cloudflare-version-upload.yml.
           Relative Nitro output directory containing server/wrangler.json. Main
           pushes and main dispatch only; docs/test-only pushes publish nothing.
-          Requires a build-script and required-reuse-pr-results=false. No deploy
+          Requires a build-script. Required reuse never applies with it (a main
+          push must build the artifact it hands off). No deploy
           credentials enter Build. Artifact retention is one day; verify storage
           allowance and a hard zero-dollar Actions budget before adoption. A
           storage refusal leaves Build green with a warning and fails the
@@ -1081,10 +1082,13 @@ on:
           pointer in the CI artifact store names that run. Without them (another
           org, a repository off their lists) `Reuse plan` finds the merged pull
           request's run on GitHub from the push's subject. Requires
-          `actions: read` on the caller's `ci` job.
+          `actions: read` on the caller's `ci` job. On by default since
+          2026-10-30: a push repeats a check only when its tree, caller
+          workflow or inputs differ from a green pull request's. Set false for
+          a gate whose behaviour intentionally differs between PR and push.
         required: false
         type: boolean
-        default: false
+        default: true
       e2e-pr-only-changed:
         description: >-
           On `pull_request` events that take the pull-request tier (no
@@ -1245,7 +1249,7 @@ jobs:
       group: workflows-nuxt-cloudflare-reuse-plan-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Reuse plan
-    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))"
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.production-output-directory == '' && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))"
     runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (toJSON(github.event.repository.private) == 'false' && '"ubuntu-latest"' || ((toJSON(github.event.repository.private) == 'false' || inputs.lightweight-runner == '"self-hosted"' || startsWith(inputs.lightweight-runner, '[') && contains(fromJSON(inputs.lightweight-runner || '[]'), 'self-hosted') || startsWith(inputs.lightweight-runner, '{') && (fromJSON(inputs.lightweight-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.lightweight-runner || '[]').labels), '[') && contains(fromJSON(inputs.lightweight-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.lightweight-runner, '"blacksmith-')) && inputs.lightweight-runner) || ((toJSON(github.event.repository.private) == 'false' || vars.CI_LIGHTWEIGHT_RUNNER == '"self-hosted"' || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]'), 'self-hosted') || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '{') && (fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels), '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels, 'self-hosted')) || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '"blacksmith-')) && vars.CI_LIGHTWEIGHT_RUNNER) || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', startsWith(vars.BLACKSMITH_LINUX_LABEL, 'blacksmith-') && vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
     timeout-minutes: 20
@@ -1963,6 +1967,10 @@ jobs:
     if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && !cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')) && needs.ci-admission.outputs.skip != 'true')"
     outputs:
       production-artifact: ${{ steps.production-output.outputs.artifact }}
+      # `true` when a pull request's dependency audit only warned about what
+      # blocks the default branch: such a run vouches for no push (Required
+      # proof), or the push would skip the audit that blocks it.
+      audit-would-block: ${{ steps.dependency-audit.outputs.would-block }}
       e2e-build-path: ${{ steps.e2e-build-path.outputs.path }}
       # JSON naming the CI artifact store object with its SHA-256, size and
       # presigned-GET signature (never a secret: GitHub drops an output that
@@ -2509,6 +2517,7 @@ jobs:
       # audit itself takes. `Required` covers it through `build`, which it
       # already demands success from.
       - name: Dependency audit
+        id: dependency-audit
         if: inputs.dependency-audit && inputs.mode != 'e2e'
         env:
           PM: ${{ inputs.package-manager }}
@@ -2546,6 +2555,9 @@ jobs:
             sed -n '1,20p' "$errlog" >&2 || true
             if [ "$warn_only" = true ]; then
               echo "::warning::dependency audit did not run on this pull request; it blocks on the default branch, schedule and manual runs"
+              # Would have blocked on the default branch: this run mints no
+              # Required proof, so its push runs the audit itself.
+              echo "would-block=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             exit 1
@@ -2750,6 +2762,9 @@ jobs:
           PYEOF_AUDIT
           if [ "$audit_rc" -ne 0 ] && [ "$warn_only" = true ]; then
             echo "::warning::dependency audit found blocking findings (listed above as warnings). They do not fail this pull request; they will fail the default branch, the nightly run and a manual run until fixed or given an audit-ignore reason."
+            # Would have blocked on the default branch: this run mints no
+            # Required proof, so its push runs the audit itself.
+            echo "would-block=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           exit "$audit_rc"
@@ -3306,7 +3321,6 @@ jobs:
         env:
           OUTPUT_DIR: ${{ inputs.production-output-directory }}
           BUILD_SCRIPT: ${{ inputs.build-script }}
-          REUSE: ${{ inputs.required-reuse-pr-results }}
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -3315,8 +3329,10 @@ jobs:
           const cp = require('node:child_process');
           const crypto = require('node:crypto');
           const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
-          if (!process.env.BUILD_SCRIPT || process.env.REUSE === 'true') {
-            throw new Error('Production handoff requires build-script and required-reuse-pr-results=false');
+          // Required reuse never applies beside the handoff (reuse-plan and
+          // REUSE_APPLIES both exclude it), so this Build always ran.
+          if (!process.env.BUILD_SCRIPT) {
+            throw new Error('Production handoff requires build-script');
           }
           const ignored = p => p.startsWith('docs/') || p.startsWith('tests/') || p.startsWith('e2e/') ||
             p.startsWith('.github/ISSUE_TEMPLATE/') || /\.md$/i.test(p) || /\.(test|spec)\.[^/]+$/.test(p);
@@ -4023,6 +4039,10 @@ jobs:
               // what was tested). The workflow path IS, so a ci.yml proof and an
               // E2E-workflow proof never cross.
               delete inputs.mode;
+              // Whether the push may reuse Required says nothing about what E2E
+              // tested (and its default flipped on 2026-10-30), so it is never
+              // part of the E2E key.
+              delete inputs['required-reuse-pr-results'];
               // Fast-path inputs (P3-C1) and the quality-level inputs stay out of
               // the key at their defaults, so proof minted before they existed
               // still matches.
@@ -7170,7 +7190,7 @@ jobs:
       - name: Require fast-path and journey-smoke lanes
         if: "needs.ci-admission.outputs.skip != 'true'"
         env:
-          REUSE_APPLIES: ${{ inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          REUSE_APPLIES: ${{ inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.production-output-directory == '' && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
           REUSE_PLAN_RESULT: ${{ needs.reuse-plan.result }}
           FAST_RESULT: ${{ needs.fast.result }}
           FAST_ESCALABLE_RESULT: ${{ needs.fast-escalable.result }}
@@ -7328,7 +7348,7 @@ jobs:
         # E2E because `CI_E2E_IN_CI` was false must mint no proof, or the
         # variable's later removal (rollback) or a repo override would let the
         # push reuse it and turn main green without E2E ever having run.
-        if: "needs.ci-admission.outputs.skip != 'true' && (success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.build.result == 'success' && (needs.checks.result == 'success' || (inputs.checks-in-build && needs.checks.result == 'skipped')) && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards)))"
+        if: "needs.ci-admission.outputs.skip != 'true' && (success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.build.result == 'success' && needs.build.outputs.audit-would-block != 'true' && (needs.checks.result == 'success' || (inputs.checks-in-build && needs.checks.result == 'skipped')) && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards)))"
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}

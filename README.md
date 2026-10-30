@@ -1685,7 +1685,12 @@ credentials. Scheduled and manual runs always run. Set
 `e2e-reuse-pr-results: false` for tests with intentionally different PR/push
 behavior or external state that must be rechecked after merge.
 `required-reuse-pr-results` reuses the whole gate the same way, from the
-`Publish Required proof <key>` step.
+`Publish Required proof <key>` step. It has been **on by default** since
+2026-10-30. A caller needs no secret for it: without the store, the push finds
+the merged pull request's run on GitHub. A push repeats the gate only when its
+tree, caller workflow or inputs differ from a green pull request's full run.
+Set it to `false` for a gate whose behaviour intentionally differs between PR
+and push.
 
 **Permission migration:** adopting this revision requires `actions: read` on
 all Nuxt callable `ci` jobs, even if E2E is disabled. GitHub validates the
