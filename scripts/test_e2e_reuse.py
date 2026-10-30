@@ -33,6 +33,8 @@ OTHER_KEY = {'e2e': 'e2e-proof-v1-' + '0' * 64, 'required': 'required-proof-v1-'
 #   jobs, jobsError, jobName, jobConclusion, stepName, stepConclusion, lagOnce
 #                                         actions.listJobsForWorkflowRunAttempt
 #   refs                                  this run's own referenced_workflows
+#   prRuns, headCommit                    actions.listWorkflowRuns and the push's
+#                                         head commit (the store-free lookup)
 #   log                                   the attesting job's log (runner header)
 HARNESS = r'''
 const fs = require('node:fs');
@@ -53,7 +55,8 @@ if (!scenario.noCreds) {
 Object.assign(process.env, scenario.env || {});
 const context = {
   repo: {owner: 'example', repo: 'app'}, sha: 'a'.repeat(40),
-  eventName: scenario.event || 'push', payload: {repository: {id: 42}}, runId: 900,
+  eventName: scenario.event || 'push', runId: 900,
+  payload: {repository: {id: 42}, head_commit: scenario.headCommit || {message: 'Ship it (#12)\n\nbody', tree_id: 't'.repeat(40)}},
 };
 // The runner's setup header: which callable, at which SHA, wrote a job.
 const CALLABLE = 'narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml';
@@ -120,8 +123,10 @@ const github = {
         if (scenario.lagOnce && jobReads === 1) {
           return {data: {total_count: 1, jobs: [{id: 7, name: 'ci / Required', conclusion: 'success', steps: [{name: 'Set up job', conclusion: 'success'}]}]}};
         }
-        const prefix = served.kind === 'required' ? 'Publish Required proof' : 'Publish full E2E proof';
-        const stepName = (scenario.stepName || '{PREFIX} {KEY}').replace('{PREFIX}', prefix).replace('{KEY}', served.key);
+        // The store-free lookup reads no pointer: the key is the one the script computed.
+        const kind = served?.kind || (String(outputs.key).startsWith('required') ? 'required' : 'e2e');
+        const prefix = kind === 'required' ? 'Publish Required proof' : 'Publish full E2E proof';
+        const stepName = (scenario.stepName || '{PREFIX} {KEY}').replace('{PREFIX}', prefix).replace('{KEY}', served?.key || outputs.key);
         const jobs = scenario.jobs || [
           {id: 6, name: 'ci / Build', conclusion: 'success', steps: [{name: 'Build', conclusion: 'success'}]},
           {id: 7, name: scenario.jobName || 'ci / Required', conclusion: scenario.jobConclusion || 'success', steps: [
@@ -130,6 +135,10 @@ const github = {
           ]},
         ];
         return {data: {total_count: jobs.length, jobs}};
+      },
+      async listWorkflowRuns(args) {
+        calls.push({listRuns: [args.event, args.status, args.branch || null]});
+        return {data: {workflow_runs: scenario.prRuns || []}};
       },
       async downloadJobLogsForWorkflowRun(args) {
         calls.push({jobLog: args.job_id});
@@ -316,6 +325,35 @@ def main() -> None:
         assert not any(kind == 'failed' for kind, _ in result['log']), (name, result['log'])
         assert any(reason in message for _, message in result['log']), (name, reason, result['log'])
         print(f'PASS  {name} runs E2E')
+    # Store-free: no credentials (another org, a repository off the secrets'
+    # lists), and GitHub's own record of the merged pull request's run.
+    pr_run = {'id': 321, 'run_attempt': 1, 'event': 'pull_request', 'status': 'completed', 'conclusion': 'success',
+              'path': '.github/workflows/ci.yml', 'repository': {'id': 42}, 'head_repository': {'id': 42},
+              'html_url': 'https://example.test/run/321', 'display_title': 'Ship it', 'head_commit': {'tree_id': 'u' * 40}}
+    free = run_lookup(script, {'noCreds': True, 'prRuns': [pr_run]})
+    assert free['outputs']['reused'] == 'true', free
+    assert {'listRuns': ['pull_request', 'success', None]} in free['calls'], free['calls']
+    assert {'jobLog': 7} in free['calls'], 'the store-free path binds to the callable header too'
+    merge = run_lookup(script, {'noCreds': True, 'prRuns': [{**pr_run, 'display_title': 'Other'}],
+                                'headCommit': {'message': 'Merge pull request #12 from example/feat/x\n\nShip it'}})
+    assert merge['outputs']['reused'] == 'true', merge
+    assert {'listRuns': ['pull_request', 'success', 'feat/x']} in merge['calls'], merge['calls']
+    by_tree = run_lookup(script, {'noCreds': True, 'prRuns': [{**pr_run, 'display_title': 'Renamed', 'head_commit': {'tree_id': 't' * 40}}]})
+    assert by_tree['outputs']['reused'] == 'true', 'a PR head that already held the pushed tree'
+    for name, scenario in {
+        'another pull request (title and tree differ)': {'prRuns': [{**pr_run, 'display_title': 'Other'}]},
+        'a fork run': {'prRuns': [{**pr_run, 'head_repository': {'id': 43}}]},
+        'another workflow': {'prRuns': [{**pr_run, 'path': '.github/workflows/other.yml'}]},
+        'a failed run': {'prRuns': [{**pr_run, 'conclusion': 'failure'}]},
+        'a header naming another SHA': {'prRuns': [pr_run], 'log': '2026-10-30T21:14:00.9Z Uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@' + '8' * 40
+                                        + '\n2026-10-30T21:14:01.0Z Complete job name: ci / Required\n'},
+        'no attesting step': {'prRuns': [pr_run], 'stepName': '{PREFIX} ' + OTHER_KEY['e2e']},
+        'a subject that names no pull request': {'prRuns': [pr_run], 'headCommit': {'message': 'direct push', 'tree_id': 'z' * 40}},
+    }.items():
+        result = run_lookup(script, {'noCreds': True, **scenario})
+        assert result['outputs']['reused'] == 'false', (name, result)
+        assert any('no CI artifact store credentials' in m for _, m in result['log']), (name, result['log'])
+    print('PASS  with no store, a merged pull request\'s own run vouches under the same rules (callable header included)')
     for name, value in [('e2e-args', '--project=other'), ('e2e-shards', 4), ('extra-env', 'DIFFERENT=1')]:
         inputs = {'e2e-args': '--project=web', 'e2e-shards': 3, name: value}
         assert run_lookup(script, {'storedKey': key}, inputs)['outputs']['reused'] == 'false'

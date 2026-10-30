@@ -3183,8 +3183,18 @@ not pass the secrets, or a caller missing from their repository list. Then:
   (a notice until ci-reset W10, W8 item 1, and nobody read it).
 - **Each E2E job** warns that it rebuilds the application, then runs `build-script` itself and fails if it cannot produce
   the output.
-- **Proofs.** No proof is published or honoured, so the default-branch push
-  runs the full gate.
+- **Proofs.** No pointer is published. The pull request's `Publish ... proof
+  <key>` step still runs and records nothing, and its name is the proof. On
+  the default-branch push, `Reuse plan` and `E2E plan` find the merged pull
+  request's run on GitHub from the push's subject: a merge commit names its
+  branch, and a squash subject is the PR title (the run's `display_title`).
+  A PR head that already held the pushed tree also counts. The same rules as
+  a pointer's run apply (`attestedRun`): a successful same-repository
+  `pull_request` run of the caller workflow, a green `<job> / Required` that
+  this callable wrote (the runner's first `Uses:` line), and the step with
+  this key. Anything else runs the full gate. This needs only
+  `actions: read`, so it also covers `narduk-enterprises-clients` callers,
+  which never receive these org secrets.
 
 A storage error, an expired link or a stalled transfer does the same, with a
 warning. A tarball transfer gives up after 3 attempts of 120 s. That is about
