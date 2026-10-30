@@ -95,6 +95,9 @@ jobs:
       # 0 — which would make this gate quietly weaker than it looks, and
       # shellcheck is what caught the real defect that shipped with this gate.
       # Assert it rather than assume the image ships it.
+      - name: Production artifact and upload contract
+        run: python3 scripts/test_production_upload.py
+
       - name: Assert shellcheck is present
         run: |
           set -euo pipefail

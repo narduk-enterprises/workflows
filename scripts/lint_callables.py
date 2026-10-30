@@ -129,6 +129,7 @@ INPUT_EXPR = re.compile(r"^\$\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*\}\}$")
 # jobs, no annotation), which is why widening one of these sets means updating
 # every adopter first and only then moving the tag (workflows#59).
 CALLER_GRANTS: dict[str, set[str]] = {
+    "cloudflare-version-upload.yml": {"contents"},
     "apple.yml": {"contents"},
     "docs-governance.yml": {"contents"},
     "node-library.yml": {"contents"},
