@@ -98,6 +98,11 @@ jobs:
       - name: Production artifact and upload contract
         run: python3 scripts/test_production_upload.py
 
+      # R13: GitHub artifact uploads are short-lived, non-fatal and surfaced
+      # (org artifact quota failed stonx's `ci / Build`, 2026-10-30).
+      - name: Artifact budget contract
+        run: python3 scripts/test_artifact_budget.py
+
       - name: Assert shellcheck is present
         run: |
           set -euo pipefail

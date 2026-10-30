@@ -2841,7 +2841,7 @@ Logan, 2026-09-18 (askme, 13:41 CT): "Moving v2 tag; repos move when touched
   `scripts/lint_callables.py` + behavior tests including
   `scripts/test_playwright_toolchain.py`. The structural gate
   enforces every convention in this list, so none of them can regress silently:
-  see the rule table (R1–R11) at the top of `scripts/lint_callables.py`. Run it
+  see the rule table (R1–R13) at the top of `scripts/lint_callables.py`. Run it
   locally before pushing: `python3 scripts/lint_callables.py`.
 - Third-party and first-party actions are pinned to full commit SHAs with a
   version comment, targeting the current Actions Node runtime (enforced: R4).
@@ -3107,8 +3107,15 @@ as a one-day artifact keyed by commit, run and attempt. Generated
 `server/wrangler.json` must name an entrypoint inside the artifact and contain no
 custom build command or environment overrides. CI receives no deploy credentials.
 The existing E2E handoff continues using R2. Before enabling GitHub production
-artifacts, verify storage allowance and the organization's hard $0 Actions budget;
-a storage failure fails CI and must never trigger a rebuild on a deploy runner.
+artifacts, verify storage allowance and the organization's hard $0 Actions budget.
+A storage failure (the org artifact quota, stonx run 41102439037, 2026-10-30) is not
+a build or test result: the upload step is `continue-on-error: true`, Build warns
+(`Production output not stored`, also in the job summary) and `ci / Required` keeps
+the build and test verdict. `production-artifact` stays set, so the caller's
+`upload` job still runs; when armed it finds no artifact and fails red, the run is
+not a success, and a promotion gated on it never fires (unarmed, it uploads nothing,
+as before). It must never trigger a rebuild on a deploy
+runner. `lint_callables.py` R13 holds every upload in this repo to that shape.
 
 In the SAME caller workflow, add an `upload` job with `needs: ci`, guarded to main
 pushes/main dispatch and `needs.ci.outputs.production-artifact != ''`. Call

@@ -32,7 +32,7 @@ container nothing loads it for you — read it first, then return here.
 | Estate operating manual | [narduk-enterprises/agent-infrastructure](https://github.com/narduk-enterprises/agent-infrastructure) → `AGENTS.md` |
 | Run the checks | `actionlint -no-color -oneline .github/workflows/*.yml`, `python3 scripts/lint_callables.py`, then each `python3 scripts/test_*.py` |
 | Catalog, consumption, versioning | [`README.md`](./README.md) — what each callable does, how to call it, how tags move |
-| Structural rules (R1–R11) | [`scripts/lint_callables.py`](./scripts/lint_callables.py) — the rule table at the top |
+| Structural rules (R1–R13) | [`scripts/lint_callables.py`](./scripts/lint_callables.py) — the rule table at the top |
 | Cloud-session setup | [narduk-enterprises/agent-infrastructure](https://github.com/narduk-enterprises/agent-infrastructure) → `docs/cloud-sessions.md` |
 
 ## Gates

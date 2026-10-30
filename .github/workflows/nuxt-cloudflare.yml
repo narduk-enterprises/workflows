@@ -216,7 +216,9 @@ on:
           pushes and main dispatch only; docs/test-only pushes publish nothing.
           Requires a build-script and required-reuse-pr-results=false. No deploy
           credentials enter Build. Artifact retention is one day; verify storage
-          allowance and a hard zero-dollar Actions budget before adoption.
+          allowance and a hard zero-dollar Actions budget before adoption. A
+          storage refusal leaves Build green with a warning and fails the
+          caller's armed upload job instead, so nothing deploys from that run.
         required: false
         type: string
         default: ""
@@ -3219,8 +3221,17 @@ jobs:
           steps.production-output.outputs.artifact == ''
         run: echo 'Production upload path-skipped; this successful step is the promotion no-op receipt.'
 
+      # A storage refusal here (org artifact quota, stonx run 41102439037,
+      # 2026-10-30) is not a build or test failure, so it no longer turns
+      # Build or `ci / Required` red (R13). It cannot ship anything either:
+      # `production-artifact` stays set, so an armed upload job's download
+      # finds no artifact and fails red and a promotion gated on the run's
+      # success never fires; an unarmed one uploads nothing, as before. A bad
+      # build already failed in Prepare above.
       - name: Publish exact production output
+        id: publish-production
         if: steps.production-output.outputs.artifact != ''
+        continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.production-output.outputs.artifact }}
@@ -3228,6 +3239,16 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
           retention-days: 1
+
+      - name: Report unstored production output
+        if: steps.publish-production.outcome == 'failure'
+        env:
+          ARTIFACT: ${{ steps.production-output.outputs.artifact }}
+        run: |
+          set -euo pipefail
+          message="Production output ${ARTIFACT} was built and checked but GitHub did not store it (see the upload step; usually the org artifact storage quota). Build and its tests stand; an armed version upload job fails closed and nothing is promoted from this run."
+          echo "::warning title=Production output not stored::${message}"
+          printf '### :warning: Production output not stored\n\n%s\n' "$message" >> "$GITHUB_STEP_SUMMARY"
 
       # Resolve only known Nuxt outputs. An ambiguous or absent build is an
       # error here, never a reason to drop the handoff. E2E compiles its own
