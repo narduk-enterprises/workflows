@@ -3531,6 +3531,8 @@ jobs:
           bash "$installer" ./actionlint
 
       - name: actionlint (caller's own workflows)
+        # Seconds normally; a hung shellcheck child once held a linux-ci slot for 18+ minutes.
+        timeout-minutes: 5
         if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results && needs.ci-admission.outputs.skip != 'true')"
         working-directory: ${{ github.workspace }}
         run: &caller_lint_actionlint |
@@ -3544,6 +3546,7 @@ jobs:
           ./actionlint -no-color "${files[@]}"
 
       - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
+        timeout-minutes: 5
         if: "!cancelled() && (inputs.mode != 'e2e' && inputs.checks-in-build && inputs.extra-gate-scripts == '' && inputs.fast-scripts == '' && !(inputs.run-e2e && (vars.CI_E2E_IN_CI != 'false' || inputs.mode == 'e2e' || inputs.e2e-full-paths != '' || inputs.expected-candidate-sha != '')) && inputs.preview-checks == 'none' && !inputs.wrangler-dry-run && inputs.journey-smoke-url == '' && !inputs.required-reuse-pr-results && needs.ci-admission.outputs.skip != 'true')"
         working-directory: ${{ github.workspace }}
         run: &caller_lint_audit |
@@ -7331,10 +7334,13 @@ jobs:
         run: *caller_lint_install_actionlint
 
       - name: actionlint (caller's own workflows)
+        # Seconds normally; a hung shellcheck child once held a linux-ci slot for 18+ minutes.
+        timeout-minutes: 5
         if: "needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.mode != 'e2e')"
         run: *caller_lint_actionlint
 
       - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
+        timeout-minutes: 5
         if: "needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.mode != 'e2e')"
         run: *caller_lint_audit
       # `required-reuse-pr-results` proof: minted only on a same-repository
@@ -7503,9 +7509,12 @@ jobs:
         env: *caller_lint_actionlint_env
         run: *caller_lint_install_actionlint
       - name: actionlint (caller's own workflows)
+        # Seconds normally; a hung shellcheck child once held a linux-ci slot for 18+ minutes.
+        timeout-minutes: 5
         if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && !cancelled())"
         run: *caller_lint_actionlint
       - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
+        timeout-minutes: 5
         if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && !cancelled())"
         run: *caller_lint_audit
       - name: Publish Fast escalation

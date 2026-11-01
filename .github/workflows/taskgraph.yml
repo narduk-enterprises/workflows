@@ -2469,6 +2469,8 @@ jobs:
           bash "$installer" ./actionlint
 
       - name: actionlint (caller's own workflows)
+        # Seconds normally; a hung shellcheck child once held a linux-ci slot for 18+ minutes.
+        timeout-minutes: 5
         if: "!cancelled()"
         working-directory: ${{ github.workspace }}
         run: |
@@ -2482,6 +2484,7 @@ jobs:
           ./actionlint -no-color "${files[@]}"
 
       - name: Caller workflow hygiene audit (concurrency, timeouts, SHA pins, permissions)
+        timeout-minutes: 5
         if: "!cancelled()"
         working-directory: ${{ github.workspace }}
         run: |
