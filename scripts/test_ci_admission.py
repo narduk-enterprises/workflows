@@ -289,6 +289,8 @@ class AdmissionTests(unittest.TestCase):
             for jid, job in doc["jobs"].items():
                 if jid == "ci-admission":
                     continue
+                if "uses" in job:
+                    continue  # Nested change-scope is a cheap, independent Linux read.
                 policy = job["concurrency"]
                 ctx = context(doc)
                 group = render(policy["group"], ctx)

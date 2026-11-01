@@ -201,6 +201,9 @@ jobs:
       - name: Design publish shape and behaviour tests
         run: python3 scripts/test_design_publish.py
 
+      - name: Change scope and Apple fallback tests
+        run: python3 scripts/test_change_scope.py
+
       - name: Apple routing and fail-capable gate tests
         run: python3 scripts/test_apple_gate.py
 
