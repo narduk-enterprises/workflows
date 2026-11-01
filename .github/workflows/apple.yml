@@ -20,6 +20,7 @@ name: Reusable Apple CI
 #   lint  -> `lint-runner`  (Linux; empty default = linux-ci group if the
 #                            caller is private, else hosted ubuntu-latest)
 #   xcode -> `apple-runner` (the repo-scoped Mac; REQUIRED, no default)
+#            or the Linux route for a proven irrelevant-only diff, retaining its context.
 #
 # `apple-runner` deliberately has NO default. A reusable workflow that
 # defaults to a self-hosted label hands estate infrastructure to whichever
@@ -94,6 +95,11 @@ on:
         required: false
         type: string
         default: ''
+      apple-ignore-paths:
+        description: 'JSON irrelevant path globs for Apple build/test only; empty preserves full validation. Linux checks always retain their scope.'
+        required: false
+        type: string
+        default: '[]'
       apple-runner:
         description: >-
           JSON-encoded runner for the Xcode/Swift job. REQUIRED and
@@ -215,6 +221,16 @@ on:
         default: 15
 
 jobs:
+  changes:
+    needs: [ci-admission]
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true'"
+    uses: ./.github/workflows/change-scope.yml
+    permissions:
+      contents: read
+    with:
+      runner: ${{ inputs.lint-runner }}
+      ignore-paths: ${{ inputs.apple-ignore-paths }}
+
   ci-admission:
     name: CI admission
     if: "(github.event_name == 'pull_request') && github.event.pull_request.draft"
@@ -309,12 +325,12 @@ jobs:
 
   xcode:
     if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (true)"
-    needs: [ci-admission]
+    needs: [ci-admission, changes]
     concurrency:
       group: workflows-apple-xcode-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     name: xcode
-    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (((toJSON(github.event.repository.private) == 'false' || inputs.apple-runner == '"self-hosted"' || startsWith(inputs.apple-runner, '[') && contains(fromJSON(inputs.apple-runner || '[]'), 'self-hosted') || startsWith(inputs.apple-runner, '{') && (fromJSON(inputs.apple-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.apple-runner || '[]').labels), '[') && contains(fromJSON(inputs.apple-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.apple-runner, '"blacksmith-')) && inputs.apple-runner) || '{"group":"apple-vm","labels":["self-hosted","macOS","X64","apple-vm"]}')) }}
+    runs-on: ${{ needs.changes.outputs.run == 'false' && fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (((toJSON(github.event.repository.private) == 'false' || inputs.lint-runner == '"self-hosted"' || startsWith(inputs.lint-runner, '[') && contains(fromJSON(inputs.lint-runner || '[]'), 'self-hosted') || startsWith(inputs.lint-runner, '{') && (fromJSON(inputs.lint-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.lint-runner || '[]').labels), '[') && contains(fromJSON(inputs.lint-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.lint-runner, '"blacksmith-')) && inputs.lint-runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) || fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (((toJSON(github.event.repository.private) == 'false' || inputs.apple-runner == '"self-hosted"' || startsWith(inputs.apple-runner, '[') && contains(fromJSON(inputs.apple-runner || '[]'), 'self-hosted') || startsWith(inputs.apple-runner, '{') && (fromJSON(inputs.apple-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.apple-runner || '[]').labels), '[') && contains(fromJSON(inputs.apple-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.apple-runner, '"blacksmith-')) && inputs.apple-runner) || '{"group":"apple-vm","labels":["self-hosted","macOS","X64","apple-vm"]}')) }}
     # Backstop only. Expressions have no arithmetic, so the real limits live
     # in the leased step: lease-wait-minutes for the queue, then
     # xcode-timeout-minutes for the work once the lease is held. Each setup
@@ -328,12 +344,29 @@ jobs:
     env:
       DEVELOPER_DIR: ${{ inputs.developer-dir }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Assert Apple change scope
+        working-directory: ${{ github.workspace }}
+        env:
+          SCOPE_RESULT: ${{ needs.changes.result }}
+          RUN_APPLE: ${{ needs.changes.outputs.run }}
+          SCOPE_REASON: ${{ needs.changes.outputs.reason }}
+        run: |
+          set -euo pipefail
+          test "$SCOPE_RESULT" = success
+          case "$RUN_APPLE:$SCOPE_REASON" in
+            true:full-lane) ;;
+            false:irrelevant-only) echo "Apple build/test not affected by this diff; reporting the same context on Linux" ;;
+            *) echo "::error::Invalid change-scope proof"; exit 1 ;;
+          esac
+
+      - if: needs.changes.outputs.run != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 10
         with:
           persist-credentials: false
 
-      - name: Validate Apple toolchain and gate configuration
+      - if: needs.changes.outputs.run != 'false'
+        name: Validate Apple toolchain and gate configuration
         timeout-minutes: 5
         env:
           BUILD_COMMAND: ${{ inputs.build-command }}
@@ -383,7 +416,7 @@ jobs:
       # bounds the queue, and `xcode-timeout-minutes` starts only once the
       # lease is held, so a busy host never eats the build's own budget.
       - name: Build and test under Apple build lease
-        if: inputs.run-build || inputs.run-tests
+        if: needs.changes.outputs.run != 'false' && (inputs.run-build || inputs.run-tests)
         env:
           DEPENDENCY_SSH_KEY: ${{ secrets.DEPENDENCY_SSH_KEY }}
           DEPENDENCY_OWNER: ${{ github.repository_owner }}
@@ -556,7 +589,7 @@ jobs:
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     name: Required
     if: always()
-    needs: ["lint", "xcode", "ci-admission"]
+    needs: ["lint", "xcode", "ci-admission", "changes"]
     # Aggregation is pure shell; use the organization lightweight route first.
     runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (((toJSON(github.event.repository.private) == 'false' || vars.CI_LIGHTWEIGHT_RUNNER == '"self-hosted"' || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]'), 'self-hosted') || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '{') && (fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels), '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels, 'self-hosted')) || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '"blacksmith-')) && vars.CI_LIGHTWEIGHT_RUNNER) || (((toJSON(github.event.repository.private) == 'false' || inputs.lint-runner == '"self-hosted"' || startsWith(inputs.lint-runner, '[') && contains(fromJSON(inputs.lint-runner || '[]'), 'self-hosted') || startsWith(inputs.lint-runner, '{') && (fromJSON(inputs.lint-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.lint-runner || '[]').labels), '[') && contains(fromJSON(inputs.lint-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.lint-runner, '"blacksmith-')) && inputs.lint-runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"'))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s, counts against timeout-minutes) -- fleet#276.
@@ -592,9 +625,14 @@ jobs:
         env:
           LINT_RESULT: ${{ needs.lint.result }}
           XCODE_RESULT: ${{ needs.xcode.result }}
+          SCOPE_RESULT: ${{ needs.changes.result }}
         run: |
           status=0
-          # xcode has no `if:` — it must always report success.
+          if [ "$SCOPE_RESULT" != success ]; then
+            echo "::error::Change scope failed"
+            status=1
+          fi
+          # xcode reports real success on either the Apple route or the proven Linux fallback.
           if [ "$XCODE_RESULT" != "success" ]; then
             echo "::error::xcode job reported '$XCODE_RESULT' (must succeed)"
             status=1

@@ -63,6 +63,7 @@ in their app-class workflow.
 
 | Workflow | Purpose |
 |----------|---------|
+| `change-scope.yml` | Linux change classifier for expensive lanes; explicit irrelevant globs, rename-safe comparisons, and full validation on unknown or truncated diffs |
 | `apple.yml` | CI gate for Apple repos (Swift packages, iOS/macOS apps): SwiftLint (official Linux binary) and boundary/plist checks on a Linux runner, `swift build` / `swift test` / `xcodebuild` on the repo-scoped Mac. **Two separately-routed runner inputs — that split is the point.** Release/signing stays per-repo |
 | `python-data.yml` | CI gate for Python / data-pipeline repos: explicit `uv` or Python provisioning, pytest, opt-in exact-version Ruff and **Pyright** (real static checking, not `py_compile`), plus an `extra-checks` hook |
 | `reusable-browser-tests.yml` | Private-repo browser CI: validates the exact manifest browser-group object before any shard is scheduled, consumes a same-run production build, asserts the immutable Playwright package/browser image and real launch, runs three Chromium shards plus opt-in WebKit, each reporting in its own job log (no report upload or merge) |
@@ -3293,3 +3294,23 @@ only then disconnect its Git integration and preview builds through its scoped
 registered Builds-control route. If that route is unavailable, stop with a
 ready-to-disconnect list. Reconnect the recorded integration to recover uploading
 on the next main push; production rollback remains a version-pointer move.
+
+### Change scope for expensive lanes
+
+`change-scope.yml` runs on Linux and returns `run: false` only for a complete,
+nonempty PR or forward-push diff whose paths all match caller-owned
+`ignore-paths` (a JSON array of globs, with `*` matching `/`). Renames check both
+names. Empty configuration, unknown events, forced/new-branch pushes, unreadable
+comparisons, and the compare API's 300-file cap run the full lane. Schedules and
+manual runs retain full coverage.
+
+Apple callers can set `apple-ignore-paths` to the same JSON list, for example
+`'["README.md","AGENTS.md","CLAUDE.md","docs/*.md"]'` after verifying these
+files are outside build resources. The default `[]` preserves full validation.
+The existing `xcode` job reports genuine success on Linux after asserting the
+classification proof; its check name and `Required` remain unchanged. Linux
+checks retain their existing scope. No required job disappears on a docs diff.
+Other callers can use the classifier before expensive jobs, but must retain an
+unconditional check which validates the scope proof and expected job outcomes
+(CI-WORKFLOW-STANDARD A7). Do not apply workflow-level filters to required or
+release-gating contexts.

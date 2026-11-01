@@ -420,7 +420,7 @@ def main() -> None:
     assert "inputs.lint-runner" in document["jobs"]["lint"]["runs-on"]
     assert "inputs.apple-runner" in document["jobs"]["xcode"]["runs-on"]
     assert "CI_LIGHTWEIGHT_RUNNER" in document["jobs"]["required"]["runs-on"]
-    assert document["jobs"]["required"]["needs"] == ["lint", "xcode", "ci-admission"]
+    assert document["jobs"]["required"]["needs"] == ["lint", "xcode", "ci-admission", "changes"]
     install_swiftlint = next(
         item
         for item in document["jobs"]["lint"]["steps"]

@@ -1,0 +1,83 @@
+name: Reusable change scope
+
+# Explicit caller-owned irrelevant globs; unknown events/diffs run the full lane.
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        description: 'JSON Linux route; private callers use the fleet, public callers use hosted capacity.'
+        type: string
+        default: ''
+      ignore-paths:
+        description: 'JSON array of irrelevant path globs (* also matches /). Empty disables skipping. Include only files the lane cannot consume.'
+        type: string
+        default: '[]'
+    outputs:
+      run:
+        description: 'false only when a complete, nonempty diff contains exclusively irrelevant files.'
+        value: ${{ jobs.required.outputs.run }}
+      reason:
+        description: 'Reason for the decision.'
+        value: ${{ jobs.required.outputs.reason }}
+
+jobs:
+  required:
+    name: Required
+    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && inputs.runner) || toJSON(github.event.repository.private) != 'false' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"ubuntu-latest"')) }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      run: ${{ steps.scope.outputs.run }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - name: Classify complete change scope
+        id: scope
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          IGNORE_PATHS: ${{ inputs.ignore-paths }}
+        with:
+          script: |
+            core.setOutput('run', 'true');
+            core.setOutput('reason', 'full-lane');
+            const patterns = JSON.parse(process.env.IGNORE_PATHS);
+            if (!Array.isArray(patterns) || patterns.some(p => typeof p !== 'string' || !p)) {
+              throw new Error('ignore-paths must be a JSON array of nonempty glob strings');
+            }
+            if (!patterns.length) return;
+            let base, head;
+            if (context.eventName === 'pull_request') {
+              base = context.payload.pull_request?.base?.sha;
+              head = context.payload.pull_request?.head?.sha;
+            } else if (context.eventName === 'push' && !context.payload.forced && !context.payload.deleted) {
+              base = context.payload.before;
+              head = context.sha;
+            } else {
+              return;
+            }
+            const validSHA = value => typeof value === 'string' && /^[0-9a-f]{40}$/.test(value) && !/^0+$/.test(value);
+            if (!validSHA(base) || !validSHA(head)) return;
+            // fnmatch-style '*' includes '/'; all other metacharacters are literal.
+            const globs = patterns.map(pattern => new RegExp('^' + pattern.split('*').map(
+              part => part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            ).join('.*') + '$'));
+            try {
+              const {data} = await github.rest.repos.compareCommitsWithBasehead({
+                ...context.repo, basehead: `${base}...${head}`, per_page: 100, page: 1
+              });
+              // GitHub returns at most 300 files, on page 1 only. A full page
+              // may be truncated; identical/behind/diverged or malformed is unknown.
+              const files = data.files;
+              if (data.status !== 'ahead' || !Array.isArray(files) || !files.length || files.length >= 300) return;
+              const ignored = path => typeof path === 'string' && path.length > 0 && globs.some(glob => glob.test(path));
+              if (!files.every(file => ['added', 'modified', 'removed', 'renamed', 'changed', 'copied'].includes(file.status) &&
+                  ignored(file.filename) && (file.status !== 'renamed' || ignored(file.previous_filename)))) return;
+              core.setOutput('run', 'false');
+              core.setOutput('reason', 'irrelevant-only');
+              core.info(`All ${files.length} changed files are outside this lane's scope`);
+            } catch (error) {
+              core.warning(`Change scope unavailable; running the full lane (${error.status || 'unknown error'})`);
+            }

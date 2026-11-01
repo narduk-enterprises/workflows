@@ -162,6 +162,7 @@ INPUT_EXPR = re.compile(r"^\$\{\{\s*inputs\.([A-Za-z0-9_-]+)\s*\}\}$")
 CALLER_GRANTS: dict[str, set[str]] = {
     "cloudflare-version-upload.yml": {"contents"},
     "apple.yml": {"contents"},
+    "change-scope.yml": {"contents"},
     "docs-governance.yml": {"contents"},
     "node-library.yml": {"contents"},
     # WIDENED for the `preview` job's sticky pull-request comment (V1). This

@@ -27,6 +27,7 @@ LINUX_CI = '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox",
 CALLABLES = {
     "reusable-browser-tests.yml": "linux-runner",
     "apple.yml": "lint-runner",
+    "change-scope.yml": "runner",
     "docs-governance.yml": "runner",
     "node-library.yml": "runner",
     "python-data.yml": "runner",
