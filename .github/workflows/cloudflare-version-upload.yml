@@ -8,7 +8,9 @@ name: Reusable Cloudflare Version Upload
 # under the entrypoint; without that, an app whose config does not set them
 # uploaded only its wasm and Cloudflare refused the version (10021, missing
 # chunks/nitro/nitro.mjs, stonx run 41325465240).
-# Caller grants: contents: read. Pass the existing per-app deployment persona
+# Caller grants: contents: read and actions: write (the cleanup job deletes the
+# consumed production artifact, so a day of retention does not count against
+# the organization's Actions storage). Pass the existing per-app deployment persona
 # explicitly; never secrets: inherit. The artifact name binds SHA/run/attempt.
 on:
   workflow_call:
@@ -138,9 +140,45 @@ jobs:
             --tag "$GITHUB_SHA" --message "Runner upload $GITHUB_SHA"
           echo 'uploaded=true' >> "$GITHUB_OUTPUT"
 
+  cleanup:
+    name: Delete uploaded artifact
+    needs: [upload]
+    if: needs.upload.outputs.uploaded == 'true'
+    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) == 'false' && '"ubuntu-latest"' || toJSON(github.event.repository.private) == 'true' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"missing-repository-visibility-do-not-run"') }}
+    timeout-minutes: 3
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+
+      # Best effort: the version is already uploaded and a leftover artifact
+      # expires a day later, so a failed delete warns and never fails the run
+      # (promotion listens to it).
+      - name: Delete this run's consumed production artifact
+        shell: bash
+        env:
+          ARTIFACT: ${{ inputs.artifact }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node <<'NODE' || echo "::warning::Could not delete production artifact $ARTIFACT; it expires in a day"
+          const api = `${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/actions`;
+          const headers = {authorization: `Bearer ${process.env.GITHUB_TOKEN}`, accept: 'application/vnd.github+json'};
+          const name = process.env.ARTIFACT;
+          const list = await fetch(`${api}/runs/${process.env.GITHUB_RUN_ID}/artifacts?name=${encodeURIComponent(name)}&per_page=10`, {headers});
+          if (!list.ok) throw new Error(`list artifacts answered ${list.status}`);
+          for (const artifact of (await list.json()).artifacts.filter((a) => a.name === name)) {
+            const del = await fetch(`${api}/artifacts/${artifact.id}`, {method: 'DELETE', headers});
+            if (!del.ok) throw new Error(`delete ${artifact.id} answered ${del.status}`);
+            console.log(`Deleted artifact ${artifact.id} (${name})`);
+          }
+          NODE
+
   required:
     name: Required
-    needs: [upload]
+    needs: [upload, cleanup]
     if: always()
     runs-on: ${{ fromJSON(toJSON(github.event.repository.private) == 'false' && '"ubuntu-latest"' || toJSON(github.event.repository.private) == 'true' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"missing-repository-visibility-do-not-run"') }}
     timeout-minutes: 2

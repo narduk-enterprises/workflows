@@ -3264,7 +3264,9 @@ runner. `lint_callables.py` R13 holds every upload in this repo to that shape.
 In the SAME caller workflow, add an `upload` job with `needs: ci`, guarded to main
 pushes/main dispatch and `needs.ci.outputs.production-artifact != ''`. Call
 `cloudflare-version-upload.yml` at the same reviewed SHA as CI, granting only
-`contents: read`, with `artifact: ${{ needs.ci.outputs.production-artifact }}` and
+`contents: read` and `actions: write` (from workflows#237 on, its cleanup job deletes
+the consumed artifact once the version is uploaded, so artifacts stop counting
+against the org's Actions storage; a caller without the grant fails at startup), with `artifact: ${{ needs.ci.outputs.production-artifact }}` and
 explicit `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` secrets. These are the
 existing per-app persona, never a root provisioner. Missing either produces a
 warning and `uploaded=false`; a missing/mismatched artifact or upload error fails.
