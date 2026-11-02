@@ -112,6 +112,8 @@ jobs:
             if (real !== root && !real.startsWith(root + path.sep)) throw new Error('Config references a path outside the artifact');
           };
           if (!process.env.CLOUDFLARE_ACCOUNT_ID && !/^[0-9a-f]{32}$/.test(config.account_id ?? '')) throw new Error('No CLOUDFLARE_ACCOUNT_ID secret and no account_id in the generated config');
+          // Wrangler prefers the config's account_id, so a secret is only a pin if they agree.
+          if (process.env.CLOUDFLARE_ACCOUNT_ID && config.account_id && config.account_id !== process.env.CLOUDFLARE_ACCOUNT_ID) throw new Error('Generated config account_id differs from CLOUDFLARE_ACCOUNT_ID');
           check(config.main);
           if (config.assets?.directory) check(config.assets.directory);
           if (config.base_dir) check(config.base_dir);

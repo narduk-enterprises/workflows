@@ -96,6 +96,10 @@ class ProductionUpload(unittest.TestCase):
         self.assertNotEqual(self.execute(VERIFY, self.output, CLOUDFLARE_ACCOUNT_ID='').returncode, 0)
         self.config.write_text(json.dumps({'main': 'index.mjs', 'account_id': 'a' * 32}))
         self.assertEqual(self.execute(VERIFY, self.output, CLOUDFLARE_ACCOUNT_ID='').returncode, 0)
+        (self.output / 'server/.narduk-upload.wrangler.json').unlink()
+        self.assertNotEqual(self.execute(VERIFY, self.output, CLOUDFLARE_ACCOUNT_ID='c' * 32).returncode, 0)
+        self.config.write_text(json.dumps({'main': 'index.mjs', 'account_id': 'not-hex'}))
+        self.assertNotEqual(self.execute(VERIFY, self.output, CLOUDFLARE_ACCOUNT_ID='').returncode, 0)
 
     def test_custom_build_or_external_paths_fail_closed(self):
         for config in ({'main': 'index.mjs', 'build': {'command': 'false'}},
