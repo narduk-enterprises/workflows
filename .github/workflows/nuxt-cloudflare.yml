@@ -142,6 +142,13 @@ name: Reusable Nuxt + Cloudflare CI
 #   on: { schedule: [{ cron: "17 8 * * *" }] }   # 08:17 UTC = 3:17 AM CT
 # alongside its push/pull_request triggers, with the same `ci:` job. The
 # quarantine lane (`e2e-quarantine-args`) runs there too.
+# A NIGHT-DISPATCHED run (fleet's night dispatcher, which replaces the cron) is
+# a `workflow_dispatch` run that carries the caller's `nightly` input
+# (`github.event.inputs.nightly == 'true'`; README "Night-dispatched runs").
+# This callable reads it in one place: the production handoff and upload skip a
+# nightly run exactly as they skip a scheduled one, since a nightly proves
+# main and never ships it. Everything else already treats `workflow_dispatch`
+# like `schedule` (full E2E, a blocking dependency audit, no path skips).
 #
 # E2E OFF THE PULL REQUEST (fast-CI program, Logan 2026-09-29: "skip on PRs;
 # run after each merge, newest wins, plus nightly; one org switch"). Two
@@ -3317,6 +3324,7 @@ jobs:
         if: >-
           inputs.production-output-directory != '' && github.ref == 'refs/heads/main' &&
           (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+          github.event.inputs.nightly != 'true' &&
           (github.event_name != 'push' || github.event.repository.full_name == github.repository)
         env:
           OUTPUT_DIR: ${{ inputs.production-output-directory }}
