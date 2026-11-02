@@ -8,7 +8,9 @@ name: Reusable Cloudflare Version Upload
 # under the entrypoint; without that, an app whose config does not set them
 # uploaded only its wasm and Cloudflare refused the version (10021, missing
 # chunks/nitro/nitro.mjs, stonx run 41325465240).
-# Caller grants: contents: read. Pass the existing per-app deployment persona
+# Caller grants: contents: read and actions: write (the cleanup job deletes the
+# consumed production artifact, so a day of retention does not count against
+# the organization's Actions storage). Pass the existing per-app deployment persona
 # explicitly; never secrets: inherit. The artifact name binds SHA/run/attempt.
 on:
   workflow_call:
@@ -64,8 +66,10 @@ jobs:
           set -euo pipefail
           prefix="production-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-"
           [[ "$ARTIFACT" == "$prefix"* && "${ARTIFACT#"$prefix"}" =~ ^[0-9a-f]{12}$ ]]
-          if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ACCOUNT_ID" ]]; then
-            echo '::warning::Runner upload NOT ARMED: per-app Cloudflare token or account ID is absent; no version uploaded.'
+          # The account ID is optional: without it Wrangler uses the generated
+          # config's account_id, which the verify step requires.
+          if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            echo '::warning::Runner upload NOT ARMED: the per-app Cloudflare token is absent; no version uploaded.'
             echo 'armed=false' >> "$GITHUB_OUTPUT"
           else
             echo 'armed=true' >> "$GITHUB_OUTPUT"
@@ -87,6 +91,8 @@ jobs:
         if: steps.armed.outputs.armed == 'true'
         shell: bash
         working-directory: ${{ runner.temp }}/${{ inputs.artifact }}
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           # Wrangler reads a matching file through a symlink; the artifact carries none.
@@ -105,6 +111,9 @@ jobs:
             const real = fs.realpathSync(path.resolve('server', p));
             if (real !== root && !real.startsWith(root + path.sep)) throw new Error('Config references a path outside the artifact');
           };
+          if (!process.env.CLOUDFLARE_ACCOUNT_ID && !/^[0-9a-f]{32}$/.test(config.account_id ?? '')) throw new Error('No CLOUDFLARE_ACCOUNT_ID secret and no account_id in the generated config');
+          // Wrangler prefers the config's account_id, so a secret is only a pin if they agree.
+          if (process.env.CLOUDFLARE_ACCOUNT_ID && config.account_id && config.account_id !== process.env.CLOUDFLARE_ACCOUNT_ID) throw new Error('Generated config account_id differs from CLOUDFLARE_ACCOUNT_ID');
           check(config.main);
           if (config.assets?.directory) check(config.assets.directory);
           if (config.base_dir) check(config.base_dir);
@@ -134,13 +143,50 @@ jobs:
           WRANGLER_SEND_METRICS: 'false'
         run: |
           set -euo pipefail
+          [[ -n "$CLOUDFLARE_ACCOUNT_ID" ]] || unset CLOUDFLARE_ACCOUNT_ID
           wrangler versions upload --config server/.narduk-upload.wrangler.json --no-bundle \
             --tag "$GITHUB_SHA" --message "Runner upload $GITHUB_SHA"
           echo 'uploaded=true' >> "$GITHUB_OUTPUT"
 
+  cleanup:
+    name: Delete uploaded artifact
+    needs: [upload]
+    if: needs.upload.outputs.uploaded == 'true'
+    runs-on: ${{ fromJSON(toJSON(github.event.repository.private) == 'false' && '"ubuntu-latest"' || toJSON(github.event.repository.private) == 'true' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"missing-repository-visibility-do-not-run"') }}
+    timeout-minutes: 3
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          package-manager-cache: false
+
+      # Best effort: the version is already uploaded and a leftover artifact
+      # expires a day later, so a failed delete warns and never fails the run
+      # (promotion listens to it).
+      - name: Delete this run's consumed production artifact
+        shell: bash
+        env:
+          ARTIFACT: ${{ inputs.artifact }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          node <<'NODE' || echo "::warning::Could not delete production artifact $ARTIFACT; it expires in a day"
+          const api = `${process.env.GITHUB_API_URL}/repos/${process.env.GITHUB_REPOSITORY}/actions`;
+          const headers = {authorization: `Bearer ${process.env.GITHUB_TOKEN}`, accept: 'application/vnd.github+json'};
+          const name = process.env.ARTIFACT;
+          const list = await fetch(`${api}/runs/${process.env.GITHUB_RUN_ID}/artifacts?name=${encodeURIComponent(name)}&per_page=10`, {headers});
+          if (!list.ok) throw new Error(`list artifacts answered ${list.status}`);
+          for (const artifact of (await list.json()).artifacts.filter((a) => a.name === name)) {
+            const del = await fetch(`${api}/artifacts/${artifact.id}`, {method: 'DELETE', headers});
+            if (!del.ok) throw new Error(`delete ${artifact.id} answered ${del.status}`);
+            console.log(`Deleted artifact ${artifact.id} (${name})`);
+          }
+          NODE
+
   required:
     name: Required
-    needs: [upload]
+    needs: [upload, cleanup]
     if: always()
     runs-on: ${{ fromJSON(toJSON(github.event.repository.private) == 'false' && '"ubuntu-latest"' || toJSON(github.event.repository.private) == 'true' && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' || '"missing-repository-visibility-do-not-run"') }}
     timeout-minutes: 2
