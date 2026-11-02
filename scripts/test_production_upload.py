@@ -71,6 +71,26 @@ class ProductionUpload(unittest.TestCase):
             result = self.execute(VERIFY, self.output, **{key: 'wrong'})
             self.assertNotEqual(result.returncode, 0, key)
 
+    def test_upload_config_attaches_nitro_chunks_without_bundling(self):
+        self.prepare()
+        upload = self.output / 'server/.narduk-upload.wrangler.json'
+        self.assertEqual(self.execute(VERIFY, self.output).returncode, 0)
+        written = json.loads(upload.read_text())
+        self.assertIs(written['find_additional_modules'], True)
+        self.assertEqual(written['rules'], [{'type': 'ESModule', 'globs': ['**/*.mjs']}])
+        rules = [{'type': 'ESModule', 'globs': ['**/*.js']}]
+        self.config.write_text(json.dumps({'main': 'index.mjs', 'base_dir': '..', 'rules': rules}))
+        upload.unlink()
+        self.assertEqual(self.execute(VERIFY, self.output).returncode, 0)
+        self.assertEqual(json.loads(upload.read_text())['rules'], rules)
+        upload.unlink()
+        self.config.write_text(json.dumps({'main': 'index.mjs', 'base_dir': '../..'}))
+        self.assertNotEqual(self.execute(VERIFY, self.output).returncode, 0)
+        self.config.write_text('{"main":"index.mjs"}')
+        (self.output / 'server/chunk.mjs').symlink_to(self.root / 'event.json')
+        self.assertNotEqual(self.execute(VERIFY, self.output).returncode, 0)
+        self.assertFalse(upload.exists())
+
     def test_custom_build_or_external_paths_fail_closed(self):
         for config in ({'main': 'index.mjs', 'build': {'command': 'false'}},
                        {'main': '../../event.json'}, {'main': 'index.mjs', 'env': {'production': {}}}):
@@ -128,7 +148,7 @@ class ProductionUpload(unittest.TestCase):
         result = self.execute(COMMAND, PATH=f'{self.root}:{os.environ["PATH"]}', ARGUMENTS=str(self.root / 'args'))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / 'args').read_text().splitlines(),
-                         ['versions', 'upload', '--config', 'server/wrangler.json', '--no-bundle',
+                         ['versions', 'upload', '--config', 'server/.narduk-upload.wrangler.json', '--no-bundle',
                           '--tag', 'a' * 40, '--message', 'Runner upload ' + 'a' * 40])
         upload = UPLOAD['jobs']['upload']
         self.assertNotIn('checkout', json.dumps(upload))

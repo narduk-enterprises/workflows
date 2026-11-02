@@ -2,7 +2,12 @@ name: Reusable Cloudflare Version Upload
 
 # Called after the app's ci job succeeds, in that SAME run. It consumes only
 # nuxt-cloudflare.yml's production-artifact output. No source checkout, app
-# dependency installation, build, migration or traffic promotion happens here.
+# dependency installation, build, bundling, migration or traffic promotion
+# happens here: `--no-bundle` keeps esbuild from resolving imports on this
+# credentialed host. Nitro's chunks are attached as additional modules from
+# under the entrypoint; without that, an app whose config does not set them
+# uploaded only its wasm and Cloudflare refused the version (10021, missing
+# chunks/nitro/nitro.mjs, stonx run 41325465240).
 # Caller grants: contents: read. Pass the existing per-app deployment persona
 # explicitly; never secrets: inherit. The artifact name binds SHA/run/attempt.
 on:
@@ -84,6 +89,8 @@ jobs:
         working-directory: ${{ runner.temp }}/${{ inputs.artifact }}
         run: |
           set -euo pipefail
+          # Wrangler reads a matching file through a symlink; the artifact carries none.
+          if [[ -n "$(find . -type l -print -quit)" ]]; then echo '::error::Production artifact contains a symlink'; exit 1; fi
           node <<'NODE'
           const fs = require('node:fs');
           const path = require('node:path');
@@ -95,10 +102,15 @@ jobs:
           const config = JSON.parse(fs.readFileSync('server/wrangler.json', 'utf8'));
           if (!config.main || config.build || config.env || config.configPath) throw new Error('Refusing custom build/env/configPath or missing entrypoint');
           const check = p => {
-            if (!fs.realpathSync(path.resolve('server', p)).startsWith(root + path.sep)) throw new Error('Config references a path outside the artifact');
+            const real = fs.realpathSync(path.resolve('server', p));
+            if (real !== root && !real.startsWith(root + path.sep)) throw new Error('Config references a path outside the artifact');
           };
           check(config.main);
           if (config.assets?.directory) check(config.assets.directory);
+          if (config.base_dir) check(config.base_dir);
+          // An app's own rules win; otherwise attach every Nitro .mjs chunk under the entrypoint.
+          const upload = {...config, find_additional_modules: true, rules: config.rules ?? [{type: 'ESModule', globs: ['**/*.mjs']}]};
+          fs.writeFileSync('server/.narduk-upload.wrangler.json', JSON.stringify(upload), {flag: 'wx'});
           NODE
 
       - name: Install pinned upload tool before exposing deployment credentials
@@ -122,7 +134,7 @@ jobs:
           WRANGLER_SEND_METRICS: 'false'
         run: |
           set -euo pipefail
-          wrangler versions upload --config server/wrangler.json --no-bundle \
+          wrangler versions upload --config server/.narduk-upload.wrangler.json --no-bundle \
             --tag "$GITHUB_SHA" --message "Runner upload $GITHUB_SHA"
           echo 'uploaded=true' >> "$GITHUB_OUTPUT"
 
