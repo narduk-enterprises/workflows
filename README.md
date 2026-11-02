@@ -1307,6 +1307,59 @@ Each workflow keeps its own "main is red: `<name>`" issue, opened by the first
 red run and closed by the next green one. A run cancelled by a newer merge is
 not a verdict and does nothing.
 
+#### Night-dispatched runs (the `nightly` input)
+
+GitHub fires `schedule:` crons 5-10 hours late, so the estate moves its nightly
+workflows to `workflow_dispatch` and a timer on ci-control (fleet
+`docs/night-dispatch.md`, `Config/night-dispatch.json`) starts them between
+22:00 and 05:00 Central. A dispatched run is not a scheduled run
+(`github.event_name` is `workflow_dispatch`), so the dispatcher marks its runs.
+**The signal is one workflow input, `nightly`, sent as `"true"` on every
+dispatch the night dispatcher makes.** A caller declares it and reads it:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      nightly:
+        description: Set by the estate night dispatcher; behave like the old schedule run
+        type: boolean
+        default: false
+
+jobs:
+  ci:
+    uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@<sha> # v2
+    with:
+      # The background tier takes scheduled and night-dispatched runs; the PR tier everything else.
+      runner: ${{ ((github.event_name == 'schedule' || github.event.inputs.nightly == 'true') && vars.CI_BACKGROUND_RUNNER) || '<the linux-ci route>' }}
+```
+
+Read it as `github.event.inputs.nightly == 'true'`, never `inputs.nightly == true`:
+`github.event.inputs` is the event payload, which a called workflow shares with
+its caller (a callable's `inputs` is its own, not the caller's), and the
+payload always holds a boolean input as the string `'true'`. Use the same
+expression for a schedule-only job (`if: github.event_name == 'schedule' ||
+github.event.inputs.nightly == 'true'`) and for a concurrency group that split
+on `schedule`. A manual dispatch leaves it `false`, so a person's run still
+lands on the PR tier; `gh workflow run <file> -f nightly=true` rehearses the
+night path.
+
+Why an input and not `github.actor`: the dispatcher's installation token belongs
+to the lane-automation App, which starts other runs too, and the dispatcher is
+due its own consumer; an input names the intent and survives that change. The
+cost is that GitHub refuses (HTTP 422) a dispatch that carries an input the
+workflow does not declare, so a workflow listed in the dispatcher's config
+declares `nightly` in the same change that removes its `schedule:`
+(agent-infrastructure `ci_quiet_hours_rollout.py --scope crons` does both).
+
+What the callables do with it: nothing new for the lanes (`workflow_dispatch`
+already takes the full E2E, a blocking `pnpm audit` and no path skips, as
+`schedule` does), and one thing on purpose: **`Prepare production artifact` and
+`cloudflare-version-upload.yml` skip a nightly run.** A nightly proves `main`
+and never ships it; without the guard a dispatched run on `main` would hand off
+and upload the same commit every night, which a scheduled run never did.
+`scripts/test_nightly_signal.py` pins both guards.
+
 #### Quality level (`quality-level`, `quality-opt-out`)
 
 The estate has web quality tools that gated nothing on most apps, because each

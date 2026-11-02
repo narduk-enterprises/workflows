@@ -43,6 +43,7 @@ jobs:
     if: >-
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.event.inputs.nightly != 'true' &&
       (github.event_name != 'push' || github.event.repository.full_name == github.repository)
     # Fleet resolver routes, group pinned. Unknown visibility fails closed.
     runs-on: ${{ fromJSON(toJSON(github.event.repository.private) == 'false' && '"ubuntu-latest"' || toJSON(github.event.repository.private) == 'true' && '{"group":"linux-deploy","labels":["self-hosted","Linux","X64","proxmox","proxmox-deploy"]}' || '"missing-repository-visibility-do-not-run"') }}

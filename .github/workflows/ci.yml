@@ -103,6 +103,11 @@ jobs:
       - name: Artifact budget contract
         run: python3 scripts/test_artifact_budget.py
 
+      # A night-dispatched run (the `nightly` input) hands nothing to production,
+      # as a scheduled run did not (README "Night-dispatched runs").
+      - name: Night-dispatch signal contract
+        run: python3 scripts/test_nightly_signal.py
+
       - name: Assert shellcheck is present
         run: |
           set -euo pipefail
