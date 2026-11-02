@@ -66,8 +66,10 @@ jobs:
           set -euo pipefail
           prefix="production-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-"
           [[ "$ARTIFACT" == "$prefix"* && "${ARTIFACT#"$prefix"}" =~ ^[0-9a-f]{12}$ ]]
-          if [[ -z "$CLOUDFLARE_API_TOKEN" || -z "$CLOUDFLARE_ACCOUNT_ID" ]]; then
-            echo '::warning::Runner upload NOT ARMED: per-app Cloudflare token or account ID is absent; no version uploaded.'
+          # The account ID is optional: without it Wrangler uses the generated
+          # config's account_id, which the verify step requires.
+          if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
+            echo '::warning::Runner upload NOT ARMED: the per-app Cloudflare token is absent; no version uploaded.'
             echo 'armed=false' >> "$GITHUB_OUTPUT"
           else
             echo 'armed=true' >> "$GITHUB_OUTPUT"
@@ -89,6 +91,8 @@ jobs:
         if: steps.armed.outputs.armed == 'true'
         shell: bash
         working-directory: ${{ runner.temp }}/${{ inputs.artifact }}
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           # Wrangler reads a matching file through a symlink; the artifact carries none.
@@ -107,6 +111,7 @@ jobs:
             const real = fs.realpathSync(path.resolve('server', p));
             if (real !== root && !real.startsWith(root + path.sep)) throw new Error('Config references a path outside the artifact');
           };
+          if (!process.env.CLOUDFLARE_ACCOUNT_ID && !/^[0-9a-f]{32}$/.test(config.account_id ?? '')) throw new Error('No CLOUDFLARE_ACCOUNT_ID secret and no account_id in the generated config');
           check(config.main);
           if (config.assets?.directory) check(config.assets.directory);
           if (config.base_dir) check(config.base_dir);
@@ -136,6 +141,7 @@ jobs:
           WRANGLER_SEND_METRICS: 'false'
         run: |
           set -euo pipefail
+          [[ -n "$CLOUDFLARE_ACCOUNT_ID" ]] || unset CLOUDFLARE_ACCOUNT_ID
           wrangler versions upload --config server/.narduk-upload.wrangler.json --no-bundle \
             --tag "$GITHUB_SHA" --message "Runner upload $GITHUB_SHA"
           echo 'uploaded=true' >> "$GITHUB_OUTPUT"

@@ -39,7 +39,7 @@ class ProductionUpload(unittest.TestCase):
         self.env = {**os.environ, 'OUTPUT_DIR': '.output', 'BUILD_SCRIPT': 'cf:build',
                     'GITHUB_EVENT_NAME': 'workflow_dispatch', 'GITHUB_SHA': 'a' * 40,
                     'GITHUB_REPOSITORY': 'narduk-enterprises/example', 'GITHUB_RUN_ID': '42',
-                    'GITHUB_RUN_ATTEMPT': '2', 'GITHUB_OUTPUT': str(self.root / 'outputs'),
+                    'GITHUB_RUN_ATTEMPT': '2', 'CLOUDFLARE_ACCOUNT_ID': 'b' * 32, 'GITHUB_OUTPUT': str(self.root / 'outputs'),
                     'GITHUB_EVENT_PATH': str(self.root / 'event.json')}
         (self.root / 'event.json').write_text('{}')
 
@@ -91,6 +91,12 @@ class ProductionUpload(unittest.TestCase):
         self.assertNotEqual(self.execute(VERIFY, self.output).returncode, 0)
         self.assertFalse(upload.exists())
 
+    def test_account_id_comes_from_the_secret_or_the_generated_config(self):
+        self.prepare()
+        self.assertNotEqual(self.execute(VERIFY, self.output, CLOUDFLARE_ACCOUNT_ID='').returncode, 0)
+        self.config.write_text(json.dumps({'main': 'index.mjs', 'account_id': 'a' * 32}))
+        self.assertEqual(self.execute(VERIFY, self.output, CLOUDFLARE_ACCOUNT_ID='').returncode, 0)
+
     def test_custom_build_or_external_paths_fail_closed(self):
         for config in ({'main': 'index.mjs', 'build': {'command': 'false'}},
                        {'main': '../../event.json'}, {'main': 'index.mjs', 'env': {'production': {}}}):
@@ -134,7 +140,11 @@ class ProductionUpload(unittest.TestCase):
 
     def test_missing_credential_warns_and_malformed_artifact_fails(self):
         artifact = self.prepare()
-        result = self.execute(ARM, ARTIFACT=artifact, CLOUDFLARE_API_TOKEN='', CLOUDFLARE_ACCOUNT_ID='')
+        result = self.execute(ARM, ARTIFACT=artifact, CLOUDFLARE_API_TOKEN='x', CLOUDFLARE_ACCOUNT_ID='')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('armed=true', (self.root / 'outputs').read_text())
+        (self.root / 'outputs').unlink()
+        result = self.execute(ARM, ARTIFACT=artifact, CLOUDFLARE_API_TOKEN='', CLOUDFLARE_ACCOUNT_ID='x')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('::warning::', result.stdout)
         self.assertIn('armed=false', (self.root / 'outputs').read_text())
