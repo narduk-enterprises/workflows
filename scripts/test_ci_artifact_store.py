@@ -323,14 +323,20 @@ def test_workflow_wiring() -> None:
             if "ci-artifact-store.cjs" in script:
                 assert step["uses"].startswith("actions/github-script@"), (job_id, step.get("name"))
                 earlier = [s.get("name") for s in steps[:index]]
-                # Required's copy of the key script runs on pull requests
-                # only, and returns before it would load the client.
+                # A pull-request-only copy of a key script returns before it
+                # would load the client; so does Required's minting copy of
+                # the Required key script (PROOF_MINT, workflows#244).
                 early_return = "if (context.eventName !== 'push') return;"
                 pull_request_only = (
                     "github.event_name == 'pull_request'" in step.get("if", "")
                     and early_return in script
                     and script.index(early_return) < script.index("ci-artifact-store.cjs"))
-                assert INSTALL in earlier or pull_request_only, (
+                mint_return = "if (process.env.PROOF_MINT === 'true' || "
+                mint_only = (
+                    (step.get("env") or {}).get("PROOF_MINT") == "true"
+                    and mint_return in script
+                    and script.index(mint_return) < script.index("ci-artifact-store.cjs"))
+                assert INSTALL in earlier or pull_request_only or mint_only, (
                     f"{job_id}/{step.get('name')} requires the client before installing it")
     assert secret_bindings == {
         ("reuse-plan", "Find equivalent successful PR Required proof"),

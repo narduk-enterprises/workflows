@@ -1304,6 +1304,103 @@ def test_required_reuse_lookup() -> None:
     print("PASS  Required reuse: same key on PR and push; only a completed successful same-repo PR run is reused")
 
 
+def test_scheduled_reuse() -> None:
+    """workflows#244: a scheduled or nightly run of the default branch reuses a
+    proof of its tree from the last 20 hours, and a full one mints its own."""
+    import datetime
+    on = {"required-reuse-pr-results": True}
+    plan_if = JOBS["reuse-plan"]["if"]
+    for event, ref, payload_inputs, want in [
+        ("schedule", "refs/heads/main", None, True),
+        ("workflow_dispatch", "refs/heads/main", {"nightly": "true"}, True),
+        ("workflow_dispatch", "refs/heads/main", None, False),
+        ("workflow_dispatch", "refs/heads/main", {"nightly": "false"}, False),
+        ("workflow_dispatch", "refs/heads/feature", {"nightly": "true"}, False),
+        ("push", "refs/heads/main", None, True),
+        ("push", "refs/heads/feature", None, False),
+        ("pull_request", "refs/pull/1/merge", None, False),
+    ]:
+        ctx = context(event, ref, inputs=on)
+        if payload_inputs is not None:
+            ctx["github"]["event"]["inputs"] = payload_inputs
+        assert ev(plan_if, ctx) is want, (event, ref, payload_inputs)
+        # Never beside the production handoff, on any event.
+        handoff = context(event, ref, inputs={**on, "production-output-directory": ".output"})
+        if payload_inputs is not None:
+            handoff["github"]["event"]["inputs"] = payload_inputs
+        assert ev(plan_if, handoff) is False, (event, "handoff")
+    # Required demands the plan exactly where it applies: one condition, two copies.
+    applies = step("required", "Require fast-path and journey-smoke lanes")["env"]["REUSE_APPLIES"]
+    assert applies.startswith("${{ ") and applies.endswith(" }}")
+    assert applies[4:-3] in plan_if, "REUSE_APPLIES drifted from Reuse plan's if:"
+
+    # The graph: a reused schedule skips every lane and Required passes on it.
+    full = {"run-e2e": True, "extra-gate-scripts": "lint", "fast-scripts": "lint", "e2e-shards": 2, **on}
+    state = simulate(JOBS, full, "schedule", "refs/heads/main", {"reuse-plan": {"reused": "true"}, **plan_outputs("false", "2")})
+    assert {j: state[j]["result"] for j in CI_LANES} == dict.fromkeys(CI_LANES, "skipped"), state
+    assert state["reuse-plan"]["result"] == "success"
+    for name, code, out in run_gates("required", state):
+        assert code == 0, (name, out)
+    # No proof: the full gate runs, as before.
+    state = simulate(JOBS, full, "schedule", "refs/heads/main", {"reuse-plan": {"reused": "false"}, **plan_outputs("false", "2")})
+    assert {"build", "checks", "extra-gate", "e2e"} <= {j for j in JOBS if state[j]["result"] == "success"}
+    for name, code, out in run_gates("required", state):
+        assert code == 0, (name, out)
+
+    lookup = next(s for s in JOBS["reuse-plan"]["steps"] if s.get("id") == "proof")["with"]["script"]
+    inputs = {**defaults(), **on}
+    now = datetime.datetime.now(datetime.timezone.utc)
+    iso = lambda hours: (now - datetime.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fresh = {"updated_at": iso(1)}
+    nightly = {"event": "workflow_dispatch", "payload": {"inputs": {"nightly": "true"}}}
+    scheduled = run_script(lookup, {"event": "schedule", "run": fresh}, inputs, "PROOF_INPUTS")
+    assert scheduled["outputs"]["reused"] == "true", scheduled
+    key = scheduled["outputs"]["key"]
+    assert run_script(lookup, {**nightly, "run": fresh}, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "true"
+    # A plain dispatch looks nothing up (its Reuse plan does not even run).
+    plain = run_script(lookup, {"event": "workflow_dispatch", "run": fresh}, inputs, "PROOF_INPUTS", install=False)
+    assert plain["outputs"] == {"reused": "false", "key": key} and plain["calls"] == [], plain
+    # Over a day old, or of unknown age: the scheduled run checks the tree in full.
+    # 20 hours, under a day: a reused run mints nothing, so a daily cron (or a
+    # nightly) 23 hours after its last full pass must run in full again.
+    assert run_script(lookup, {"event": "schedule", "run": {"updated_at": iso(19)}}, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "true"
+    for name, run in {"21 h": {"updated_at": iso(21)}, "a daily cron's 23 h": {"updated_at": iso(23)},
+                      "no completion time": {}}.items():
+        stale = run_script(lookup, {"event": "schedule", "run": run}, inputs, "PROOF_INPUTS")
+        assert stale["outputs"]["reused"] == "false", (name, stale)
+        assert any("over 20 h ago" in m for _, m in stale["log"]), (name, stale)
+    # A push keeps honouring a pull request's proof of any age, as before.
+    assert run_script(lookup, {"run": {"updated_at": iso(24 * 20)}}, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "true"
+    # A full scheduled or nightly pass of the default branch vouches; the same
+    # events off it, and a push run, never do.
+    for minter in ({"event": "schedule", "head_branch": "main"}, {"event": "workflow_dispatch", "head_branch": "main"}):
+        assert run_script(lookup, {"event": "schedule", "run": {**fresh, **minter}}, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "true", minter
+        assert run_script(lookup, {"run": {**fresh, **minter}}, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "true", minter
+    for refused in ({"event": "schedule", "head_branch": "feature"}, {"event": "workflow_dispatch", "head_branch": "feature"},
+                    {"event": "workflow_dispatch"}, {"event": "push", "head_branch": "main"}):
+        assert run_script(lookup, {"event": "schedule", "run": {**fresh, **refused}}, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "false", refused
+    # The store only: a scheduled run has no merged pull request to find on GitHub.
+    pr_run = {"id": 321, "run_attempt": 1, "event": "pull_request", "status": "completed", "conclusion": "success",
+              "path": ".github/workflows/ci.yml", "repository": {"id": 42}, "head_repository": {"id": 42},
+              "html_url": "https://example.test/run/321", "display_title": "Ship it", "head_commit": {"tree_id": "u" * 40}}
+    assert run_script(lookup, {"event": "schedule", "noCreds": True, "prRuns": [pr_run]}, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "false"
+    # Required's copy mints with the same key and looks nothing up, even on a schedule.
+    mint_step = step("required", "Compute Required proof key")
+    assert mint_step["env"]["PROOF_MINT"] == "true"
+    mint = test_e2e_reuse.run_github_script(lookup, {"event": "schedule"}, {
+        "CALLER_WORKFLOW_REF": "example/app/.github/workflows/ci.yml@refs/heads/main",
+        "PROOF_INPUTS": json.dumps(inputs), "PROOF_MINT": "true"}, install=False)
+    assert mint["outputs"] == {"reused": "false", "key": key} and mint["calls"] == [], mint
+    assert not [m for level, m in mint["log"] if level == "warning"], mint  # it never tried the store
+    mint_if = " ".join(mint_step["if"].split())
+    for guard in ("github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository",
+                  "(github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' && github.event.inputs.nightly == 'true') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
+                  "needs.build.outputs.audit-would-block != 'true'"):
+        assert guard in mint_if, guard
+    print("PASS  scheduled and nightly runs reuse a proof of their tree from the last 20 h and mint their own; "
+          "a plain dispatch, a stale proof or another branch's run never reuses")
+
+
 def test_e2e_proof_key_ignores_default_fast_path_inputs() -> None:
     script = next(s for s in JOBS["e2e-plan"]["steps"] if s.get("id") == "proof")["with"]["script"]
     legacy = {"e2e-args": "--project=web", "e2e-shards": 3}
@@ -1582,6 +1679,7 @@ def main() -> None:
     test_fast_escalation_is_published_on_the_check_named_fast()
     test_escalation_fails_closed_on_unknown_plan()
     test_required_reuse_lookup()
+    test_scheduled_reuse()
     test_e2e_proof_key_ignores_default_fast_path_inputs()
     test_only_changed()
     test_journey_smoke_verdicts()

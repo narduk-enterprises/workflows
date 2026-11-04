@@ -125,7 +125,9 @@ name: Reusable Nuxt + Cloudflare CI
 #                                   escalating to the full gate on protected
 #                                   paths (`e2e-full-paths`)
 #   required-reuse-pr-results    -> a default-branch push whose tree already
-#                                   passed the full PR gate skips every lane
+#                                   passed the full PR gate skips every lane;
+#                                   so does a scheduled or nightly run whose
+#                                   tree passed in full within 20 hours
 #   pr-fast-only                 -> a pull request that does not escalate
 #                                   runs only `Fast` (no Build, Checks, Extra
 #                                   gate, E2E, Preview, Deploy dry run or
@@ -137,8 +139,12 @@ name: Reusable Nuxt + Cloudflare CI
 #                                   called from the caller's promote workflow
 # NIGHTLY FULL E2E needs no input: a `schedule:` trigger on the caller's CI
 # workflow already takes the full configuration, because path skips, the PR
-# subset, `--only-changed` and both proof reuses apply only to pull requests
-# and pushes. For example, in the caller's ci.yml:
+# subset, `--only-changed` and the E2E proof reuse apply only to pull requests
+# and pushes. The Required proof reuse (`required-reuse-pr-results`) also
+# applies to a scheduled or nightly run of the default branch (workflows#244):
+# when a full pass of the same tree, workflow and inputs finished within 20
+# hours, the run finishes on it and E2E, quarantine included, does not run
+# again. For example, in the caller's ci.yml:
 #   on: { schedule: [{ cron: "17 8 * * *" }] }   # 08:17 UTC = 3:17 AM CT
 # alongside its push/pull_request triggers, with the same `ci:` job. The
 # quarantine lane (`e2e-quarantine-args`) runs there too.
@@ -1107,6 +1113,17 @@ on:
           2026-10-30: a push repeats a check only when its tree, caller
           workflow or inputs differ from a green pull request's. Set false for
           a gate whose behaviour intentionally differs between PR and push.
+          SCHEDULED AND NIGHTLY RUNS (workflows#244): a `schedule` run, or a
+          `workflow_dispatch` with `nightly: true`, of the default branch looks
+          the same key up too, from the store only (no GitHub fallback). It
+          honours a pull request's proof, or one a full scheduled or nightly
+          pass of the default branch minted (they mint as a pull request
+          does), only when that run finished within the last 20 hours. So a
+          reused scheduled run always rests on a full pass, blocking
+          dependency audit included, under 20 hours old (a pull request mints
+          only when its audit would not have blocked). Full scheduled passes
+          of a daily cron can still be up to about 44 hours apart when a pull
+          request's pass falls between them.
         required: false
         type: boolean
         default: true
@@ -1284,7 +1301,7 @@ jobs:
       group: workflows-nuxt-cloudflare-reuse-plan-${{ github.workflow }}-${{ inputs.working-directory }}-${{ inputs.ci-concurrency-key }}-${{ (github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '') && github.event.pull_request.number || format('{0}-{1}', github.run_id, github.run_attempt) }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' && inputs.mode != 'e2e' && inputs.journey-smoke-url == '' && inputs.expected-candidate-sha == '' }}
     name: Reuse plan
-    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.production-output-directory == '' && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))"
+    if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && (inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.production-output-directory == '' && inputs.journey-smoke-url == '' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' && github.event.inputs.nightly == 'true') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))"
     runs-on: ${{ fromJSON(toJSON(github.event.repository.private) != 'true' && toJSON(github.event.repository.private) != 'false' && '"missing-repository-visibility-do-not-run"' || (toJSON(github.event.repository.private) == 'false' && '"ubuntu-latest"' || ((toJSON(github.event.repository.private) == 'false' || inputs.lightweight-runner == '"self-hosted"' || startsWith(inputs.lightweight-runner, '[') && contains(fromJSON(inputs.lightweight-runner || '[]'), 'self-hosted') || startsWith(inputs.lightweight-runner, '{') && (fromJSON(inputs.lightweight-runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.lightweight-runner || '[]').labels), '[') && contains(fromJSON(inputs.lightweight-runner || '[]').labels, 'self-hosted')) || startsWith(inputs.lightweight-runner, '"blacksmith-')) && inputs.lightweight-runner) || ((toJSON(github.event.repository.private) == 'false' || vars.CI_LIGHTWEIGHT_RUNNER == '"self-hosted"' || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]'), 'self-hosted') || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '{') && (fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels), '[') && contains(fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '[]').labels, 'self-hosted')) || startsWith(vars.CI_LIGHTWEIGHT_RUNNER, '"blacksmith-')) && (vars.CI_LIGHTWEIGHT_RUNNER == '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' && ((github.event_name == 'schedule' || github.event.inputs.nightly == 'true' || github.event.pull_request.draft == true || github.event.pull_request.user.login == 'dependabot[bot]' || github.event.pull_request.user.login == 'narduk-lane-automation[bot]') && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci-background"]}' || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || vars.CI_LIGHTWEIGHT_RUNNER)) || (github.event.repository.private == true && vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && (inputs.runner == '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' && ((github.event_name == 'schedule' || github.event.inputs.nightly == 'true' || github.event.pull_request.draft == true || github.event.pull_request.user.login == 'dependabot[bot]' || github.event.pull_request.user.login == 'narduk-lane-automation[bot]') && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci-background"]}' || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || inputs.runner)) || toJSON(github.event.repository.private) != 'false' && ((github.event_name == 'schedule' || github.event.inputs.nightly == 'true' || github.event.pull_request.draft == true || github.event.pull_request.user.login == 'dependabot[bot]' || github.event.pull_request.user.login == 'narduk-lane-automation[bot]') && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci-background"]}' || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"') != '"ubuntu-latest"' && format('"{0}"', startsWith(vars.BLACKSMITH_LINUX_LABEL, 'blacksmith-') && vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || (((toJSON(github.event.repository.private) == 'false' || inputs.runner == '"self-hosted"' || startsWith(inputs.runner, '[') && contains(fromJSON(inputs.runner || '[]'), 'self-hosted') || startsWith(inputs.runner, '{') && (fromJSON(inputs.runner || '[]').labels == 'self-hosted' || startsWith(toJSON(fromJSON(inputs.runner || '[]').labels), '[') && contains(fromJSON(inputs.runner || '[]').labels, 'self-hosted')) || startsWith(inputs.runner, '"blacksmith-')) && (inputs.runner == '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}' && ((github.event_name == 'schedule' || github.event.inputs.nightly == 'true' || github.event.pull_request.draft == true || github.event.pull_request.user.login == 'dependabot[bot]' || github.event.pull_request.user.login == 'narduk-lane-automation[bot]') && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci-background"]}' || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || inputs.runner)) || toJSON(github.event.repository.private) != 'false' && ((github.event_name == 'schedule' || github.event.inputs.nightly == 'true' || github.event.pull_request.draft == true || github.event.pull_request.user.login == 'dependabot[bot]' || github.event.pull_request.user.login == 'narduk-lane-automation[bot]') && '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci-background"]}' || '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}') || '"ubuntu-latest"')))) }}
     # Headroom for the linux-ci capacity-hook slot wait (up to 900s) -- fleet#276.
     timeout-minutes: 20
@@ -1321,7 +1338,9 @@ jobs:
       #     Build signed, so browser guests never hold the secret access key.
       #   - A proof object is only a pointer to a run. It is honoured only when
       #     GitHub's API reports that run as this repository's completed,
-      #     successful pull-request run of the same caller workflow, on the
+      #     successful pull-request run (or, for the Required proof, scheduled
+      #     or nightly run of the default branch: workflows#244) of the same
+      #     caller workflow, on the
       #     attempt that wrote the pointer, whose Required job ran the publish
       #     step carrying this exact key in its NAME. The key is unchanged:
       #     the digest of the tested Git tree, the caller workflow and every
@@ -1359,8 +1378,9 @@ jobs:
           //     run's Build job reported through job outputs, or the E2E job fails;
           //   - a proof object is only a POINTER to a run. It is honoured only when
           //     GitHub reports that run as this repository's successful pull-request
-          //     run of the same caller workflow, whose Required job ran the publish
-          //     step carrying this exact key in its name.
+          //     run (or scheduled or nightly run of the default branch) of the same
+          //     caller workflow, whose Required job ran the publish step carrying
+          //     this exact key in its name.
           // A missing, unreadable or unconfirmed object means "run it": the gate runs
           // in full and E2E builds its own application. Nothing here can turn a check
           // green on its own.
@@ -1381,6 +1401,10 @@ jobs:
           const TRANSFER_TIMEOUT_MS = 120 * 1000;
           const TRANSFER_ATTEMPTS = 3;
           const POINTER_SCHEMA = 'narduk-ci-proof-pointer-v1';
+          // A scheduled or nightly run reuses only a proof this young (workflows#244).
+          // Under a day on purpose: a reused run mints nothing, so with 24 h a daily
+          // cron would reuse yesterday's pass and run in full only every other day.
+          const SCHEDULED_PROOF_MAX_AGE_MS = 20 * 60 * 60 * 1000;
           const PROOF_STEP = { required: 'Publish Required proof', e2e: 'Publish full E2E proof' };
           const PROOF_KEY = { required: /^required-proof-v1-[0-9a-f]{64}$/, e2e: /^e2e-proof-v1-[0-9a-f]{64}$/ };
           const SEGMENT = /^[A-Za-z0-9._-]+$/;
@@ -1815,7 +1839,7 @@ jobs:
           }
 
           // Returns { found: true, run } only when GitHub itself confirms the pointer.
-          async function findProof({ github, context, kind, key, workflowPath, env = process.env }) {
+          async function findProof({ github, context, kind, key, workflowPath, scheduled = false, now = Date.now(), env = process.env }) {
             const cfg = storeConfig(env);
             if (!cfg) return { found: false, reason: 'no CI artifact store credentials in this run' };
             const repositoryId = context.payload.repository.id;
@@ -1835,9 +1859,18 @@ jobs:
               return { found: false, reason: `${objectKey} does not describe this key and repository` };
             }
             const { data: run } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: pointer.run_id, request: { timeout: 10000 } });
-            if (run.id !== pointer.run_id || run.event !== 'pull_request' || run.status !== 'completed' || run.conclusion !== 'success'
+            // A pull request mints proof; so does a scheduled or nightly run of the
+            // default branch (workflows#244), which runs that branch's own workflow.
+            const minter = run.event === 'pull_request'
+              || (['schedule', 'workflow_dispatch'].includes(run.event) && run.head_branch === context.payload.repository?.default_branch);
+            if (run.id !== pointer.run_id || !minter || run.status !== 'completed' || run.conclusion !== 'success'
                 || run.path !== workflowPath || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) {
-              return { found: false, reason: `run ${pointer.run_id} is not a successful same-repository pull-request run of ${workflowPath}` };
+              return { found: false, reason: `run ${pointer.run_id} is not a successful same-repository pull-request run (or scheduled or nightly run of the default branch) of ${workflowPath}` };
+            }
+            // Advisories, registries and toolchains move without the tree: a
+            // scheduled check reuses only a pass from the last 20 hours.
+            if (scheduled && !(now - Date.parse(run.updated_at) < SCHEDULED_PROOF_MAX_AGE_MS)) {
+              return { found: false, reason: `run ${run.id} finished over 20 h ago, and a scheduled run checks an unchanged tree in full at least daily` };
             }
             // A rerun must publish fresh proof, not inherit an older attempt's.
             if (run.run_attempt !== pointer.run_attempt) {
@@ -1922,7 +1955,7 @@ jobs:
           }
 
           module.exports = {
-            BUCKET, PRESIGN_SECONDS, TRANSFER_TIMEOUT_MS, TRANSFER_ATTEMPTS, PROOF_STEP, IntegrityError,
+            BUCKET, PRESIGN_SECONDS, TRANSFER_TIMEOUT_MS, TRANSFER_ATTEMPTS, PROOF_STEP, SCHEDULED_PROOF_MAX_AGE_MS, IntegrityError,
             sha256Hex, amzDate, canonicalUri, canonicalQuery, sign, presign, presignedUrl,
             storeConfig, endpoint, repositoryOf, assertKey, prebuiltKey, proofObjectKey,
             putObject, getObject, deleteObject,
@@ -1963,12 +1996,18 @@ jobs:
               const digest = createHash('sha256').update(JSON.stringify({ tree, workflow, inputs: canonicalInputs })).digest('hex');
               const key = `required-proof-v1-${digest}`;
               core.setOutput('key', key);
-              if (context.eventName !== 'push') return;
+              // A push reuses the pull request that tested its tree. A scheduled
+              // or nightly run on the default branch reuses a proof of its tree
+              // from the last 20 hours (workflows#244). Required mints with this same
+              // text (PROOF_MINT) and looks nothing up.
+              const scheduled = context.eventName === 'schedule'
+                || (context.eventName === 'workflow_dispatch' && String(context.payload.inputs?.nightly) === 'true');
+              if (process.env.PROOF_MINT === 'true' || (context.eventName !== 'push' && !scheduled)) return;
               // A pointer in the CI artifact store, honoured only once GitHub
               // confirms the run it names (THE CI ARTIFACT STORE, above).
               // Bounded; an absent proof costs a run, never coverage.
               const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
-              let proof = await store.findProof({ github, context, kind: 'required', key, workflowPath });
+              let proof = await store.findProof({ github, context, kind: 'required', key, workflowPath, scheduled });
               // No pointer (no store credentials, another org, no pointer stored;
               // a store error throws and runs the full gate):
               // GitHub's own record of the merged pull request's run.
@@ -7229,7 +7268,7 @@ jobs:
       - name: Require fast-path and journey-smoke lanes
         if: "needs.ci-admission.outputs.skip != 'true'"
         env:
-          REUSE_APPLIES: ${{ inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.production-output-directory == '' && inputs.journey-smoke-url == '' && github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          REUSE_APPLIES: ${{ inputs.mode != 'e2e' && inputs.required-reuse-pr-results && inputs.production-output-directory == '' && inputs.journey-smoke-url == '' && (github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' && github.event.inputs.nightly == 'true') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
           REUSE_PLAN_RESULT: ${{ needs.reuse-plan.result }}
           FAST_RESULT: ${{ needs.fast.result }}
           FAST_ESCALABLE_RESULT: ${{ needs.fast-escalable.result }}
@@ -7380,7 +7419,8 @@ jobs:
         if: "needs.ci-admission.outputs.skip != 'true' && (!cancelled() && inputs.mode != 'e2e')"
         run: *caller_lint_audit
       # `required-reuse-pr-results` proof: minted only on a same-repository
-      # pull request whose Required passed with every enabled lane RUN, and
+      # pull request, or a scheduled or nightly run of the default branch
+      # (workflows#244), whose Required passed with every enabled lane RUN, and
       # E2E (when enabled) at its full configuration -- never a path skip, the
       # PR subset or `--only-changed`. The key is computed by the same anchored
       # script `Reuse plan` runs on the push.
@@ -7390,17 +7430,19 @@ jobs:
         # E2E because `CI_E2E_IN_CI` was false must mint no proof, or the
         # variable's later removal (rollback) or a repo override would let the
         # push reuse it and turn main green without E2E ever having run.
-        if: "needs.ci-admission.outputs.skip != 'true' && (success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.build.result == 'success' && needs.build.outputs.audit-would-block != 'true' && (needs.checks.result == 'success' || (inputs.checks-in-build && needs.checks.result == 'skipped')) && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards)))"
+        if: "needs.ci-admission.outputs.skip != 'true' && (success() && inputs.required-reuse-pr-results && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository || (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' && github.event.inputs.nightly == 'true') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) && needs.build.result == 'success' && needs.build.outputs.audit-would-block != 'true' && (needs.checks.result == 'success' || (inputs.checks-in-build && needs.checks.result == 'skipped')) && (!inputs.run-e2e || (needs.e2e.result == 'success' && needs.e2e-plan.outputs.e2e-args == inputs.e2e-args && fromJSON(needs.e2e-plan.outputs.shard-total || '0') == inputs.e2e-shards)))"
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
           PROOF_INPUTS: ${{ toJSON(inputs) }}
+          PROOF_MINT: 'true'
         with:
           script: *required_proof_script
       # Both proofs below are pointers in the CI artifact store (see THE CI
-      # ARTIFACT STORE at `reuse-plan`), written only on a pull request.
+      # ARTIFACT STORE at `reuse-plan`), written on a pull request; the
+      # Required proof also on a scheduled or nightly run (workflows#244).
       - name: Install CI artifact store client
-        if: "needs.ci-admission.outputs.skip != 'true' && (success() && github.event_name == 'pull_request')"
+        if: "needs.ci-admission.outputs.skip != 'true' && (success() && (github.event_name == 'pull_request' || steps.required-key.outputs.key != ''))"
         run: *install_ci_artifact_store
       # The step NAME carries the key on purpose. GitHub's jobs API reports
       # it, and the push honours a stored pointer only when the run it names

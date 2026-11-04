@@ -705,6 +705,38 @@ const keyOf = (p, t) => p.tasks.find(x => x.task === t).key;
     assert.equal(tg.mergedPull('Fix it'), null);
   });
 
+  await test('whole run: a scheduled or nightly run also weighs the branch\'s earlier scheduled and dispatched runs (workflows#244)', async () => {
+    const want = 'd'.repeat(64);
+    const run = (id, event) => ({ id, event, run_attempt: 1, path: '.github/workflows/ci.yml', head_sha: 'h'.repeat(40), html_url: `https://x/${id}`, repository: { id: repoId }, head_repository: { id: repoId } });
+    const gh = only => {
+      const list = [];
+      return { list, paginate: async (fn, args) => (await fn(args)).data, rest: {
+        actions: {
+          listWorkflowRuns: async params => { list.push(params); return { data: { workflow_runs: params.event === only ? [run(70, only)] : [] } }; },
+          listJobsForWorkflowRunAttempt: async () => ({ data: [{ id: 7, name: 'ci / Required', conclusion: 'success', steps: [{ name: `${tg.VERDICT_STEP} ${want}`, conclusion: 'success' }] }] }),
+          downloadJobLogsForWorkflowRun: async () => ({ data: header() }),
+        },
+        repos: { getContent: async () => ({ data: { sha: 'f'.repeat(40) } }) },
+      } };
+    };
+    // A schedule payload carries no head_commit and no pull request.
+    const ctx = eventName => ({ repo: { owner: 'narduk-enterprises', repo: 'app' }, payload: { repository: { id: repoId } }, ref: 'refs/heads/main', runId: 99, eventName, sha: 'c'.repeat(40) });
+    const find = (g, eventName) => tg.findRunAttestation({ github: g, context: ctx(eventName), digests: [want], workflowPath: '.github/workflows/ci.yml', callerBlob: 'f'.repeat(40), callable: SHA, sleep: async () => {} });
+    for (const eventName of ['schedule', 'workflow_dispatch']) {
+      for (const source of ['schedule', 'workflow_dispatch', 'push']) {
+        const g = gh(source);
+        const hit = await find(g, eventName);
+        assert.equal(hit.found, true, `${eventName} reuses an earlier ${source} run`);
+        assert.equal(hit.run.id, 70);
+        assert.ok(['schedule', 'workflow_dispatch'].every(event => g.list.some(p => p.event === event && p.branch === 'main')), JSON.stringify(g.list));
+      }
+    }
+    // A push weighs pull requests and pushes only, as before.
+    const g = gh('schedule');
+    assert.equal((await find(g, 'push')).found, false, 'a push never weighs a scheduled run');
+    assert.ok(!g.list.some(p => ['schedule', 'workflow_dispatch'].includes(p.event)), JSON.stringify(g.list));
+  });
+
   await test('proof: a publish step the jobs API has not listed yet is read again', async () => {
     let n = 0;
     const g = fakeGithub();
