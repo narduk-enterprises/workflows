@@ -508,7 +508,14 @@ validation. **Re-run failed jobs** preserves the succeeded admission job's draft
 outputs and leaves validation deferred. For automatic recovery on marking ready,
 callers must explicitly include `ready_for_review` in `pull_request.types` along
 with their other desired activity types; the default types do not receive it.
-A full rerun bypasses draft deferral even though its event payload still says draft.
+A full rerun replays the original event payload, so it still says draft: admission
+then reads the pull request's live state (workflows#243). Readied since, the rerun
+validates; still a draft, it stays deferred. Only `nuxt-cloudflare.yml`'s admission
+job holds `pull-requests: read` (inside the `pull-requests: write` its callers
+already grant `preview`). The other callables' callers grant no `pull-requests`
+scope, so on a private repository the read is refused and a full rerun validates
+as it always did; on a public one the read needs no grant and a draft stays
+deferred.
 
 Title/body edits run normal validation when the caller subscribes to `edited`.
 Admission does not reuse earlier successful runs: a workflow run's
