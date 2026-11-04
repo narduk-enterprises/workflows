@@ -285,6 +285,32 @@ until onboarding, it does not justify a hosted override.
 expressions against hosted inputs, variable overrides, public/private/unknown
 visibility, valid fleet and Blacksmith values, and conditional job routes.
 
+### Route by event (`nuxt-cloudflare.yml`, `taskgraph.yml`)
+
+These two callables pick the tier for the **default** linux-ci route from the
+event, so the background tier (`linux-ci-background`, CT 215 aus1-ci-1) takes
+the work nobody is waiting on, with no caller opt-in and no variable
+(workflows#241):
+
+| Event | Route |
+|---|---|
+| `schedule`; `workflow_dispatch` with `nightly` (`github.event.inputs.nightly == 'true'`); a pull request that is a draft or was opened by `dependabot[bot]` or `narduk-lane-automation[bot]` | `{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci-background"]}` |
+| everything else (push, a ready human pull request, a manual dispatch) | `{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}` |
+
+Both literals are fleet `python3 scripts/github_runner_fleet.py route
+--workload linux-ci-background` / `--workload linux-ci` output, copied
+verbatim. "The default route" is any of: an empty `runner`, `runner` set to
+the plain linux-ci route above, byte for byte (what generated callers and the hand
+`CI_BACKGROUND_RUNNER` expressions pass), or the org `CI_LIGHTWEIGHT_RUNNER`
+holding it. Anything else keeps precedence on every event: another explicit
+fleet route (including a caller's own background route), a set
+`vars.CI_LINUX_RUNNER`, `lightweight-runner`, `e2e-runner`, and Blacksmith.
+A deploy build (`production-output-directory` set) stays on linux-ci. An
+interactive event resolves exactly as before; `scripts/test_runner_default.py`
+(`check_event_routing`) pins both halves. The draft is read from the event
+payload, so marking a draft ready runs on linux-ci only if the caller's
+`pull_request` types include `ready_for_review`.
+
 ### Blacksmith overflow (`BLACKSMITH_RUNNERS_ENABLED`)
 
 D-CI-CAP-1 (c) (2026-09-07, extends D-BLACKSMITH-2; Operator Portal decision log,
@@ -1329,10 +1355,11 @@ on:
 jobs:
   ci:
     uses: narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml@<sha> # v2
-    with:
-      # The background tier takes scheduled and night-dispatched runs; the PR tier everything else.
-      runner: ${{ ((github.event_name == 'schedule' || github.event.inputs.nightly == 'true') && vars.CI_BACKGROUND_RUNNER) || '<the linux-ci route>' }}
 ```
+
+The callable sends a nightly run to the background tier itself ("Route by
+event" above), so the caller needs no `runner:` expression for it; an older
+caller's `vars.CI_BACKGROUND_RUNNER` expression still works.
 
 Read it as `github.event.inputs.nightly == 'true'`, never `inputs.nightly == true`:
 `github.event.inputs` is the event payload, which a called workflow shares with
