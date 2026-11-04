@@ -410,6 +410,7 @@ def check_event_routing() -> None:
         ("nuxt-cloudflare.yml", "build", {"production-output-directory": ".output"}, org, "schedule", {}, fg),
         # vars.CI_LINUX_RUNNER keeps precedence where it is set.
         ("nuxt-cloudflare.yml", "build", {}, {"CI_LINUX_RUNNER": OTHER_FLEET}, "schedule", {}, json.loads(OTHER_FLEET)),
+        ("taskgraph.yml", "tasks", {}, {"CI_LINUX_RUNNER": LINUX_CI}, "schedule", {}, fg),
         ("nuxt-cloudflare.yml", "required", {}, org, "pull_request", pr("narduk-lane-automation[bot]"), bg),
     ]
     for filename, jid, inputs, variables, event_name, payload, wanted in cases:

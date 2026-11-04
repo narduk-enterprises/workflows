@@ -300,7 +300,7 @@ the work nobody is waiting on, with no caller opt-in and no variable
 Both literals are fleet `python3 scripts/github_runner_fleet.py route
 --workload linux-ci-background` / `--workload linux-ci` output, copied
 verbatim. "The default route" is any of: an empty `runner`, `runner` set to
-the plain linux-ci route above (what generated callers and the hand
+the plain linux-ci route above, byte for byte (what generated callers and the hand
 `CI_BACKGROUND_RUNNER` expressions pass), or the org `CI_LIGHTWEIGHT_RUNNER`
 holding it. Anything else keeps precedence on every event: another explicit
 fleet route (including a caller's own background route), a set
