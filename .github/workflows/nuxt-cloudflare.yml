@@ -139,8 +139,12 @@ name: Reusable Nuxt + Cloudflare CI
 #                                   called from the caller's promote workflow
 # NIGHTLY FULL E2E needs no input: a `schedule:` trigger on the caller's CI
 # workflow already takes the full configuration, because path skips, the PR
-# subset, `--only-changed` and both proof reuses apply only to pull requests
-# and pushes. For example, in the caller's ci.yml:
+# subset, `--only-changed` and the E2E proof reuse apply only to pull requests
+# and pushes. The Required proof reuse (`required-reuse-pr-results`) also
+# applies to a scheduled or nightly run of the default branch (workflows#244):
+# when a full pass of the same tree, workflow and inputs finished within 20
+# hours, the run finishes on it and E2E, quarantine included, does not run
+# again. For example, in the caller's ci.yml:
 #   on: { schedule: [{ cron: "17 8 * * *" }] }   # 08:17 UTC = 3:17 AM CT
 # alongside its push/pull_request triggers, with the same `ci:` job. The
 # quarantine lane (`e2e-quarantine-args`) runs there too.
@@ -1114,11 +1118,12 @@ on:
           the same key up too, from the store only (no GitHub fallback). It
           honours a pull request's proof, or one a full scheduled or nightly
           pass of the default branch minted (they mint as a pull request
-          does), only when that run finished within the last 20 hours. An
-          unchanged tree therefore still runs in full, blocking dependency
-          audit included, at least once a day (a daily cron or nightly every
-          time; a 4-hourly one about every 20 hours), and the runs between
-          finish on the proof.
+          does), only when that run finished within the last 20 hours. So a
+          reused scheduled run always rests on a full pass, blocking
+          dependency audit included, under 20 hours old (a pull request mints
+          only when its audit would not have blocked). Full scheduled passes
+          of a daily cron can still be up to about 44 hours apart when a pull
+          request's pass falls between them.
         required: false
         type: boolean
         default: true
@@ -1333,7 +1338,9 @@ jobs:
       #     Build signed, so browser guests never hold the secret access key.
       #   - A proof object is only a pointer to a run. It is honoured only when
       #     GitHub's API reports that run as this repository's completed,
-      #     successful pull-request run of the same caller workflow, on the
+      #     successful pull-request run (or, for the Required proof, scheduled
+      #     or nightly run of the default branch: workflows#244) of the same
+      #     caller workflow, on the
       #     attempt that wrote the pointer, whose Required job ran the publish
       #     step carrying this exact key in its NAME. The key is unchanged:
       #     the digest of the tested Git tree, the caller workflow and every

@@ -1786,19 +1786,24 @@ with `nightly: true` (README "Night-dispatched runs"), looks the same key up:
 the tree, the caller workflow and every input. A full scheduled or nightly pass
 mints a proof as a green pull request does, so the next scheduled run on that
 tree finishes on it. Such a run honours a proof only when the run behind it
-finished within the last 20 hours, so an unchanged tree still runs in full,
-blocking dependency audit included, at least once a day. That is every run of
-a daily cron or nightly, and about one run in five of a 4-hourly cron. The cap
-is under a day because a reused run mints nothing: with 24 hours, a daily run
-would reuse yesterday's pass and run in full only every other day. The lookup reads the CI
+finished within the last 20 hours. So a reused scheduled run always rests on a
+full pass, blocking dependency audit included, under 20 hours old: a pull
+request mints only when its audit would not have blocked. On an unchanged tree,
+a 4-hourly cron runs in full about one run in five. A daily cron or nightly runs
+in full unless a pull request's pass of the same tree came less than 20 hours
+before it, so its own full passes can be up to about 44 hours apart. The cap is
+under a day because a reused run mints nothing: with 24 hours, a daily run
+would reuse its own pass from the day before and run in full only every other
+day. This cap is `nuxt-cloudflare.yml`'s; taskgraph's whole-run reuse has none
+(see `reuse` below). The lookup reads the CI
 artifact store only; without its secrets every scheduled run runs in full.
 Not covered:
 - `mode: e2e` callers, such as an `e2e.yml` schedule, which run no `Reuse plan`;
 - a plain `workflow_dispatch`, which always runs in full;
 - an input that differs by event, which gives a different key.
 
-A caller that wants every scheduled run in full passes
-`required-reuse-pr-results: ${{ github.event_name != 'schedule' }}`.
+A caller that wants every scheduled and nightly run in full passes
+`required-reuse-pr-results: ${{ github.event_name != 'schedule' && github.event.inputs.nightly != 'true' }}`.
 
 **Permission migration:** adopting this revision requires `actions: read` on
 all Nuxt callable `ci` jobs, even if E2E is disabled. GitHub validates the
@@ -2403,7 +2408,9 @@ kills), capped at one slot per 3 GiB. The run's timing annotation reports
 what was detected. `reuse: false` runs every task, for a scheduled full
 check, and still records the passes. With `reuse` on, a scheduled or
 dispatched run also honours the whole-run pass of the branch's earlier
-scheduled and dispatched runs, as well as its pushes (workflows#244).
+scheduled and dispatched runs, as well as its pushes (workflows#244). It
+applies no age cap: a caller that wants a periodic full check passes
+`reuse: false` on that event.
 
 Tag a heavy task (a Nuxt build, `vue-tsc`, a full ESLint, a large unit
 suite) `ci:machine` so it gets a seat of its own. Leave light checks untagged
