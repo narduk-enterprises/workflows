@@ -107,19 +107,24 @@ def check_seeded_escalation_is_rejected() -> None:
 
 
 def check_preview_is_the_only_pull_requests_job() -> None:
-    """`pull-requests: write` is the sticky comment's grant, and only its."""
+    """`pull-requests: write` is the sticky comment's grant, and only its.
+
+    The one other holder is `CI admission`, at `read`, to read a re-run's live
+    draft state (workflows#243). It is inside the same caller grant `preview`
+    already requires, so it cannot reintroduce workflows#59. Anything else is
+    refused.
+    """
     doc = yaml.safe_load((WORKFLOWS / "nuxt-cloudflare.yml").read_text())
     holders = {
-        job_id
+        job_id: job["permissions"]["pull-requests"]
         for job_id, job in doc["jobs"].items()
         if isinstance(job, dict) and "pull-requests" in (job.get("permissions") or {})
     }
-    assert holders == {"preview"}, (
-        "only the `preview` job may hold the widened `pull-requests` grant; "
-        f"found {sorted(holders)}"
+    assert holders == {"preview": "write", "ci-admission": "read"}, (
+        "only `preview` (write) and `ci-admission` (read) may hold the widened "
+        f"`pull-requests` grant; found {holders}"
     )
-    assert doc["jobs"]["preview"]["permissions"]["pull-requests"] == "write"
-    print("PASS  only nuxt-cloudflare.yml's `preview` job holds `pull-requests: write`")
+    print("PASS  nuxt-cloudflare.yml: only `preview` writes and only `ci-admission` reads `pull-requests`")
 
 
 # D-PORTAL-APP-CONFIG-1: jobs that run narduk-app or caller-supplied package

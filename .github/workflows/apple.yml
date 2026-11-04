@@ -251,8 +251,19 @@ jobs:
             core.setOutput('reason', 'validate');
             const pr = context.payload.pull_request;
             if (context.eventName !== 'pull_request' || !pr) return;
-            if (Number(process.env.GITHUB_RUN_ATTEMPT || '1') > 1) return;
             if (pr.draft) {
+              // A re-run replays the original payload, so a PR readied since
+              // still reads draft here: ask GitHub for its live state (workflows#243).
+              // An unreadable state validates, as a re-run always did.
+              if (Number(process.env.GITHUB_RUN_ATTEMPT || '1') > 1) {
+                try {
+                  const { data } = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number });
+                  if (!data.draft) return;
+                } catch (error) {
+                  core.notice(`Re-run validates: the pull request's draft state is unreadable (${error.status || error.message}).`);
+                  return;
+                }
+              }
               core.setOutput('skip', 'true');
               core.setOutput('reason', 'draft');
               return;
