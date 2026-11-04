@@ -1306,7 +1306,7 @@ def test_required_reuse_lookup() -> None:
 
 def test_scheduled_reuse() -> None:
     """workflows#244: a scheduled or nightly run of the default branch reuses a
-    proof of its tree from the last day, and a full one mints its own."""
+    proof of its tree from the last 20 hours, and a full one mints its own."""
     import datetime
     on = {"required-reuse-pr-results": True}
     plan_if = JOBS["reuse-plan"]["if"]
@@ -1361,10 +1361,14 @@ def test_scheduled_reuse() -> None:
     plain = run_script(lookup, {"event": "workflow_dispatch", "run": fresh}, inputs, "PROOF_INPUTS", install=False)
     assert plain["outputs"] == {"reused": "false", "key": key} and plain["calls"] == [], plain
     # Over a day old, or of unknown age: the scheduled run checks the tree in full.
-    for name, run in {"stale": {"updated_at": iso(25)}, "no completion time": {}}.items():
+    # 20 hours, under a day: a reused run mints nothing, so a daily cron (or a
+    # nightly) 23 hours after its last full pass must run in full again.
+    assert run_script(lookup, {"event": "schedule", "run": {"updated_at": iso(19)}}, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "true"
+    for name, run in {"21 h": {"updated_at": iso(21)}, "a daily cron's 23 h": {"updated_at": iso(23)},
+                      "no completion time": {}}.items():
         stale = run_script(lookup, {"event": "schedule", "run": run}, inputs, "PROOF_INPUTS")
         assert stale["outputs"]["reused"] == "false", (name, stale)
-        assert any("over 24 h ago" in m for _, m in stale["log"]) or name != "stale", stale
+        assert any("over 20 h ago" in m for _, m in stale["log"]), (name, stale)
     # A push keeps honouring a pull request's proof of any age, as before.
     assert run_script(lookup, {"run": {"updated_at": iso(24 * 20)}}, inputs, "PROOF_INPUTS")["outputs"]["reused"] == "true"
     # A full scheduled or nightly pass of the default branch vouches; the same
@@ -1393,7 +1397,7 @@ def test_scheduled_reuse() -> None:
                   "(github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' && github.event.inputs.nightly == 'true') && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
                   "needs.build.outputs.audit-would-block != 'true'"):
         assert guard in mint_if, guard
-    print("PASS  scheduled and nightly runs reuse a proof of their tree from the last day and mint their own; "
+    print("PASS  scheduled and nightly runs reuse a proof of their tree from the last 20 h and mint their own; "
           "a plain dispatch, a stale proof or another branch's run never reuses")
 
 

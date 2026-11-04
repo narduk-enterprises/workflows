@@ -1786,8 +1786,11 @@ with `nightly: true` (README "Night-dispatched runs"), looks the same key up:
 the tree, the caller workflow and every input. A full scheduled or nightly pass
 mints a proof as a green pull request does, so the next scheduled run on that
 tree finishes on it. Such a run honours a proof only when the run behind it
-finished within the last 24 hours, so an unchanged tree still runs in full,
-blocking dependency audit included, once a day. The lookup reads the CI
+finished within the last 20 hours, so an unchanged tree still runs in full,
+blocking dependency audit included, at least once a day. That is every run of
+a daily cron or nightly, and about one run in five of a 4-hourly cron. The cap
+is under a day because a reused run mints nothing: with 24 hours, a daily run
+would reuse yesterday's pass and run in full only every other day. The lookup reads the CI
 artifact store only; without its secrets every scheduled run runs in full.
 Not covered:
 - `mode: e2e` callers, such as an `e2e.yml` schedule, which run no `Reuse plan`;

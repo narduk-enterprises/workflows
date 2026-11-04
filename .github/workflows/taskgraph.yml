@@ -197,9 +197,10 @@ jobs:
           const TRANSFER_TIMEOUT_MS = 120 * 1000;
           const TRANSFER_ATTEMPTS = 3;
           const POINTER_SCHEMA = 'narduk-ci-proof-pointer-v1';
-          // A scheduled or nightly run reuses only a proof this young, so an unchanged
-          // tree is still checked in full once a day (workflows#244).
-          const SCHEDULED_PROOF_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+          // A scheduled or nightly run reuses only a proof this young (workflows#244).
+          // Under a day on purpose: a reused run mints nothing, so with 24 h a daily
+          // cron would reuse yesterday's pass and run in full only every other day.
+          const SCHEDULED_PROOF_MAX_AGE_MS = 20 * 60 * 60 * 1000;
           const PROOF_STEP = { required: 'Publish Required proof', e2e: 'Publish full E2E proof' };
           const PROOF_KEY = { required: /^required-proof-v1-[0-9a-f]{64}$/, e2e: /^e2e-proof-v1-[0-9a-f]{64}$/ };
           const SEGMENT = /^[A-Za-z0-9._-]+$/;
@@ -663,9 +664,9 @@ jobs:
               return { found: false, reason: `run ${pointer.run_id} is not a successful same-repository pull-request run (or scheduled or nightly run of the default branch) of ${workflowPath}` };
             }
             // Advisories, registries and toolchains move without the tree: a
-            // scheduled check reuses only a pass from the last day.
+            // scheduled check reuses only a pass from the last 20 hours.
             if (scheduled && !(now - Date.parse(run.updated_at) < SCHEDULED_PROOF_MAX_AGE_MS)) {
-              return { found: false, reason: `run ${run.id} finished over 24 h ago, and a scheduled run checks an unchanged tree in full once a day` };
+              return { found: false, reason: `run ${run.id} finished over 20 h ago, and a scheduled run checks an unchanged tree in full at least daily` };
             }
             // A rerun must publish fresh proof, not inherit an older attempt's.
             if (run.run_attempt !== pointer.run_attempt) {
