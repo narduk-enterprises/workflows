@@ -34,7 +34,7 @@ process.env.GITHUB_RUN_ATTEMPT = String(fixture.attempt || 1);
 process.env.CI_INPUTS_JSON = fixture.inputs || '{}';
 process.env.CI_VARS_JSON = fixture.vars || '{}';
 const outputs = {}, calls = [];
-const core = {setOutput(k,v) {outputs[k] = v}, info() {}, notice() {}};
+const core = {setOutput(k,v) {outputs[k] = v}, info() {}, notice(m) {calls.push(['notice', m])}};
 const context = {repo: {owner:'example', repo:'app'}, runId: 20,
   eventName: fixture.event || 'pull_request', payload: fixture.payload};
 const github = {rest: {actions: {
@@ -43,6 +43,10 @@ const github = {rest: {actions: {
     return {data: fixture.current};},
   async listWorkflowRuns(args) {calls.push(['runs', args]); return {data: {workflow_runs: fixture.runs}}},
   async listJobsForWorkflowRunAttempt(args) {calls.push(['jobs', args]); return {data: fixture.jobs}},
+}, pulls: {
+  async get(args) {calls.push(['pull', args]);
+    if (fixture.pull_denied) throw {status:403};
+    return {data: fixture.pull};},
 }}};
 (async () => {
   await new Function('github','context','core','require',`return (async () => {${script}})()`)(github,context,core,require);
@@ -131,9 +135,13 @@ class AdmissionTests(unittest.TestCase):
         scripts = {doc["jobs"]["ci-admission"]["steps"][0]["with"]["script"] for doc in DOCS.values()}
         self.assertEqual(len(scripts), 1)
         for slug, doc in DOCS.items():
-            self.assertEqual(doc["jobs"]["ci-admission"]["permissions"],
-                             {"contents": "read", "actions": "read"}
-                             if slug in ("nuxt-cloudflare", "reusable-browser-tests") else {"contents": "read"})
+            wanted = {"contents": "read"}
+            if slug in ("nuxt-cloudflare", "reusable-browser-tests"):
+                wanted["actions"] = "read"
+            if slug == "nuxt-cloudflare":
+                # A re-run reads the live draft state (workflows#243).
+                wanted["pull-requests"] = "read"
+            self.assertEqual(doc["jobs"]["ci-admission"]["permissions"], wanted)
             for changes in ({"title": {}}, {"body": {}}, {"title": {}, "body": {}},
                             {}, {"base": {}}, {"body": {}, "base": {}}):
                 with self.subTest(slug=slug, changes=changes):
@@ -161,8 +169,14 @@ class AdmissionTests(unittest.TestCase):
         result = self.execute(data)
         self.assertEqual(result["outputs"]["reason"], "draft")
         self.assertEqual(result["calls"], [])
+        # workflows#243: a re-run of a still-draft PR stays deferred; it reads
+        # the live state once, because the replayed payload is the original.
         data["attempt"] = 2
-        self.assertEqual(self.execute(data)["outputs"]["skip"], "false")
+        data["pull"] = {"number": 7, "draft": True}
+        result = self.execute(data)
+        self.assertEqual(result["outputs"], {"skip": "true", "reason": "draft"})
+        self.assertEqual(result["calls"], [["pull", {"owner": "example", "repo": "app", "pull_number": 7}]])
+        data["attempt"] = 1
         for event in ("push", "workflow_dispatch", "schedule", "pull_request_target"):
             data["event"] = event
             result = self.execute(data)
@@ -180,13 +194,26 @@ class AdmissionTests(unittest.TestCase):
             ready = graph(doc, ctx, "validate")
             self.assertEqual(ready["ci-admission"]["result"], "skipped")
             self.assertEqual(ready["required"]["result"], "success")
-            # A full rerun executes admission again, but retains the draft event payload.
+            # A full rerun executes admission again, but retains the draft event
+            # payload: the PR's live state decides (workflows#243). Readied since,
+            # it validates; unreadable (a callable without the grant), it validates
+            # as before; still a draft, it stays deferred.
             data = fixture()
             data["payload"]["pull_request"]["draft"] = True
             data["attempt"] = 2
+            data["pull"] = {"number": 7, "draft": False}
             result = self.execute(data, slug)
             self.assertEqual(result["outputs"], {"skip": "false", "reason": "validate"})
-            self.assertEqual(result["calls"], [])
+            self.assertEqual([c[0] for c in result["calls"]], ["pull"])
+            denied = self.execute({**data, "pull_denied": True}, slug)
+            self.assertEqual(denied["outputs"], {"skip": "false", "reason": "validate"})
+            self.assertEqual([c[0] for c in denied["calls"]], ["pull", "notice"])
+            still = self.execute({**data, "pull": {"number": 7, "draft": True}}, slug)
+            self.assertEqual(still["outputs"], {"skip": "true", "reason": "draft"})
+            ctx = context(doc, draft=True)
+            ctx["github"]["run_attempt"] = 2
+            deferred = graph(doc, ctx, "draft", admission_outputs=still["outputs"])
+            self.assertEqual(deferred["required"]["result"], "success", slug)
             ctx = context(doc, draft=True)
             ctx["github"]["run_attempt"] = 2
             rerun = graph(doc, ctx, "validate", admission_outputs=result["outputs"])
