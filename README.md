@@ -1780,6 +1780,23 @@ tree, caller workflow or inputs differ from a green pull request's full run.
 Set it to `false` for a gate whose behaviour intentionally differs between PR
 and push.
 
+**Scheduled and nightly runs** (workflows#244) skip an unchanged tree the same
+way. A `schedule` run of the default branch, or a `workflow_dispatch` there
+with `nightly: true` (README "Night-dispatched runs"), looks the same key up:
+the tree, the caller workflow and every input. A full scheduled or nightly pass
+mints a proof as a green pull request does, so the next scheduled run on that
+tree finishes on it. Such a run honours a proof only when the run behind it
+finished within the last 24 hours, so an unchanged tree still runs in full,
+blocking dependency audit included, once a day. The lookup reads the CI
+artifact store only; without its secrets every scheduled run runs in full.
+Not covered:
+- `mode: e2e` callers, such as an `e2e.yml` schedule, which run no `Reuse plan`;
+- a plain `workflow_dispatch`, which always runs in full;
+- an input that differs by event, which gives a different key.
+
+A caller that wants every scheduled run in full passes
+`required-reuse-pr-results: ${{ github.event_name != 'schedule' }}`.
+
 **Permission migration:** adopting this revision requires `actions: read` on
 all Nuxt callable `ci` jobs, even if E2E is disabled. GitHub validates the
 permission ceiling before evaluating job conditions. The proof lookup needs
@@ -2381,7 +2398,9 @@ budget. By default it comes from the runner's cores and cgroup
 (`cpu.max`, `memory.max` and `memory.high`, which throttles rather than
 kills), capped at one slot per 3 GiB. The run's timing annotation reports
 what was detected. `reuse: false` runs every task, for a scheduled full
-check, and still records the passes.
+check, and still records the passes. With `reuse` on, a scheduled or
+dispatched run also honours the whole-run pass of the branch's earlier
+scheduled and dispatched runs, as well as its pushes (workflows#244).
 
 Tag a heavy task (a Nuxt build, `vue-tsc`, a full ESLint, a large unit
 suite) `ci:machine` so it gets a seat of its own. Leave light checks untagged

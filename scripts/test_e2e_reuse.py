@@ -56,7 +56,7 @@ Object.assign(process.env, scenario.env || {});
 const context = {
   repo: {owner: 'example', repo: 'app'}, sha: 'a'.repeat(40),
   eventName: scenario.event || 'push', runId: 900,
-  payload: {repository: {id: 42}, head_commit: scenario.headCommit || {message: 'Ship it (#12)\n\nbody', tree_id: 't'.repeat(40)}},
+  payload: {repository: {id: 42, default_branch: 'main'}, head_commit: scenario.headCommit || {message: 'Ship it (#12)\n\nbody', tree_id: 't'.repeat(40)}, ...scenario.payload},
 };
 // The runner's setup header: which callable, at which SHA, wrote a job.
 const CALLABLE = 'narduk-enterprises/workflows/.github/workflows/nuxt-cloudflare.yml';
@@ -236,7 +236,10 @@ def main() -> None:
     assert "store.publishProofStep({ core, context, kind: 'e2e' })" in publish['with']['script']
     required_install = next(step for step in required if step.get('name') == INSTALL_STEP)
     assert required.index(required_install) < required.index(publish)
-    assert required_install['if'] == "needs.ci-admission.outputs.skip != 'true' && (success() && github.event_name == 'pull_request')"
+    # Pull requests publish both proofs; a scheduled or nightly run of the
+    # default branch mints only the Required one (workflows#244).
+    assert required_install['if'] == ("needs.ci-admission.outputs.skip != 'true' && (success() && "
+                                      "(github.event_name == 'pull_request' || steps.required-key.outputs.key != ''))")
     print('PASS  only an actually successful full PR gate can publish proof, under a name that carries its key')
 
     baseline = run_lookup(script, {})

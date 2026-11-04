@@ -174,8 +174,9 @@ jobs:
           //     run's Build job reported through job outputs, or the E2E job fails;
           //   - a proof object is only a POINTER to a run. It is honoured only when
           //     GitHub reports that run as this repository's successful pull-request
-          //     run of the same caller workflow, whose Required job ran the publish
-          //     step carrying this exact key in its name.
+          //     run (or scheduled or nightly run of the default branch) of the same
+          //     caller workflow, whose Required job ran the publish step carrying
+          //     this exact key in its name.
           // A missing, unreadable or unconfirmed object means "run it": the gate runs
           // in full and E2E builds its own application. Nothing here can turn a check
           // green on its own.
@@ -196,6 +197,9 @@ jobs:
           const TRANSFER_TIMEOUT_MS = 120 * 1000;
           const TRANSFER_ATTEMPTS = 3;
           const POINTER_SCHEMA = 'narduk-ci-proof-pointer-v1';
+          // A scheduled or nightly run reuses only a proof this young, so an unchanged
+          // tree is still checked in full once a day (workflows#244).
+          const SCHEDULED_PROOF_MAX_AGE_MS = 24 * 60 * 60 * 1000;
           const PROOF_STEP = { required: 'Publish Required proof', e2e: 'Publish full E2E proof' };
           const PROOF_KEY = { required: /^required-proof-v1-[0-9a-f]{64}$/, e2e: /^e2e-proof-v1-[0-9a-f]{64}$/ };
           const SEGMENT = /^[A-Za-z0-9._-]+$/;
@@ -630,7 +634,7 @@ jobs:
           }
 
           // Returns { found: true, run } only when GitHub itself confirms the pointer.
-          async function findProof({ github, context, kind, key, workflowPath, env = process.env }) {
+          async function findProof({ github, context, kind, key, workflowPath, scheduled = false, now = Date.now(), env = process.env }) {
             const cfg = storeConfig(env);
             if (!cfg) return { found: false, reason: 'no CI artifact store credentials in this run' };
             const repositoryId = context.payload.repository.id;
@@ -650,9 +654,18 @@ jobs:
               return { found: false, reason: `${objectKey} does not describe this key and repository` };
             }
             const { data: run } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: pointer.run_id, request: { timeout: 10000 } });
-            if (run.id !== pointer.run_id || run.event !== 'pull_request' || run.status !== 'completed' || run.conclusion !== 'success'
+            // A pull request mints proof; so does a scheduled or nightly run of the
+            // default branch (workflows#244), which runs that branch's own workflow.
+            const minter = run.event === 'pull_request'
+              || (['schedule', 'workflow_dispatch'].includes(run.event) && run.head_branch === context.payload.repository?.default_branch);
+            if (run.id !== pointer.run_id || !minter || run.status !== 'completed' || run.conclusion !== 'success'
                 || run.path !== workflowPath || run.repository?.id !== repositoryId || run.head_repository?.id !== repositoryId) {
-              return { found: false, reason: `run ${pointer.run_id} is not a successful same-repository pull-request run of ${workflowPath}` };
+              return { found: false, reason: `run ${pointer.run_id} is not a successful same-repository pull-request run (or scheduled or nightly run of the default branch) of ${workflowPath}` };
+            }
+            // Advisories, registries and toolchains move without the tree: a
+            // scheduled check reuses only a pass from the last day.
+            if (scheduled && !(now - Date.parse(run.updated_at) < SCHEDULED_PROOF_MAX_AGE_MS)) {
+              return { found: false, reason: `run ${run.id} finished over 24 h ago, and a scheduled run checks an unchanged tree in full once a day` };
             }
             // A rerun must publish fresh proof, not inherit an older attempt's.
             if (run.run_attempt !== pointer.run_attempt) {
@@ -737,7 +750,7 @@ jobs:
           }
 
           module.exports = {
-            BUCKET, PRESIGN_SECONDS, TRANSFER_TIMEOUT_MS, TRANSFER_ATTEMPTS, PROOF_STEP, IntegrityError,
+            BUCKET, PRESIGN_SECONDS, TRANSFER_TIMEOUT_MS, TRANSFER_ATTEMPTS, PROOF_STEP, SCHEDULED_PROOF_MAX_AGE_MS, IntegrityError,
             sha256Hex, amzDate, canonicalUri, canonicalQuery, sign, presign, presignedUrl,
             storeConfig, endpoint, repositoryOf, assertKey, prebuiltKey, proofObjectKey,
             putObject, getObject, deleteObject,
@@ -1291,7 +1304,9 @@ jobs:
           // first: on a pull request its own earlier runs (a re-push of the same
           // content, a base that did not move); on a push, the runs of the pull
           // request it merges (by branch, title, or a head that already held this
-          // tree), then earlier pushes to the same branch. It needs
+          // tree), then earlier pushes to the same branch; on a scheduled or
+          // dispatched run, also that branch's earlier scheduled and dispatched
+          // runs. `reuse: false` (a scheduled full check) looks none up. It needs
           // only `actions: read` and `contents: read`, so a repository without
           // the CI_ARTIFACTS_R2_* secrets (another org, a fork) still reuses a
           // pull request's pass on main.
@@ -1318,7 +1333,13 @@ jobs:
                   .filter(r => (merged?.title && r.display_title === merged.title) || (tree && r.head_commit?.tree_id === tree));
               const branch = String(context.ref || '').replace(/^refs\/heads\//, '');
               const pushes = branch ? await list({ event: 'push', branch, per_page: 3 }) : [];
-              candidates = [...prRuns.slice(0, limit), ...pushes];
+              // A scheduled or nightly run also weighs the branch's earlier
+              // scheduled and dispatched runs (workflows#244): an unchanged tree
+              // whose last push is older than its last full pass.
+              const scheduled = branch && ['schedule', 'workflow_dispatch'].includes(context.eventName)
+                ? (await Promise.all(['schedule', 'workflow_dispatch'].map(event => list({ event, branch, per_page: 3 })))).flat()
+                : [];
+              candidates = [...prRuns.slice(0, limit), ...pushes, ...scheduled];
             }
             candidates = candidates.filter(r => r.id !== context.runId && r.path === workflowPath
               && r.repository?.id === repositoryId && r.head_repository?.id === repositoryId
