@@ -9,6 +9,7 @@ routes, including required/lightweight jobs and platform-specific inputs.
 from __future__ import annotations
 
 import functools
+import itertools
 import json
 import re
 import sys
@@ -33,9 +34,20 @@ BACKGROUND_EVENT = ("(github.event_name == 'schedule' || github.event.inputs.nig
                     " || github.event.pull_request.draft == true"
                     " || github.event.pull_request.user.login == 'dependabot[bot]'"
                     " || github.event.pull_request.user.login == 'narduk-lane-automation[bot]')")
+# The T2 interactive tier's route (CI-RULES T2), from fleet
+# `github_runner_fleet.py route --workload linux-ci-interactive`; both orgs
+# resolve to the same value. A non-background pull_request in a T2 repository
+# goes here in place of the default linux-ci route.
+LINUX_CI_INTERACTIVE = '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci-interactive"]}'
+# The one list of T2 repositories (workflows README, "Route by event").
+T2_REPOSITORIES = ("narduk-enterprises/stonx", "narduk-enterprises-clients/pacc-trac")
+INTERACTIVE_EVENT = ("(github.event_name == 'pull_request'"
+                     f" && contains(fromJSON('{json.dumps(list(T2_REPOSITORIES), separators=(',', ':'))}'),"
+                     " github.repository))")
 # The default tier, routed by event: every place the two callables used to
 # fall back to (or were explicitly given) the plain linux-ci route.
-DEFAULT_TIER = f"({BACKGROUND_EVENT} && '{LINUX_CI_BACKGROUND}' || '{LINUX_CI}')"
+DEFAULT_TIER = (f"({BACKGROUND_EVENT} && '{LINUX_CI_BACKGROUND}'"
+                f" || {INTERACTIVE_EVENT} && '{LINUX_CI_INTERACTIVE}' || '{LINUX_CI}')")
 # callable -> the input that carries the caller's route
 CALLABLES = {
     "reusable-browser-tests.yml": "linux-runner",
@@ -214,8 +226,9 @@ def evaluate(template: str, ctx: dict):
     return Evaluator(ctx).run(m.group(1)) if m else template
 
 
-def runner_context(private, inputs, variables, event_name="pull_request", event=None):
-    return {"github": {"event_name": event_name,
+def runner_context(private, inputs, variables, event_name="pull_request", event=None,
+                   repository="narduk-enterprises/example"):
+    return {"github": {"event_name": event_name, "repository": repository,
                        "event": {**(event or {}), "repository": {"private": private}}},
             "inputs": inputs, "vars": variables}
 
@@ -319,8 +332,8 @@ def check_single_literal() -> None:
     literals = set()
     for f in WORKFLOWS.glob("*.yml"):
         literals.update(re.findall(r'\{"group":"linux-ci","labels":\[(?:"[^"]*",?)*\]\}', f.read_text()))
-    assert literals == {LINUX_CI, LINUX_CI_BACKGROUND}, f"divergent linux-ci route literals: {sorted(literals)}"
-    print("ok  one linux-ci and one linux-ci-background route literal across callables")
+    assert literals == {LINUX_CI, LINUX_CI_BACKGROUND, LINUX_CI_INTERACTIVE}, f"divergent linux-ci route literals: {sorted(literals)}"
+    print("ok  one linux-ci, linux-ci-background and linux-ci-interactive route literal across callables")
 
 
 def pr(login, draft=False):
@@ -341,6 +354,7 @@ EVENTS = [
     ("other bot PR", "pull_request", pr("narduk-durable-agent-sessions[bot]"), False),
     ("push", "push", {}, False),
     ("merge group", "merge_group", {}, False),
+    ("human PR target", "pull_request_target", pr("loganrenz"), False),
 ]
 OTHER_FLEET = '{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci-tailnet"]}'
 BROWSER = '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}'
@@ -350,10 +364,11 @@ def check_event_routing() -> None:
     """The default tier follows the event; nothing else moves.
 
     The reference is the same expression with the default tier pinned to
-    linux-ci, which is the pre-#241 shape the rest of this file pins. An
-    interactive event must resolve exactly as that reference. A background
-    event must too, except that a resolved linux-ci route becomes the
-    background route, bar a deploy build (production-output-directory set).
+    linux-ci, which is the pre-#241 shape the rest of this file pins. Every
+    event must resolve exactly as that reference, except that a resolved
+    linux-ci route (bar a deploy build, production-output-directory set)
+    becomes the background route on a background event, and the interactive
+    route on any other pull_request in a T2 repository.
     """
     checks = 0
     for fname in ("nuxt-cloudflare.yml", "taskgraph.yml"):
@@ -374,21 +389,27 @@ def check_event_routing() -> None:
             assert DEFAULT_TIER in expression, (fname, jid, "default tier is not routed by event")
             reference = expression.replace(DEFAULT_TIER, f"'{LINUX_CI}'")
             assert LINUX_CI_BACKGROUND not in reference, (fname, jid, "background route outside the default tier")
+            assert LINUX_CI_INTERACTIVE not in reference, (fname, jid, "interactive route outside the default tier")
             for extra in input_variants:
                 inputs = {**defaults, **extra}
                 for extra_vars in var_variants:
                     variables = {"CI_LIGHTWEIGHT_RUNNER": "", "CI_LINUX_RUNNER": "",
                                  "BLACKSMITH_RUNNERS_ENABLED": "", "BLACKSMITH_LINUX_LABEL": "", **extra_vars}
-                    for visibility in (True, False, None):
-                        for name, event_name, payload, background in EVENTS:
-                            ctx = runner_context(visibility, inputs, variables, event_name, payload)
-                            got, old = evaluate(expression, ctx), evaluate(reference, ctx)
-                            wanted = old
-                            deploy_build = jid == "build" and inputs["production-output-directory"] != ""
-                            if background and old == json.loads(LINUX_CI) and not deploy_build:
+                    for visibility, (name, event_name, payload, background), repository in itertools.product(
+                            (True, False, None), EVENTS, ("narduk-enterprises/example", T2_REPOSITORIES[0])):
+                        ctx = runner_context(visibility, inputs, variables, event_name, payload, repository)
+                        got, old = evaluate(expression, ctx), evaluate(reference, ctx)
+                        wanted = old
+                        deploy_build = jid == "build" and inputs["production-output-directory"] != ""
+                        interactive = (not background and event_name == "pull_request"
+                                       and repository in T2_REPOSITORIES)
+                        if old == json.loads(LINUX_CI) and not deploy_build:
+                            if background:
                                 wanted = json.loads(LINUX_CI_BACKGROUND)
-                            assert got == wanted, (fname, jid, name, visibility, extra, extra_vars, got, wanted)
-                            checks += 1
+                            elif interactive:
+                                wanted = json.loads(LINUX_CI_INTERACTIVE)
+                        assert got == wanted, (fname, jid, name, repository, visibility, extra, extra_vars, got, wanted)
+                        checks += 1
     # Spelled out: what the done-when runs will see on a private caller with
     # the org CI_LIGHTWEIGHT_RUNNER (linux-ci) and gonogo's hand runner
     # expression, which yields the plain linux-ci route while
@@ -413,12 +434,38 @@ def check_event_routing() -> None:
         ("taskgraph.yml", "tasks", {}, {"CI_LINUX_RUNNER": LINUX_CI}, "schedule", {}, fg),
         ("nuxt-cloudflare.yml", "required", {}, org, "pull_request", pr("narduk-lane-automation[bot]"), bg),
     ]
-    for filename, jid, inputs, variables, event_name, payload, wanted in cases:
+    # T2 (stonx): only a human or other non-background pull_request moves.
+    it, stonx = json.loads(LINUX_CI_INTERACTIVE), "narduk-enterprises/stonx"
+    t2_cases = [
+        ("nuxt-cloudflare.yml", "fast", {}, org, "pull_request", pr("loganrenz"), it),
+        ("nuxt-cloudflare.yml", "ci-admission", {}, org, "pull_request", pr("loganrenz"), it),
+        ("nuxt-cloudflare.yml", "build", {}, org, "pull_request", pr("loganrenz"), it),
+        ("nuxt-cloudflare.yml", "fast", {}, org, "pull_request", pr("loganrenz", draft=True), bg),
+        ("nuxt-cloudflare.yml", "fast", {}, org, "pull_request", pr("dependabot[bot]"), bg),
+        ("nuxt-cloudflare.yml", "fast", {}, org, "pull_request", pr("narduk-lane-automation[bot]"), bg),
+        ("nuxt-cloudflare.yml", "fast", {}, org, "schedule", {}, bg),
+        ("nuxt-cloudflare.yml", "fast", {}, org, "workflow_dispatch", {"inputs": {"nightly": "true"}}, bg),
+        ("nuxt-cloudflare.yml", "fast", {}, org, "push", {}, fg),
+        ("nuxt-cloudflare.yml", "fast", {}, org, "workflow_dispatch", {"inputs": {"nightly": "false"}}, fg),
+        ("nuxt-cloudflare.yml", "build", {"production-output-directory": ".output"}, org, "pull_request", pr("loganrenz"), fg),
+        ("nuxt-cloudflare.yml", "build", {}, {"CI_LINUX_RUNNER": OTHER_FLEET}, "pull_request", pr("loganrenz"), json.loads(OTHER_FLEET)),
+        ("taskgraph.yml", "tasks", {"runner": OTHER_FLEET}, org, "pull_request", pr("loganrenz"), json.loads(OTHER_FLEET)),
+        ("taskgraph.yml", "tasks", {"runner": LINUX_CI}, org, "pull_request", pr("loganrenz"), it),
+    ]
+    # Every listed repository, not only the one the full sweep above uses.
+    t2_cases = [case + (stonx,) for case in t2_cases] + [
+        ("nuxt-cloudflare.yml", "fast", {}, org, "pull_request", pr("loganrenz"), it, repository)
+        for repository in T2_REPOSITORIES] + [
+        ("nuxt-cloudflare.yml", "fast", {}, org, "pull_request", pr("loganrenz"), fg, "narduk-enterprises/stonx-apple"),
+        ("nuxt-cloudflare.yml", "fast", {}, org, "push", {}, fg, "narduk-enterprises-clients/pacc-trac"),
+    ]
+    for filename, jid, inputs, variables, event_name, payload, wanted, repository in [
+            *(case + ("narduk-enterprises/example",) for case in cases), *t2_cases]:
         doc = yaml.safe_load((WORKFLOWS / filename).read_text())
         defaults = {k: v.get("default", "") for k, v in doc[True]["workflow_call"]["inputs"].items()}
-        ctx = runner_context(True, {**defaults, **inputs}, variables, event_name, payload)
+        ctx = runner_context(True, {**defaults, **inputs}, variables, event_name, payload, repository)
         got = evaluate(doc["jobs"][jid]["runs-on"], ctx)
-        assert got == wanted, (filename, jid, event_name, payload, got)
+        assert got == wanted, (filename, jid, repository, event_name, payload, got)
         checks += 1
     print(f"ok  event routing: {checks} default-tier evaluations")
 

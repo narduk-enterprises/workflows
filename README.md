@@ -295,19 +295,41 @@ the work nobody is waiting on, with no caller opt-in and no variable
 | Event | Route |
 |---|---|
 | `schedule`; `workflow_dispatch` with `nightly` (`github.event.inputs.nightly == 'true'`); a pull request that is a draft or was opened by `dependabot[bot]` or `narduk-lane-automation[bot]` | `{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci-background"]}` |
-| everything else (push, a ready human pull request, a manual dispatch) | `{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}` |
+| any other `pull_request` (not a draft, not one of those two bots) in a **T2 repository** (below) | `{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci-interactive"]}` |
+| everything else (push, a ready human pull request elsewhere, a manual dispatch, `pull_request_target`, `merge_group`) | `{"group":"linux-ci","labels":["self-hosted","Linux","X64","proxmox","linux-ci"]}` |
 
-Both literals are fleet `python3 scripts/github_runner_fleet.py route
---workload linux-ci-background` / `--workload linux-ci` output, copied
-verbatim. "The default route" is any of: an empty `runner`, `runner` set to
+The three literals are fleet `python3 scripts/github_runner_fleet.py route
+--workload linux-ci-background` / `--workload linux-ci-interactive` /
+`--workload linux-ci` output, copied verbatim.
+
+**T2 repositories** (agent-infrastructure CI-RULES T2, Logan's interactive
+tier; CT 217 x740-ci-interactive-1): `narduk-enterprises/stonx` and
+`narduk-enterprises-clients/pacc-trac`. This is the one list. It lives in the
+default tier itself (`contains(fromJSON('[...]'), github.repository)`) and in
+`T2_REPOSITORIES` in `scripts/test_runner_default.py`, which pins every
+copy. It is keyed on the repository rather than a caller input or variable
+because:
+
+- the nuxt-cloudflare input surface is frozen (`test_nuxt_input_freeze.py`);
+- `CI_LINUX_RUNNER` outranks event routing, so it would move nightly and
+  deploy work too;
+- portal-mapped variables change only through the portal (E21);
+- the generator emits no caller `runner:` (narduk-libs `create-narduk-app`).
+
+The list therefore survives regeneration and `upgrade`, which only moves the
+pin. To add a repository, change the list in both places and repin the
+caller. A T2 repository's hand-written jobs (not through these callables)
+carry their own pull-request route, following the same rule. stocks (Apple
+CI only) and narcode (owned by the Narcode orchestrator) are T2 in CI-RULES
+but not on this list. "The default route" is any of: an empty `runner`, `runner` set to
 the plain linux-ci route above, byte for byte (what generated callers and the hand
 `CI_BACKGROUND_RUNNER` expressions pass), or the org `CI_LIGHTWEIGHT_RUNNER`
 holding it. Anything else keeps precedence on every event: another explicit
 fleet route (including a caller's own background route), a set
 `vars.CI_LINUX_RUNNER`, `lightweight-runner`, `e2e-runner`, and Blacksmith.
-A deploy build (`production-output-directory` set) stays on linux-ci. An
-interactive event resolves exactly as before; `scripts/test_runner_default.py`
-(`check_event_routing`) pins both halves. The draft is read from the event
+A deploy build (`production-output-directory` set) stays on linux-ci. Any
+other event resolves exactly as before; `scripts/test_runner_default.py`
+(`check_event_routing`) pins all three. The draft is read from the event
 payload, so marking a draft ready runs on linux-ci only if the caller's
 `pull_request` types include `ready_for_review`.
 
