@@ -419,7 +419,9 @@ def main() -> None:
     # Shipped expressions are evaluated across hosted and fleet inputs by test_runner_default.
     assert "inputs.lint-runner" in document["jobs"]["lint"]["runs-on"]
     assert "inputs.apple-runner" in document["jobs"]["xcode"]["runs-on"]
-    assert "CI_LIGHTWEIGHT_RUNNER" in document["jobs"]["required"]["runs-on"]
+    # The org lightweight route is retired: Required resolves like the lint job.
+    assert "CI_LIGHTWEIGHT_RUNNER" not in document["jobs"]["required"]["runs-on"]
+    assert "inputs.lint-runner" in document["jobs"]["required"]["runs-on"]
     assert document["jobs"]["required"]["needs"] == ["lint", "xcode", "ci-admission", "changes"]
     install_swiftlint = next(
         item

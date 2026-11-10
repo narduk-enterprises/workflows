@@ -57,7 +57,7 @@ class ProductionUpload(unittest.TestCase):
         definitions = CI[True]['workflow_call']['inputs']
         inputs = {key: value.get('default', '') for key, value in definitions.items()}
         inputs.update({'production-output-directory': '.output', 'runner': '\"ubuntu-latest\"'})
-        overrides = {'BLACKSMITH_RUNNERS_ENABLED': 'true', 'CI_LINUX_RUNNER': '\"blacksmith-x\"'}
+        overrides = {'CI_LINUX_RUNNER': '\"blacksmith-x\"'}
         for visibility, expected in ((True, json.loads(LINUX_CI)), (False, 'ubuntu-latest'),
                                      (None, 'missing-repository-visibility-do-not-run')):
             self.assertEqual(evaluate(expression, runner_context(visibility, inputs, overrides)), expected)
