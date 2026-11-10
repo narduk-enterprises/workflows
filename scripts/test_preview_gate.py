@@ -492,7 +492,7 @@ def check_structure(doc: dict) -> None:
         "structure: the preview job stays off the browser pool unless e2e-subset is selected",
         "contains(inputs.preview-checks, 'e2e-subset')" in str(preview["runs-on"])
         and "e2e-runner" in str(preview["runs-on"])
-        and "CI_LIGHTWEIGHT_RUNNER" in str(preview["runs-on"]),
+        and "CI_LIGHTWEIGHT_RUNNER" not in str(preview["runs-on"]),
         str(preview["runs-on"]),
     )
     record(

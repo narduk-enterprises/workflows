@@ -3,7 +3,7 @@
 Shared reusable GitHub Actions workflows for the narduk-enterprises estate (CI-5).
 
 > **This repository is public.** Its own CI and public callers run on
-> GitHub-hosted capacity, with no org-variable or Blacksmith routing. Private
+> GitHub-hosted capacity, with no org-variable routing. Private
 > callers retain reusable-workflow compatibility and may use manifest-routed
 > self-hosted capacity only where their repository policy permits it. The
 > workflows hold no secrets — every
@@ -256,7 +256,7 @@ which is why the explicit hosted value is the four-character JSON string
 
 Only an explicitly public caller may select GitHub-hosted capacity. Private
 callers ignore hosted runner inputs and
-variables, including `CI_LIGHTWEIGHT_RUNNER`, `CI_LINUX_RUNNER`,
+variables, including `CI_LINUX_RUNNER`,
 `required-runner`, `lightweight-runner`, and platform-specific runner inputs.
 This prevents stale `"ubuntu-latest"` overrides from spending Actions minutes.
 
@@ -272,8 +272,8 @@ then to the `linux-ci` group. Xcode and browser shard inputs instead fall back
 to their existing `apple-vm` and `playwright-isolated` fleet classes. Public
 callers retain their explicit runner input and free hosted default.
 
-The existing Blacksmith switch remains opt-in and private-only. Its label
-variable must begin `blacksmith-`; a hosted value cannot redirect that branch.
+The Blacksmith overflow switch and the org lightweight route are retired
+(see [Retired routes](#retired-routes-blacksmith-overflow-and-ci_lightweight_runner)).
 No provider, paid plan, or allowance is added by this routing contract.
 
 A public caller must never pass a self-hosted route: public fork code must not
@@ -283,7 +283,7 @@ until onboarding, it does not justify a hosted override.
 
 `scripts/test_runner_default.py` evaluates every shipped callable's routing
 expressions against hosted inputs, variable overrides, public/private/unknown
-visibility, valid fleet and Blacksmith values, and conditional job routes.
+visibility, valid fleet values, and conditional job routes.
 
 ### Route by event (`nuxt-cloudflare.yml`, `taskgraph.yml`)
 
@@ -323,70 +323,35 @@ carry their own pull-request route, following the same rule. stocks (Apple
 CI only) and narcode (owned by the Narcode orchestrator) are T2 in CI-RULES
 but not on this list. "The default route" is any of: an empty `runner`, `runner` set to
 the plain linux-ci route above, byte for byte (what generated callers and the hand
-`CI_BACKGROUND_RUNNER` expressions pass), or the org `CI_LIGHTWEIGHT_RUNNER`
-holding it. Anything else keeps precedence on every event: another explicit
+`CI_BACKGROUND_RUNNER` expressions pass). Anything else keeps precedence on every event: another explicit
 fleet route (including a caller's own background route), a set
-`vars.CI_LINUX_RUNNER`, `lightweight-runner`, `e2e-runner`, and Blacksmith.
+`vars.CI_LINUX_RUNNER`, `lightweight-runner` and `e2e-runner`.
 A deploy build (`production-output-directory` set) stays on linux-ci. Any
 other event resolves exactly as before; `scripts/test_runner_default.py`
 (`check_event_routing`) pins all three. The draft is read from the event
 payload, so marking a draft ready runs on linux-ci only if the caller's
 `pull_request` types include `ready_for_review`.
 
-### Blacksmith overflow (`BLACKSMITH_RUNNERS_ENABLED`)
+### Retired routes: Blacksmith overflow and `CI_LIGHTWEIGHT_RUNNER`
 
-D-CI-CAP-1 (c) (2026-09-07, extends D-BLACKSMITH-2; Operator Portal decision log,
-fleet#337) makes Blacksmith a kill-switched overflow for the `linux-ci`
-class's ordinary private CI. Every `runs-on: ${{ fromJSON(inputs.runner) }}`
-site in `nuxt-cloudflare.yml`, `node-library.yml`, `docs-governance.yml`, and
-`python-data.yml`
-(16 sites, none of them a deploy-credentialed job — `nuxt-cloudflare.yml`'s
-only deploy-shaped job, `deploy-dry-run`, runs `wrangler deploy --dry-run`
-with zero Cloudflare secrets in scope) resolves as:
+Two org-variable routes are gone from every callable's `runs-on`:
 
-```
-runs-on: ${{ fromJSON(vars.BLACKSMITH_RUNNERS_ENABLED == 'true' && inputs.runner != '"ubuntu-latest"' && format('"{0}"', vars.BLACKSMITH_LINUX_LABEL || 'blacksmith-2vcpu-ubuntu-2404') || inputs.runner) }}
-```
+- **Blacksmith overflow** (`vars.BLACKSMITH_RUNNERS_ENABLED`,
+  `vars.BLACKSMITH_LINUX_LABEL`; D-CI-CAP-1 (c), D-BLACKSMITH-2). Blacksmith was
+  disabled 2026-10-06 (D-BLACKSMITH-7). Setting either variable now changes
+  nothing.
+- **The org lightweight route** (`vars.CI_LIGHTWEIGHT_RUNNER`). The lightweight
+  class was retired 2026-10-13 (D-RUNNER-LIGHTWEIGHT-RETIRE-1). The planner,
+  `Required` and `Fast` jobs resolve from the `lightweight-runner` input (where
+  the callable declares it), then the same route as the caller's `runner`.
+  Setting the variable now changes nothing.
 
-In the callables with an empty `runner` default, each `inputs.runner` above is
-the parenthesised effective route from [Default route](#default-route-empty-runner),
-so a private caller that passes nothing is Blacksmith-eligible (it is on the
-`linux-ci` class this overflow serves) and a public one never is.
+With both variables unset, every job resolves
+exactly as before. `scripts/test_runner_default.py` pins that the retired
+variables are ignored when set. A JSON string beginning `"blacksmith-` is
+still accepted as a caller-supplied `runner` value, as is a `blacksmith-`
+`CI_LINUX_RUNNER`; those predicates were left in place and are a follow-up.
 
-- **Switch**: the org Actions variable `BLACKSMITH_RUNNERS_ENABLED`
-  (default `false`, visibility restricted to private repos). Only the exact
-  string `true` selects Blacksmith. A **repo-level** variable of the same
-  name overrides the org default for exactly that repo (GitHub's normal
-  repo-over-org precedence) — the mechanism for canarying or kill-switching
-  one adopter without moving the org default.
-- **Label, not a group id**: the vendor's documented
-  `blacksmith-2vcpu-ubuntu-2404` string, overridable via
-  `vars.BLACKSMITH_LINUX_LABEL`. No Blacksmith runner-group id is pinned
-  anywhere — D-BLACKSMITH-4's live proof established that provider-created
-  groups are not a stable routing contract; only the label is.
-- **Public callers are never affected**: every Blacksmith branch in
-  `node-library.yml`, `nuxt-cloudflare.yml`, `docs-governance.yml` and
-  `python-data.yml` requires `github.event.repository.private == true` before
-  it reads `BLACKSMITH_RUNNERS_ENABLED`, so a public repository never lands on
-  Blacksmith, even when it passes an explicit self-hosted `runner` (Logan,
-  2026-10-05: public repos run free on GitHub-hosted runners).
-  `node-library.yml` additionally ignores `CI_LIGHTWEIGHT_RUNNER` for public
-  repositories; their caller-supplied hosted `runner` value remains the route.
-  `scripts/test_runner_default.py` asserts it.
-- **Manual, not automatic fallback**: GitHub does not move an already-queued
-  job to another `runs-on:` target. If Blacksmith cannot schedule or its free
-  allowance is exhausted, flip the variable back to `false` (or remove the
-  repo-level override) and rerun — same operational shape as every other
-  Blacksmith cohort (D-BLACKSMITH-3).
-- **Cost boundary** (D-BLACKSMITH-2/3, unchanged): free allowance only, no
-  payment method, no paid overage; disable at 2,400 equivalent 2-vCPU
-  minutes in a monthly cycle, any non-zero amount due, or any unexpected
-  billing state, whichever comes first.
-- **Never routes here**: production/deploy jobs (all app-owned and bespoke,
-  outside these six CI-only callables), the Playwright/browser class
-  (`reusable-browser-tests.yml`'s browser-runner job is untouched — its own
-  trust boundary per agent-infrastructure `docs/standards/CI-RUNNER-POLICY.md` §5), and Apple builds
-  (`apple.yml` is untouched — it has its own D-APPLE-CI-1 ladder).
 - **Per-repo ordinary route (`CI_LINUX_RUNNER`, CI reset 2026-09-28)**: in
   `nuxt-cloudflare.yml`, the ordinary private route of `Build`, `Checks`,
   `Extra gate`, `Deploy dry run` and both `Fast` jobs reads a repo-level
@@ -397,22 +362,17 @@ so a private caller that passes nothing is Blacksmith-eligible (it is on the
   overflow was needed:
   `(github.event.repository.private == true && vars.CI_LINUX_RUNNER || inputs.runner || github.event.repository.private == true && '<linux-ci route>' || '"ubuntu-latest"')`.
   A controller sets or deletes it to move one burst repository's ordinary CI
-  (for example to a Blacksmith label) without a pin bump. Setting it is a
+  without a pin bump. Setting it is a
   deliberate per-repo routing decision that also overrides an explicit
   `runner:` (a CI-RUNNER-POLICY §2 hosted exception included), so only set it
   where that repo's policy allows the target. Unset, the route is
   byte-for-byte the previous one (`scripts/test_runner_default.py` evaluates
   both). It never applies to a public caller and does not touch the
   lightweight, browser or preview routes.
-  The Blacksmith switch above still applies to the resulting route unchanged.
   Configuration variables in a called workflow resolve from the CALLER's
   repository (GitHub docs, "Variables": *"For reusable workflows, the
   variables from the caller workflow's repository are used"*), so a repo-level
   value reaches this callable.
-- **Adding a job is not additive here without checking this section again**:
-  a new job that copies `${{ fromJSON(inputs.runner) }}` verbatim does *not*
-  get Blacksmith overflow automatically — use the expression above, or it
-  silently stays off the overflow route.
 
 ## Cursor review (retired 2026-09-28)
 
@@ -777,55 +737,27 @@ Notes:
   step text extracted from the YAML itself, so the tests cannot drift from the
   shipped script.
 
-### Central lightweight-job routing
+### Lightweight-job routing
 
 `nuxt-cloudflare.lightweight-runner` routes E2E plan and Required
-independently of the build. Selection is explicit input, then
-`CI_LIGHTWEIGHT_RUNNER`, then the existing build/Blacksmith route. Public
-callers always use `ubuntu-latest` for these jobs. An unset override is
-backward compatible; required check names and failure/skip semantics are unchanged.
+independently of the build. Selection is the explicit input, then the existing
+build route. Public callers always use `ubuntu-latest` for these jobs. An unset
+override is backward compatible; required check names and failure/skip
+semantics are unchanged.
 
-
-`CI_LIGHTWEIGHT_RUNNER` is an organization Actions variable containing a JSON
-`runs-on` value, initially `"ubuntu-slim"` for the authorized company gates.
-Every shared `Required` job reads it except `python-data.yml`'s, which runs on
-the caller's own `test` route (CI reset 2026-09-28): its only caller runs
-those jobs GitHub-hosted, so a lightweight `Required` on `linux-ci` was the one
-self-hosted job in each run. Changing this one value changes routing
-for subsequent jobs without changing callable code or repinning callers.
-Package, browser, Apple, and deployment jobs retain their own routes.
-`node-library.required-runner` remains an explicit per-caller override; avoid
-setting it on ordinary callers that should follow the central route. Repository
-variables take precedence over organization variables, so reserve repository
-values for documented exceptions.
-
-Inline planners or final assertions need a one-time adoption of the same
-expression, preserving their job names and dependency conditions:
-
-```yaml
-runs-on: ${{ fromJSON(vars.CI_LIGHTWEIGHT_RUNNER || '"ubuntu-slim"') }}
-```
-
-Use this only for bounded, secrets-free metadata and result checks with no
-private-network requirement. Their existing policy authorization still applies.
-It is a routing contract, not automatic classification by job duration. Already
-queued jobs keep their selected route. A composite action cannot select a
-runner because it starts after GitHub has assigned one.
-
-Consumers pinned before this feature need one reviewed SHA update. That initial
-adoption is unavoidable; later capacity changes require only the organization
-variable. Keep immutable workflow pins. Unsetting the variable restores each
-callable's prior fallback, and malformed JSON fails visibly. Public callers must
-continue to use GitHub-hosted runners; never give the variable a self-hosted
-route in an organization that exposes it to public callers.
+The org `CI_LIGHTWEIGHT_RUNNER` variable that used to sit between the two was
+retired 2026-10-13 (D-RUNNER-LIGHTWEIGHT-RETIRE-1) and is no longer read.
+`node-library.required-runner` remains an explicit per-caller override of the
+`Required` job. Package, browser, Apple, and deployment jobs retain their own
+routes. A composite action cannot select a runner because it starts after
+GitHub has assigned one; already queued jobs keep their selected route.
 
 ### `node-library.yml`
 
 `required-runner` optionally separates the small `Required` aggregation job
 from the package runner. It accepts the same JSON runner shape as `runner`;
-empty uses the organization-level `CI_LIGHTWEIGHT_RUNNER` route for private
-callers, falling back to existing routing (including Blacksmith) when that
-variable is absent; public callers retain their supplied hosted route. An
+empty uses the package `runner` route for private callers; public callers
+retain their supplied hosted route. An
 explicit value takes precedence for `Required` only. The gate checks dependency results
 without checking out source, installing packages, or receiving registry secrets.
 For a secrets-free gate before a privileged self-hosted release, the caller may
@@ -3026,10 +2958,10 @@ P3-C2 / O-D8 rather than kept as a dead compatibility surface.
   temporary npm configuration contains only an environment-variable reference.
   Missing or rejected credentials leave a blocking UNKNOWN artifact rather
   than falling back to `github.token`.
-- The D-CI-CAP-1 (c) Blacksmith-overflow change (see "Blacksmith overflow"
-  above) is within-major on the same rule: no new input, no new job, no new
-  job-level `permissions:`, and the default (`vars.BLACKSMITH_RUNNERS_ENABLED`
-  undeclared) reproduces every existing adopter's behavior byte-for-byte.
+- The D-CI-CAP-1 (c) Blacksmith-overflow change (retired; see "Retired
+  routes" above) was within-major on the same rule: no new input, no new job,
+  no new job-level `permissions:`, and the default (`vars.BLACKSMITH_RUNNERS_ENABLED`
+  undeclared) reproduced every existing adopter's behavior byte-for-byte.
   `v1` moves again rather than a `v2` being cut, behind the usual fan-out
   canary.
 

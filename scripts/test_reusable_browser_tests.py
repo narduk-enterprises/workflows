@@ -80,7 +80,7 @@ def validate_structure(document: dict) -> None:
     assert jobs["webkit"]["runs-on"] == jobs["chromium"]["runs-on"]
     assert "inputs.linux-runner" in jobs["validate"]["runs-on"]
     assert "report" not in jobs
-    assert "CI_LIGHTWEIGHT_RUNNER" in jobs["required"]["runs-on"]
+    assert "CI_LIGHTWEIGHT_RUNNER" not in jobs["required"]["runs-on"]  # retired org route
     assert jobs["validate"]["needs"] == ["contract", "ci-admission"]
     assert jobs["chromium"]["needs"] == ["contract", "validate", "ci-admission"]
     assert jobs["webkit"]["needs"] == ["contract", "validate", "chromium", "ci-admission"]

@@ -2,8 +2,10 @@
 """Evaluate shipped runner expressions across visibility and override inputs.
 
 Only an explicitly public caller may select GitHub-hosted capacity. Private or
-unknown callers ignore hosted overrides and keep existing fleet/Blacksmith
-routes, including required/lightweight jobs and platform-specific inputs.
+unknown callers ignore hosted overrides and keep existing fleet routes,
+including required/planner jobs and platform-specific inputs. The Blacksmith
+overflow switch and the org lightweight route were retired (D-BLACKSMITH-7,
+D-RUNNER-LIGHTWEIGHT-RETIRE-1): setting those variables changes nothing.
 """
 
 from __future__ import annotations
@@ -247,8 +249,7 @@ def check_callable(fname, _name=None):
     definitions = doc[True]["workflow_call"]["inputs"]
     inputs = {key: value.get("default", "") for key, value in definitions.items()}
     runner_names = [key for key in definitions if key.endswith("runner") or key == "runs-on"]
-    variables = {"CI_LIGHTWEIGHT_RUNNER": "", "CI_LINUX_RUNNER": "",
-                 "BLACKSMITH_RUNNERS_ENABLED": "", "BLACKSMITH_LINUX_LABEL": ""}
+    variables = {"CI_LINUX_RUNNER": ""}
     hosted = ['"ubuntu-latest"', '"ubuntu-24.04"', '"ubuntu-slim"',
               '"windows-latest"', '"macos-latest"', '["ubuntu-latest"]',
               '{"group":"self-hosted","labels":["ubuntu-latest"]}',
@@ -260,27 +261,23 @@ def check_callable(fname, _name=None):
         expression = job.get("runs-on")
         if not isinstance(expression, str):
             continue
-        # Exercise ordinary, lightweight, preview-browser, and parallel routes.
+        # Exercise ordinary, planner, preview-browser, and parallel routes.
         for extra in ({}, {"fast-parallel": True}, {"preview-checks": "e2e-subset"}):
             base_inputs = {**inputs, **extra}
             for visibility in (True, None):
-                for blacksmith in ("", "true"):
-                    base_vars = {**variables, "BLACKSMITH_RUNNERS_ENABLED": blacksmith}
-                    for value in hosted:
-                        # One bad override at a time, and all together, catch precedence leaks.
-                        variants = [({**base_inputs, key: value}, base_vars) for key in runner_names]
-                        variants += [(base_inputs, {**base_vars, key: value})
-                                     for key in ("CI_LIGHTWEIGHT_RUNNER", "CI_LINUX_RUNNER")]
-                        variants += [({**base_inputs, **dict.fromkeys(runner_names, value)},
-                                      {**base_vars, "CI_LIGHTWEIGHT_RUNNER": value, "CI_LINUX_RUNNER": value,
-                                       "BLACKSMITH_LINUX_LABEL": "ubuntu-latest"})]
-                        for trial_inputs, trial_vars in variants:
-                            got = evaluate(expression, runner_context(visibility, trial_inputs, trial_vars))
-                            if visibility is None:
-                                assert got == "missing-repository-visibility-do-not-run", (fname, jid, value, got)
-                            else:
-                                assert is_private_route(got), (fname, jid, visibility, value, got)
-                            checks += 1
+                for value in hosted:
+                    # One bad override at a time, and all together, catch precedence leaks.
+                    variants = [({**base_inputs, key: value}, variables) for key in runner_names]
+                    variants += [(base_inputs, {**variables, "CI_LINUX_RUNNER": value})]
+                    variants += [({**base_inputs, **dict.fromkeys(runner_names, value)},
+                                  {**variables, "CI_LINUX_RUNNER": value})]
+                    for trial_inputs, trial_vars in variants:
+                        got = evaluate(expression, runner_context(visibility, trial_inputs, trial_vars))
+                        if visibility is None:
+                            assert got == "missing-repository-visibility-do-not-run", (fname, jid, value, got)
+                        else:
+                            assert is_private_route(got), (fname, jid, visibility, value, got)
+                        checks += 1
             # Valid explicit fleet routes retain precedence when this job reads them.
             for key in runner_names:
                 if f"inputs.{key}" not in expression:
@@ -297,8 +294,7 @@ def check_callable(fname, _name=None):
             # Empty public inputs retain free GitHub-hosted Linux routing. Required
             # platform inputs may specify a public macOS/browser runner explicitly.
             public_inputs = {**base_inputs, **dict.fromkeys(runner_names, '"ubuntu-latest"')}
-            got = evaluate(expression, runner_context(False, public_inputs,
-                           {**variables, "BLACKSMITH_RUNNERS_ENABLED": "true"}))
+            got = evaluate(expression, runner_context(False, public_inputs, variables))
             assert got == "ubuntu-latest", (fname, jid, "public", got)
             checks += 1
     print(f"ok  {fname}: {checks} routing evaluations")
@@ -309,15 +305,17 @@ def check_precedence():
     fleet_a = '{"group":"linux-ci","labels":["self-hosted","seat-a"]}'
     fleet_b = '{"group":"linux-ci","labels":["self-hosted","seat-b"]}'
     cases = [
-        ("red-main-listener.yml", "reconcile", {"runner": fleet_a}, {"CI_LIGHTWEIGHT_RUNNER": fleet_b}, fleet_b),
+        # The retired org lightweight route (D-RUNNER-LIGHTWEIGHT-RETIRE-1) is ignored where set.
+        ("red-main-listener.yml", "reconcile", {"runner": fleet_a}, {"CI_LIGHTWEIGHT_RUNNER": fleet_b}, fleet_a),
         ("red-main-listener.yml", "reconcile", {"runner": fleet_a}, {"CI_LIGHTWEIGHT_RUNNER": '\"ubuntu-latest\"'}, fleet_a),
         ("node-library.yml", "required", {"runner": fleet_a, "required-runner": fleet_b}, {"CI_LIGHTWEIGHT_RUNNER": fleet_a}, fleet_b),
-        ("node-library.yml", "required", {"runner": fleet_a}, {"CI_LIGHTWEIGHT_RUNNER": fleet_b}, fleet_b),
+        ("node-library.yml", "required", {"runner": fleet_a}, {"CI_LIGHTWEIGHT_RUNNER": fleet_b}, fleet_a),
         ("nuxt-cloudflare.yml", "build", {"runner": fleet_a}, {"CI_LINUX_RUNNER": fleet_b}, fleet_b),
         ("taskgraph.yml", "tasks", {"runner": fleet_a}, {"CI_LINUX_RUNNER": fleet_b}, fleet_b),
         ("docs-governance.yml", "required", {"runner": fleet_a}, {}, fleet_a),
-        ("docs-governance.yml", "required", {"runner": fleet_a}, {"BLACKSMITH_RUNNERS_ENABLED": "true"}, '\"blacksmith-2vcpu-ubuntu-2404\"'),
-        ("docs-governance.yml", "required", {"runner": fleet_a}, {"BLACKSMITH_RUNNERS_ENABLED": "true", "BLACKSMITH_LINUX_LABEL": "blacksmith-4vcpu-ubuntu-2404"}, '\"blacksmith-4vcpu-ubuntu-2404\"'),
+        # The Blacksmith overflow switch (D-BLACKSMITH-7) is ignored where set.
+        ("docs-governance.yml", "required", {"runner": fleet_a}, {"BLACKSMITH_RUNNERS_ENABLED": "true"}, fleet_a),
+        ("docs-governance.yml", "required", {"runner": fleet_a}, {"BLACKSMITH_RUNNERS_ENABLED": "true", "BLACKSMITH_LINUX_LABEL": "blacksmith-4vcpu-ubuntu-2404"}, fleet_a),
         ("apple.yml", "xcode", {"apple-runner": '{"group":"apple-vm","labels":["self-hosted","macOS","X64","apple-vm"]}'}, {}, '{"group":"apple-vm","labels":["self-hosted","macOS","X64","apple-vm"]}'),
         ("reusable-browser-tests.yml", "chromium", {"browser-runner": '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}'}, {}, '{"group":"playwright-isolated","labels":["self-hosted","Linux","X64","proxmox-playwright-x64"]}'),
     ]
@@ -325,7 +323,7 @@ def check_precedence():
         expression = yaml.safe_load((WORKFLOWS / filename).read_text())["jobs"][job]["runs-on"]
         assert evaluate(expression, runner_context(True, inputs, variables)) == json.loads(wanted), (filename, job, "precedence")
         assert evaluate(expression, runner_context(None, inputs, variables)) == "missing-repository-visibility-do-not-run", (filename, job, "unknown")
-    print(f"ok  {len(cases)} exact fleet/Blacksmith precedence and unknown-visibility cases")
+    print(f"ok  {len(cases)} exact fleet precedence and unknown-visibility cases")
 
 
 def check_single_literal() -> None:
@@ -380,7 +378,8 @@ def check_event_routing() -> None:
                            {"production-output-directory": ".output"},
                            {"production-output-directory": ".output", "runner": LINUX_CI},
                            {"fast-parallel": True}, {"preview-checks": "e2e-subset"}]
-        var_variants = [{}, {"CI_LIGHTWEIGHT_RUNNER": LINUX_CI}, {"CI_LINUX_RUNNER": OTHER_FLEET},
+        # The last variant sets the retired variables: they must change nothing.
+        var_variants = [{}, {"CI_LINUX_RUNNER": OTHER_FLEET},
                         {"CI_LIGHTWEIGHT_RUNNER": LINUX_CI, "BLACKSMITH_RUNNERS_ENABLED": "true"}]
         for jid, job in doc["jobs"].items():
             expression = job.get("runs-on")
@@ -393,8 +392,7 @@ def check_event_routing() -> None:
             for extra in input_variants:
                 inputs = {**defaults, **extra}
                 for extra_vars in var_variants:
-                    variables = {"CI_LIGHTWEIGHT_RUNNER": "", "CI_LINUX_RUNNER": "",
-                                 "BLACKSMITH_RUNNERS_ENABLED": "", "BLACKSMITH_LINUX_LABEL": "", **extra_vars}
+                    variables = {"CI_LINUX_RUNNER": "", **extra_vars}
                     for visibility, (name, event_name, payload, background), repository in itertools.product(
                             (True, False, None), EVENTS, ("narduk-enterprises/example", T2_REPOSITORIES[0])):
                         ctx = runner_context(visibility, inputs, variables, event_name, payload, repository)
@@ -411,10 +409,9 @@ def check_event_routing() -> None:
                         assert got == wanted, (fname, jid, name, repository, visibility, extra, extra_vars, got, wanted)
                         checks += 1
     # Spelled out: what the done-when runs will see on a private caller with
-    # the org CI_LIGHTWEIGHT_RUNNER (linux-ci) and gonogo's hand runner
-    # expression, which yields the plain linux-ci route while
-    # CI_BACKGROUND_RUNNER is unset.
-    org = {"CI_LIGHTWEIGHT_RUNNER": LINUX_CI}
+    # no org route variable set and gonogo's hand runner expression, which
+    # yields the plain linux-ci route while CI_BACKGROUND_RUNNER is unset.
+    org = {}
     bg, fg = json.loads(LINUX_CI_BACKGROUND), json.loads(LINUX_CI)
     cases = [
         ("taskgraph.yml", "fast", {"runner": LINUX_CI}, org, "workflow_dispatch", {"inputs": {"nightly": "true"}}, bg),
