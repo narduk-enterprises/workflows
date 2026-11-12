@@ -2229,7 +2229,7 @@ jobs:
           echo "quality-level $LEVEL ($CONTEXT): foundation-check=$foundation performance-budget=$perf security-headers=$headers"
           exit "$status"
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         if: inputs.package-manager == 'pnpm'
         # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
         # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
@@ -3438,7 +3438,7 @@ jobs:
         id: publish-production
         if: steps.production-output.outputs.artifact != ''
         continue-on-error: true
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.production-output.outputs.artifact }}
           path: ${{ inputs.working-directory }}/${{ inputs.production-output-directory }}
@@ -3758,7 +3758,7 @@ jobs:
             echo '::error::Checked-out source differs from the requested validation candidate.'
             exit 1
           fi
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         if: inputs.package-manager == 'pnpm'
         # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
         # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
@@ -3927,7 +3927,7 @@ jobs:
             echo '::error::Checked-out source differs from the requested validation candidate.'
             exit 1
           fi
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         if: inputs.package-manager == 'pnpm'
         # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
         # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
@@ -4630,7 +4630,7 @@ jobs:
             const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
             await store.fetchPrebuiltStep({ core });
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         if: inputs.package-manager == 'pnpm'
         # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
         # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
@@ -5417,7 +5417,7 @@ jobs:
       # BEFORE dependency installation, exactly as in the e2e job: once an
       # install has run, a browser could already have been acquired and the
       # guard would be auditing state it no longer controls. Same anchored text.
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         if: inputs.package-manager == 'pnpm'
         # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
         # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
@@ -5978,7 +5978,7 @@ jobs:
             exit 1
           fi
 
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         if: inputs.package-manager == 'pnpm'
         # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
         # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
@@ -6344,7 +6344,7 @@ jobs:
             echo '::error::Checked-out source differs from the requested validation candidate.'
             exit 1
           fi
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.package-manager == 'pnpm'))"
         env:
           PNPM_CONFIG_LOGLEVEL: error
@@ -6882,7 +6882,7 @@ jobs:
           HEADER_PATHS: ${{ inputs.security-headers-paths }}
           HEADER_URL: ${{ inputs.security-headers-url }}
         run: *resolve_quality_gates
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
         if: inputs.package-manager == 'pnpm'
         # Hides pnpm's '[WARN] Detected a pnpm v10 installation layout at
         # PNPM_HOME' (the action's own npm-linked bootstrap; cosmetic, fires on
