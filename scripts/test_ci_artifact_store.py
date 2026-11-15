@@ -44,8 +44,10 @@ WORKFLOW = Path(".github/workflows/nuxt-cloudflare.yml")
 UPLOAD_WORKFLOW = Path(".github/workflows/cloudflare-version-upload.yml")
 UPLOAD_FETCH = "Fetch exact production output from the CI artifact store"
 PRODUCTION_PUBLISH = "Publish exact production output to the CI artifact store"
+PRODUCTION_INSTALL = "Install CI artifact store client for the production handoff"
 BROWSER_WORKFLOW = Path(".github/workflows/reusable-browser-tests.yml")
 INSTALL = "Install CI artifact store client"
+INSTALLS = (INSTALL, PRODUCTION_INSTALL)
 BUCKET = "narduk-ci-artifacts"
 ACCOUNT = "0123456789abcdef0123456789abcdef"
 ACCESS = "fedcba9876543210fedcba9876543210"
@@ -305,7 +307,7 @@ def test_workflow_wiring() -> None:
     for name in CREDS:
         assert call["secrets"][name] == {"required": False}, name
     installs = {job_id: step for job_id, job in document["jobs"].items()
-                for step in job.get("steps", []) if step.get("name") == INSTALL}
+                for step in job.get("steps", []) if step.get("name") in INSTALLS}
     assert set(installs) == {"reuse-plan", "build", "e2e-plan", "e2e", "e2e-quarantine", "required"}, set(installs)
     texts = {step["run"] for step in installs.values()}
     assert len(texts) == 1, "every install step must be the one anchored text"
@@ -340,7 +342,7 @@ def test_workflow_wiring() -> None:
                     (step.get("env") or {}).get("PROOF_MINT") == "true"
                     and mint_return in script
                     and script.index(mint_return) < script.index("ci-artifact-store.cjs"))
-                assert INSTALL in earlier or pull_request_only or mint_only, (
+                assert any(name in INSTALLS for name in earlier) or pull_request_only or mint_only, (
                     f"{job_id}/{step.get('name')} requires the client before installing it")
     assert secret_bindings == {
         ("reuse-plan", "Find equivalent successful PR Required proof"),
@@ -614,7 +616,10 @@ def test_production(client: Client, root: Path) -> None:
     assert r2["if"] == "steps.production-output.outputs.artifact != ''"
     assert "await store.publishProductionStep({ core });" in r2["with"]["script"]
     # The store is tried first; the GitHub artifact only when it took nothing.
-    assert names.index("Prepare production artifact") < names.index(INSTALL) < names.index(PRODUCTION_PUBLISH) \
+    install = build_steps[names.index(PRODUCTION_INSTALL)]
+    assert install["if"] == r2["if"]
+    assert install["run"] == next(s for s in nuxt["jobs"]["reuse-plan"]["steps"] if s.get("name") == INSTALL)["run"]
+    assert names.index("Prepare production artifact") < names.index(PRODUCTION_INSTALL) < names.index(PRODUCTION_PUBLISH) \
         < names.index("Publish exact production output")
     assert nuxt["jobs"]["build"]["outputs"]["production-object"] == "${{ steps.production-r2.outputs.object }}"
     assert nuxt[True]["workflow_call"]["outputs"]["production-object"]["value"] == "${{ jobs.build.outputs.production-object }}"

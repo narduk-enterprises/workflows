@@ -3483,7 +3483,9 @@ jobs:
           steps.production-output.outputs.artifact == ''
         run: echo 'Production upload path-skipped; this successful step is the promotion no-op receipt.'
 
-      - name: Install CI artifact store client
+      # Its own name: the E2E handoff's install step below stays the one
+      # `Install CI artifact store client` in Build (test_e2e_build_artifact).
+      - name: Install CI artifact store client for the production handoff
         if: steps.production-output.outputs.artifact != ''
         run: *install_ci_artifact_store
 
