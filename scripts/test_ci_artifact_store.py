@@ -41,8 +41,13 @@ import urllib.parse
 import yaml
 
 WORKFLOW = Path(".github/workflows/nuxt-cloudflare.yml")
+UPLOAD_WORKFLOW = Path(".github/workflows/cloudflare-version-upload.yml")
+UPLOAD_FETCH = "Fetch exact production output from the CI artifact store"
+PRODUCTION_PUBLISH = "Publish exact production output to the CI artifact store"
+PRODUCTION_INSTALL = "Install CI artifact store client for the production handoff"
 BROWSER_WORKFLOW = Path(".github/workflows/reusable-browser-tests.yml")
 INSTALL = "Install CI artifact store client"
+INSTALLS = (INSTALL, PRODUCTION_INSTALL)
 BUCKET = "narduk-ci-artifacts"
 ACCOUNT = "0123456789abcdef0123456789abcdef"
 ACCESS = "fedcba9876543210fedcba9876543210"
@@ -282,7 +287,8 @@ def test_no_github_artifacts() -> None:
     assert len(production) == 1
     upload = production[0]
     assert upload['name'] == 'Publish exact production output'
-    assert upload['if'] == "steps.production-output.outputs.artifact != ''"
+    # Only the fallback: with a store object, nothing goes to GitHub storage.
+    assert upload['if'] == "steps.production-output.outputs.artifact != '' && steps.production-r2.outputs.object == ''"
     assert upload['with']['retention-days'] == 1
     assert upload['with']['if-no-files-found'] == 'error'
     # A storage refusal is surfaced and fails the consumer, not Build (R13).
@@ -301,7 +307,7 @@ def test_workflow_wiring() -> None:
     for name in CREDS:
         assert call["secrets"][name] == {"required": False}, name
     installs = {job_id: step for job_id, job in document["jobs"].items()
-                for step in job.get("steps", []) if step.get("name") == INSTALL}
+                for step in job.get("steps", []) if step.get("name") in INSTALLS}
     assert set(installs) == {"reuse-plan", "build", "e2e-plan", "e2e", "e2e-quarantine", "required"}, set(installs)
     texts = {step["run"] for step in installs.values()}
     assert len(texts) == 1, "every install step must be the one anchored text"
@@ -336,11 +342,12 @@ def test_workflow_wiring() -> None:
                     (step.get("env") or {}).get("PROOF_MINT") == "true"
                     and mint_return in script
                     and script.index(mint_return) < script.index("ci-artifact-store.cjs"))
-                assert INSTALL in earlier or pull_request_only or mint_only, (
+                assert any(name in INSTALLS for name in earlier) or pull_request_only or mint_only, (
                     f"{job_id}/{step.get('name')} requires the client before installing it")
     assert secret_bindings == {
         ("reuse-plan", "Find equivalent successful PR Required proof"),
         ("build", "Publish prebuilt E2E application"),
+        ("build", PRODUCTION_PUBLISH),
         ("e2e-plan", "Find equivalent successful PR E2E proof"),
         ("required", "Publish Required proof ${{ steps.required-key.outputs.key }}"),
         ("required", "Publish full E2E proof ${{ needs.e2e-plan.outputs.proof-key }}"),
@@ -590,6 +597,143 @@ def test_prebuilt(client: Client, root: Path) -> None:
     print("PASS  Build never fails on the store: no credentials, bad credentials or an outage publish nothing")
 
 
+# Redirects R2's host to the double inside the upload job's own node process.
+FETCH_PATCH = r'''
+const realFetch = globalThis.fetch;
+globalThis.fetch = (url, init) => realFetch(String(url).replace(/^https:\/\/[0-9a-f]{32}\.r2\.cloudflarestorage\.com/, process.env.TEST_R2_ORIGIN), init);
+const realSetTimeout = setTimeout;
+globalThis.setTimeout = (fn, ms, ...args) => realSetTimeout(fn, 0, ...args);
+'''
+
+
+def test_production(client: Client, root: Path) -> None:
+    """Build -> cloudflare-version-upload through the store, as the two shipped steps run it (workflows#152)."""
+    nuxt = yaml.safe_load(WORKFLOW.read_text())
+    build_steps = nuxt["jobs"]["build"]["steps"]
+    names = [s.get("name") for s in build_steps]
+    r2 = build_steps[names.index(PRODUCTION_PUBLISH)]
+    assert r2["id"] == "production-r2" and "continue-on-error" not in r2
+    assert r2["if"] == "steps.production-output.outputs.artifact != ''"
+    assert "await store.publishProductionStep({ core });" in r2["with"]["script"]
+    # The store is tried first; the GitHub artifact only when it took nothing.
+    install = build_steps[names.index(PRODUCTION_INSTALL)]
+    assert install["if"] == r2["if"]
+    assert install["run"] == next(s for s in nuxt["jobs"]["reuse-plan"]["steps"] if s.get("name") == INSTALL)["run"]
+    assert names.index("Prepare production artifact") < names.index(PRODUCTION_INSTALL) < names.index(PRODUCTION_PUBLISH) \
+        < names.index("Publish exact production output")
+    assert nuxt["jobs"]["build"]["outputs"]["production-object"] == "${{ steps.production-r2.outputs.object }}"
+    assert nuxt[True]["workflow_call"]["outputs"]["production-object"]["value"] == "${{ jobs.build.outputs.production-object }}"
+
+    upload = yaml.safe_load(UPLOAD_WORKFLOW.read_text())
+    call = upload[True]["workflow_call"]
+    assert call["inputs"]["production-object"]["default"] == ""
+    assert set(call["secrets"]) == {"CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID",
+                                    "CI_ARTIFACTS_R2_ACCOUNT_ID", "CI_ARTIFACTS_R2_ACCESS_KEY_ID"}, call["secrets"]
+    assert "CI_ARTIFACTS_R2_SECRET_ACCESS_KEY" not in UPLOAD_WORKFLOW.read_text()
+    steps = upload["jobs"]["upload"]["steps"]
+    fetch_step = next(s for s in steps if s.get("name") == UPLOAD_FETCH)
+    download = next(s for s in steps if str(s.get("uses", "")).startswith("actions/download-artifact@"))
+    assert fetch_step["if"] == "steps.armed.outputs.armed == 'true' && inputs.production-object != ''"
+    assert download["if"] == "steps.armed.outputs.armed == 'true' && inputs.production-object == ''"
+    assert "continue-on-error" not in fetch_step and "continue-on-error" not in download
+    order = [s.get("name") or s.get("uses") for s in steps]
+    assert order.index(UPLOAD_FETCH) < order.index("Verify exact build identity and generated upload configuration")
+
+    double = client.double
+    double.reset()
+    workspace = root / "production-ws"
+    source = workspace / "apps/web/.output"
+    make_tree(source)
+    (source / ".narduk-build.json").write_text('{"sha": "a"}')
+    (source / "server/linked.mjs").symlink_to(source / "server/index.mjs")
+    artifact = "production-" + "a" * 40 + "-77-2-0123456789ab"
+    key = f"prebuilt/example/app/{artifact}.tar.gz"
+    publish_env = {**CREDS, "ARTIFACT": artifact, "OUTPUT_DIR": str(source), "GITHUB_REPOSITORY": "example/app",
+                   "RUNNER_TEMP": str(client.runner_temp)}
+    publish = "await store.publishProductionStep({ core, env: vars.env });"
+    published = client.run(publish, env=publish_env)
+    assert published["threw"] is None and not messages(published, "warning"), published
+    object_text = published["outputs"]["object"]
+    reference = json.loads(object_text)
+    assert reference["key"] == key and double.log == [("PUT", key, "header")], (reference, double.log)
+    assert reference["sha256"] == hashlib.sha256(double.objects[key]).hexdigest()
+    for value in CREDS.values():
+        assert value not in object_text
+
+    patch = root / "fetch-patch.cjs"
+    patch.write_text(FETCH_PATCH)
+    script = fetch_step["run"]
+    base = {k: v for k, v in os.environ.items() if not k.startswith("CI_ARTIFACTS_R2_")}
+
+    def fetch(dest: Path, **overrides) -> subprocess.CompletedProcess:
+        env = {**base, "NODE_OPTIONS": f"--require {patch}", "TEST_R2_ORIGIN": double.origin,
+               "GITHUB_REPOSITORY": "example/app", "RUNNER_TEMP": str(client.runner_temp),
+               "ARTIFACT": artifact, "OBJECT": object_text, "DEST": str(dest),
+               "CI_ARTIFACTS_R2_ACCOUNT_ID": ACCOUNT, "CI_ARTIFACTS_R2_ACCESS_KEY_ID": ACCESS, **overrides}
+        return subprocess.run(["bash", "-c", script], env={k: v for k, v in env.items() if v is not None},
+                              capture_output=True, text=True, timeout=120)
+
+    dest = root / "upload-temp" / artifact
+    result = fetch(dest)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"R2 get {key}: {reference['bytes']} bytes, sha256 {reference['sha256']} verified" in result.stdout
+    assert double.log[-1] == ("GET", key, "presigned"), double.log
+    expected = snapshot(source)
+    assert snapshot(dest) == expected, "the uploaded output differs from what Build published"
+    assert not (dest / "server/linked.mjs").is_symlink(), "a symlink survived the handoff"
+    print("PASS  production round trip: Build's store object is fetched by presigned GET without the secret key, "
+          "identical tree, hidden files kept, links stored as files")
+
+    original = double.objects[key]
+    failures = {
+        "one byte flipped": ({}, original[:-1] + bytes([original[-1] ^ 1]), "does not match the SHA-256 and size"),
+        "object for another run": ({"ARTIFACT": artifact.replace("-77-", "-78-")}, None, "does not describe"),
+        "object for another repository": ({"GITHUB_REPOSITORY": "example/other"}, None, "does not describe"),
+        "forged signature": ({"OBJECT": json.dumps({**reference, "signature": "0" * 64})}, None, "HTTP 403"),
+        "not JSON": ({"OBJECT": "{"}, None, "not JSON"),
+        "no account ID": ({"CI_ARTIFACTS_R2_ACCOUNT_ID": None}, None, "not both passed"),
+        "no access key ID": ({"CI_ARTIFACTS_R2_ACCESS_KEY_ID": ""}, None, "not both passed"),
+        "object gone": ({}, b"", "HTTP 404"),
+    }
+    for index, (name, (overrides, stored, fragment)) in enumerate(failures.items()):
+        if stored == b"":
+            double.objects.pop(key, None)
+        elif stored is not None:
+            double.objects[key] = stored
+        target = root / "upload-fail" / str(index)
+        result = fetch(target, **overrides)
+        assert result.returncode != 0, (name, result.stdout)
+        assert "::error::" in result.stdout and fragment in result.stdout, (name, result.stdout, result.stderr)
+        assert not target.exists() or not any(target.iterdir()), f"{name}: something was unpacked"
+        double.objects[key] = original
+    double.fail[:] = [500, 500, 500]
+    result = fetch(root / "upload-outage")
+    assert result.returncode != 0 and "HTTP 500" in result.stdout, result.stdout
+    occupied = root / "upload-occupied"
+    occupied.mkdir()
+    (occupied / "stale.txt").write_text("x")
+    result = fetch(occupied)
+    assert result.returncode != 0 and "is not empty" in result.stdout, result.stdout
+    print(f"PASS  the upload job fails closed on {len(failures) + 2} bad, foreign, forged or unreadable handoffs")
+
+    double.log.clear()
+    for name, overrides, fragment in (
+        ("no credentials", {k: None for k in CREDS}, "No CI artifact store credentials"),
+        ("malformed credentials", {"CI_ARTIFACTS_R2_ACCESS_KEY_ID": "nope"}, "malformed"),
+        ("not a handoff name", {"ARTIFACT": "production-x"}, "not a production handoff name"),
+    ):
+        env = {k: v for k, v in {**publish_env, **overrides}.items() if v is not None}
+        outcome = client.run(publish, env=env)
+        assert outcome["threw"] is None and outcome["outputs"] == {"object": ""}, (name, outcome)
+        assert any(fragment in m and "GitHub artifact storage instead" in m for m in messages(outcome, "warning")), (
+            name, outcome["log"])
+    assert double.log == [], double.log
+    double.fail[:] = [503, 503, 503]
+    outcome = client.run(publish, env=publish_env)
+    assert outcome["outputs"] == {"object": ""} and not messages(outcome, "failed"), outcome
+    print("PASS  Build never fails on the store: without an object the GitHub artifact is the handoff, as before")
+
+
 ATTEMPT = '''
   try {
     return { ok: true, value: await (async () => { %s })() };
@@ -743,6 +887,7 @@ def main() -> None:
             test_sigv4_vectors(client)
             test_config_and_keys(client)
             test_prebuilt(client, root)
+            test_production(client, root)
             test_stalled_transfer(client, root)
             test_proofs(client)
     finally:

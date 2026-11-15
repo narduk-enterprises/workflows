@@ -3315,6 +3315,22 @@ cover the wiring and the proof lookups job by job.
 
 ## Production build handoff (Workers Builds replacement)
 
+**Through the CI artifact store first (workflows#152).** The org's GitHub artifact
+quota refused this handoff from 2026-11-12, so main could build but never deploy
+(mybo-at-v2 runs 43312559543, 43759945904). When the `ci` call passes the three
+`CI_ARTIFACTS_R2_*` secrets, Build puts the output (a tar.gz, hidden files kept,
+symlinks stored as their targets) at
+`prebuilt/<owner>/<repo>/<production-artifact>.tar.gz` in `narduk-ci-artifacts`,
+which the `prebuilt/` lifecycle rule expires after 7 days, and publishes
+`production-object` (key, SHA-256, size and the presigned-GET parts; no secret).
+Pass it to the upload call as `production-object: ${{ needs.ci.outputs.production-object }}`
+with the secrets `CI_ARTIFACTS_R2_ACCOUNT_ID` and `CI_ARTIFACTS_R2_ACCESS_KEY_ID`
+(never the secret key). The upload job fetches the object by presigned GET, refuses
+it unless its key names this repository and exact handoff and its SHA-256 and size
+match Build's, and only then runs the unchanged identity check and Wrangler. A
+publish to the store never fails Build: without an object, the GitHub artifact
+below is the handoff, as before.
+
 Opt in to `nuxt-cloudflare.yml` with `production-output-directory: .output` and a real
 production `build-script`. It publishes that existing build, including hidden files,
 as a one-day artifact keyed by commit, run and attempt. Generated
@@ -3337,7 +3353,8 @@ pushes/main dispatch and `needs.ci.outputs.production-artifact != ''`. Call
 `contents: read` and `actions: write` (from workflows#237 on, its cleanup job deletes
 the consumed artifact once the version is uploaded, so artifacts stop counting
 against the org's Actions storage; a caller without the grant fails at startup), with `artifact: ${{ needs.ci.outputs.production-artifact }}` and
-explicit `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` secrets. These are the
+explicit `CLOUDFLARE_API_TOKEN` / `CLOUDFLARE_ACCOUNT_ID` secrets (plus
+`production-object` and the two store IDs above). These are the
 existing per-app persona, never a root provisioner. Missing either produces a
 warning and `uploaded=false`; a missing/mismatched artifact or upload error fails.
 Private apps must already have portal-approved linux-deploy membership. Public
