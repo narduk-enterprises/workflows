@@ -69,7 +69,8 @@ def check_shipped() -> None:
     assert publish["continue-on-error"] is True
     assert publish["with"]["retention-days"] == 1
     assert publish["with"]["if-no-files-found"] == "error"
-    assert publish["if"] == "steps.production-output.outputs.artifact != ''"
+    # The GitHub artifact is the fallback when the CI artifact store took nothing (workflows#152).
+    assert publish["if"] == "steps.production-output.outputs.artifact != '' && steps.production-r2.outputs.object == ''"
     report = named_step(build, REPORT)
     assert report["if"] == "steps.publish-production.outcome == 'failure'"
     # The handoff name is published from Prepare, never from the upload, so a

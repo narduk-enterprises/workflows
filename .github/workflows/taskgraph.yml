@@ -166,6 +166,8 @@ jobs:
           // One bucket, lifecycle rules by prefix, every key scoped by the calling
           // repository:
           //   prebuilt/<owner>/<repo>/<run>-<attempt>-<scope>.tar.gz   E2E handoff, 7 days
+          //   prebuilt/<owner>/<repo>/production-<sha>-<run>-<attempt>-<hex>.tar.gz
+          //                                                            production handoff, 7 days
           //   proof/<owner>/<repo>/<proof key>.json                    reuse pointers, 30 days
           //   probe/<owner>/<repo>/<name>                              credential probes, 1 day
           //
@@ -174,6 +176,8 @@ jobs:
           // against something GitHub vouches for instead:
           //   - a prebuilt application must match the SHA-256 and size that its own
           //     run's Build job reported through job outputs, or the E2E job fails;
+          //   - so must the production output, or cloudflare-version-upload.yml
+          //     fails and uploads nothing (workflows#152);
           //   - a proof object is only a POINTER to a run. It is honoured only when
           //     GitHub reports that run as this repository's successful pull-request
           //     run (or scheduled or nightly run of the default branch) of the same
@@ -402,11 +406,13 @@ jobs:
 
           // ---- Prebuilt E2E application (Build -> E2E) -------------------------------
 
-          async function publishPrebuilt({ cfg, sourceDir, key, tmpDir, now = new Date(), expires = PRESIGN_SECONDS, timeoutMs = TRANSFER_TIMEOUT_MS }) {
+          // `dereference` stores what a symlink points at, as actions/upload-artifact
+          // did for the production output (Prepare already holds every link inside it).
+          async function publishPrebuilt({ cfg, sourceDir, key, tmpDir, now = new Date(), expires = PRESIGN_SECONDS, timeoutMs = TRANSFER_TIMEOUT_MS, dereference = false }) {
             if (!fs.statSync(sourceDir).isDirectory()) throw new Error(`${sourceDir} is not a directory`);
             const tarball = path.join(tmpDir, `ci-artifact-${crypto.randomBytes(6).toString('hex')}.tar.gz`);
             try {
-              tar(['-czf', tarball, '-C', sourceDir, '.']);
+              tar([dereference ? '-czhf' : '-czf', tarball, '-C', sourceDir, '.']);
               const body = fs.readFileSync(tarball);
               const sha256 = sha256Hex(body);
               await putObject(cfg, key, body, { contentType: 'application/gzip', timeoutMs, attempts: TRANSFER_ATTEMPTS });
@@ -482,6 +488,47 @@ jobs:
               core.setOutput('object', JSON.stringify(object));
             } catch (error) {
               core.warning(`Could not publish the prebuilt E2E application to the CI artifact store; each E2E job builds its own instead: ${describe(error)}`);
+            }
+          }
+
+          // ---- Exact production output (Build -> cloudflare-version-upload) ---------
+          //
+          // The org's GitHub artifact storage quota refused this handoff from
+          // 2026-11-12 (mybo-at-v2 runs 43312559543 and 43759945904), so main could
+          // build but never deploy (workflows#152). The output goes under prebuilt/,
+          // whose lifecycle rule already expires it, keyed by the handoff name that
+          // binds SHA, run and attempt. The upload job rebuilds the presigned GET and
+          // refuses anything whose SHA-256 and size differ from this step's output.
+          function productionKey(repository, artifact) {
+            if (!/^production-[0-9a-f]{40}-\d+-\d+-[0-9a-f]{12}$/.test(String(artifact))) {
+              throw new Error(`not a production handoff name: ${JSON.stringify(artifact)}`);
+            }
+            return assertKey(`prebuilt/${repositoryOf(repository)}/${artifact}.tar.gz`);
+          }
+
+          // github-script glue for the Build job. Never fails the job: with no
+          // object, `Publish exact production output` stores it as a GitHub artifact.
+          async function publishProductionStep({ core, env = process.env }) {
+            core.setOutput('object', '');
+            const fallback = 'the production output goes to GitHub artifact storage instead';
+            let cfg;
+            try {
+              cfg = storeConfig(env);
+            } catch (error) {
+              core.warning(`${error.message}; ${fallback}`);
+              return;
+            }
+            if (!cfg) {
+              core.warning(`No CI artifact store credentials in this run (a caller that does not pass CI_ARTIFACTS_R2_ACCOUNT_ID, CI_ARTIFACTS_R2_ACCESS_KEY_ID and CI_ARTIFACTS_R2_SECRET_ACCESS_KEY in its secrets: block); ${fallback}, which the org quota can refuse.`);
+              return;
+            }
+            try {
+              const key = productionKey(env.GITHUB_REPOSITORY, env.ARTIFACT);
+              const object = await publishPrebuilt({ cfg, sourceDir: env.OUTPUT_DIR, key, tmpDir: env.RUNNER_TEMP, dereference: true });
+              core.info(`R2 put ${object.key}: ${object.bytes} bytes, sha256 ${object.sha256}`);
+              core.setOutput('object', JSON.stringify(object));
+            } catch (error) {
+              core.warning(`Could not publish the production output to the CI artifact store; ${fallback}: ${describe(error)}`);
             }
           }
 
@@ -755,9 +802,10 @@ jobs:
           module.exports = {
             BUCKET, PRESIGN_SECONDS, TRANSFER_TIMEOUT_MS, TRANSFER_ATTEMPTS, PROOF_STEP, SCHEDULED_PROOF_MAX_AGE_MS, IntegrityError,
             sha256Hex, amzDate, canonicalUri, canonicalQuery, sign, presign, presignedUrl,
-            storeConfig, endpoint, repositoryOf, assertKey, prebuiltKey, proofObjectKey,
+            storeConfig, endpoint, repositoryOf, assertKey, prebuiltKey, proofObjectKey, productionKey,
             putObject, getObject, deleteObject,
             publishPrebuilt, parsePrebuilt, fetchPrebuilt, publishPrebuiltStep, fetchPrebuiltStep, buildDir,
+            publishProductionStep,
             publishProof, publishProofStep, findProof, findProofOnGitHub, attestedRun, mergedPull,
             callableSha, headerNamesCallable, writtenByCallable, settledJobs,
           };

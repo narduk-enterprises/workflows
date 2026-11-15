@@ -237,6 +237,13 @@ on:
       production-artifact:
         description: Exact production output for this main SHA; empty for excluded paths.
         value: ${{ jobs.build.outputs.production-artifact }}
+      production-object:
+        description: >-
+          The production output in the CI artifact store (key, SHA-256, size and
+          presigned-GET parts, no secret); pass it with production-artifact to
+          cloudflare-version-upload.yml. Empty when it went to GitHub artifact
+          storage instead (no store credentials or a store failure).
+        value: ${{ jobs.build.outputs.production-object }}
     inputs:
       production-output-directory:
         description: >-
@@ -1371,6 +1378,8 @@ jobs:
           // One bucket, lifecycle rules by prefix, every key scoped by the calling
           // repository:
           //   prebuilt/<owner>/<repo>/<run>-<attempt>-<scope>.tar.gz   E2E handoff, 7 days
+          //   prebuilt/<owner>/<repo>/production-<sha>-<run>-<attempt>-<hex>.tar.gz
+          //                                                            production handoff, 7 days
           //   proof/<owner>/<repo>/<proof key>.json                    reuse pointers, 30 days
           //   probe/<owner>/<repo>/<name>                              credential probes, 1 day
           //
@@ -1379,6 +1388,8 @@ jobs:
           // against something GitHub vouches for instead:
           //   - a prebuilt application must match the SHA-256 and size that its own
           //     run's Build job reported through job outputs, or the E2E job fails;
+          //   - so must the production output, or cloudflare-version-upload.yml
+          //     fails and uploads nothing (workflows#152);
           //   - a proof object is only a POINTER to a run. It is honoured only when
           //     GitHub reports that run as this repository's successful pull-request
           //     run (or scheduled or nightly run of the default branch) of the same
@@ -1607,11 +1618,13 @@ jobs:
 
           // ---- Prebuilt E2E application (Build -> E2E) -------------------------------
 
-          async function publishPrebuilt({ cfg, sourceDir, key, tmpDir, now = new Date(), expires = PRESIGN_SECONDS, timeoutMs = TRANSFER_TIMEOUT_MS }) {
+          // `dereference` stores what a symlink points at, as actions/upload-artifact
+          // did for the production output (Prepare already holds every link inside it).
+          async function publishPrebuilt({ cfg, sourceDir, key, tmpDir, now = new Date(), expires = PRESIGN_SECONDS, timeoutMs = TRANSFER_TIMEOUT_MS, dereference = false }) {
             if (!fs.statSync(sourceDir).isDirectory()) throw new Error(`${sourceDir} is not a directory`);
             const tarball = path.join(tmpDir, `ci-artifact-${crypto.randomBytes(6).toString('hex')}.tar.gz`);
             try {
-              tar(['-czf', tarball, '-C', sourceDir, '.']);
+              tar([dereference ? '-czhf' : '-czf', tarball, '-C', sourceDir, '.']);
               const body = fs.readFileSync(tarball);
               const sha256 = sha256Hex(body);
               await putObject(cfg, key, body, { contentType: 'application/gzip', timeoutMs, attempts: TRANSFER_ATTEMPTS });
@@ -1687,6 +1700,47 @@ jobs:
               core.setOutput('object', JSON.stringify(object));
             } catch (error) {
               core.warning(`Could not publish the prebuilt E2E application to the CI artifact store; each E2E job builds its own instead: ${describe(error)}`);
+            }
+          }
+
+          // ---- Exact production output (Build -> cloudflare-version-upload) ---------
+          //
+          // The org's GitHub artifact storage quota refused this handoff from
+          // 2026-11-12 (mybo-at-v2 runs 43312559543 and 43759945904), so main could
+          // build but never deploy (workflows#152). The output goes under prebuilt/,
+          // whose lifecycle rule already expires it, keyed by the handoff name that
+          // binds SHA, run and attempt. The upload job rebuilds the presigned GET and
+          // refuses anything whose SHA-256 and size differ from this step's output.
+          function productionKey(repository, artifact) {
+            if (!/^production-[0-9a-f]{40}-\d+-\d+-[0-9a-f]{12}$/.test(String(artifact))) {
+              throw new Error(`not a production handoff name: ${JSON.stringify(artifact)}`);
+            }
+            return assertKey(`prebuilt/${repositoryOf(repository)}/${artifact}.tar.gz`);
+          }
+
+          // github-script glue for the Build job. Never fails the job: with no
+          // object, `Publish exact production output` stores it as a GitHub artifact.
+          async function publishProductionStep({ core, env = process.env }) {
+            core.setOutput('object', '');
+            const fallback = 'the production output goes to GitHub artifact storage instead';
+            let cfg;
+            try {
+              cfg = storeConfig(env);
+            } catch (error) {
+              core.warning(`${error.message}; ${fallback}`);
+              return;
+            }
+            if (!cfg) {
+              core.warning(`No CI artifact store credentials in this run (a caller that does not pass CI_ARTIFACTS_R2_ACCOUNT_ID, CI_ARTIFACTS_R2_ACCESS_KEY_ID and CI_ARTIFACTS_R2_SECRET_ACCESS_KEY in its secrets: block); ${fallback}, which the org quota can refuse.`);
+              return;
+            }
+            try {
+              const key = productionKey(env.GITHUB_REPOSITORY, env.ARTIFACT);
+              const object = await publishPrebuilt({ cfg, sourceDir: env.OUTPUT_DIR, key, tmpDir: env.RUNNER_TEMP, dereference: true });
+              core.info(`R2 put ${object.key}: ${object.bytes} bytes, sha256 ${object.sha256}`);
+              core.setOutput('object', JSON.stringify(object));
+            } catch (error) {
+              core.warning(`Could not publish the production output to the CI artifact store; ${fallback}: ${describe(error)}`);
             }
           }
 
@@ -1960,9 +2014,10 @@ jobs:
           module.exports = {
             BUCKET, PRESIGN_SECONDS, TRANSFER_TIMEOUT_MS, TRANSFER_ATTEMPTS, PROOF_STEP, SCHEDULED_PROOF_MAX_AGE_MS, IntegrityError,
             sha256Hex, amzDate, canonicalUri, canonicalQuery, sign, presign, presignedUrl,
-            storeConfig, endpoint, repositoryOf, assertKey, prebuiltKey, proofObjectKey,
+            storeConfig, endpoint, repositoryOf, assertKey, prebuiltKey, proofObjectKey, productionKey,
             putObject, getObject, deleteObject,
             publishPrebuilt, parsePrebuilt, fetchPrebuilt, publishPrebuiltStep, fetchPrebuiltStep, buildDir,
+            publishProductionStep,
             publishProof, publishProofStep, findProof, findProofOnGitHub, attestedRun, mergedPull,
             callableSha, headerNamesCallable, writtenByCallable, settledJobs,
           };
@@ -2044,6 +2099,7 @@ jobs:
     if: "!cancelled() && needs.ci-admission.outputs.skip != 'true' && !cancelled() && inputs.journey-smoke-url == '' && needs.reuse-plan.outputs.reused != 'true' && !(inputs.pr-fast-only && inputs.mode != 'e2e' && inputs.fast-scripts != '' && inputs.journey-smoke-url == '' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && inputs.expected-candidate-sha == '' && (inputs.e2e-full-paths == '' || (needs.fast-plan.result == 'success' && needs.fast-plan.outputs.full == 'false')) && needs.ci-admission.outputs.skip != 'true')"
     outputs:
       production-artifact: ${{ steps.production-output.outputs.artifact }}
+      production-object: ${{ steps.production-r2.outputs.object }}
       # `true` when a pull request's dependency audit only warned about what
       # blocks the default branch: such a run vouches for no push (Required
       # proof), or the push would skip the audit that blocks it.
@@ -3427,16 +3483,39 @@ jobs:
           steps.production-output.outputs.artifact == ''
         run: echo 'Production upload path-skipped; this successful step is the promotion no-op receipt.'
 
-      # A storage refusal here (org artifact quota, stonx run 41102439037,
-      # 2026-10-30) is not a build or test failure, so it no longer turns
-      # Build or `ci / Required` red (R13). It cannot ship anything either:
-      # `production-artifact` stays set, so an armed upload job's download
-      # finds no artifact and fails red and a promotion gated on the run's
-      # success never fires; an unarmed one uploads nothing, as before. A bad
-      # build already failed in Prepare above.
+      - name: Install CI artifact store client
+        if: steps.production-output.outputs.artifact != ''
+        run: *install_ci_artifact_store
+
+      # The CI artifact store first (workflows#152): the org's GitHub artifact
+      # quota refused this handoff from 2026-11-12 and main could not deploy.
+      # Never fails Build: with no object the GitHub artifact below is the
+      # handoff, as before.
+      - name: Publish exact production output to the CI artifact store
+        id: production-r2
+        if: steps.production-output.outputs.artifact != ''
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          ARTIFACT: ${{ steps.production-output.outputs.artifact }}
+          OUTPUT_DIR: ${{ github.workspace }}/${{ inputs.working-directory }}/${{ inputs.production-output-directory }}
+          CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
+          CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
+          CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
+        with:
+          script: |
+            const store = require(`${process.env.RUNNER_TEMP}/ci-artifact-store.cjs`);
+            await store.publishProductionStep({ core });
+
+      # Only when the store took nothing. A storage refusal here (org artifact
+      # quota, stonx run 41102439037, 2026-10-30) is not a build or test
+      # failure, so it no longer turns Build or `ci / Required` red (R13). It
+      # cannot ship anything either: `production-artifact` stays set, so an
+      # armed upload job's download finds no artifact and fails red and a
+      # promotion gated on the run's success never fires; an unarmed one
+      # uploads nothing, as before. A bad build already failed in Prepare above.
       - name: Publish exact production output
         id: publish-production
-        if: steps.production-output.outputs.artifact != ''
+        if: steps.production-output.outputs.artifact != '' && steps.production-r2.outputs.object == ''
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
