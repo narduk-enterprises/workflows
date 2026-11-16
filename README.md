@@ -485,6 +485,12 @@ that could satisfy protection after it becomes ready. Nuxt's E2E, exact-candidat
 and post-deploy smoke invocations are excluded. Deferred paths never publish
 build or gate proof artifacts.
 
+A caller's own required job must never skip on a draft (`if: ... !github.event.pull_request.draft`):
+GitHub counts a skipped required job as passed, and a push to a draft in the same second as *ready for
+review* lets the push's run (payload still draft) cancel the ready run in the same concurrency group,
+leaving only the skip; the PR then shows mergeable with nothing run (pacc-trac `fast`, 2026-11-16).
+Report a failure on drafts, as the callables do, or read the live draft state (workflows#243).
+
 After marking a PR ready, push a commit or choose **Re-run all jobs** to run
 validation. **Re-run failed jobs** preserves the succeeded admission job's draft
 outputs and leaves validation deferred. For automatic recovery on marking ready,
