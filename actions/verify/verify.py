@@ -4,8 +4,8 @@
   plan         A pull request. Read the changed files and the repository's gate file, choose the checks, write the
                plan to $RUNNER_TEMP/verify-plan.json.
   plan --all   Any other event. The whole list (`default` in the gate file).
-  run          Run the planned checks side by side, keep going past a red one, print one timed line each and the
-               job's peak memory. Exit 1 when any check failed.
+  run          Run the planned checks side by side, keep going past a red one, print one timed line each.
+               Exit 1 when any check failed.
   select       Read changed file names on stdin; print the checks `plan` would choose for them.
 
 The gate file is `Config/remote-gate.json`, the file `remote-gate --changed` reads on a developer's machine
@@ -33,7 +33,6 @@ CONFIG = ROOT / os.environ.get('VERIFY_CONFIG', 'Config/remote-gate.json')
 PLAN = Path(os.environ.get('RUNNER_TEMP', tempfile.gettempdir())) / 'verify-plan.json'
 BASE = os.environ.get('VERIFY_BASE') or 'HEAD^1'
 ALONE = tuple(os.environ.get('VERIFY_ALONE', '').split())
-MEMORY_PEAK = Path('/sys/fs/cgroup/memory.peak')
 
 
 def glob_match(pattern: str, path: str, fold: bool = False) -> bool:
@@ -155,11 +154,6 @@ def run() -> int:
                 failed.append(name)
     summary('\n'.join(['| check | result | wall |', '| --- | --- | --- |'] + [f'| {n} | {r} | {t:.1f} s |' for n, r, t in rows]))
     summary(f'verify checks total: {time.monotonic() - began:.1f} s')
-    # What the checks cost in memory when they run together, for sizing the runner. Absent outside a cgroup v2 job.
-    try:
-        summary(f'peak memory: {int(MEMORY_PEAK.read_text()) / 2**30:.1f} GiB')
-    except (OSError, ValueError):
-        pass
     if failed:
         print(f'::error::verify failed: {", ".join(failed)}')
         return 1
