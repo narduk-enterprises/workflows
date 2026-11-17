@@ -82,6 +82,10 @@ in their app-class workflow.
 | `flake-digest.yml` | **New 2026-09-24** (narduk-reboot P3-C2). Weekly, advisory: scans a caller's completed runs of one workflow, counts failures in jobs matching `quarantine-job-pattern` (nuxt-cloudflare.yml's `e2e-quarantine` by default), and files or refreshes one digest issue per ISO week. Never gates `main`, never opens `red-main` |
 | `taskgraph.yml` | **New 2026-10-29.** Vercel CI's model (beta 2026-10-28) for any `package.json`-script repo: the caller's `turbo.json` tags the CI tasks, each task gets a content key from Git's blob hashes, a task whose key already passed is never run again (GitHub's own record of a green run of the same content, with no secret; per task, a pointer in the R2 CI artifact store that GitHub's API must confirm), `FAST_BASE_REF` scripts run narrowed on PRs keyed on their base, and the rest run side by side after one install per machine, each in its own worktree; a `ci:machine` task gets its own seat. Plan, Tasks legs, Required, and a `Fast` alias of Required's real result for rulesets that still require `ci / Fast`; nine inputs. See [taskgraph.yml](#taskgraphyml) |
 
+**v3 (2026-11-17) is composite actions, not more callables:** `setup`, `verify`, `version-proof` and `health` under
+[`actions/`](./actions/README.md). A caller keeps its own jobs and uses them as steps, so there is no `runner` input, no
+`Required` job and nothing here to route. New work starts there; the callables above keep their callers.
+
 All eleven shipped callables are `on: workflow_call` only — none of them declare their own
 triggers, and none declare workflow-level `concurrency:` (see "How to consume"
 below for job-level cancellation and the caller's workflow group).

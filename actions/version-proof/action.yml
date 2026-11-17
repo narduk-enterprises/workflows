@@ -1,0 +1,43 @@
+name: Prove the deployed commit
+description: >-
+  Poll a URL until its body is exactly the expected text (by default this commit's SHA), and fail when it never is.
+  A deploy step that exits 0 says the upload was accepted, not that the new code is serving: this asks the live host.
+
+inputs:
+  url:
+    description: The URL to read, e.g. https://staging.example.com/version. It must answer with the commit and nothing else.
+    required: true
+  expected:
+    description: The text the URL must answer with.
+    default: ${{ github.sha }}
+  attempts:
+    description: How many times to ask.
+    default: '60'
+  interval:
+    description: Seconds between attempts.
+    default: '5'
+
+runs:
+  using: composite
+  steps:
+    - name: Ask the live host which commit it serves
+      shell: bash
+      env:
+        PROOF_URL: ${{ inputs.url }}
+        PROOF_EXPECTED: ${{ inputs.expected }}
+        PROOF_ATTEMPTS: ${{ inputs.attempts }}
+        PROOF_INTERVAL: ${{ inputs.interval }}
+      run: |
+        set -uo pipefail
+        live=""
+        for i in $(seq 1 "$PROOF_ATTEMPTS"); do
+          live=$(curl --silent --max-time 10 "$PROOF_URL" || true)
+          echo "[$i] $PROOF_URL=${live:-<unreachable>} expected=$PROOF_EXPECTED"
+          [ "$live" = "$PROOF_EXPECTED" ] && break
+          [ "$i" = "$PROOF_ATTEMPTS" ] || sleep "$PROOF_INTERVAL"
+        done
+        if [ "$live" != "$PROOF_EXPECTED" ]; then
+          echo "::error::$PROOF_URL answers '${live:-<nothing>}', not $PROOF_EXPECTED: the deploy shipped nothing, or shipped something else"
+          exit 1
+        fi
+        echo "$PROOF_URL serves $PROOF_EXPECTED"

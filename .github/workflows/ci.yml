@@ -348,6 +348,11 @@ jobs:
       - name: E2E quarantine lane tests
         run: python3 scripts/test_e2e_quarantine.py
 
+      # The v3 composite actions (actions/): actionlint and lint_callables.py read only .github/workflows, so this is
+      # the one check that sees them. It runs each step's shipped script, and shellcheck over it.
+      - name: Composite action tests (v3)
+        run: python3 scripts/test_actions.py
+
       # Cheap belt-and-braces: actionlint parses YAML itself, but a file it
       # cannot classify as a workflow is skipped rather than failed, so an
       # unparseable stray .yml would slip past both checks above.

@@ -1,0 +1,41 @@
+name: Health probe
+description: >-
+  Ask a health URL until it answers 200, and fail with the first 600 bytes of its last answer when it never does.
+  For the deep probe after a deploy: the code is proven by version-proof, this proves what it is bound to.
+
+inputs:
+  url:
+    description: The URL to probe, e.g. https://staging.example.com/healthz?deep=1.
+    required: true
+  attempts:
+    description: How many times to ask.
+    default: '10'
+  interval:
+    description: Seconds between attempts.
+    default: '5'
+  means:
+    description: What a failure means, for the error line, e.g. "the D1 binding or its migrations are wrong".
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Probe the health URL
+      shell: bash
+      env:
+        HEALTH_URL: ${{ inputs.url }}
+        HEALTH_ATTEMPTS: ${{ inputs.attempts }}
+        HEALTH_INTERVAL: ${{ inputs.interval }}
+        HEALTH_MEANS: ${{ inputs.means }}
+      run: |
+        set -uo pipefail
+        body="$(mktemp)"; trap 'rm -f "$body"' EXIT
+        for i in $(seq 1 "$HEALTH_ATTEMPTS"); do
+          code=$(curl --silent --max-time 15 -o "$body" -w '%{http_code}' "$HEALTH_URL") || code=000
+          echo "[$i] $HEALTH_URL -> $code"
+          [ "$code" = 200 ] && { echo "$HEALTH_URL is healthy"; exit 0; }
+          [ "$i" = "$HEALTH_ATTEMPTS" ] || sleep "$HEALTH_INTERVAL"
+        done
+        echo "::error::$HEALTH_URL did not answer 200${HEALTH_MEANS:+: $HEALTH_MEANS}"
+        head -c 600 "$body" 2>/dev/null; echo
+        exit 1
