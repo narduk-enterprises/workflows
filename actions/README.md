@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@<sha> # v7
         with:
-          fetch-depth: 0        # a pull request is compared with HEAD^1, so the base commit must be present
+          fetch-depth: 2        # a pull request is compared with HEAD^1: that commit must be present, older history need not be
           persist-credentials: false
       - uses: narduk-enterprises/workflows/actions/setup@<sha> # v3
       - uses: narduk-enterprises/workflows/actions/verify@<sha> # v3
@@ -53,6 +53,10 @@ jobs:
 ```
 
 Pin the full commit SHA `v3` points to, with a `# v3` comment, as for v2. Never `@main`.
+
+A repository whose checks read history itself (old commits, their trees) needs `fetch-depth: 0`; give it
+`filter: blob:none` as well. Full history with every old file's contents was PACC·TRAC's longest step in this job (28 s
+at the median, up to 653 s, 2026-11-17); without the contents the same checkout took 4 to 10 s.
 
 ## The gate file
 
