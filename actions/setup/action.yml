@@ -27,7 +27,9 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        mount_point=$(df --output=target "$GITHUB_WORKSPACE" | tail -n 1)
+        # POSIX `df -P`: one line a filesystem, the mount point last. GNU's `--output=target` stops a macOS runner here.
+        # A mount point with a space in it is read short, finds no store, and falls to the last branch.
+        mount_point=$(df -P "$GITHUB_WORKSPACE" | tail -n 1 | awk '{print $NF}')
         store="$mount_point/pnpm-store"
         if [ "$mount_point" = "/" ]; then
           store="$GITHUB_WORKSPACE/.pnpm-store"

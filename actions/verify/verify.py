@@ -53,12 +53,14 @@ def glob_match(pattern: str, path: str, fold: bool = False) -> bool:
 
 
 def changed_files() -> list[str]:
-    """What this pull request proposes: parent 1 of the merge commit is the base branch."""
+    """What this pull request proposes: parent 1 of the merge commit is the base branch.
+    `-z`: without it git quotes and escapes a name that has a non-ASCII character, a tab or a quote in it
+    (`"src/caf\\303\\251.ts"`), no rule matches the quoted text, and that file's checks are silently not chosen."""
     out = subprocess.run(
-        ['git', 'diff', '--no-renames', '--name-only', BASE, 'HEAD'],
+        ['git', 'diff', '--no-renames', '--name-only', '-z', BASE, 'HEAD'],
         cwd=ROOT, check=True, capture_output=True, text=True,
     ).stdout
-    return [f for f in out.splitlines() if f]
+    return [f for f in out.split('\0') if f]
 
 
 def select_changed(spec: dict, checks: dict, files: list[str]) -> list[tuple[str, str]]:

@@ -10,8 +10,10 @@ What is locked down:
                  read a composite action, so nothing else would), every `uses:` is a full SHA with a version comment,
                  and no `run:` text interpolates `${{ }}` (an input reaches a script through `env:`).
   setup          the three places a pnpm store can live: in the workspace with the cache (workspace on `/`), beside
-                 the workspace without a cache (a persistent runner), and nowhere (no writable store: degrade, never fail).
-  version-proof  green only when the URL answers exactly the expected text; red, after every attempt, when it does not.
+                 the workspace without a cache (a persistent runner), and nowhere (no writable store: degrade, never fail);
+                 and the step ends well with this machine's own `df`, GNU or BSD.
+  version-proof  green only when the URL answers 200 with exactly the expected text; red, after every attempt, when it
+                 does not, when the text comes with another status, and when the response is cut short.
   health         green on a 200; red, with the body's head, on anything else or no answer.
   verify         the selection from a gate file (rules, `always`, the `full` swap, a deleted file), the whole list,
                  side-by-side runs that keep going past a red check, `alone` order, and a refused unknown `alone` name.
@@ -141,6 +143,16 @@ def test_setup() -> None:
         done, out, env = run_store(tmp, str(tmp / "volume"))
         check(done.returncode == 0 and out.strip() == "cache=false" and env.strip() == "",
               "setup: no writable store beside the workspace degrades to pnpm's default, and does not fail")
+    with tempfile.TemporaryDirectory() as d:
+        # No shim: the `df` of the machine this runs on (BSD on a Mac, GNU on the Linux runner). The step must end well
+        # and say where the store is, whatever that machine's mount table looks like.
+        tmp = Path(d)
+        out, env = tmp / "out", tmp / "env"
+        out.write_text("")
+        env.write_text("")
+        done = bash(step_script("setup", "Where the pnpm store lives"), {"GITHUB_WORKSPACE": str(tmp), "GITHUB_OUTPUT": str(out), "GITHUB_ENV": str(env)})
+        check(done.returncode == 0 and out.read_text().strip() in ("cache=true", "cache=false"),
+              f"setup: the step ends well with this machine's own df ({done.stderr.strip() or out.read_text().strip()})")
     doc = load("setup")
     nodes = [s for s in doc["runs"]["steps"] if str(s.get("uses", "")).startswith("actions/setup-node@")]
     check(len(nodes) == 2 and nodes[0]["if"] == "steps.store.outputs.cache != 'true'" and nodes[1]["if"] == "steps.store.outputs.cache == 'true'"
@@ -160,8 +172,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         Handler.hits[path] = Handler.hits.get(path, 0) + 1
         answers = Handler.routes.get(path, [(404, "not here")])
-        code, body = answers[min(Handler.hits[path], len(answers)) - 1]
+        # (status, body) or (status, body, the Content-Length to declare): a declared length longer than the body is a
+        # response cut short, which the client sees when the connection closes.
+        code, body, *declared = answers[min(Handler.hits[path], len(answers)) - 1]
         self.send_response(code)
+        if declared:
+            self.send_header("Content-Length", str(declared[0]))
         self.end_headers()
         self.wfile.write(body.encode())
 
@@ -181,6 +197,8 @@ def test_probes() -> None:
         "/version": [(200, sha)],
         "/late": [(200, "old"), (200, "old"), (200, sha)],
         "/stale": [(200, "old")],
+        "/sick": [(503, sha)],
+        "/cut": [(200, sha, len(sha) + 40)],
         "/healthz": [(200, "ok")],
         "/warming": [(503, "warming"), (200, "ok")],
         "/broken": [(503, "the control database is not migrated")],
@@ -199,6 +217,12 @@ def test_probes() -> None:
               "version-proof: red after every attempt, naming what answered")
         done = bash(proof, {**env, "PROOF_URL": "http://127.0.0.1:9/version", "PROOF_ATTEMPTS": "2"})
         check(done.returncode == 1 and "<unreachable>" in done.stdout, "version-proof: an unreachable host is red, not an error in the script")
+        done = bash(proof, {**env, "PROOF_URL": f"{base}/sick"})
+        check(done.returncode == 1 and Handler.hits["/sick"] == 3 and "answers HTTP 503" in done.stdout,
+              "version-proof: the commit in the body of a 503 is not proof")
+        done = bash(proof, {**env, "PROOF_URL": f"{base}/cut"})
+        check(done.returncode == 1 and Handler.hits["/cut"] == 3 and f"serves {sha}" not in done.stdout,
+              "version-proof: the commit at the head of a response that was cut short is not proof")
 
         health = step_script("health", "Probe the health URL")
         env = {"HEALTH_ATTEMPTS": "3", "HEALTH_INTERVAL": "0", "HEALTH_MEANS": "the binding is wrong"}
@@ -284,6 +308,18 @@ def test_verify() -> None:
         done = verify(repo, "run")
         check(done.returncode == 0 and "lint ./src/b.ts" in done.stdout and "| types | pass |" in done.stdout and "verify checks total" in done.stdout,
               "verify: run prints each check's log and one timed line each")
+
+        # git prints such a name quoted and escaped unless asked for NUL-separated names: read line by line, the only
+        # changed file matches no rule and the pull request runs neither its lint nor its typecheck.
+        (repo / "docs").mkdir()
+        (repo / "docs" / "caf\u00e9 menu.ts").write_text("c")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "a name git would quote")
+        done = verify(repo, "plan")
+        plan = json.loads((repo / "verify-plan.json").read_text())["checks"]
+        check(done.returncode == 0 and plan == [["lint-files", "echo lint './docs/caf\u00e9 menu.ts'"], ["test", "echo test"]],
+              f"verify: a changed file whose name git would quote is still chosen by its rule ({plan})")
+        git(repo, "reset", "-q", "--hard", "HEAD^")
 
         done = verify(repo, "plan", "--all")
         plan = json.loads((repo / "verify-plan.json").read_text())["checks"]
