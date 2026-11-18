@@ -1,0 +1,39 @@
+name: Verify
+description: >-
+  Run the checks the repository's gate file (Config/remote-gate.json) names: on a pull request the ones its diff
+  selects, on any other event the whole list. They run side by side in this one job and each prints one timed line.
+  Run it after actions/checkout (with the base commit present: fetch-depth 2 or more on a pull request) and after the
+  dependencies are installed.
+
+inputs:
+  scope:
+    description: "`changed` runs what the diff from `base` selects; `all` runs the gate file's `default` list."
+    default: ${{ github.event_name == 'pull_request' && 'changed' || 'all' }}
+  alone:
+    description: Names of checks that run one at a time after the others, space separated, in that order (a build, a second typecheck).
+    default: ''
+  config:
+    description: The gate file, relative to the workspace.
+    default: Config/remote-gate.json
+  base:
+    description: The commit a pull request is compared with. HEAD^1 is the base branch on the merge commit a pull request checks out.
+    default: HEAD^1
+
+runs:
+  using: composite
+  steps:
+    - name: Plan and run the checks
+      shell: bash
+      env:
+        VERIFY_SCOPE: ${{ inputs.scope }}
+        VERIFY_ALONE: ${{ inputs.alone }}
+        VERIFY_CONFIG: ${{ inputs.config }}
+        VERIFY_BASE: ${{ inputs.base }}
+      run: |
+        set -euo pipefail
+        case "$VERIFY_SCOPE" in
+          changed) python3 "$GITHUB_ACTION_PATH/verify.py" plan ;;
+          all) python3 "$GITHUB_ACTION_PATH/verify.py" plan --all ;;
+          *) echo "::error::scope must be changed or all, not '$VERIFY_SCOPE'"; exit 1 ;;
+        esac
+        python3 "$GITHUB_ACTION_PATH/verify.py" run

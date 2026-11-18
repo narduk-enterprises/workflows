@@ -1,0 +1,71 @@
+name: Node, pnpm and the dependencies
+description: >-
+  The toolchain the checkout pins (.node-version, packageManager) and `pnpm install --frozen-lockfile`, with the pnpm
+  store where the runner can keep it. Run it after actions/checkout.
+
+inputs:
+  node-version-file:
+    description: The file that pins Node.
+    default: .node-version
+  install-args:
+    description: Extra arguments for `pnpm install --frozen-lockfile`, e.g. `--ignore-scripts` in a job that holds a deploy token.
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      with:
+        run_install: false
+
+    # About the disk, not the provider. pnpm hard-links node_modules out of its store, and a hard link cannot cross
+    # filesystems. A runner whose workspace sits on its own volume keeps one live store beside it, and no cache is
+    # restored or saved: a cache archive of a store other jobs are writing is torn. A runner whose workspace is on the
+    # root filesystem (a hosted VM) has no such store: it gets one inside the workspace, restored by setup-node's cache.
+    - name: Where the pnpm store lives
+      id: store
+      shell: bash
+      run: |
+        set -euo pipefail
+        # POSIX `df -P`: one line a filesystem, the mount point last. GNU's `--output=target` stops a macOS runner here.
+        # A mount point with a space in it is read short, finds no store, and falls to the last branch.
+        mount_point=$(df -P "$GITHUB_WORKSPACE" | tail -n 1 | awk '{print $NF}')
+        store="$mount_point/pnpm-store"
+        if [ "$mount_point" = "/" ]; then
+          store="$GITHUB_WORKSPACE/.pnpm-store"
+          echo "cache=true" >> "$GITHUB_OUTPUT"
+          echo "npm_config_store_dir=$store" >> "$GITHUB_ENV"
+          echo "pnpm store -> $store (in the workspace, restored from the Actions cache)"
+        elif [ -d "$store" ] && [ -w "$store" ]; then
+          echo "cache=false" >> "$GITHUB_OUTPUT"
+          echo "npm_config_store_dir=$store" >> "$GITHUB_ENV"
+          echo "pnpm store -> $store (kept on this runner, same filesystem as $GITHUB_WORKSPACE)"
+        else
+          echo "cache=false" >> "$GITHUB_OUTPUT"
+          echo "no writable store beside the workspace; pnpm's default store, no cache (installs copy instead of linking)"
+        fi
+
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      if: steps.store.outputs.cache != 'true'
+      with:
+        node-version-file: ${{ inputs.node-version-file }}
+        package-manager-cache: false
+
+    - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      if: steps.store.outputs.cache == 'true'
+      with:
+        node-version-file: ${{ inputs.node-version-file }}
+        cache: pnpm
+        cache-dependency-path: |
+          pnpm-lock.yaml
+          package.json
+
+    - name: Install dependencies
+      shell: bash
+      env:
+        INSTALL_ARGS: ${{ inputs.install-args }}
+      run: |
+        set -euo pipefail
+        # Word-split on purpose: the input is a list of flags.
+        # shellcheck disable=SC2086
+        pnpm install --frozen-lockfile $INSTALL_ARGS

@@ -19,6 +19,10 @@ public; its own CI and every public caller must use GitHub-hosted runners.
 Private callers retain their existing reusable-workflow access and may use
 manifest-routed self-hosted capacity where their repository policy permits it.
 
+v3 is four composite actions under [`actions/`](./actions/README.md) (`setup`,
+`verify`, `version-proof`, `health`): steps a caller's own job uses, with no
+runner input and no `Required` job. `scripts/test_actions.py` is their gate.
+
 The estate-wide operating manual for agents lives in
 [narduk-enterprises/agent-infrastructure](https://github.com/narduk-enterprises/agent-infrastructure)
 (its root `AGENTS.md`). On the Macs it is loaded automatically; in a cloud
@@ -30,7 +34,7 @@ container nothing loads it for you — read it first, then return here.
 |---|---|
 | What is this repo? | The estate's shared reusable Actions workflows, consumed via `workflow_call` |
 | Estate operating manual | [narduk-enterprises/agent-infrastructure](https://github.com/narduk-enterprises/agent-infrastructure) → `AGENTS.md` |
-| Run the checks | `actionlint -no-color -oneline .github/workflows/*.yml`, `python3 scripts/lint_callables.py`, then each `python3 scripts/test_*.py` |
+| Run the checks | `actionlint -no-color -oneline .github/workflows/*.yml`, `python3 scripts/lint_callables.py`, then each `python3 scripts/test_*.py` (`test_actions.py` alone covers `actions/`) |
 | Catalog, consumption, versioning | [`README.md`](./README.md) — what each callable does, how to call it, how tags move |
 | Structural rules (R1–R13) | [`scripts/lint_callables.py`](./scripts/lint_callables.py) — the rule table at the top |
 | Cloud-session setup | [narduk-enterprises/agent-infrastructure](https://github.com/narduk-enterprises/agent-infrastructure) → `docs/cloud-sessions.md` |
