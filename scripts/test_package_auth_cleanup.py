@@ -76,18 +76,13 @@ AUTH_PATH_EXPR = (
 CLEANUP_RM = (
     'rm -f "${GITHUB_WORKSPACE}/${{ inputs.working-directory }}/.npmrc.auth"'
 )
-CALLER_NVAULT_EXPR = (
-    "${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && "
-    "secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}"
-)
+CALLER_NVAULT_EXPR = "${{ secrets.NVAULT_TOKEN }}"
 # Dependabot runs cannot see the Actions-only NVAULT_TOKEN. The caller script
-# receives the org package-read secret as GH_PACKAGES_READ only when no
-# service token is present and the legacy nvault foundation mode is off
-# (workflows#98), so it never sees both credentials.
-CALLER_PACKAGE_READ_FALLBACK_EXPR = (
-    "${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && "
-    "secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}"
-)
+# receives the job's own github.token as GH_PACKAGES_READ only when no
+# service token is present (workflows#98), so it never sees both credentials.
+# No hand-made package PAT since 2026-11-27.
+CALLER_PACKAGE_READ_FALLBACK_EXPR = "${{ !secrets.NVAULT_TOKEN && github.token || '' }}"
+JOB_TOKEN_EXPR = "${{ github.token }}"
 
 # Patterns that would print auth content or delete more than the exact file.
 FORBIDDEN_CLEANUP = (
@@ -207,7 +202,7 @@ def validate_job(job_id: str, job: dict) -> None:
     assert install_condition(job_id, caller) == "inputs.install-script != ''"
     caller_env = caller.get("env") or {}
     assert caller_env.get("NVAULT_TOKEN") == CALLER_NVAULT_EXPR
-    assert "NARDUK_PLATFORM_GH_PACKAGES_READ" not in caller_env
+    assert {key for key in caller_env if "PACKAGES" in key} == {"GH_PACKAGES_READ"}
     assert caller_env.get("GH_PACKAGES_READ") == CALLER_PACKAGE_READ_FALLBACK_EXPR, (
         f"{job_id}: caller install must map the package-read secret only as a "
         "fallback when NVAULT_TOKEN is empty"
@@ -224,7 +219,6 @@ def validate_job(job_id: str, job: dict) -> None:
 def validate(document: dict) -> None:
     workflow_call = document.get("on", document.get(True))["workflow_call"]
     secrets = workflow_call["secrets"]
-    assert secrets.get("NARDUK_PLATFORM_GH_PACKAGES_READ") == {"required": False}
     assert secrets.get("NVAULT_TOKEN") == {"required": False}, (
         "caller-owned installers need a separate optional nVault service-token secret"
     )
@@ -309,7 +303,7 @@ def caller_install_can_omit_nvault_token(document: dict) -> None:
 
 
 def validate_registry_mapping(document: dict, workflow: str) -> set[str]:
-    secret_expr = "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}"
+    secret_expr = JOB_TOKEN_EXPR
     scripts = set()
     for job_id, job in auth_jobs(document).items():
         auth = named_steps(job, AUTH_STEP)[0]
@@ -322,7 +316,7 @@ def validate_registry_mapping(document: dict, workflow: str) -> set[str]:
         for install_name in INSTALL_STEPS:
             for install in named_steps(job, install_name):
                 assert install["env"].get("GH_PACKAGES_READ") == secret_expr, (workflow, job_id, install_name)
-                assert install["env"]["NARDUK_PLATFORM_GH_PACKAGES_READ"] == secret_expr
+                assert {key for key in install["env"] if "PACKAGES" in key} == {"GH_PACKAGES_READ"}, (workflow, job_id, install_name)
                 assert install["env"]["NPM_CONFIG_USERCONFIG"].endswith("/.npmrc.auth"), (workflow, job_id, install_name)
                 assert install["env"]["NPM_CONFIG_GLOBALCONFIG"] == "/dev/null", (workflow, job_id, install_name)
                 assert job["steps"].index(cleanup[0]) > job["steps"].index(install)
@@ -347,7 +341,7 @@ def registry_auth_behavior() -> None:
                     (root / "pnpm-lock.yaml").write_text("resolution: https://npm.pkg.github.com/example.tgz")
                 result = subprocess.run(["bash", "-c", script], cwd=root, env={
                     "PATH": node_dir + os.pathsep + os.environ["PATH"], "HOME": tmp,
-                    "NARDUK_PLATFORM_GH_PACKAGES_READ": token, "GH_PACKAGES_READ": token,
+                    "GH_PACKAGES_READ": token,
                     "PACKAGE_REGISTRY_AUTH": "auto",
                 }, capture_output=True, text=True, timeout=20)
                 assert result.returncode == expected, (workflow, kind, result.stderr)
@@ -386,7 +380,7 @@ def registry_auth_behavior() -> None:
                     (root / "pnpm-lock.yaml").write_text(lock)
                 result = subprocess.run(["bash", "-c", script], cwd=root, env={
                     "PATH": node_dir + os.pathsep + os.environ["PATH"], "HOME": tmp,
-                    "NARDUK_PLATFORM_GH_PACKAGES_READ": "", "GH_PACKAGES_READ": "",
+                    "GH_PACKAGES_READ": "",
                     "PACKAGE_REGISTRY_AUTH": "auto",
                 }, capture_output=True, text=True, timeout=20)
                 assert result.returncode == expected, (workflow, case, result.stderr)
@@ -401,7 +395,7 @@ def registry_auth_behavior() -> None:
                 (root / "package.json").write_text(json.dumps({"dependencies": {"@narduk-enterprises/core": "workspace:*"}}))
                 result = subprocess.run(["bash", "-c", script], cwd=root, env={
                     "PATH": node_dir + os.pathsep + os.environ["PATH"], "HOME": tmp,
-                    "NARDUK_PLATFORM_GH_PACKAGES_READ": "", "GH_PACKAGES_READ": "",
+                    "GH_PACKAGES_READ": "",
                     "PACKAGE_REGISTRY_AUTH": "disabled",
                 }, capture_output=True, text=True, timeout=20)
                 assert result.returncode == 0, (workflow, "disabled", result.stderr)
@@ -411,7 +405,7 @@ def registry_auth_behavior() -> None:
                 (root / "package.json").write_text(json.dumps({"dependencies": {"example": "1.0.0"}}))
                 result = subprocess.run(["bash", "-c", script], cwd=root, env={
                     "PATH": node_dir + os.pathsep + os.environ["PATH"], "HOME": tmp,
-                    "NARDUK_PLATFORM_GH_PACKAGES_READ": "", "GH_PACKAGES_READ": "",
+                    "GH_PACKAGES_READ": "",
                     "PACKAGE_REGISTRY_AUTH": "unknown",
                 }, capture_output=True, text=True, timeout=20)
                 assert result.returncode == 1, (workflow, "invalid-mode", result.stderr)
@@ -490,7 +484,7 @@ def main() -> None:
     candidate = deepcopy(document)
     step = named_steps(candidate["jobs"]["build"], CALLER_INSTALL_STEP)[0]
     step["env"] = {
-        "NARDUK_PLATFORM_GH_PACKAGES_READ": "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}",
+        "GH_PACKAGES_READ": "${{ secrets.SOME_PACKAGE_PAT }}",
         "INSTALL_SCRIPT": "${{ inputs.install-script }}",
         "PM": "${{ inputs.package-manager }}",
     }
@@ -505,7 +499,7 @@ def main() -> None:
     # visible to the caller script) must fail.
     candidate = deepcopy(document)
     step = named_steps(candidate["jobs"]["extra-gate"], CALLER_INSTALL_STEP)[0]
-    step["env"]["GH_PACKAGES_READ"] = "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}"
+    step["env"]["GH_PACKAGES_READ"] = JOB_TOKEN_EXPR
     try:
         validate(candidate)
     except AssertionError:

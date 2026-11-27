@@ -53,7 +53,6 @@ test "${GH_PACKAGES_READ:-}" = "$EXPECTED_PACKAGE_TOKEN"
 # item-2.3 registry lookup, independent of either npmrc's ${GH_PACKAGES_READ}
 # templating. Both names must carry the identical resolved credential.
 test "${NODE_AUTH_TOKEN:-}" = "$EXPECTED_PACKAGE_TOKEN"
-test -z "${NARDUK_PLATFORM_GH_PACKAGES_READ:-}"
 echo "pnpm $*" >> "$STUB_LOG"
 if [ "$1" = "exec" ] && [ "$2" = "narduk-app" ]; then
   cat "$FIXTURE_JSON"
@@ -77,7 +76,6 @@ set -euo pipefail
 test "${GH_PACKAGES_READ:-}" = "$EXPECTED_PACKAGE_TOKEN"
 # workflows#85: same dual-credential requirement as the pnpm stub above.
 test "${NODE_AUTH_TOKEN:-}" = "$EXPECTED_PACKAGE_TOKEN"
-test -z "${NARDUK_PLATFORM_GH_PACKAGES_READ:-}"
 echo "npx $*" >> "$STUB_LOG"
 if [ "$1" = "--no-install" ] && [ "$2" = "narduk-app" ]; then
   cat "$FIXTURE_JSON"
@@ -98,27 +96,8 @@ exit 64
 
 FIXTURE_ARTEFACT = json.dumps({"schemaVersion": 1, "result": "PASS", "exitCode": 0})
 
-FETCH_STUB = """
-globalThis.fetch = async (url, options) => {
-  if (url !== 'https://api.nvault.nardukenterprises.com/v1/resolve'
-      || options.method !== 'POST' || options.body !== '{}'
-      || options.headers.authorization !== 'Bearer test-service-token'
-      || options.redirect !== 'error' || !options.signal) {
-    throw new Error('Unexpected credential request');
-  }
-  if (process.env.STUB_RESOLVE === 'denied') return { ok: false, status: 403 };
-  if (process.env.STUB_RESOLVE === 'old-alias') return { ok: true, json: async () => ({ data: { secrets: { NARDUK_PLATFORM_GH_PACKAGES_READ: 'old-alias-token' } } }) };
-  return { ok: true, json: async () => ({ data: { secrets: {
-    GH_PACKAGES_READ: process.env.STUB_RESOLVE === 'malformed'
-      ? 'invalid\\ntoken' : 'resolved-test-package-token'
-  } } }) };
-};
-"""
-
-
 def run_check_step(
-    *, has_dep: bool, pm: str, auth_source: str = "package-token",
-    resolve: str = "ok", credential: str | None = None, npmrc: str | None = None,
+    *, has_dep: bool, pm: str, credential: str = "test-job-token", npmrc: str | None = None,
     expected_token: str | None = None, captured: list[str] | None = None,
 ) -> tuple[int, str, str | None, str]:
     """Execute the "Run..." step; returns (rc, stdout+stderr, produced JSON, stub log)."""
@@ -142,8 +121,6 @@ def run_check_step(
 
         fixture_json = tmp_path / "fixture.json"
         fixture_json.write_text(FIXTURE_ARTEFACT)
-        fetch_stub = tmp_path / "fetch-stub.mjs"
-        fetch_stub.write_text(FETCH_STUB)
         captured_npmrc = tmp_path / "captured.npmrc"
         stub_log = tmp_path / "stub.log"
         # A dedicated, otherwise-empty TMPDIR proves the throwaway npmrc
@@ -156,15 +133,9 @@ def run_check_step(
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "PM": pm,
             "TOOL_VERSION": "0.10.0",
-            "AUTH_SOURCE": auth_source,
-            "NARDUK_PLATFORM_GH_PACKAGES_READ": credential if credential is not None else (
-                "test-service-token" if auth_source == "nvault" else "test-secret-token"
-            ),
-            "EXPECTED_PACKAGE_TOKEN": expected_token if expected_token is not None else (
-                "resolved-test-package-token" if auth_source == "nvault" else "test-secret-token"
-            ),
-            "STUB_RESOLVE": resolve,
-            "NODE_OPTIONS": f"--import={fetch_stub}",
+            # The job's own github.token (packages: read), as the step's env maps it.
+            "GH_PACKAGES_READ": credential,
+            "EXPECTED_PACKAGE_TOKEN": expected_token if expected_token is not None else credential,
             "FIXTURE_JSON": str(fixture_json),
             "CAPTURED_NPMRC": str(captured_npmrc),
             "STUB_LOG": str(stub_log),
@@ -219,7 +190,7 @@ def main() -> int:
 
     total += 1
     ok = input_default("foundation-check-auth") == "package-token"
-    failures += 0 if check("existing package-token callers retain the default auth type", ok) else 1
+    failures += 0 if check("the deprecated auth-type input keeps its default so existing callers start", ok) else 1
 
     # --- "Run web-foundation conformance check" ---
 
@@ -261,9 +232,8 @@ def main() -> int:
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "PM": "pnpm",
             "TOOL_VERSION": "0.10.0",
-            "AUTH_SOURCE": "package-token",
-            "NARDUK_PLATFORM_GH_PACKAGES_READ": "test-secret-token",
-            "EXPECTED_PACKAGE_TOKEN": "test-secret-token",
+            "GH_PACKAGES_READ": "test-job-token",
+            "EXPECTED_PACKAGE_TOKEN": "test-job-token",
             "FIXTURE_JSON": str(fixture_json),
             "CAPTURED_NPMRC": str(captured_npmrc),
             "STUB_LOG": str(tmp_path / "stub.log"),
@@ -273,29 +243,19 @@ def main() -> int:
         ok = (
             "@narduk-enterprises:registry=https://npm.pkg.github.com" in npmrc_text
             and "//npm.pkg.github.com/:_authToken=${GH_PACKAGES_READ}" in npmrc_text
-            and "test-secret-token" not in npmrc_text
+            and "test-job-token" not in npmrc_text
         )
         failures += 0 if check(
             "dlx uses a child-scoped token reference without persisting its value",
             ok, f"npmrc={npmrc_text!r}",
         ) else 1
 
-    for pm in ("pnpm", "npm"):
-        for has_dep in (True, False):
-            total += 1
-            rc, out, produced, leftover = run_check_step(has_dep=has_dep, pm=pm, auth_source="nvault")
-            ok = rc == 0 and produced == FIXTURE_ARTEFACT and leftover == "[]" and "test-service-token" not in out
-            failures += 0 if check(
-                f"[{pm}] nvault dependency={has_dep}: resolves once, isolates credential, supports registry lookup",
-                ok, f"rc={rc} produced={produced!r} leftover={leftover}\n{out}",
-            ) else 1
-
     # --- workflows#109: npm.nard.uk mirror callers need no credential ---
 
     mirror_rc = "@narduk-enterprises:registry=https://npm.nard.uk\n"
     for pm in ("pnpm", "npm"):
         for has_dep in (True, False):
-            for credential, what in (("", "no secret"), ("test-secret-token", "secret forwarded")):
+            for credential, what in (("", "no token"), ("test-job-token", "job token present")):
                 total += 1
                 captured: list[str] = []
                 rc, out, produced, leftover = run_check_step(
@@ -305,7 +265,7 @@ def main() -> int:
                 npmrc_ok = has_dep or captured == ["@narduk-enterprises:registry=https://npm.nard.uk\n"]
                 ok = (
                     rc == 0 and produced == FIXTURE_ARTEFACT and leftover == "[]" and npmrc_ok
-                    and "::error::" not in out and "test-secret-token" not in out
+                    and "::error::" not in out and "test-job-token" not in out
                 )
                 failures += 0 if check(
                     f"[{pm}] mirror dependency={has_dep}, {what}: runs with no token, dlx routes to npm.nard.uk",
@@ -333,16 +293,12 @@ def main() -> int:
     )
     ok = rc == 0 and produced == "" and "registry authentication is unavailable" in out
     failures += 0 if check(
-        "a GitHub-Packages-routed caller with no secret still reports missing auth",
+        "a GitHub-Packages-routed caller with no job token still reports missing auth",
         ok, f"rc={rc} produced={produced!r}\n{out}",
     ) else 1
 
     for label, kwargs in (
-        ("nVault denial", {"auth_source": "nvault", "resolve": "denied"}),
-        ("malformed resolved token", {"auth_source": "nvault", "resolve": "malformed"}),
-        ("missing canonical nVault key", {"auth_source": "nvault", "resolve": "old-alias"}),
-        ("missing input credential", {"credential": ""}),
-        ("unknown credential type", {"auth_source": "unsupported"}),
+        ("missing job token", {"credential": ""}),
     ):
         total += 1
         rc, out, produced, leftover = run_check_step(has_dep=True, pm="pnpm", **kwargs)
@@ -370,8 +326,7 @@ def main() -> int:
             "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
             "PM": "pnpm",
             "TOOL_VERSION": "0.10.0",
-            "AUTH_SOURCE": "package-token",
-            "NARDUK_PLATFORM_GH_PACKAGES_READ": "test-secret-token",
+            "GH_PACKAGES_READ": "test-job-token",
         }
         p = subprocess.run(["bash", "-c", RUN_STEP], cwd=tmp, env=env, capture_output=True, text=True)
         ok = p.returncode == 0
