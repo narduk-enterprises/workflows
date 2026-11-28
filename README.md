@@ -8,9 +8,9 @@ Shared reusable GitHub Actions workflows for the narduk-enterprises estate (CI-5
 > self-hosted capacity only where their repository policy permits it. The
 > workflows hold no secrets — every
 > `workflow_call` secret is optional and skips cleanly, and `apple.yml` and
-> `python-data.yml` declare none at all. `reusable-browser-tests.yml` declares
-> one optional secret (`NARDUK_PLATFORM_GH_PACKAGES_READ`) that falls back to
-> the ephemeral `github.token` when a caller passes nothing.
+> `python-data.yml` declare none at all. Package reads use the job's own
+> ephemeral `github.token` (`packages: read`); the old package-read secret
+> input is deprecated and ignored (2026-11-27).
 >
 > **Callers must pin the full 40-character commit SHA that `v2` points to,
 > with a `# v2` comment (new work; `@v1` is frozen, see
@@ -430,8 +430,6 @@ jobs:
     uses: narduk-enterprises/workflows/.github/workflows/<workflow>.yml@<sha-of-v2> # v2
     with:
       # ...per-workflow inputs, see below
-    secrets:
-      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
 ```
 
 #### Concurrency is the caller's job, and putting it here would be actively dangerous
@@ -591,13 +589,12 @@ behavior. Do not pass credentials to untrusted code or fork pull requests.
       DEPENDENCY_SSH_KEY: ${{ secrets.PRIVATE_SWIFTPM_SSH_KEY }}
 ```
 
-`reusable-browser-tests.yml` is the one exception: it declares a single
-optional `NARDUK_PLATFORM_GH_PACKAGES_READ` secret (`required: false`), mirroring
-`node-library.yml` and `nuxt-cloudflare.yml`'s existing CI-alias-for-the-PAT
-convention, so that a browser CI caller installing cross-repo
-`@narduk-enterprises/*` packages can pass a real read credential. A caller that
-passes nothing keeps today's behavior unchanged: every consuming step falls
-back to the ephemeral `github.token`.
+Package reads need no secret: every consuming step uses the job's ephemeral
+`github.token` (`packages: read`). `reusable-browser-tests.yml`,
+`node-library.yml`, `nuxt-cloudflare.yml`, `taskgraph.yml` and
+`docs-governance.yml` still declare the old package-read secret as an optional
+input so that callers which pass it keep starting; it is ignored, and the
+input goes away once no caller passes it. Do not pass it.
 
 ### `apple.yml`
 
@@ -794,8 +791,6 @@ jobs:
     with:
       node-version: "22"
       package-manager: pnpm
-    secrets:
-      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
 ```
 
 `install-args` and `extra-scripts` were added for narduk-charts' adoption
@@ -834,8 +829,6 @@ jobs:
             "extra-scripts": ""
           }
         ]
-    secrets:
-      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
 ```
 
 Matrix lanes own their extras. The optional lane-level `extra-scripts` field
@@ -844,12 +837,10 @@ value means the lane has no extra gates. Omitting the field preserves the
 shared-input behavior for existing callers, while declaring it on every lane
 prevents one package's requirement from leaking into another.
 
-The org Actions secret `NARDUK_PLATFORM_GH_PACKAGES_READ` maps into
-`GH_PACKAGES_READ` on the auth and install steps. The legacy process alias is
-also supplied for existing caller bootstrap scripts; it is an interface
-compatibility detail, not another secret to create. There is no implicit
-`github.token` fallback. Missing credentials fail before private-package
-installs; public-only installs need no credential. A caller whose committed
+The job's `github.token` (`packages: read`) maps into `GH_PACKAGES_READ` on
+the auth and install steps, so existing caller bootstrap scripts keep
+working; there is no package-read secret to create or pass (the hand-made
+PAT was retired 2026-11-27). Public-only installs need no credential. A caller whose committed
 project `.npmrc` routes `@narduk-enterprises` to the anonymous
 `https://npm.nard.uk` mirror (company-hq `D-PKG-6`) counts as public for that
 scope and can drop the secret, unless it also depends on `@narduk-geo` (not
@@ -927,8 +918,6 @@ jobs:
       # "Quality level" below; new apps start here.
       quality-level: standard
     secrets:
-      # Foundation checks and direct registry installs use the canonical PAT.
-      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
       # Caller-owned install scripts receive the service token separately.
       NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
       # The CI artifact store (see "The CI artifact store (2026-09-26)").
@@ -946,26 +935,17 @@ The value must be one package.json script name using letters, digits, `:`, `_`,
 or `-`; the callable rejects missing or unsafe names. Existing callers that
 leave it empty keep the legacy install path unchanged.
 
-`NARDUK_PLATFORM_GH_PACKAGES_READ` always carries the org package-read PAT;
-foundation checks use it by default. `NVAULT_TOKEN` carries the caller's
-service token when an explicitly selected `install-script` needs nVault; that
-installer resolves `GH_PACKAGES_READ` from nVault before starting npm/pnpm.
-Generic caller-owned install scripts may omit it and validate their own
-credentials. When `NVAULT_TOKEN` is empty (Dependabot runs see only
-Dependabot-store secrets, and `NVAULT_TOKEN` is Actions-only) and
-`foundation-check-auth` is not `nvault`, the caller script instead receives
-the org package-read secret as `GH_PACKAGES_READ`, so it can install without
-an nVault exchange. It never receives both (workflows#98). Raw PAT consumers omit `install-script` and pass only
-`secrets.NARDUK_PLATFORM_GH_PACKAGES_READ`.
+Foundation checks and installs read packages with the job's `github.token`.
+`NVAULT_TOKEN` carries the caller's service token when an explicitly selected
+`install-script` needs nVault. When `NVAULT_TOKEN` is empty (Dependabot runs
+see only Dependabot-store secrets, and `NVAULT_TOKEN` is Actions-only), the
+caller script instead receives the job's `github.token` as `GH_PACKAGES_READ`.
+It never receives both (workflows#98).
 
-`foundation-check-auth: nvault` remains a compatibility mode for callers that
-previously mapped their service token into the package-read secret. New callers
-use the default `package-token` mode and map both secrets as shown above.
+`foundation-check-auth` is deprecated and ignored (2026-11-27).
 
-Local workstations use `gh-packages-run`, and Workers Builds uses the protected
-build secret `GH_PACKAGES_READ`. Neither uses the Actions input name as a vault
-key. [The credential route](https://github.com/narduk-enterprises/agent-infrastructure/blob/main/docs/agents/credentials.md)
-provides the exact nVault selector and value-free diagnostics.
+Outside Actions there is no package-read credential: workstations and Workers
+Builds install `@narduk-enterprises/*` anonymously from `https://npm.nard.uk`.
 
 #### App config from the portal (`id-token: write`)
 
@@ -2356,7 +2336,6 @@ jobs:
     with:
       node-version-file: .node-version
     secrets:
-      NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
       CI_ARTIFACTS_R2_ACCOUNT_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCOUNT_ID }}
       CI_ARTIFACTS_R2_ACCESS_KEY_ID: ${{ secrets.CI_ARTIFACTS_R2_ACCESS_KEY_ID }}
       CI_ARTIFACTS_R2_SECRET_ACCESS_KEY: ${{ secrets.CI_ARTIFACTS_R2_SECRET_ACCESS_KEY }}
@@ -2954,20 +2933,12 @@ P3-C2 / O-D8 rather than kept as a dead compatibility surface.
   `standard`. See [Quality level](#quality-level-quality-level-quality-opt-out)
   for why this is an input rather than a default flip (Dependabot pin bumps
   would otherwise turn the fleet red at once).
-- `foundation-check-auth` defaults to `package-token`. `nvault` remains only
-  for callers whose legacy `NARDUK_PLATFORM_GH_PACKAGES_READ` mapping carries
-  an nVault service token; new callers use the canonical package PAT there and
-  map the service token separately as `NVAULT_TOKEN` for `install-script`.
-  The callable resolves the existing package-read grant for that legacy one
-  step and supplies `NODE_AUTH_TOKEN` to both the installed checker and the
-  optional pinned download. The checker needs this credential for its live N-1
-  registry lookup even when dependencies are already installed, unless the
-  caller's project `.npmrc` routes `@narduk-enterprises` to `npm.nard.uk`
-  (workflows#109): then no credential is resolved or exported. Neither the
-  service token nor the resolved package token is exported to later steps;
-  temporary npm configuration contains only an environment-variable reference.
-  Missing or rejected credentials leave a blocking UNKNOWN artifact rather
-  than falling back to `github.token`.
+- `foundation-check-auth` was an optional input and is now deprecated and
+  ignored (2026-11-27): the checker's live N-1 registry lookup uses the job's
+  `github.token`, or no credential when the caller's project `.npmrc` routes
+  `@narduk-enterprises` to `npm.nard.uk` (workflows#109). Keeping the input
+  declared keeps existing callers starting, so the change is within-major.
+  Temporary npm configuration contains only an environment-variable reference.
 - The D-CI-CAP-1 (c) Blacksmith-overflow change (retired; see "Retired
   routes" above) was within-major on the same rule: no new input, no new job,
   no new job-level `permissions:`, and the default (`vars.BLACKSMITH_RUNNERS_ENABLED`
