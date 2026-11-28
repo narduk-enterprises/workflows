@@ -57,8 +57,10 @@ def workflow_call(document: dict) -> dict:
 
 def validate_structure(document: dict) -> None:
     call = workflow_call(document)
-    assert set(call["secrets"]) == {"NARDUK_PLATFORM_GH_PACKAGES_READ"}
-    assert call["secrets"]["NARDUK_PLATFORM_GH_PACKAGES_READ"]["required"] is False
+    # The only declared secret is the deprecated, ignored package-read alias
+    # (kept so callers that still pass it start); it must stay optional.
+    assert len(call["secrets"]) <= 1
+    assert all(spec["required"] is False for spec in call["secrets"].values())
     for name in ("linux-runner", "browser-runner", "build-artifact-path",
                  "build-artifact-marker", "playwright-version"):
         assert call["inputs"][name]["required"] is True
@@ -137,9 +139,8 @@ def validate_structure(document: dict) -> None:
 
     for job in ("chromium", "webkit"):
         auth_env = step(document, job, "Configure package registry auth")["env"]
-        assert auth_env["NARDUK_PLATFORM_GH_PACKAGES_READ"] == (
-            "${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}"
-        )
+        # The job's own token reads packages; no hand-made PAT.
+        assert auth_env == {"GH_PACKAGES_READ": "${{ github.token }}"}
 
     required = step(document, "required", "Require every enabled browser gate")[
         "run"

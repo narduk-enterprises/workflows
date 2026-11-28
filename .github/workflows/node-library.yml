@@ -192,6 +192,8 @@ on:
         type: string
         default: '[{"label":"default","filter":""}]'
     secrets:
+      # Deprecated and ignored since 2026-11-27 (packages read with the job's
+      # github.token). Kept only so callers that still pass it start.
       NARDUK_PLATFORM_GH_PACKAGES_READ:
         required: false
 
@@ -373,8 +375,7 @@ jobs:
 
       - name: Configure package registry auth
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           PACKAGE_REGISTRY_AUTH: ${{ inputs.package-registry-auth }}
         run: |
           set -euo pipefail
@@ -391,8 +392,10 @@ jobs:
               exit 1
               ;;
           esac
-          if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
-            if ! package_scope=$(node --input-type=module <<'NODE'
+          # The job's own github.token reads GitHub Packages (every job here
+          # grants packages: read). No hand-made PAT since 2026-11-27: the
+          # classic PAT expired 11-21 and Logan ruled out regenerating it.
+          if ! package_scope=$(node --input-type=module <<'NODE'
           import fs from 'node:fs';
           try {
             const pkg = fs.existsSync('package.json') ? JSON.parse(fs.readFileSync('package.json', 'utf8')) : {};
@@ -413,31 +416,21 @@ jobs:
             process.exitCode = 1;
           }
           NODE
-            ); then
-              exit 1
-            fi
-            if [ "$package_scope" = private ]; then
-              echo '::error::Private packages require the org NARDUK_PLATFORM_GH_PACKAGES_READ secret forwarded to this workflow. It maps to GH_PACKAGES_READ; do not substitute a GitHub App or write token.'
-              exit 1
-            fi
-            echo 'No GitHub Packages dependencies (none, or @narduk-enterprises via npm.nard.uk) and no package-read secret; skipping registry auth.'
-            exit 0
-          fi
-          if [[ "$NARDUK_PLATFORM_GH_PACKAGES_READ" == *[[:space:]]* ]]; then
-            echo '::error::Package-read credential contains whitespace; repair the mapped secret.'
+          ); then
             exit 1
           fi
-          if [ -f ./scripts/package-registry-auth.mjs ]; then
-            node ./scripts/package-registry-auth.mjs
-          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
-            node ./tools/configure-package-registry-auth.mjs
-          else
-            # Direct org PAT path; legacy caller bootstraps keep their existing contract.
-            umask 077
-            # Variable reference stays literal; the token never enters this file.
-            # shellcheck disable=SC2016
-            printf '@narduk-enterprises:registry=https://npm.pkg.github.com\n@narduk-geo:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=${GH_PACKAGES_READ}\n' > .npmrc.auth
+          if [ "$package_scope" = public ]; then
+            echo 'No GitHub Packages dependencies (none, or @narduk-enterprises via npm.nard.uk); skipping registry auth.'
+            exit 0
           fi
+          if [ -z "${GH_PACKAGES_READ:-}" ] || [[ "$GH_PACKAGES_READ" == *[[:space:]]* ]]; then
+            echo '::error::The job token is unavailable; the calling job must grant permissions: packages: read.'
+            exit 1
+          fi
+          umask 077
+          # Variable reference stays literal; the token never enters this file.
+          # shellcheck disable=SC2016
+          printf '@narduk-enterprises:registry=https://npm.pkg.github.com\n@narduk-geo:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=${GH_PACKAGES_READ}\n' > .npmrc.auth
 
       # SELF-HOSTED: THE PNPM STORE MUST SIT ON THE WORKSPACE'S OWN FILESYSTEM.
       #
@@ -504,8 +497,7 @@ jobs:
         if: inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile ${{ inputs.install-args }}
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -517,8 +509,7 @@ jobs:
         # caller with private @narduk-enterprises/* dependencies would fail on
         # a 401 that looks like a token problem rather than a wiring one.
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 

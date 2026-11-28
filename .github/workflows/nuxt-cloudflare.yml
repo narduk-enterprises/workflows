@@ -904,11 +904,9 @@ on:
         default: "0.10.0"
       foundation-check-auth:
         description: >-
-          Type of the credential used for foundation checks. package-token is
-          the default and consumes NARDUK_PLATFORM_GH_PACKAGES_READ. nvault is
-          a legacy compatibility mode for callers that previously mapped their
-          nVault service token into that package secret. New callers pass the
-          canonical package-read secret and leave this at package-token.
+          Deprecated and ignored since 2026-11-27: foundation checks read
+          GitHub Packages with the job's own github.token (packages: read).
+          Kept so existing callers that set it still start.
         required: false
         type: string
         default: "package-token"
@@ -1203,17 +1201,14 @@ on:
         type: string
         default: ""
     secrets:
-      # CI alias for the single estate packages-read PAT. This is the only
-      # credential foundation checks and legacy direct installs may consume.
-      # Callers pass secrets.NARDUK_PLATFORM_GH_PACKAGES_READ (org Actions,
-      # same value as nvault GH_PACKAGES_READ). Local installs use
-      # GH_PACKAGES_READ. Do not mint a per-app PAT.
+      # Deprecated and ignored since 2026-11-27: every package read uses the
+      # job's own github.token (packages: read), and no hand-made PAT exists.
+      # Kept only so callers that still pass it start; removed once none do.
       NARDUK_PLATFORM_GH_PACKAGES_READ:
         required: false
-      # Caller-owned install wrappers may receive only this service token,
-      # never the package PAT. It is separate so one invocation can both
-      # install through nVault and run the foundation check with its canonical
-      # PAT. Generic caller-owned installers may omit it.
+      # Caller-owned install wrappers may receive this nVault service token.
+      # Without it they get GH_PACKAGES_READ, the job's github.token.
+      # Generic caller-owned installers may omit it.
       NVAULT_TOKEN:
         required: false
       # Journey-smoke rollback credential. Exposed as ROLLBACK_TOKEN to the
@@ -2401,13 +2396,14 @@ jobs:
       - name: Configure package registry auth
         if: inputs.install-script == ''
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
         run: &configure_package_registry_auth |
           set -euo pipefail
           set +x
-          if [ -z "$NARDUK_PLATFORM_GH_PACKAGES_READ" ]; then
-            if ! package_scope=$(node --input-type=module <<'NODE'
+          # The job's own github.token reads GitHub Packages (every job here
+          # grants packages: read). No hand-made PAT since 2026-11-27: the
+          # classic PAT expired 11-21 and Logan ruled out regenerating it.
+          if ! package_scope=$(node --input-type=module <<'NODE'
           import fs from 'node:fs';
           try {
             const pkg = fs.existsSync('package.json') ? JSON.parse(fs.readFileSync('package.json', 'utf8')) : {};
@@ -2428,31 +2424,21 @@ jobs:
             process.exitCode = 1;
           }
           NODE
-            ); then
-              exit 1
-            fi
-            if [ "$package_scope" = private ]; then
-              echo '::error::Private packages require the org NARDUK_PLATFORM_GH_PACKAGES_READ secret forwarded to this workflow. It maps to GH_PACKAGES_READ; do not substitute a GitHub App or write token.'
-              exit 1
-            fi
-            echo 'No GitHub Packages dependencies (none, or @narduk-enterprises via npm.nard.uk) and no package-read secret; skipping registry auth.'
-            exit 0
-          fi
-          if [[ "$NARDUK_PLATFORM_GH_PACKAGES_READ" == *[[:space:]]* ]]; then
-            echo '::error::Package-read credential contains whitespace; repair the mapped secret.'
+          ); then
             exit 1
           fi
-          if [ -f ./scripts/package-registry-auth.mjs ]; then
-            node ./scripts/package-registry-auth.mjs
-          elif [ -f ./tools/configure-package-registry-auth.mjs ]; then
-            node ./tools/configure-package-registry-auth.mjs
-          else
-            # Direct org PAT path; legacy caller bootstraps keep their existing contract.
-            umask 077
-            # Variable reference stays literal; the token never enters this file.
-            # shellcheck disable=SC2016
-            printf '@narduk-enterprises:registry=https://npm.pkg.github.com\n@narduk-geo:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=${GH_PACKAGES_READ}\n' > .npmrc.auth
+          if [ "$package_scope" = public ]; then
+            echo 'No GitHub Packages dependencies (none, or @narduk-enterprises via npm.nard.uk); skipping registry auth.'
+            exit 0
           fi
+          if [ -z "${GH_PACKAGES_READ:-}" ] || [[ "$GH_PACKAGES_READ" == *[[:space:]]* ]]; then
+            echo '::error::The job token is unavailable; the calling job must grant permissions: packages: read.'
+            exit 1
+          fi
+          umask 077
+          # Variable reference stays literal; the token never enters this file.
+          # shellcheck disable=SC2016
+          printf '@narduk-enterprises:registry=https://npm.pkg.github.com\n@narduk-geo:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=${GH_PACKAGES_READ}\n' > .npmrc.auth
 
       # SELF-HOSTED: THE PNPM STORE MUST SIT ON THE WORKSPACE'S OWN FILESYSTEM.
       #
@@ -2519,8 +2505,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -2528,8 +2513,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -2546,10 +2530,10 @@ jobs:
         if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
           # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
           # org package-read secret to GH_PACKAGES_READ (workflows#98).
-          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && github.token || '' }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
@@ -2904,8 +2888,8 @@ jobs:
         env:
           PM: ${{ inputs.package-manager }}
           TOOL_VERSION: ${{ inputs.foundation-check-tool-version }}
-          AUTH_SOURCE: ${{ inputs.foundation-check-auth }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          # The job's own token reads GitHub Packages (packages: read).
+          GH_PACKAGES_READ: ${{ github.token }}
           # Item 2.3 reads the narduk-core packument. On GitHub Packages that
           # is the FULL document and it ignores the abbreviated Accept header:
           # 10.4 MB on 2026-10-19 (it was 240 KB on 2026-09-16), about 15 s on
@@ -2938,40 +2922,12 @@ jobs:
           ' 2>/dev/null || echo no)
           if [ "$mirrored" = "yes" ]; then
             echo "@narduk-enterprises routes to https://npm.nard.uk; running foundation:check with no package-read credential"
-            unset NARDUK_PLATFORM_GH_PACKAGES_READ GH_PACKAGES_READ NODE_AUTH_TOKEN
-          elif ! GH_PACKAGES_READ=$(node --input-type=module <<'NODE'
-          const secret = process.env.NARDUK_PLATFORM_GH_PACKAGES_READ;
-          const valid = value => typeof value === 'string' && value.length > 0 && value === value.trim() && !/[\0\r\n]/.test(value);
-          try {
-            if (!valid(secret)) throw new Error('Package-read credential is missing or invalid.');
-            let token;
-            if (process.env.AUTH_SOURCE === 'package-token') {
-              token = secret;
-            } else if (process.env.AUTH_SOURCE === 'nvault') {
-              const response = await fetch('https://api.nvault.nardukenterprises.com/v1/resolve', {
-                method: 'POST',
-                headers: { accept: 'application/json', authorization: `Bearer ${secret}`, 'content-type': 'application/json' },
-                body: '{}', cache: 'no-store', credentials: 'omit', redirect: 'error',
-                signal: AbortSignal.timeout(30000),
-              });
-              if (!response.ok) throw new Error(`nVault package-read resolve failed (HTTP ${response.status}).`);
-              const payload = await response.json();
-              token = payload?.data?.secrets?.GH_PACKAGES_READ;
-            } else {
-              throw new Error('foundation-check-auth must be package-token or nvault.');
-            }
-            if (!valid(token)) throw new Error('Resolved package-read credential is missing or invalid.');
-            process.stdout.write(token);
-          } catch {
-            console.error('Unable to resolve foundation-check package-read credential.');
-            process.exitCode = 1;
-          }
-          NODE
-          ); then
-            echo "::error::foundation-check registry authentication is unavailable"
+            unset GH_PACKAGES_READ NODE_AUTH_TOKEN
+          elif [ -z "${GH_PACKAGES_READ:-}" ]; then
+            # The job's own github.token (packages: read); no hand-made PAT.
+            echo "::error::foundation-check registry authentication is unavailable (the job token is missing)"
             exit 0
           else
-            echo "::add-mask::$GH_PACKAGES_READ"
             export GH_PACKAGES_READ
             # workflows#85: #79 renamed this step's exported credential from
             # NODE_AUTH_TOKEN to GH_PACKAGES_READ, but narduk-app-tools's own
@@ -2987,7 +2943,6 @@ jobs:
             # the code without updating that contract. Export both names, same
             # value, until narduk-app-tools reads GH_PACKAGES_READ instead.
             export NODE_AUTH_TOKEN="$GH_PACKAGES_READ"
-            unset NARDUK_PLATFORM_GH_PACKAGES_READ
           fi
           has_dep=$(node -e '
             let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
@@ -3891,8 +3846,7 @@ jobs:
       - name: Configure package registry auth
         if: inputs.install-script == ''
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
         run: *configure_package_registry_auth
 
       - name: Point pnpm at a workspace-local store (self-hosted)
@@ -3907,16 +3861,14 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       - name: Install dependencies (npm)
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       # Exact-path cleanup only: persistent self-hosted workspaces must not keep
@@ -3928,10 +3880,10 @@ jobs:
         if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
           # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
           # org package-read secret to GH_PACKAGES_READ (workflows#98).
-          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && github.token || '' }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
@@ -4060,8 +4012,7 @@ jobs:
       - name: Configure package registry auth
         if: inputs.install-script == ''
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
         run: *configure_package_registry_auth
 
       - name: Point pnpm at a workspace-local store (self-hosted)
@@ -4076,16 +4027,14 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       - name: Install dependencies (npm)
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       # Exact-path cleanup only: persistent self-hosted workspaces must not keep
@@ -4097,10 +4046,10 @@ jobs:
         if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
           # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
           # org package-read secret to GH_PACKAGES_READ (workflows#98).
-          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && github.token || '' }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
@@ -4843,8 +4792,7 @@ jobs:
       - name: Configure package registry auth
         if: inputs.install-script == ''
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
         run: *configure_package_registry_auth
 
       # Store placement, same reasoning as the `build` job above: on a
@@ -4872,8 +4820,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -4881,8 +4828,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -4897,10 +4843,10 @@ jobs:
         if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
           # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
           # org package-read secret to GH_PACKAGES_READ (workflows#98).
-          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && github.token || '' }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
@@ -5558,8 +5504,7 @@ jobs:
       - name: Configure package registry auth
         if: inputs.install-script == ''
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
         run: *configure_package_registry_auth
 
       - name: Point pnpm at a workspace-local store (self-hosted)
@@ -5580,16 +5525,14 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       - name: Install dependencies (npm)
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       - name: Remove package auth materialization
@@ -5599,10 +5542,10 @@ jobs:
         if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
           # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
           # org package-read secret to GH_PACKAGES_READ (workflows#98).
-          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && github.token || '' }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
@@ -6128,8 +6071,7 @@ jobs:
       - name: Configure package registry auth
         if: inputs.install-script == ''
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
         run: *configure_package_registry_auth
 
       # Store placement, same reasoning as the `build` job above: on a
@@ -6157,8 +6099,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -6166,8 +6107,7 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
 
@@ -6182,10 +6122,10 @@ jobs:
         if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
           # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
           # org package-read secret to GH_PACKAGES_READ (workflows#98).
-          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && github.token || '' }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
@@ -6474,8 +6414,7 @@ jobs:
       - name: Configure package registry auth
         if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script == ''))"
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
         run: *configure_package_registry_auth
 
       - name: Point pnpm at a workspace-local store (self-hosted)
@@ -6490,16 +6429,14 @@ jobs:
         if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script == '' && inputs.package-manager == 'pnpm'))"
         run: pnpm install --frozen-lockfile
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       - name: Install dependencies (npm)
         if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script == '' && inputs.package-manager == 'npm'))"
         run: npm ci
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       # Exact-path cleanup only: persistent self-hosted workspaces must not keep
@@ -6512,10 +6449,10 @@ jobs:
         if: "needs.ci-admission.outputs.skip != 'true' && (env.FAST_ENABLED == 'true' && env.FAST_ROLE != 'aggregate' && (inputs.install-script != ''))"
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
           # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
           # org package-read secret to GH_PACKAGES_READ (workflows#98).
-          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && github.token || '' }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
@@ -6993,8 +6930,7 @@ jobs:
       - name: Configure package registry auth
         if: inputs.install-script == ''
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
         run: *configure_package_registry_auth
 
       - name: Point pnpm at a workspace-local store (self-hosted)
@@ -7009,16 +6945,14 @@ jobs:
         if: inputs.install-script == '' && inputs.package-manager == 'pnpm'
         run: pnpm install --frozen-lockfile
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       - name: Install dependencies (npm)
         if: inputs.install-script == '' && inputs.package-manager == 'npm'
         run: npm ci
         env:
-          GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
           NPM_CONFIG_USERCONFIG: ${{ github.workspace }}/${{ inputs.working-directory }}/.npmrc.auth
           NPM_CONFIG_GLOBALCONFIG: /dev/null
       # Exact-path cleanup only: persistent self-hosted workspaces must not keep
@@ -7030,10 +6964,10 @@ jobs:
         if: inputs.install-script != ''
         env:
           INSTALL_SCRIPT: ${{ inputs.install-script }}
-          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN || (inputs.foundation-check-auth == 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '') }}
+          NVAULT_TOKEN: ${{ secrets.NVAULT_TOKEN }}
           # Dependabot runs see no Actions-only NVAULT_TOKEN. Only then, map the
           # org package-read secret to GH_PACKAGES_READ (workflows#98).
-          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && inputs.foundation-check-auth != 'nvault' && secrets.NARDUK_PLATFORM_GH_PACKAGES_READ || '' }}
+          GH_PACKAGES_READ: ${{ !secrets.NVAULT_TOKEN && github.token || '' }}
           PM: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail

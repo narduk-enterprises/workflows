@@ -108,6 +108,8 @@ on:
         type: string
         default: "pnpm"
     secrets:
+      # Deprecated and ignored since 2026-11-27 (packages read with the job's
+      # github.token). Kept only so callers that still pass it start.
       NARDUK_PLATFORM_GH_PACKAGES_READ:
         required: false
 
@@ -308,7 +310,7 @@ jobs:
       - name: Run governance check
         if: "needs.ci-admission.outputs.skip != 'true'"
         env:
-          NARDUK_PLATFORM_GH_PACKAGES_READ: ${{ secrets.NARDUK_PLATFORM_GH_PACKAGES_READ }}
+          GH_PACKAGES_READ: ${{ github.token }}
         run: ${{ inputs.command }}
 
       # The governance command is what populates the store here (this workflow
